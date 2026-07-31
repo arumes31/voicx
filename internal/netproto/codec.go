@@ -458,4 +458,8 @@ func Decode(f *Frame, msg any) error {
 		// Allow empty payloads (e.g. Ping) to decode into zero-value structs.
 		return nil
 	}
-	if err := json.Unmarshal(f.Payload,
+	if err := json.Unmarshal(f.Payload, msg); err != nil {
+		return fmt.Errorf("netproto: decoding %s: %w", MessageType(f.Type), err)
+	}
+	return nil
+}
