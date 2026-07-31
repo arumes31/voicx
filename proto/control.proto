@@ -1,0 +1,171 @@
+syntax = "proto3";
+
+package voicx.v1;
+
+option go_package = "voicx/v1;voicxv1";
+
+// Control service handles authentication, channel management, permission
+// queries, and file transfer control.
+service Control {
+  // Authenticate validates credentials and returns a session token.
+  rpc Authenticate(AuthenticateRequest) returns (AuthenticateResponse);
+  // CreateChannel creates a new channel under an optional parent.
+  rpc CreateChannel(CreateChannelRequest) returns (CreateChannelResponse);
+  // DeleteChannel removes a channel.
+  rpc DeleteChannel(DeleteChannelRequest) returns (DeleteChannelResponse);
+  // ListChannels returns the channel tree.
+  rpc ListChannels(ListChannelsRequest) returns (ListChannelsResponse);
+  // QueryPermissions returns the effective permissions for a user in a channel.
+  rpc QueryPermissions(QueryPermissionsRequest) returns (QueryPermissionsResponse);
+  // File transfer control RPCs.
+  rpc StartFileTransfer(StartFileTransferRequest) returns (StartFileTransferResponse);
+  rpc GetFileTransferStatus(GetFileTransferStatusRequest) returns (GetFileTransferStatusResponse);
+  rpc CancelFileTransfer(CancelFileTransferRequest) returns (CancelFileTransferResponse);
+}
+
+// --- Authentication ---
+
+message AuthenticateRequest {
+  string username = 1;
+  string password = 2;
+  // Optional pre-issued token (e.g. for reconnect).
+  string token = 3;
+  string client_version = 4;
+  map<string, string> metadata = 5;
+}
+
+message AuthenticateResponse {
+  bool success = 1;
+  string session_token = 2;
+  string user_id = 3;
+  string display_name = 4;
+  int64 expires_at = 5; // unix millis
+  string error = 6;
+}
+
+// --- Channel management ---
+
+message Channel {
+  string id = 1;
+  string name = 2;
+  string parent_id = 3;
+  int32 max_clients = 4;
+  bool permanent = 5;
+  int32 current_clients = 6;
+  map<string, string> metadata = 7;
+}
+
+message CreateChannelRequest {
+  string name = 1;
+  string parent_id = 2;
+  int32 max_clients = 3;
+  bool permanent = 4;
+  map<string, string> metadata = 5;
+}
+
+message CreateChannelResponse {
+  bool success = 1;
+  string channel_id = 2;
+  string error = 3;
+}
+
+message DeleteChannelRequest {
+  string channel_id = 1;
+  string reason = 2;
+}
+
+message DeleteChannelResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message ListChannelsRequest {
+  // If set, only the subtree rooted at this channel is returned.
+  string root_channel_id = 1;
+}
+
+message ListChannelsResponse {
+  repeated Channel channels = 1;
+}
+
+// --- Permissions ---
+
+enum Permission {
+  PERMISSION_UNSPECIFIED = 0;
+  PERMISSION_JOIN = 1;
+  PERMISSION_SPEAK = 2;
+  PERMISSION_VIDEO = 3;
+  PERMISSION_CHAT = 4;
+  PERMISSION_KICK = 5;
+  PERMISSION_BAN = 6;
+  PERMISSION_MOVE = 7;
+  PERMISSION_CREATE_CHANNEL = 8;
+  PERMISSION_DELETE_CHANNEL = 9;
+  PERMISSION_TRANSFER_FILE = 10;
+}
+
+message QueryPermissionsRequest {
+  string channel_id = 1;
+  string user_id = 2; // empty means the authenticated caller
+}
+
+message QueryPermissionsResponse {
+  repeated Permission granted = 1;
+  repeated Permission denied = 2;
+  bool is_admin = 3;
+}
+
+// --- File transfer control ---
+
+enum FileTransferDirection {
+  FILE_TRANSFER_DIRECTION_UNSPECIFIED = 0;
+  FILE_TRANSFER_DIRECTION_UPLOAD = 1;
+  FILE_TRANSFER_DIRECTION_DOWNLOAD = 2;
+}
+
+enum FileTransferStatus {
+  FILE_TRANSFER_STATUS_UNSPECIFIED = 0;
+  FILE_TRANSFER_STATUS_PENDING = 1;
+  FILE_TRANSFER_STATUS_IN_PROGRESS = 2;
+  FILE_TRANSFER_STATUS_COMPLETED = 3;
+  FILE_TRANSFER_STATUS_FAILED = 4;
+  FILE_TRANSFER_STATUS_CANCELED = 5;
+}
+
+message StartFileTransferRequest {
+  string channel_id = 1;
+  string filename = 2;
+  int64 size_bytes = 3;
+  FileTransferDirection direction = 4;
+  string content_type = 5;
+}
+
+message StartFileTransferResponse {
+  bool success = 1;
+  string transfer_id = 2;
+  // Endpoint where the client should send/receive file bytes (e.g. HTTP URL).
+  string endpoint = 3;
+  string error = 4;
+}
+
+message GetFileTransferStatusRequest {
+  string transfer_id = 1;
+}
+
+message GetFileTransferStatusResponse {
+  string transfer_id = 1;
+  FileTransferStatus status = 2;
+  int64 bytes_transferred = 3;
+  int64 total_bytes = 4;
+  string error = 5;
+}
+
+message CancelFileTransferRequest {
+  string transfer_id = 1;
+  string reason = 2;
+}
+
+message CancelFileTransferResponse {
+  bool success = 1;
+  string error = 2;
+}

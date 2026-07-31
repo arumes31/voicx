@@ -1,0 +1,14 @@
+# buf.yaml configures the buf CLI for linting and breaking-change detection.
+# See: https://buf.build/docs/configuration/v2/buf-yaml/
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+  except:
+    - PACKAGE_VERSION_SUFFIX
+  enum_zero_value_suffix: _UNSPECIFIED
+breaking:
+  use:
+    - FILE

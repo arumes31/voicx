@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package voicx.v1;
+
+option go_package = "voicx/v1;voicxv1";
+
+// Events service streams server-side events to clients. Clients open a stream
+// and receive events scoped to their session (channels they are in, the
+// server, and direct notifications).
+service Events {
+  // Subscribe opens a stream of server events for the authenticated client.
+  rpc Subscribe(SubscribeEventsRequest) returns (stream Event);
+}
+
+message SubscribeEventsRequest {
+  // Optional filter of event types to receive; empty means all.
+  repeated EventType event_types = 1;
+}
+
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  EVENT_TYPE_USER_JOINED = 1;
+  EVENT_TYPE_USER_LEFT = 2;
+  EVENT_TYPE_USER_SPEAKING = 3;
+  EVENT_TYPE_CHANNEL_CREATED = 4;
+  EVENT_TYPE_CHANNEL_DELETED = 5;
+  EVENT_TYPE_USER_MOVED = 6;
+  EVENT_TYPE_USER_KICKED = 7;
+  EVENT_TYPE_USER_BANNED = 8;
+}
+
+// Event is the envelope for all server events. Exactly one payload field is set.
+message Event {
+  string id = 1;
+  EventType type = 2;
+  int64 timestamp = 3; // unix millis
+  oneof payload {
+    UserJoinedEvent user_joined = 10;
+    UserLeftEvent user_left = 11;
+    UserSpeakingEvent user_speaking = 12;
+    ChannelCreatedEvent channel_created = 13;
+    ChannelDeletedEvent channel_deleted = 14;
+    UserMovedEvent user_moved = 15;
+    UserKickedEvent user_kicked = 16;
+    UserBannedEvent user_banned = 17;
+  }
+}
+
+message UserJoinedEvent {
+  string channel_id = 1;
+  string user_id = 2;
+  string display_name = 3;
+}
+
+message UserLeftEvent {
+  string channel_id = 1;
+  string user_id = 2;
+  string reason = 3;
+}
+
+message UserSpeakingEvent {
+  string channel_id = 1;
+  string user_id = 2;
+  bool speaking = 3; // true when speaking starts, false when stops
+}
+
+message ChannelCreatedEvent {
+  string channel_id = 1;
+  string name = 2;
+  string parent_id = 3;
+  int32 max_clients = 4;
+}
+
+message ChannelDeletedEvent {
+  string channel_id = 1;
+  string reason = 2;
+}
+
+message UserMovedEvent {
+  string user_id = 1;
+  string from_channel_id = 2;
+  string to_channel_id = 3;
+  string moved_by = 4; // user id of the actor
+}
+
+message UserKickedEvent {
+  string channel_id = 1;
+  string user_id = 2;
+  string kicked_by = 3;
+  string reason = 4;
+}
+
+message UserBannedEvent {
+  string user_id = 1;
+  string banned_by = 2;
+  string reason = 3;
+  int64 expires_at = 4; // unix millis; 0 means permanent
+}

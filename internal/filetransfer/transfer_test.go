@@ -1,0 +1,296 @@
+// transfer_test.go exercises the file-transfer protocol over real TCP:
+// upload/download round-trips, abort paths, and init-frame validation.
+package filetransfer
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"net"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"voicx/internal/netproto"
+	"voicx/internal/store"
+)
+
+// startServer starts a file-transfer server on an ephemeral port and returns
+// its address and the server.
+func startServer(t *testing.T, fs FileStore) (string, *Server) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	s := New(Config{Addr: addr, RootDir: t.TempDir()}, fs, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Start(ctx) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.Dial("tcp", addr)
+		if err == nil {
+			_ = conn.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Cleanup(func() {
+		cancel()
+		_ = s.Close()
+		<-errCh
+	})
+	return addr, s
+}
+
+// dialTransfer connects and sends the init frame.
+func dialTransfer(t *testing.T, addr, transferID, token string) net.Conn {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if err := writeJSON(conn, frameInit, initMsg{Token: token, TransferID: transferID}); err != nil {
+		t.Fatalf("write init: %v", err)
+	}
+	return conn
+}
+
+// readStatus reads the final status frame.
+func readStatus(t *testing.T, conn net.Conn) statusMsg {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	f, err := netproto.ReadFrame(conn)
+	if err != nil {
+		t.Fatalf("read status: %v", err)
+	}
+	if f.Type != frameStatus {
+		t.Fatalf("frame type = %d, want status (%d)", f.Type, frameStatus)
+	}
+	var st statusMsg
+	if err := json.Unmarshal(f.Payload, &st); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	return st
+}
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// TestUploadRoundTrip uploads a file end-to-end and verifies the on-disk
+// content, the store record, and the ok status.
+func TestUploadRoundTrip(t *testing.T) {
+	fs := newFakeFileStore()
+	addr, s := startServer(t, fs)
+
+	content := []byte("hello world")
+	id, token, err := s.InitUpload(context.Background(), 7, "hello.txt", int64(len(content)), "uid-1")
+	if err != nil {
+		t.Fatalf("InitUpload: %v", err)
+	}
+
+	conn := dialTransfer(t, addr, id, token)
+	defer conn.Close()
+
+	// Two chunks, then the digest.
+	for _, chunk := range [][]byte{content[:6], content[6:]} {
+		if err := netproto.WriteFrame(conn, &netproto.Frame{Type: frameChunk, Payload: chunk}); err != nil {
+			t.Fatalf("write chunk: %v", err)
+		}
+	}
+	if err := writeJSON(conn, frameDigest, digestMsg{SHA256: sha256Hex(content)}); err != nil {
+		t.Fatalf("write digest: %v", err)
+	}
+
+	st := readStatus(t, conn)
+	if !st.OK {
+		t.Fatalf("status = %+v, want ok", st)
+	}
+
+	onDisk, err := os.ReadFile(filepath.Join(s.cfg.RootDir, "7", "hello.txt"))
+	if err != nil {
+		t.Fatalf("read uploaded file: %v", err)
+	}
+	if string(onDisk) != string(content) {
+		t.Fatalf("file content = %q, want %q", onDisk, content)
+	}
+
+	rec, err := fs.GetFile(context.Background(), 7, "hello.txt")
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if rec.Size != int64(len(content)) || rec.SHA256 != sha256Hex(content) || rec.Uploader != "uid-1" {
+		t.Fatalf("store record = %+v", rec)
+	}
+}
+
+// TestUploadSizeMismatch verifies sending more bytes than declared aborts
+// the transfer without leaving a file behind.
+func TestUploadSizeMismatch(t *testing.T) {
+	fs := newFakeFileStore()
+	addr, s := startServer(t, fs)
+
+	id, token, err := s.InitUpload(context.Background(), 7, "m.txt", 4, "uid-1")
+	if err != nil {
+		t.Fatalf("InitUpload: %v", err)
+	}
+
+	conn := dialTransfer(t, addr, id, token)
+	defer conn.Close()
+
+	if err := netproto.WriteFrame(conn, &netproto.Frame{Type: frameChunk, Payload: []byte("hello")}); err != nil {
+		t.Fatalf("write chunk: %v", err)
+	}
+	st := readStatus(t, conn)
+	if st.OK {
+		t.Fatal("size mismatch accepted")
+	}
+
+	if _, err := os.Stat(filepath.Join(s.cfg.RootDir, "7", "m.txt")); !os.IsNotExist(err) {
+		t.Fatal("file left behind after abort")
+	}
+	if fs.addedCount() != 0 {
+		t.Fatal("store record created after abort")
+	}
+}
+
+// TestUploadChecksumMismatch verifies a wrong digest aborts the transfer.
+func TestUploadChecksumMismatch(t *testing.T) {
+	fs := newFakeFileStore()
+	addr, s := startServer(t, fs)
+
+	content := []byte("abcd")
+	id, token, err := s.InitUpload(context.Background(), 7, "c.txt", 4, "uid-1")
+	if err != nil {
+		t.Fatalf("InitUpload: %v", err)
+	}
+
+	conn := dialTransfer(t, addr, id, token)
+	defer conn.Close()
+	if err := netproto.WriteFrame(conn, &netproto.Frame{Type: frameChunk, Payload: content}); err != nil {
+		t.Fatalf("write chunk: %v", err)
+	}
+	if err := writeJSON(conn, frameDigest, digestMsg{SHA256: sha256Hex([]byte("wxyz"))}); err != nil {
+		t.Fatalf("write digest: %v", err)
+	}
+
+	st := readStatus(t, conn)
+	if st.OK {
+		t.Fatal("checksum mismatch accepted")
+	}
+	if _, err := os.Stat(filepath.Join(s.cfg.RootDir, "7", "c.txt")); !os.IsNotExist(err) {
+		t.Fatal("file left behind after checksum failure")
+	}
+}
+
+// TestDownloadRoundTrip downloads a file end-to-end.
+func TestDownloadRoundTrip(t *testing.T) {
+	fs := newFakeFileStore()
+	addr, s := startServer(t, fs)
+
+	content := []byte("download me, please")
+	if err := os.MkdirAll(filepath.Join(s.cfg.RootDir, "7"), 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(s.cfg.RootDir, "7", "doc.txt"), content, 0o600); err != nil {
+		t.Fatalf("write seed file: %v", err)
+	}
+	if err := fs.AddFile(context.Background(), store.FileRecord{
+		ChannelID: 7, Name: "doc.txt", Size: int64(len(content)), SHA256: sha256Hex(content),
+	}); err != nil {
+		t.Fatalf("AddFile: %v", err)
+	}
+
+	id, token, err := s.InitDownload(context.Background(), 7, "doc.txt")
+	if err != nil {
+		t.Fatalf("InitDownload: %v", err)
+	}
+
+	conn := dialTransfer(t, addr, id, token)
+	defer conn.Close()
+
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var got []byte
+	var digest digestMsg
+	for {
+		f, err := netproto.ReadFrame(conn)
+		if err != nil {
+			t.Fatalf("read frame: %v", err)
+		}
+		switch f.Type {
+		case frameChunk:
+			got = append(got, f.Payload...)
+		case frameDigest:
+			if err := json.Unmarshal(f.Payload, &digest); err != nil {
+				t.Fatalf("decode digest: %v", err)
+			}
+			goto done
+		default:
+			t.Fatalf("unexpected frame type %d", f.Type)
+		}
+	}
+done:
+	if string(got) != string(content) {
+		t.Fatalf("download = %q, want %q", got, content)
+	}
+	if digest.SHA256 != sha256Hex(content) {
+		t.Fatalf("digest = %q, want %q", digest.SHA256, sha256Hex(content))
+	}
+
+	st := readStatus(t, conn)
+	if !st.OK {
+		t.Fatalf("status = %+v, want ok", st)
+	}
+}
+
+// TestDownloadMissing verifies downloading an unknown file fails at init.
+func TestDownloadMissing(t *testing.T) {
+	fs := newFakeFileStore()
+	_, s := startServer(t, fs)
+	if _, _, err := s.InitDownload(context.Background(), 7, "nope.txt"); err == nil {
+		t.Fatal("InitDownload for missing file succeeded")
+	}
+}
+
+// TestInvalidInitFrame verifies a connection not starting with an init frame
+// is rejected.
+func TestInvalidInitFrame(t *testing.T) {
+	fs := newFakeFileStore()
+	addr, _ := startServer(t, fs)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	if err := netproto.WriteFrame(conn, &netproto.Frame{Type: frameChunk, Payload: []byte("x")}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	st := readStatus(t, conn)
+	if st.OK {
+		t.Fatal("non-init first frame accepted")
+	}
+}
+
+// TestInvalidToken verifies a bad token is rejected.
+func TestInvalidToken(t *testing.T) {
+	fs := newFakeFileStore()
+	addr, _ := startServer(t, fs)
+
+	conn := dialTransfer(t, addr, "no-such-id", "no-such-token")
+	defer conn.Close()
+	st := readStatus(t, conn)
+	if st.OK {
+		t.Fatal("invalid token accepted")
+	}
+}

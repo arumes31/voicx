@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>voicx</title>
+    <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+    <!-- Login overlay -->
+    <div id="login-overlay">
+        <div class="login-card">
+            <h1 class="wordmark">voicx</h1>
+            <p class="tagline">voice ops console</p>
+            <label>SERVER <input id="login-addr" value="127.0.0.1:10011" /></label>
+            <label>NICKNAME <input id="login-nick" placeholder="nickname or unique id" /></label>
+            <label>PASSWORD <input id="login-password" type="password" placeholder="optional — account login" /></label>
+            <label>SERVER PASSWORD <input id="login-serverpw" type="password" placeholder="if required" /></label>
+            <button id="login-connect">CONNECT</button>
+            <div id="login-error"></div>
+            <div class="identity-footnote">
+                Identity auto-generated — stored locally
+                <span class="mono" id="login-identity"></span>
+            </div>
+        </div>
+    </div>
+
+    <div id="toasts"></div>
+
+    <!-- Main three-pane layout -->
+    <div id="app" class="hidden">
+        <nav id="menubar"></nav>
+        <div id="app-body">
+        <aside id="sidebar">
+            <div class="brand">
+                <span class="wordmark">voicx</span>
+                <span id="conn-pill" class="pill">offline</span>
+            </div>
+            <div class="pane-head">CHANNELS</div>
+            <div id="channel-tree"></div>
+        </aside>
+
+        <main id="center">
+            <div id="voice-bar">
+                <button id="ptt-btn" title="Hold to talk (Space)">🎙</button>
+                <div class="voice-buttons">
+                    <button id="voice-join" class="icon-btn" title="Join / leave voice">⏻</button>
+                    <button id="voice-mute" class="icon-btn" title="Mute">🔇</button>
+                    <button id="voice-screen" class="icon-btn" title="Share screen">🖥</button>
+                </div>
+                <div class="voice-info">
+                    <div id="voice-status">voice off</div>
+                    <div id="mic-status" class="warn"></div>
+                </div>
+                <span id="hotkey-status" title="global hotkey status"></span>
+            </div>
+            <div id="talk-banner" class="hidden">● TALKING</div>
+            <div id="chat-log"></div>
+            <div id="chat-input-row">
+                <select id="chat-scope">
+                    <option value="channel">channel</option>
+                    <option value="global">global</option>
+                    <option value="direct">direct</option>
+                </select>
+                <input id="chat-target" class="hidden" placeholder="target unique id" />
+                <input id="chat-text" placeholder="message…" />
+                <button id="chat-send">SEND</button>
+            </div>
+            <video id="remote-video" autoplay playsinline class="hidden"></video>
+            <video id="local-video" autoplay playsinline muted class="hidden"></video>
+        </main>
+
+        <aside id="details">
+            <div class="pane-head">DETAILS</div>
+            <div id="client-card"></div>
+            <div class="pane-head">PERMISSIONS</div>
+            <div id="perm-area"></div>
+        </aside>
+        </div>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+</body>
+</html>

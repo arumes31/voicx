@@ -1,0 +1,167 @@
+# docker-compose.yml — voicx full stack (Go server + PostgreSQL + Redis)
+#
+# Usage:
+#   make compose-up   # build & start the whole stack detached
+#   make compose-down # stop & remove containers/networks
+#
+# Services resolve each other by service name on the `voicx-net` bridge network
+# (e.g. the Go server connects to `postgres:5432` and `redis:6379`).
+#
+# The voicx service is configured purely through VOICX_* environment variables
+# below (no config file is mounted). Credentials/defaults can be overridden via
+# a .env file (see .env.example).
+
+services:
+  # ---------------------------------------------------------------------------
+  # voicx — the Go voice/video server
+  # ---------------------------------------------------------------------------
+  voicx:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: voicx:latest
+    container_name: voicx
+    # --- GPU access for server-side hardware transcoding (optional) --------
+    # Only needed when recording.video_args uses a hardware encoder. Uncomment
+    # ONE of the variants below.
+    #
+    # Intel/AMD (VAAPI/QuickSync via DRI):
+    # devices:
+    #   - /dev/dri:/dev/dri
+    #
+    # NVIDIA (NVENC; requires the NVIDIA Container Toolkit on the host):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    # --- Container hardening -------------------------------------------------
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    networks:
+      - voicx-net
+    ports:
+      # TeamSpeak-style voice transport (UDP)
+      - "9987:9987/udp"
+      # ServerQuery / raw TCP control
+      - "10011:10011"
+      # ServerQuery (admin/bot text protocol)
+      - "10012:10012"
+      # File transfer
+      - "30033:30033"
+      # Health/readiness/metrics HTTP endpoint
+      - "9090:9090"
+    volumes:
+      # Writable data (uploaded files, avatars, icons, recordings) so the
+      # root filesystem can stay read-only.
+      - voicxdata:/data
+    environment:
+      # --- Logging ---
+      VOICX_LOG_LEVEL: ${VOICX_LOG_LEVEL:-info}
+      VOICX_DEV_MODE: ${VOICX_DEV_MODE:-false}
+
+      # --- Database (points at the postgres service) ---
+      VOICX_DATABASE_URL: "postgres://${POSTGRES_USER:-voicx}:${POSTGRES_PASSWORD:-voicx}@postgres:5432/${POSTGRES_DB:-voicx}?sslmode=disable"
+
+      # --- Redis (points at the redis service) ---
+      VOICX_REDIS_ADDR: "redis:6379"
+      VOICX_REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+
+      # --- Listen addresses (kept in sync with the published ports) ---
+      VOICX_TCP_ADDR: ":10011"
+      VOICX_UDP_ADDR: ":9987"
+      VOICX_GRPC_ADDR: ":50051"
+      VOICX_HEALTH_ADDR: ":9090"
+      VOICX_QUERY_ADDR: ":10012"
+
+      # --- Writable data on the named volume (read_only root fs) ---
+      VOICX_FILE_ROOT: "/data/files"
+      VOICX_RECORDING_DIR: "/data/recordings"
+    healthcheck:
+      test: [ "CMD-SHELL", "wget -qO- http://127.0.0.1:9090/healthz || exit 1" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # postgres — primary relational database
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: voicx-postgres
+    restart: unless-stopped
+    networks:
+      - voicx-net
+    # Exposed only internally; the voicx service connects via `postgres:5432`.
+    expose:
+      - "5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-voicx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-voicx}
+      POSTGRES_DB: ${POSTGRES_DB:-voicx}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-voicx} -d ${POSTGRES_DB:-voicx}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # redis — cache / pub-sub / session store
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: voicx-redis
+    restart: unless-stopped
+    networks:
+      - voicx-net
+    # Exposed only internally; the voicx service connects via `redis:6379`.
+    expose:
+      - "6379"
+    # Enable AOF persistence so cached/session state survives restarts.
+    command: [ "redis-server", "--appendonly", "yes" ]
+    # If a Redis password is desired, set REDIS_PASSWORD in .env and uncomment:
+    # command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+# ---------------------------------------------------------------------------
+# Networks
+# ---------------------------------------------------------------------------
+networks:
+  voicx-net:
+    driver: bridge
+    name: voicx-net
+
+# ---------------------------------------------------------------------------
+# Volumes
+# ---------------------------------------------------------------------------
+volumes:
+  pgdata:
+    name: voicx-pgdata
+  redisdata:
+    name: voicx-redisdata
+  voicxdata:
+    name: voicx-data

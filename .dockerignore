@@ -1,0 +1,51 @@
+# .dockerignore for voicx
+# Keep the Docker build context small and reproducible by excluding files
+# that are not needed to compile or run the binary.
+
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+
+# Documentation - keep README for context, ignore the rest
+*.md
+!README.md
+
+# Editor / IDE config
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build artifacts and caches
+out/
+dist/
+bin/
+build/
+*.exe
+*.test
+*.out
+coverage.out
+coverage.txt
+
+# Go module vendoring (we use `go mod download` in the builder)
+vendor/
+
+# Docker metadata (avoid recursive context)
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Local config that should not be baked into the image
+config.yaml

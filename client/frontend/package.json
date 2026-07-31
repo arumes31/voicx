@@ -1,0 +1,18 @@
+{
+  "name": "frontend",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@fontsource-variable/jetbrains-mono": "^5.2.5",
+    "@fontsource-variable/outfit": "^5.2.5",
+    "@fontsource-variable/sora": "^5.2.5"
+  },
+  "devDependencies": {
+    "vite": "^7.0.0"
+  }
+}

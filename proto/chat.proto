@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+package voicx.v1;
+
+option go_package = "voicx/v1;voicxv1";
+
+// Chat service handles channel chat, global server chat, direct messages,
+// and offline message spool requests.
+service Chat {
+  // SendChannelChat sends a message to a channel.
+  rpc SendChannelChat(SendChannelChatRequest) returns (SendChatResponse);
+  // SendGlobalChat sends a message to the entire server.
+  rpc SendGlobalChat(SendGlobalChatRequest) returns (SendChatResponse);
+  // SendDirectMessage sends a private message to a specific client.
+  rpc SendDirectMessage(SendDirectMessageRequest) returns (SendChatResponse);
+  // FetchOfflineMessages retrieves messages spooled while the client was offline.
+  rpc FetchOfflineMessages(FetchOfflineMessagesRequest) returns (FetchOfflineMessagesResponse);
+  // AckOfflineMessages acknowledges receipt of spooled messages so the server may delete them.
+  rpc AckOfflineMessages(AckOfflineMessagesRequest) returns (AckOfflineMessagesResponse);
+}
+
+// ChatMessage is the canonical representation of a chat message.
+message ChatMessage {
+  string id = 1;
+  string channel_id = 2;
+  string sender_id = 3;
+  string recipient_id = 4; // empty for channel/global messages
+  string content = 5;
+  int64 timestamp = 6; // unix millis
+  ChatScope scope = 7;
+  map<string, string> metadata = 8;
+}
+
+enum ChatScope {
+  CHAT_SCOPE_UNSPECIFIED = 0;
+  CHAT_SCOPE_CHANNEL = 1;
+  CHAT_SCOPE_GLOBAL = 2;
+  CHAT_SCOPE_DIRECT = 3;
+}
+
+message SendChannelChatRequest {
+  string channel_id = 1;
+  string content = 2;
+  map<string, string> metadata = 3;
+}
+
+message SendGlobalChatRequest {
+  string content = 1;
+  map<string, string> metadata = 2;
+}
+
+message SendDirectMessageRequest {
+  string recipient_id = 1;
+  string content = 2;
+  map<string, string> metadata = 3;
+}
+
+message SendChatResponse {
+  bool accepted = 1;
+  string message_id = 2;
+  string error = 3;
+}
+
+message FetchOfflineMessagesRequest {
+  // Maximum number of messages to retrieve; 0 means server default.
+  int32 limit = 1;
+  // If set, only messages newer than this unix millis timestamp are returned.
+  int64 since = 2;
+}
+
+message FetchOfflineMessagesResponse {
+  repeated ChatMessage messages = 1;
+  bool has_more = 2;
+}
+
+message AckOfflineMessagesRequest {
+  repeated string message_ids = 1;
+}
+
+message AckOfflineMessagesResponse {
+  int32 acknowledged = 1;
+  repeated string failed_ids = 2;
+}

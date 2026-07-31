@@ -1,0 +1,58 @@
+# voicx server configuration sample.
+# The loader searches for config.yaml in the working directory first, then in
+# /etc/voicx. Environment variables prefixed with VOICX_ override these values
+# (e.g. VOICX_TCP_ADDR=:10012). See .env.example for the full list of supported
+# environment variables.
+
+server_name: voicx
+server_password: ""  # global server password; empty = open server (hashed at startup)
+log_level: info        # debug | info | warn | error
+dev_mode: true        # true = development logger (console), false = production (JSON)
+
+tcp_addr: ":10011"    # TeamSpeak-like query / control TCP port
+udp_addr: ":9987"     # voice UDP port (Pion WebRTC/media in later phases)
+udp_rate_limit_pps: 200   # per-source-IP UDP rate limit (pkt/s); 0 = disabled
+udp_rate_burst: 400       # per-source-IP UDP burst allowance
+grpc_addr: ":50051"   # gRPC API port (reserved; no listener yet)
+health_addr: ":9090"  # health/readiness HTTP endpoint (/healthz, /readyz)
+query_addr: ":10012"  # ServerQuery (TS3-style admin/bot text protocol)
+
+# File transfer (token-authorized uploads/downloads on its own port).
+file_addr: ":30033"
+file_root: "./data/files"     # on-disk layout: <channel_id>/<name>
+file_max_kbps: 0              # per-connection bandwidth cap in KiB/s; 0 = unlimited
+file_channel_quota_mb: 0      # per-channel total file quota in MiB; 0 = unlimited
+file_max_size_mb: 100         # per-transfer size cap in MiB; 0 = unlimited
+
+database_url: "postgres://voicx:voicx@localhost:5432/voicx?sslmode=disable"
+redis_addr: "localhost:6379"
+redis_password: ""
+redis_enabled: true   # false = skip Redis entirely (server runs without it)
+
+max_clients: 1024
+
+# Database connection pool tuning.
+db_max_open_conns: 25
+db_max_idle_conns: 5
+db_conn_max_lifetime: 30m
+
+# WebRTC (Pion) engine configuration.
+# ice_servers: STUN/TURN URLs used when creating peer connections. If empty,
+#   the engine falls back to "stun:stun.l.google.com:19302".
+# enable_av1: register the AV1 video codec (optional; not all clients support it).
+webrtc:
+  ice_servers:
+    - "stun:stun.l.google.com:19302"
+  enable_av1: false
+
+# Server-side stream recording via an ffmpeg subprocess (see internal/recorder).
+# Disabled by default. video_args/audio_args are the ffmpeg output options;
+# set e.g. ["-c:v", "h264_nvenc"] (NVIDIA), ["-c:v", "h264_qsv"] (Intel), or
+# ["-c:v", "h264_vaapi"] (AMD/Intel Linux) for hardware encoding.
+recording:
+  enabled: false
+  dir: recordings
+  ffmpeg_path: ffmpeg
+  format: webm
+  video_args: ["-c:v", "copy"]
+  audio_args: ["-c:a", "copy"]
