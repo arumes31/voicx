@@ -763,3 +763,152 @@ func TestChallengeAuthWithBoundKey(t *testing.T) {
 		t.Fatalf("unique id = %q, want canonical user-uid", resp.UniqueID)
 	}
 }
+
+// --- client info -------------------------------------------------------------
+
+// queryClientInfo sends a ClientInfoQuery and decodes the response.
+func queryClientInfo(t *testing.T, conn net.Conn, clientID string) netproto.ClientInfoResponse {
+	t.Helper()
+	send(t, conn, netproto.MsgClientInfoQuery, netproto.ClientInfoQuery{ClientID: clientID})
+	f := readOfType(t, conn, netproto.MsgClientInfoResponse)
+	var resp netproto.ClientInfoResponse
+	if err := netproto.Decode(f, &resp); err != nil {
+		t.Fatalf("decode client info: %v", err)
+	}
+	return resp
+}
+
+// TestClientInfoSelf verifies a self query returns full data incl. own IP.
+func TestClientInfoSelf(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+
+	conn, clientID := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+
+	resp := queryClientInfo(t, conn, clientID)
+	if resp.ClientID != clientID || resp.UniqueID != "user-uid" || resp.Nickname != "user" {
+		t.Fatalf("info = %+v", resp)
+	}
+	if resp.IP == "" || resp.Port == 0 {
+		t.Fatalf("self query missing ip/port: %+v", resp)
+	}
+	if resp.ConnectedAt <= 0 {
+		t.Fatalf("connected_at = %d, want > 0", resp.ConnectedAt)
+	}
+	if resp.BytesIn <= 0 {
+		t.Fatalf("bytes_in = %d, want > 0 after auth", resp.BytesIn)
+	}
+	// Ping unknown on loopback without a server ping cycle: -1 or measured.
+	if resp.PingMs < -1 {
+		t.Fatalf("ping_ms = %d", resp.PingMs)
+	}
+}
+
+// TestClientInfoOtherGuestDenied verifies a guest querying another client
+// gets no IP (deny-on-unset for the remote address permission).
+func TestClientInfoOtherGuestDenied(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+
+	bobConn, bobID := dialAuthed(t, env.addr, "user-uid")
+	defer bobConn.Close()
+	guestConn, _ := dialGuest(t, env.addr, "snoopy", "")
+	defer guestConn.Close()
+
+	resp := queryClientInfo(t, guestConn, bobID)
+	if resp.ClientID != bobID {
+		t.Fatalf("info = %+v", resp)
+	}
+	if resp.IP != "" || resp.Port != 0 {
+		t.Fatalf("guest query leaked ip/port: %+v", resp)
+	}
+}
+
+// TestClientInfoOtherGranted verifies the remote-address permission grants
+// IP visibility.
+func TestClientInfoOtherGranted(t *testing.T) {
+	perms := tieredWith(boolPerm(permissions.PermissionKeyClientRemoteAddressView, true))
+	env := startTestEnv(t, &perms)
+	defer env.stop()
+
+	bobConn, bobID := dialAuthed(t, env.addr, "user-uid")
+	defer bobConn.Close()
+	aliceConn, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer aliceConn.Close()
+
+	resp := queryClientInfo(t, aliceConn, bobID)
+	if resp.IP == "" || resp.Port == 0 {
+		t.Fatalf("granted query missing ip/port: %+v", resp)
+	}
+}
+
+// TestClientInfoAdminBypass verifies admins see the remote address without
+// an explicit grant.
+func TestClientInfoAdminBypass(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+
+	userConn, userID := dialAuthed(t, env.addr, "user-uid")
+	defer userConn.Close()
+	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer adminConn.Close()
+
+	resp := queryClientInfo(t, adminConn, userID)
+	if resp.IP == "" || resp.Port == 0 {
+		t.Fatalf("admin query missing ip/port: %+v", resp)
+	}
+}
+
+// TestClientInfoUnknown verifies querying a missing client errors.
+func TestClientInfoUnknown(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+
+	send(t, conn, netproto.MsgClientInfoQuery, netproto.ClientInfoQuery{ClientID: "c-nope"})
+	f := readOfType(t, conn, netproto.MsgError)
+	var e netproto.Error
+	if err := netproto.Decode(f, &e); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if e.Code != errCodeNotFound {
+		t.Fatalf("error code = %d, want %d", e.Code, errCodeNotFound)
+	}
+}
+
+// TestClientInfoActivityTracking verifies received frames bump the
+// last-active/bytes counters.
+func TestClientInfoActivityTracking(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+
+	conn, clientID := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+
+	before := queryClientInfo(t, conn, clientID)
+	// Send a chat message to bump activity.
+	send(t, conn, netproto.MsgChatSend, netproto.ChatSend{Text: "bump"})
+	after := queryClientInfo(t, conn, clientID)
+	if after.BytesIn <= before.BytesIn {
+		t.Fatalf("bytes_in did not increase: before=%d after=%d", before.BytesIn, after.BytesIn)
+	}
+	if after.IdleSeconds > before.IdleSeconds+2 {
+		t.Fatalf("idle not refreshed: before=%d after=%d", before.IdleSeconds, after.IdleSeconds)
+	}
+}
+
+// TestEWMARTT verifies the smoothed RTT math.
+func TestEWMARTT(t *testing.T) {
+	if got := ewmaRTT(0, 80, false); got != 80 {
+		t.Fatalf("first sample = %d, want 80", got)
+	}
+	prev := int64(80)
+	got := ewmaRTT(prev, 40, true)
+	want := prev*7/8 + 40/8
+	if got != want {
+		t.Fatalf("ewma = %d, want %d", got, want)
+	}
+}

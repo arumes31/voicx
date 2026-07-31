@@ -30,6 +30,7 @@ import (
 	"voicx/internal/server"
 	"voicx/internal/state"
 	"voicx/internal/store"
+	"voicx/internal/version"
 	"voicx/internal/webrtc"
 )
 
@@ -53,6 +54,7 @@ func run() error {
 	defer logger.Sync()
 
 	logger.Info("voicx server starting",
+		zap.String("version", version.String()),
 		zap.String("server_name", cfg.ServerName),
 		zap.Bool("dev_mode", cfg.DevMode),
 		zap.String("log_level", cfg.LogLevel),

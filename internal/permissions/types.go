@@ -81,7 +81,8 @@ const (
 	PermissionKeyClientPoke            PermissionKey = "b_client_poke"
 
 	// --- ServerQuery / visibility ---
-	PermissionKeyClientServerQueryView PermissionKey = "b_client_serverquery_view"
+	PermissionKeyClientServerQueryView   PermissionKey = "b_client_serverquery_view"
+	PermissionKeyClientRemoteAddressView PermissionKey = "b_client_remoteaddress_view"
 
 	// --- Permission management ---
 	PermissionKeyPermissionModifyPower  PermissionKey = "b_permission_modify_power"

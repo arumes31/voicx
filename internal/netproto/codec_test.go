@@ -45,6 +45,8 @@ func TestMessageTypeString(t *testing.T) {
 		{MsgTokenUse, "TokenUse"},
 		{MsgComplaint, "Complaint"},
 		{MsgScreenShare, "ScreenShare"},
+		{MsgClientInfoQuery, "ClientInfoQuery"},
+		{MsgClientInfoResponse, "ClientInfoResponse"},
 		{MessageType(999), "Unknown(999)"},
 	}
 	for _, tc := range cases {
@@ -295,6 +297,28 @@ func TestCodecRoundTrip(t *testing.T) {
 		in := ScreenShare{Active: true}
 		var out ScreenShare
 		roundTrip(t, MsgScreenShare, in, &out)
+		if out != in {
+			t.Errorf("got %+v, want %+v", out, in)
+		}
+	})
+
+	t.Run("ClientInfoQuery", func(t *testing.T) {
+		in := ClientInfoQuery{ClientID: "c-1"}
+		var out ClientInfoQuery
+		roundTrip(t, MsgClientInfoQuery, in, &out)
+		if out != in {
+			t.Errorf("got %+v, want %+v", out, in)
+		}
+	})
+
+	t.Run("ClientInfoResponse", func(t *testing.T) {
+		in := ClientInfoResponse{
+			ClientID: "c-1", UniqueID: "uid", Nickname: "nick", ChannelID: 7,
+			ConnectedAt: 1700000000, IdleSeconds: 42, PingMs: 62, IP: "1.2.3.4",
+			Port: 5000, BytesIn: 1000, BytesOut: 2000,
+		}
+		var out ClientInfoResponse
+		roundTrip(t, MsgClientInfoResponse, in, &out)
 		if out != in {
 			t.Errorf("got %+v, want %+v", out, in)
 		}

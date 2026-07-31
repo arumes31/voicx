@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"voicx/internal/netproto"
+	"voicx/internal/version"
 )
 
 // App is the Wails application.
@@ -204,6 +205,16 @@ func (a *App) Greet(name string) string {
 	return fmt.Sprintf("Hello %s, welcome to voicx!", name)
 }
 
+// ClientVersion returns the full embedded version string.
+func (a *App) ClientVersion() string {
+	return version.String()
+}
+
+// ClientVersionShort returns the short version (base + build number).
+func (a *App) ClientVersionShort() string {
+	return version.Short()
+}
+
 // IdentityUID returns the unique ID derived from the client's identity key
 // (used by the login screen to show the auto-generated identity).
 func (a *App) IdentityUID() string {
@@ -233,4 +244,19 @@ func (a *App) GetAvatar(uniqueID string) (netproto.AvatarData, error) {
 		return netproto.AvatarData{}, err
 	}
 	return data, nil
+}
+
+// GetClientInfo fetches the connection info of an online client (TS3-style
+// Client Info dialog).
+func (a *App) GetClientInfo(clientID string) (netproto.ClientInfoResponse, error) {
+	f, err := a.cm.request(netproto.MsgClientInfoQuery, netproto.MsgClientInfoResponse,
+		netproto.ClientInfoQuery{ClientID: clientID}, 5*time.Second)
+	if err != nil {
+		return netproto.ClientInfoResponse{}, err
+	}
+	var resp netproto.ClientInfoResponse
+	if err := decodeJSON(f, &resp); err != nil {
+		return netproto.ClientInfoResponse{}, err
+	}
+	return resp, nil
 }

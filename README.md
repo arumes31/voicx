@@ -31,6 +31,7 @@ A TeamSpeak-like voice/video server written in Go. TCP/JSON control protocol, UD
 - Complaints: file complaints against users (max 5 open per reporter); manage via ServerQuery (`complaintlist`/`complaintdel`/`complaintdelall`).
 - Privilege tokens: TS3-style privilege keys (`tokenadd`/`tokenlist`/`tokendelete` via ServerQuery, `TokenUse` from clients) granting server-group membership or admin; first-run bootstrap logs a one-time admin token when no admin exists.
 - Screen share: declared via `ScreenShare`, relayed to channel members as `screenshare_changed`.
+- Client Info (TS3-style): per-client activity tracking (connect/idle times, bytes in/out, smoothed RTT from server-initiated 15s pings), `ClientInfoQuery`/`ClientInfoResponse` — self queries always full, others' IP/port gated by admin or `b_client_remoteaddress_view` (deny-on-unset).
 - Prometheus metrics on `/metrics` (health port): `voicx_clients_connected`, `voicx_channels_active`, `voicx_udp_packets_total{kind}`, `voicx_udp_packets_dropped_total`, `voicx_tcp_connections_total`, `voicx_chat_messages_total{scope}`, `voicx_webrtc_peers`, `voicx_rtp_packets_forwarded_total{media}`, `voicx_file_transfers_total{direction,result}`, plus the Go collector.
 - UDP DDoS mitigation: per-source-IP token-bucket rate limiting with idle-bucket eviction (`udp_rate_limit_pps`, `udp_rate_burst`; 0 disables).
 - Ping/pong keepalive; graceful shutdown of all listeners.
@@ -206,6 +207,35 @@ Guests are never admin, resolve to an empty permission set (all defaults: join/c
 **Nickname login & key binding**: password auth accepts a nickname in place of a unique ID — the server falls back to a nickname lookup when the unique ID isn't found, returns the account's canonical unique ID, and binds the client's presented identity public key to the account (`public_key` column). Future challenge logins with that key resolve the account via the bound key even though the key-derived UID differs from the account's canonical one.
 
 ## Guest / anonymous login is also used by the tooling: `cmd/loadtest -anonymous` connects N guests with `loadtest-N` nicknames (no provisioning needed), and `cmd/e2e` covers the guest paths in its checklist.
+
+## Versioning & releases
+
+Every binary embeds build metadata (`internal/version`, injected via
+`-ldflags -X`): **base semver + commit count + short SHA**, e.g.
+`0.4.0+87.abc1234` (or `-dirty` for uncommitted changes). The base semver
+lives in the root `VERSION` file; the build number is
+`git rev-list --count HEAD`, so **every commit bumps the version**
+automatically.
+
+- `make build` / `make run` / `make client-build` inject it locally
+  (`VERSION_FLAGS` in the Makefile).
+- Docker builds take it via `--build-arg` (`.git` is excluded from the
+  context; `make docker-build` and compose `build.args` pass it).
+- The server logs it at startup, ServerQuery `version` returns it,
+  `/healthz` reports `{"status":"ok","version":"..."}`, and Prometheus
+  exports `voicx_build_info{version,commit} 1`.
+
+**Releasing**: tag `vX.Y.Z` and push — the CI `release` job
+(`.github/workflows/ci.yml`) builds the Windows client (`wails build`) and a
+Linux server binary with the tag as the embedded version, generates
+`checksums.txt` (SHA-256), and uploads all three to a GitHub Release. The
+client's auto-updater compares against that release feed, so tag names
+decide availability: a higher base semver or a higher `+build` number wins.
+
+**Update source**: the client reads the repo slug from
+`version.UpdateRepo` (ldflags `-X voicx/internal/version.UpdateRepo=<owner/repo>`;
+CI sets it to `github.repository` automatically). With the placeholder
+default, update checks report "no update source" and stay quiet.
 
 ## Status / roadmap
 

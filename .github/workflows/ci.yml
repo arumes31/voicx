@@ -76,3 +76,69 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}:${{ github.ref_name }}
             ghcr.io/${{ github.repository }}:latest
+
+  release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: compute version metadata
+        shell: bash
+        run: |
+          echo "VOICX_BUILD=$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
+          echo "VOICX_COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "VOICX_BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          echo "VOICX_DIRTY=false" >> "$GITHUB_ENV"
+
+      - name: install wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+      - name: build client (windows/amd64)
+        working-directory: client
+        run: |
+          wails build -ldflags "-s -w \
+            -X voicx/internal/version.Version=${{ github.ref_name }} \
+            -X voicx/internal/version.Build=${{ env.VOICX_BUILD }} \
+            -X voicx/internal/version.Commit=${{ env.VOICX_COMMIT }} \
+            -X voicx/internal/version.BuildDate=${{ env.VOICX_BUILD_DATE }} \
+            -X voicx/internal/version.Dirty=${{ env.VOICX_DIRTY }} \
+            -X voicx/internal/version.UpdateRepo=${{ github.repository }}"
+
+      - name: build server (linux/amd64)
+        run: |
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build \
+            -ldflags "-s -w \
+              -X voicx/internal/version.Version=${{ github.ref_name }} \
+              -X voicx/internal/version.Build=${{ env.VOICX_BUILD }} \
+              -X voicx/internal/version.Commit=${{ env.VOICX_COMMIT }} \
+              -X voicx/internal/version.BuildDate=${{ env.VOICX_BUILD_DATE }} \
+              -X voicx/internal/version.Dirty=${{ env.VOICX_DIRTY }} \
+              -X voicx/internal/version.UpdateRepo=${{ github.repository }}" \
+            -o voicx-server-linux-amd64 ./cmd/server
+
+      - name: checksums
+        shell: bash
+        run: |
+          cp client/build/bin/voicx-client.exe voicx-client-windows-amd64.exe
+          sha256sum voicx-client-windows-amd64.exe voicx-server-linux-amd64 > checksums.txt
+          cat checksums.txt
+
+      - name: upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            voicx-client-windows-amd64.exe
+            voicx-server-linux-amd64
+            checksums.txt

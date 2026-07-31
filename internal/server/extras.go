@@ -6,10 +6,12 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -216,6 +218,64 @@ func (s *TCPServer) handleTokenUse(ctx context.Context, client *Client, f *netpr
 		}
 	}
 	return nil
+}
+
+// handleClientInfoQuery returns the connection info of an online client.
+// Self queries always return full data (including own IP/port). For other
+// clients, IP and port are only included when the requester is admin or
+// holds b_client_remoteaddress_view (deny-on-unset; IP is sensitive).
+func (s *TCPServer) handleClientInfoQuery(ctx context.Context, client *Client, f *netproto.Frame) error {
+	var msg netproto.ClientInfoQuery
+	if err := netproto.Decode(f, &msg); err != nil {
+		return s.sendError(client, errCodeMalformed, "malformed client_info_query: "+err.Error())
+	}
+
+	target, ok := s.clientByID(msg.ClientID)
+	if !ok || !target.isAuthed() {
+		return s.sendError(client, errCodeNotFound, "client not found")
+	}
+
+	resp := netproto.ClientInfoResponse{
+		ClientID: target.ID,
+		PingMs:   -1,
+	}
+	{
+		target.mu.RLock()
+		resp.UniqueID = target.UniqueID
+		resp.Nickname = target.Username
+		target.mu.RUnlock()
+	}
+	if s.deps != nil && s.deps.State != nil {
+		if sc, ok := s.deps.State.GetClient(target.ID); ok {
+			resp.ChannelID = sc.ChannelID
+			resp.ConnectedAt = sc.ConnectedAt.Unix()
+		}
+	}
+	st := target.stats()
+	resp.IdleSeconds = int64(time.Since(st.lastActive).Seconds())
+	if st.rttKnown {
+		resp.PingMs = st.rttNs / int64(time.Millisecond)
+	}
+	resp.BytesIn = st.bytesIn
+	resp.BytesOut = st.bytesOut
+
+	// IP/port gating: self, admin, or b_client_remoteaddress_view.
+	showAddr := target.ID == client.ID
+	if !showAddr {
+		pc, err := s.permCheckerFor(ctx, client)
+		if err != nil {
+			return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		}
+		showAddr = pc.granted(permissions.PermissionKeyClientRemoteAddressView)
+	}
+	if showAddr {
+		if host, portStr, err := net.SplitHostPort(target.Conn.RemoteAddr().String()); err == nil {
+			resp.IP = host
+			resp.Port, _ = strconv.Atoi(portStr)
+		}
+	}
+
+	return s.writeMessage(client, netproto.MsgClientInfoResponse, resp)
 }
 
 // handleComplaint files a complaint against a user. The store enforces the

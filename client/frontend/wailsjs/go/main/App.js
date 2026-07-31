@@ -26,6 +26,10 @@ export function GetAvatar(arg1) {
   return window['go']['main']['App']['GetAvatar'](arg1);
 }
 
+export function GetClientInfo(arg1) {
+  return window['go']['main']['App']['GetClientInfo'](arg1);
+}
+
 export function GetPermissions() {
   return window['go']['main']['App']['GetPermissions']();
 }

@@ -308,6 +308,10 @@ func (m *connManager) dispatch(f *netproto.Frame) {
 		}
 	case netproto.MsgPong, netproto.MsgChatBroadcast, netproto.MsgAuthResponse:
 		// Nothing to do.
+	case netproto.MsgPing:
+		// Answer server-initiated keepalive pings (feeds server-side RTT for
+		// the Client Info dialog).
+		_ = m.write(netproto.MsgPong, netproto.Pong{})
 	default:
 		// Unknown frame: ignore.
 	}

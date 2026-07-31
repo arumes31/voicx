@@ -83,7 +83,7 @@ function dlgAbout() {
             <h3>About voicx</h3>
             <div class="about-body">
                 <div class="wordmark" style="font-size:26px">voicx</div>
-                <div>voice ops console — client v0.1.0</div>
+                <div class="mono about-version"></div>
                 <div class="mono about-uid"></div>
                 <div class="about-links">
                     <a href="https://github.com/voicx" target="_blank">project</a> ·
@@ -92,6 +92,9 @@ function dlgAbout() {
             </div>
             <div class="dlg-buttons"><button class="dlg-ok">Close</button></div>
         </div>`;
+    window.go.main.App.ClientVersion().then((v) => {
+        overlay.querySelector(".about-version").textContent = "version " + v;
+    });
     const uidEl = overlay.querySelector(".about-uid");
     uidEl.textContent = state.myUniqueID || "(not connected)";
     overlay.querySelector(".dlg-ok").onclick = () => overlay.remove();
@@ -266,6 +269,8 @@ export function initMenu() {
     ]);
 
     const help = buildMenu("Help", [
+        menuAction("Check for updates…", () => window.__voicx.checkForUpdatesInteractive()),
+        divider(),
         menuAction("About voicx", dlgAbout),
         menuAction("Open log folder", async () => {
             const err = await window.go.main.App.OpenLogFolder();

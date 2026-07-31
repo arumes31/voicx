@@ -213,6 +213,9 @@ func simulateClient(ctx context.Context, opts options, st *stats, index int) {
 				st.pongs.Add(1)
 			case netproto.MsgEvent:
 				st.chatRecv.Add(1)
+			case netproto.MsgPing:
+				// Answer server-initiated keepalive pings.
+				_ = writeMsg(conn, netproto.MsgPong, netproto.Pong{})
 			}
 		}
 	}()

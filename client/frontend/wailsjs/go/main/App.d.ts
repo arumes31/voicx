@@ -15,6 +15,8 @@ export function ExportIdentity():Promise<string>;
 
 export function GetAvatar(arg1:string):Promise<netproto.AvatarData>;
 
+export function GetClientInfo(arg1:string):Promise<netproto.ClientInfoResponse>;
+
 export function GetPermissions():Promise<Array<netproto.PermissionEntry>>;
 
 export function GetSettings():Promise<main.Settings>;

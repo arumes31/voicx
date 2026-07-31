@@ -439,6 +439,29 @@ type PermissionsResponse struct {
 	Entries []PermissionEntry `json:"entries"`
 }
 
+// ClientInfoQuery requests the connection info of an online client.
+type ClientInfoQuery struct {
+	ClientID string `json:"client_id"`
+}
+
+// ClientInfoResponse is the connection info of an online client (TS3-style
+// Client Info dialog). PingMs is -1 when unknown (the client never answered
+// a server Ping). IP and Port are empty/0 unless the requester is the
+// target itself, an admin, or holds b_client_remoteaddress_view.
+type ClientInfoResponse struct {
+	ClientID    string `json:"client_id"`
+	UniqueID    string `json:"unique_id"`
+	Nickname    string `json:"nickname"`
+	ChannelID   int64  `json:"channel_id"`
+	ConnectedAt int64  `json:"connected_at"` // unix seconds
+	IdleSeconds int64  `json:"idle_seconds"`
+	PingMs      int64  `json:"ping_ms"`
+	IP          string `json:"ip,omitempty"`
+	Port        int    `json:"port,omitempty"`
+	BytesIn     int64  `json:"bytes_in"`
+	BytesOut    int64  `json:"bytes_out"`
+}
+
 // Encode marshals a message into a Frame with the given type.
 func Encode(mt MessageType, msg any) (*Frame, error) {
 	payload, err := json.Marshal(msg)

@@ -10,6 +10,11 @@ grid); polish (recording UI, complaint UI) comes later.
 A dark "voice ops console" (vanilla JS/CSS, fonts bundled locally via
 fontsource — fully offline in WebView2):
 
+- **Client Info** — right-click any user in the channel tree for a context
+  menu (Client Info, private message, copy unique ID). The TS3-style dialog
+  shows connection/idle time (ticking), ping (or `unknown`), client address
+  (IP only for self or with `b_client_remoteaddress_view`), and transfer
+  stats — live-refreshing every 2s.
 - **Menu bar** (TS3-style): Connections (Connect/Disconnect/Quit), Bookmarks
   (save/connect/manage server bookmarks — passwords are never stored), Self
   (nickname, avatar, mute/deafen), Permissions, Tools (Settings, Whisper
@@ -138,6 +143,30 @@ hotkey status (`⌨ ptt` = registered, `⌨ off` = failed). If a hotkey shows
 off: check `<UserConfigDir>/voicx/client.log` — the usual cause is a second
 client instance already holding the global hotkey. Debug lines like
 `hotkey ptt_down fired` are logged there for every captured event.
+
+## Auto-update
+
+The client can update itself from GitHub Releases (Help → **Check for
+updates…**): it queries the latest release of the configured repo, compares
+base semver + build number against the embedded version, downloads the
+Windows asset with a progress bar, verifies its SHA-256 against the
+release's `checksums.txt`, and self-applies via `minio/selfupdate` (which
+handles the running-exe rename dance on Windows). Nothing applies without
+explicit confirmation — a final "Restart now" button relaunches the new
+binary.
+
+At startup (after login) it auto-checks quietly and shows a toast when an
+update exists; disable it in Settings → Application → "Check for updates at
+startup".
+
+The update source is the `UpdateRepo` ldflags variable
+(`-X voicx/internal/version.UpdateRepo=<owner/repo>` — CI sets it to the
+repo automatically). With the placeholder default the check reports "no
+update source" and stays silent.
+
+**Security note**: SHA-256 verification guards download corruption/tampering
+on the mirror path, **not authenticity** — whoever can publish to the repo
+controls the binary. Signed releases (sigstore/minisign) are future work.
 
 ## Headless backend test
 

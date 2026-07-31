@@ -50,12 +50,12 @@ type Client struct {
 	admin  bool
 
 	// Activity and connection stats (Client Info dialog).
-	lastActive time.Time     // last received frame
-	bytesIn    int64         // payload bytes received
-	bytesOut   int64         // payload bytes sent
-	lastPingAt time.Time     // last server-initiated Ping sent
-	rttNs      int64         // smoothed RTT in nanoseconds (EWMA)
-	rttKnown   bool          // whether any Pong was received
+	lastActive time.Time // last received frame
+	bytesIn    int64     // payload bytes received
+	bytesOut   int64     // payload bytes sent
+	lastPingAt time.Time // last server-initiated Ping sent
+	rttNs      int64     // smoothed RTT in nanoseconds (EWMA)
+	rttKnown   bool      // whether any Pong was received
 
 	// Pending challenge-response handshake state (set on Authenticate without
 	// a password, consumed by AuthSignature).

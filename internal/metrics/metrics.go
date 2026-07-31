@@ -10,6 +10,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"voicx/internal/version"
 )
 
 // Sink is the narrow metrics interface used across voicx. *Metrics and Noop
@@ -39,6 +41,7 @@ type Metrics struct {
 	webrtcPeers      prometheus.Gauge
 	rtpForwarded     *prometheus.CounterVec
 	fileTransfers    *prometheus.CounterVec
+	buildInfo        *prometheus.GaugeVec
 }
 
 // New constructs a Metrics with its own registry (voicx_* metrics plus the
@@ -85,12 +88,17 @@ func New() *Metrics {
 			Namespace: "voicx", Name: "file_transfers_total",
 			Help: "File transfers by direction and result.",
 		}, []string{"direction", "result"}),
+		buildInfo: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: "voicx", Name: "build_info",
+			Help: "Embedded build metadata (always 1).",
+		}, []string{"version", "commit"}),
 	}
 	reg.MustRegister(
 		m.clientsConnected, m.channelsActive, m.udpPackets, m.udpDropped,
 		m.tcpConnections, m.chatMessages, m.webrtcPeers, m.rtpForwarded,
-		m.fileTransfers,
+		m.fileTransfers, m.buildInfo,
 	)
+	m.buildInfo.WithLabelValues(version.String(), version.Commit).Set(1)
 	return m
 }
 

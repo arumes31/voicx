@@ -7,10 +7,13 @@ package health
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
 	"go.uber.org/zap"
+
+	"voicx/internal/version"
 )
 
 // readyTimeout bounds how long /readyz waits for the readiness probe.
@@ -72,10 +75,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.srv.Shutdown(ctx)
 }
 
-// handleHealthz reports liveness: the process is up and serving.
+// handleHealthz reports liveness: the process is up and serving. It returns
+// a small JSON body carrying the embedded version.
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("ok\n"))
+	fmt.Fprintf(w, `{"status":"ok","version":%q}`+"\n", version.String())
 }
 
 // handleReadyz reports readiness: 200 when the probe succeeds, 500 otherwise.

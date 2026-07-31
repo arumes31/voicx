@@ -53,8 +53,9 @@ type Settings struct {
 	WhisperActive   bool     `json:"whisper_active"`
 
 	// Misc.
-	DownloadFolder  string `json:"download_folder"`
-	ReconnectOnLoss bool   `json:"reconnect_on_loss"`
+	DownloadFolder   string `json:"download_folder"`
+	ReconnectOnLoss  bool   `json:"reconnect_on_loss"`
+	UpdatesAutoCheck bool   `json:"updates_auto_check"`
 }
 
 // DefaultSettings returns the defaults used when no settings file exists.
@@ -71,6 +72,7 @@ func DefaultSettings() Settings {
 		NotifyJoinLeave:  true,
 		NotifyConnection: true,
 		WhisperSound:     true,
+		UpdatesAutoCheck: true,
 	}
 }
 

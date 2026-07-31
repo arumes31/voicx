@@ -7,6 +7,8 @@ import "@fontsource-variable/outfit";
 import "@fontsource-variable/jetbrains-mono";
 import { initMenu } from "./menu.js";
 import { initSettingsUI } from "./settings-ui.js";
+import { initClientInfo } from "./clientinfo.js";
+import { initUpdater } from "./updater.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -88,6 +90,11 @@ function toast(text, kind = "info", category = "social") {
         const uid = await window.go.main.App.IdentityUID();
         if (uid) $("login-identity").textContent = uid.slice(0, 12) + "…";
     } catch { /* identity display is best-effort */ }
+    try {
+        const v = await window.go.main.App.ClientVersionShort();
+        $("login-version").textContent = "voicx " + v;
+        state.clientVersion = v;
+    } catch { /* version display is best-effort */ }
     document.querySelector(".login-card").classList.add("in");
 })();
 
@@ -119,6 +126,7 @@ async function connectFromLogin() {
         $("app").classList.remove("hidden");
         refreshPermissions();
         applyWhisperSettings();
+        startupAutoCheck();
     } catch (e) {
         $("login-error").textContent = String(e);
     }
@@ -298,6 +306,7 @@ function renderChannel(parentEl, ch, byParent, depth) {
 function clientRow(c) {
     const row = document.createElement("div");
     row.className = "client" + (c.is_speaking ? " speaking" : "") + (c.client_id === state.selectedClientID ? " selected" : "");
+    row.dataset.clid = c.client_id;
     const av = document.createElement("span");
     av.className = "avatar";
     av.dataset.uid = c.unique_id;
@@ -789,3 +798,5 @@ window.__voicx = {
 
 initMenu();
 initSettingsUI();
+initClientInfo();
+initUpdater();

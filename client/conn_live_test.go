@@ -308,3 +308,52 @@ func TestLivePermissions(t *testing.T) {
 	}
 	t.Logf("resolved %d permission entries for alice", len(entries))
 }
+
+// TestLiveClientInfo verifies the ClientInfo query/response flow against the
+// live server: bob's self query includes his IP; alice's query of bob hides
+// the IP (no b_client_remoteaddress_view grant by default).
+func TestLiveClientInfo(t *testing.T) {
+	addr := liveAddr(t)
+
+	alice, _ := newTestBackend(t)
+	if err := alice.connect(addr, liveAliceUID, liveAlicePass, ""); err != "" {
+		t.Fatalf("alice connect: %s", err)
+	}
+	defer alice.disconnect()
+
+	bob, _ := newTestBackend(t)
+	if err := bob.connect(addr, liveBobUID, liveBobPass, ""); err != "" {
+		t.Fatalf("bob connect: %s", err)
+	}
+	defer bob.disconnect()
+
+	aliceApp := &App{cm: alice}
+	bobApp := &App{cm: bob}
+
+	// Self query: full data incl. IP.
+	self, err := bobApp.GetClientInfo(bob.clientID)
+	if err != nil {
+		t.Fatalf("GetClientInfo(self): %v", err)
+	}
+	if self.UniqueID != liveBobUID {
+		t.Fatalf("self unique id = %q, want %q", self.UniqueID, liveBobUID)
+	}
+	if self.IP == "" || self.Port == 0 {
+		t.Fatalf("self query missing ip/port: %+v", self)
+	}
+	if self.ConnectedAt <= 0 {
+		t.Fatalf("connected_at = %d", self.ConnectedAt)
+	}
+
+	// Alice queries bob: IP must be hidden (deny-on-unset).
+	other, err := aliceApp.GetClientInfo(bob.clientID)
+	if err != nil {
+		t.Fatalf("GetClientInfo(bob): %v", err)
+	}
+	if other.UniqueID != liveBobUID {
+		t.Fatalf("other unique id = %q, want %q", other.UniqueID, liveBobUID)
+	}
+	if other.IP != "" || other.Port != 0 {
+		t.Fatalf("alice sees bob's ip/port without permission: %+v", other)
+	}
+}

@@ -127,6 +127,38 @@ export namespace netproto {
 	        this.content_type = source["content_type"];
 	    }
 	}
+	export class ClientInfoResponse {
+	    client_id: string;
+	    unique_id: string;
+	    nickname: string;
+	    channel_id: number;
+	    connected_at: number;
+	    idle_seconds: number;
+	    ping_ms: number;
+	    ip?: string;
+	    port?: number;
+	    bytes_in: number;
+	    bytes_out: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new ClientInfoResponse(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.client_id = source["client_id"];
+	        this.unique_id = source["unique_id"];
+	        this.nickname = source["nickname"];
+	        this.channel_id = source["channel_id"];
+	        this.connected_at = source["connected_at"];
+	        this.idle_seconds = source["idle_seconds"];
+	        this.ping_ms = source["ping_ms"];
+	        this.ip = source["ip"];
+	        this.port = source["port"];
+	        this.bytes_in = source["bytes_in"];
+	        this.bytes_out = source["bytes_out"];
+	    }
+	}
 	export class PermissionEntry {
 	    key: string;
 	    value: number;

@@ -124,6 +124,7 @@ function pageApplication() {
     el.appendChild(row("Toasts for join/leave", checkbox(s.notify_join_leave, (v) => { s.notify_join_leave = v; })));
     el.appendChild(row("Toasts for connection events", checkbox(s.notify_connection, (v) => { s.notify_connection = v; })));
     el.appendChild(row("Reconnect on connection loss (5 tries)", checkbox(s.reconnect_on_loss, (v) => { s.reconnect_on_loss = v; })));
+    el.appendChild(row("Check for updates at startup", checkbox(s.updates_auto_check !== false, (v) => { s.updates_auto_check = v; })));
     return el;
 }
 

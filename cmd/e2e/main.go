@@ -310,6 +310,11 @@ func readOfType(conn net.Conn, mt netproto.MessageType, timeout time.Duration) (
 		if err != nil {
 			return nil, err
 		}
+		// Answer server-initiated keepalive pings while waiting.
+		if netproto.MessageType(f.Type) == netproto.MsgPing {
+			_ = writeMsg(conn, netproto.MsgPong, netproto.Pong{})
+			continue
+		}
 		if netproto.MessageType(f.Type) == mt {
 			return f, nil
 		}
@@ -326,6 +331,11 @@ func readEvent(conn net.Conn, want string, timeout time.Duration) (*eventEnvelop
 		f, err := netproto.ReadFrame(conn)
 		if err != nil {
 			return nil, err
+		}
+		// Answer server-initiated keepalive pings while waiting.
+		if netproto.MessageType(f.Type) == netproto.MsgPing {
+			_ = writeMsg(conn, netproto.MsgPong, netproto.Pong{})
+			continue
 		}
 		if netproto.MessageType(f.Type) == netproto.MsgError {
 			var e netproto.Error
