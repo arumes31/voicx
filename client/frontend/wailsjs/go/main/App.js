@@ -322,10 +322,6 @@ export function MOTD() {
   return window['go']['main']['App']['MOTD']();
 }
 
-export function MarkChannelRead(arg1, arg2) {
-  return window['go']['main']['App']['MarkChannelRead'](arg1, arg2);
-}
-
 export function MoveClient(arg1, arg2) {
   return window['go']['main']['App']['MoveClient'](arg1, arg2);
 }
@@ -372,10 +368,6 @@ export function Poke(arg1, arg2) {
 
 export function RecordRecent(arg1, arg2) {
   return window['go']['main']['App']['RecordRecent'](arg1, arg2);
-}
-
-export function ReadStateSnapshot() {
-  return window['go']['main']['App']['ReadStateSnapshot']();
 }
 
 export function RegenerateIdentity() {

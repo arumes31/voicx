@@ -163,8 +163,6 @@ export function LogChat(arg1:string):Promise<void>;
 
 export function MOTD():Promise<string>;
 
-export function MarkChannelRead(arg1:number,arg2:number):Promise<string>;
-
 export function MoveClient(arg1:string,arg2:number):Promise<string>;
 
 export function Notify(arg1:string,arg2:string):Promise<string>;
@@ -188,8 +186,6 @@ export function PickSavePath(arg1:string):Promise<string>;
 export function Poke(arg1:string,arg2:string):Promise<string>;
 
 export function RecordRecent(arg1:string,arg2:string):Promise<void>;
-
-export function ReadStateSnapshot():Promise<{[key: string]: number}>;
 
 export function RegenerateIdentity():Promise<string>;
 
