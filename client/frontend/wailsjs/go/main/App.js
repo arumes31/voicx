@@ -438,8 +438,8 @@ export function WebRTCAnswer(arg1) {
   return window['go']['main']['App']['WebRTCAnswer'](arg1);
 }
 
-export function WebRTCOffer(arg1) {
-  return window['go']['main']['App']['WebRTCOffer'](arg1);
+export function WebRTCOffer(arg1, arg2) {
+  return window['go']['main']['App']['WebRTCOffer'](arg1, arg2);
 }
 
 export function WhatsNew() {

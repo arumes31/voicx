@@ -1,14 +1,38 @@
 // video.js — video grid (61), focus mode with filmstrip (73), per-subscriber
-// quality selector (63), share dialog (69-72), stop-share confirm (85), and
-// the low-bandwidth mode (88). Everything here works against the shared
-// namespace (window.__voicx) populated by main.js.
+// quality selector (63), share dialog (69-72), camera on/off + stop-share
+// confirm (85), and the low-bandwidth mode (88). Everything here works against
+// the shared namespace (window.__voicx) populated by main.js.
 const V = () => window.__voicx;
 
-// tiles maps publisher clientID -> {el, video, nameEl, badgeEl, track, stream}.
-// track is that publisher's own video track and stream the per-tile
-// MediaStream wrapping it (never the shared stream from ontrack).
+// (70/73) Track-identity contract with the router: a publisher's media arrives
+// as one track per SLOT, so camera and screen share are separate tiles and
+// shared system audio is a separate source from the microphone.
+//   default slots ("mic", "cam")   track id "<clientID>"
+//                                  msid stream "voicx-<clientID>"
+//   extra slots ("screenaudio", "screen")
+//                                  track id "<clientID>|<slot>"
+//                                  msid stream "voicx-<clientID>|<slot>"
+// The separator is "|" because an msid id is an RFC 4566 token and "/" is not
+// a token character. Default slots keep the bare publisher ID, so parsing
+// yields slot "" for them and a router that labels nothing still resolves.
+const SLOT_SCREEN = "screen";
+export const SLOT_SCREEN_AUDIO = "screenaudio"; // main.js routes this slot's audio
+const SLOT_SEP = "|";
+
+// parseTrackID splits a media track id into publisher id and slot.
+export function parseTrackID(id) {
+    const s = String(id ?? "");
+    const i = s.indexOf(SLOT_SEP);
+    return i < 0 ? { clientID: s, slot: "" } : { clientID: s.slice(0, i), slot: s.slice(i + 1) };
+}
+
+// tiles maps media track id -> {el, video, nameEl, kindEl, badgeEl, track,
+// stream, clientID, slot, frames, stalls, flowing}. The key is the TRACK id,
+// not the publisher, so one publisher can own several tiles (73). track is
+// that slot's own video track and stream the per-tile MediaStream wrapping it
+// (never the shared stream from ontrack).
 const tiles = new Map();
-let focusedID = null;
+let focusedID = null; // track id of the focused tile
 
 // Connection-wide video quality preference. NOTE: the server's simulcast
 // routing keeps ONE layer preference per subscriber (all publishers), so the
@@ -26,34 +50,41 @@ let statsTimer = null;
 
 function gridEl() { return document.getElementById("video-grid"); }
 
-// videoTrackAdded registers (or re-registers) a publisher's video track as a
-// grid tile. trackID is the publisher's client ID (per-publisher SFU model).
+// videoTrackAdded registers (or re-registers) one publisher video slot as a
+// grid tile. trackID follows the slot contract above, so a publisher sending
+// camera and screen at once gets one tile per slot (73).
 export function videoTrackAdded(trackID, stream, publisher) {
-    const { $ } = V();
-    const clid = String(publisher?.client_id || trackID);
-    let t = tiles.get(clid);
+    const key = String(trackID);
+    const parsed = parseTrackID(key);
+    const clid = String(publisher?.client_id || parsed.clientID);
+    let t = tiles.get(key);
     if (!t) {
         const el = document.createElement("div");
         el.className = "vtile";
         el.dataset.clid = clid;
+        el.dataset.slot = parsed.slot;
         el.innerHTML = `
             <video autoplay playsinline></video>
             <div class="vtile-fallback"><div class="avatar"></div></div>
             <div class="vtile-label">
                 <span class="vtile-name"></span>
+                <span class="vtile-kind hidden"></span>
                 <span class="vtile-badge hidden"></span>
             </div>
             <button class="vtile-fullscreen icon-btn" title="fullscreen (Esc exits)">⛶</button>`;
         const video = el.querySelector("video");
         const nameEl = el.querySelector(".vtile-name");
+        const kindEl = el.querySelector(".vtile-kind");
         const badgeEl = el.querySelector(".vtile-badge");
         // The fallback panel is opaque and paints over the <video>, so the
         // has-video class has to follow the element's decode state.
         video.onloadeddata = video.onplaying = video.onemptied = () => {
             updateTileVideo(t);
-            // (88) low-bandwidth stops rendering only once a frame is decoded,
-            // so the tile freezes on a still image; pausing an element that has
-            // never decoded leaves it on the avatar forever.
+            // (88) a paused tile must show a still image, not an avatar: the
+            // point of the mode is to stop decoding while still showing who is
+            // on camera. So pausing waits for the first decoded frame — an
+            // element paused before that has nothing to hold and would sit on
+            // the avatar for the rest of the call.
             if (lowBandwidth && t.video.readyState >= 2) t.video.pause();
         };
         // (340) fullscreen video tile.
@@ -62,71 +93,94 @@ export function videoTrackAdded(trackID, stream, publisher) {
             if (document.fullscreenElement) document.exitFullscreen();
             else el.requestFullscreen?.().catch(() => {});
         };
-        el.onclick = () => toggleFocus(clid);
+        el.onclick = () => toggleFocus(key);
         el.oncontextmenu = (e) => {
             e.preventDefault();
-            openQualityMenu(e.clientX, e.clientY);
+            openTileMenu(e.clientX, e.clientY, t);
         };
-        t = { el, video, nameEl, badgeEl, track: null, stream: null };
-        tiles.set(clid, t);
+        t = {
+            el, video, nameEl, kindEl, badgeEl, track: null, stream: null,
+            clientID: clid, slot: parsed.slot, frames: 0, stalls: 0, flowing: true,
+        };
+        tiles.set(key, t);
         gridEl().appendChild(el);
     }
-    // (61) select by track id (it is the publisher's client id) and render from
-    // a private stream, so a tile can never follow another publisher even if
-    // the ontrack stream ever carries more than one.
-    const vt = stream?.getVideoTracks().find((tr) => tr.id === clid) || null;
+    t.clientID = clid;
+    t.el.dataset.clid = clid;
+    // (61) select by track id and render from a private stream, so a tile can
+    // never follow another slot or publisher even if the ontrack stream ever
+    // carries more than one track.
+    const vt = stream?.getVideoTracks().find((tr) => tr.id === key) || null;
     t.track = vt;
     t.stream = vt ? new MediaStream([vt]) : null;
     t.video.srcObject = t.stream;
+    t.frames = 0;
+    t.stalls = 0;
+    t.flowing = true;
     // A publisher turning the camera off arrives as a muted receiver track,
     // not as a removed track — that flips the tile back to the avatar.
     if (vt) vt.onmute = vt.onunmute = vt.onended = () => updateTileVideo(t);
     updateTileVideo(t);
-    applyTileIdentity(t, clid);
+    applyTileIdentity(t);
     layoutGrid();
     startStatsPoll();
 }
 
-// videoTrackRemoved drops a publisher's tile (track ended / publisher left).
+// videoTrackRemoved drops one slot's tile (track ended / publisher left).
 export function videoTrackRemoved(trackID) {
-    const clid = String(trackID);
-    const t = tiles.get(clid);
+    const key = String(trackID);
+    const t = tiles.get(key);
     if (!t) return;
     t.video.srcObject = null;
     t.el.remove();
-    tiles.delete(clid);
-    if (focusedID === clid) focusedID = null;
+    tiles.delete(key);
+    if (focusedID === key) focusedID = null;
     layoutGrid();
     if (tiles.size === 0) stopStatsPoll();
 }
 
-// videoSpeaking toggles the speaking ring on a publisher's tile.
+// videoSpeaking toggles the speaking ring on every tile of a publisher: with
+// slot tiles (73) a speaker can own a camera tile and a screen tile, and a
+// publisher with no video at all still gets the ring around their avatar (61).
 export function videoSpeaking(clientID, speaking) {
-    const t = tiles.get(String(clientID));
-    if (t) t.el.classList.toggle("speaking", speaking);
+    const clid = String(clientID);
+    for (const t of tiles.values()) {
+        if (t.clientID === clid) t.el.classList.toggle("speaking", speaking);
+    }
 }
 
 // videoRefreshNames re-resolves nickname/avatar on all tiles (user joined,
-// moved, avatar changed).
+// moved, avatar changed, started/stopped sharing).
 export function videoRefreshNames() {
-    for (const [clid, t] of tiles) applyTileIdentity(t, clid);
+    for (const t of tiles.values()) applyTileIdentity(t);
 }
 
 // clearVideoGrid removes all tiles (voice teardown).
 export function clearVideoGrid() {
-    for (const clid of [...tiles.keys()]) videoTrackRemoved(clid);
+    for (const key of [...tiles.keys()]) videoTrackRemoved(key);
     focusedID = null;
+    // the next session starts from the server's default layer, so a stale
+    // lastSentQuality would suppress the first push of this session.
+    lastSentQuality = "";
     layoutGrid();
 }
 
-// applyTileIdentity fills the nickname label and the avatar fallback (61:
-// avatar-with-ring fallback behind the video; visible when no frames flow,
-// e.g. camera off or black screen share).
-function applyTileIdentity(t, clid) {
-    const { state, clientName, initials, fetchAvatar } = V();
+// applyTileIdentity fills the nickname label, the "what is this" marker and the
+// avatar fallback (61: avatar-with-ring fallback behind the video; visible when
+// no frames flow, e.g. camera off or black screen share).
+function applyTileIdentity(t) {
+    const { state, initials, fetchAvatar } = V();
+    const clid = t.clientID;
     const c = state.clients.find((c) => String(c.client_id) === clid);
     const name = c ? (c.nickname || c.unique_id) : clid;
     t.nameEl.textContent = name;
+    // (73) several tiles can carry the same nickname, so each one says what it
+    // shows.
+    const isScreen = tileIsScreen(t);
+    t.kindEl.textContent = isScreen ? "🖥 screen" : "";
+    t.kindEl.classList.toggle("hidden", !isScreen);
+    t.el.classList.toggle("is-screen", isScreen);
+    t.el.title = name + (isScreen ? " — screen share" : "");
     const av = t.el.querySelector(".vtile-fallback .avatar");
     const uid = c?.unique_id || "";
     av.dataset.uid = uid;
@@ -140,13 +194,27 @@ function applyTileIdentity(t, clid) {
     t.el.classList.toggle("speaking", !!(c && c.is_speaking));
 }
 
+// tileIsScreen reports whether a tile shows a shared surface. A publisher that
+// declares the "screen" slot has a dedicated tile for it, so its default tile
+// is the camera. One that does not publishes the share on the default slot
+// instead, where the screenshare_changed flag is the only marker (73).
+function tileIsScreen(t) {
+    if (t.slot === SLOT_SCREEN) return true;
+    if (t.slot !== "" || !isSharing(t.clientID)) return false;
+    for (const other of tiles.values()) {
+        if (other.clientID === t.clientID && other.slot === SLOT_SCREEN) return false;
+    }
+    return true;
+}
+
 // updateTileVideo toggles has-video, which hides the avatar fallback. Frames
-// have to be decoded (readyState >= HAVE_CURRENT_DATA) *and* the track live:
-// a paused low-bandwidth tile still shows its last frame, a muted one does not.
+// have to be decoded (readyState >= HAVE_CURRENT_DATA), the track live, and
+// the stream not stalled (61, see refreshBadges): a paused low-bandwidth tile
+// still shows its last frame, a camera that was switched off does not.
 function updateTileVideo(t) {
     const track = t.track;
     const live = !!track && track.readyState === "live" && track.enabled && !track.muted;
-    t.el.classList.toggle("has-video", live && t.video.readyState >= 2);
+    t.el.classList.toggle("has-video", live && t.flowing && t.video.readyState >= 2);
 }
 
 // layoutGrid recomputes the auto-layout class (1→full, 2→half, 3-4→2x2,
@@ -157,7 +225,7 @@ function layoutGrid() {
     grid.classList.toggle("hidden", n === 0);
     grid.dataset.count = n <= 4 ? String(n) : "many";
     grid.classList.toggle("has-focus", !!focusedID && tiles.has(focusedID));
-    for (const [clid, t] of tiles) t.el.classList.toggle("focused", clid === focusedID);
+    for (const [key, t] of tiles) t.el.classList.toggle("focused", key === focusedID);
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +240,7 @@ function toggleFocus(clid) {
 }
 
 export function initVideo() {
+    syncCameraButton(); // (85) disabled until a voice session captures a camera
     document.addEventListener("keydown", (e) => {
         if (e.key === "Escape" && focusedID) {
             focusedID = null;
@@ -205,6 +274,13 @@ export function setIdleQualityOverride(on) {
 // pushQuality sends MsgVideoQuality when the effective layer changed.
 async function pushQuality() {
     const q = effectiveQuality();
+    // (88) the persisted restore and the voice-bar toggle both run while
+    // disconnected, where there is no connection to send the preference on.
+    // Clearing the last-sent value keeps the first push after joining honest.
+    if (!V().state.pc) {
+        lastSentQuality = "";
+        return;
+    }
     if (q === lastSentQuality) return;
     lastSentQuality = q;
     const err = await window.go.main.App.SetVideoQuality(q);
@@ -213,20 +289,31 @@ async function pushQuality() {
 
 let qMenuEl = null;
 
-function openQualityMenu(x, y) {
+// openTileMenu is the tile right-click menu: the shared receive-quality
+// preference (63) plus, when the tile's publisher is sharing system audio,
+// that share's own volume/mute (70).
+function openTileMenu(x, y, t) {
     if (qMenuEl) qMenuEl.remove();
     qMenuEl = document.createElement("div");
     qMenuEl.className = "ctx-menu";
     const cur = qualityPref;
+    const sa = V().shareAudioCtl?.get(t.clientID) || null;
     qMenuEl.innerHTML = `
         <a data-q="auto">${cur === "auto" ? "✓ " : ""}Auto (follows view)</a>
         <a data-q="high">${cur === "high" ? "✓ " : ""}High</a>
         <a data-q="mid">${cur === "mid" ? "✓ " : ""}Mid</a>
         <a data-q="low">${cur === "low" ? "✓ " : ""}Low</a>
         <div class="ctx-divider"></div>
-        <a class="ctx-note">applies to all incoming video</a>`;
+        <a class="ctx-note">applies to all incoming video</a>` + (sa ? `
+        <div class="ctx-divider"></div>
+        <a data-sa="mute">${sa.muted ? "Unmute" : "Mute"} shared system audio</a>
+        <div class="ctx-volume">
+            <span>Shared audio <span class="mono ctx-vol-pct">${sa.volume}%</span></span>
+            <input type="range" min="0" max="200" value="${sa.volume}" />
+        </div>
+        <a class="ctx-note">separate from this user's voice volume/mute</a>` : "");
     qMenuEl.style.left = Math.min(x, window.innerWidth - 260) + "px";
-    qMenuEl.style.top = Math.min(y, window.innerHeight - 200) + "px";
+    qMenuEl.style.top = Math.min(y, window.innerHeight - (sa ? 320 : 200)) + "px";
     qMenuEl.onclick = (e) => e.stopPropagation();
     for (const a of qMenuEl.querySelectorAll("a[data-q]")) {
         a.onclick = () => {
@@ -234,6 +321,18 @@ function openQualityMenu(x, y) {
             pushQuality();
             qMenuEl.remove();
             qMenuEl = null;
+        };
+    }
+    if (sa) {
+        qMenuEl.querySelector('a[data-sa="mute"]').onclick = () => {
+            V().shareAudioCtl.setMuted(t.clientID, !sa.muted);
+            qMenuEl.remove();
+            qMenuEl = null;
+        };
+        const slider = qMenuEl.querySelector(".ctx-volume input");
+        slider.oninput = () => {
+            qMenuEl.querySelector(".ctx-vol-pct").textContent = slider.value + "%";
+            V().shareAudioCtl.setVolume(t.clientID, parseInt(slider.value, 10));
         };
     }
     document.body.appendChild(qMenuEl);
@@ -258,22 +357,44 @@ function stopStatsPoll() {
     }
 }
 
+// STALL_POLLS is how many consecutive polls without a newly decoded frame
+// count as "the camera is off" (61). Two polls ≈ 6 s, long enough to survive a
+// freeze/keyframe gap and short enough that a camera-off does not linger.
+const STALL_POLLS = 2;
+
 async function refreshBadges() {
     const { state } = V();
     if (!state.pc || tiles.size === 0) return;
     try {
         const stats = await state.pc.getStats();
-        const byTrack = new Map(); // trackIdentifier -> frameWidth
+        const byTrack = new Map(); // trackIdentifier -> {w, frames}
         stats.forEach((r) => {
             if (r.type === "inbound-rtp" && (r.kind === "video" || r.mediaType === "video")) {
-                byTrack.set(r.trackIdentifier, r.frameWidth || 0);
+                byTrack.set(r.trackIdentifier, { w: r.frameWidth || 0, frames: r.framesDecoded || 0 });
             }
         });
-        for (const [clid, t] of tiles) {
+        for (const t of tiles.values()) {
+            const s = (t.track && byTrack.get(t.track.id)) || null;
+            // (61) a camera switched off mid-call keeps its receiver track
+            // "live" and unmuted in WebView2 — onmute never fires — so without
+            // this the tile would freeze on a stale frame for the rest of the
+            // call. Screen shares are exempt: a still desktop legitimately
+            // encodes nothing, and so does a tile paused by low-bandwidth
+            // mode (88), which is meant to hold its last frame.
+            const exempt = tileIsScreen(t) || t.video.paused;
+            if (!s || exempt) {
+                t.stalls = 0;
+                t.flowing = true;
+            } else if (s.frames > t.frames) {
+                t.frames = s.frames;
+                t.stalls = 0;
+                t.flowing = true;
+            } else if (++t.stalls >= STALL_POLLS) {
+                t.flowing = false;
+            }
             updateTileVideo(t); // WebView2 does not always fire track mute/unmute
-            let w = 0;
-            if (t.track) w = byTrack.get(t.track.id) || 0;
-            if (!w) {
+            const w = s ? s.w : 0;
+            if (!w || !t.flowing) {
                 t.badgeEl.classList.add("hidden");
                 continue;
             }
@@ -283,12 +404,22 @@ async function refreshBadges() {
     } catch { /* stats unavailable */ }
 }
 
+// isSharing reports the publisher's screen-share flag from screenshare_changed.
+function isSharing(clientID) {
+    const c = V().state.clients.find((c) => String(c.client_id) === String(clientID));
+    return !!c?.sharing;
+}
+
 // ---------------------------------------------------------------------------
 // Low-bandwidth mode (88): cap own video send to 150 kbps (single layer),
 // request the low simulcast layer, pause tile rendering, persist the toggle.
 // ---------------------------------------------------------------------------
 
 let lowBandwidth = false;
+
+// LOW_BW_BITRATE is the send ceiling of the mode; a screen share must not lift
+// it (88), so the share preset caps are clamped to it while the mode is on.
+const LOW_BW_BITRATE = 150000;
 
 export function isLowBandwidth() { return lowBandwidth; }
 
@@ -301,9 +432,9 @@ export async function setLowBandwidth(on, persist) {
     lastSentQuality = ""; // force re-push with the new effective quality
     pushQuality();
     for (const t of tiles.values()) {
-        // (88) a tile with nothing decoded yet keeps playing until its first
-        // frame lands (the element pauses itself then), so it freezes on an
-        // image instead of never leaving the avatar.
+        // (88) same rule as the decode handler: a tile with nothing decoded yet
+        // keeps playing until its first frame lands and pauses on it there, so
+        // every tile ends up frozen on a picture rather than on an avatar.
         if (on) { if (t.video.readyState >= 2) t.video.pause(); }
         else t.video.play().catch(() => {});
     }
@@ -340,14 +471,21 @@ function applySendCaps() {
     p.encodings.forEach((e, i) => {
         if (lowBandwidth) {
             e.active = i === 0;
-            e.maxBitrate = 150000;
+            e.maxBitrate = LOW_BW_BITRATE;
         } else {
             e.active = true;
-            e.maxBitrate = undefined;
+            // a share sets a preset ceiling on the same sender; restore it
+            // (undefined = codec default) so stopping the share uncaps again.
+            e.maxBitrate = sharePresetBitrate || undefined;
         }
     });
     sender.setParameters(p).catch(() => {});
 }
+
+// sharePresetBitrate is the active share's preset ceiling (72), 0 when the
+// camera is on the sender. applySendCaps needs it so leaving low-bandwidth
+// mode mid-share restores the preset instead of uncapping the share.
+let sharePresetBitrate = 0;
 
 // ---------------------------------------------------------------------------
 // Screen share (69-72, 85)
@@ -361,8 +499,14 @@ const SHARE_PRESETS = {
     motion: { label: "Motion (720p60)", width: 1280, height: 720, fps: 60, bitrate: 2500000 },
 };
 
-const regionSupported = typeof CropTarget !== "undefined" &&
-    typeof MediaStreamTrack !== "undefined" && "cropTo" in MediaStreamTrack.prototype;
+// (71) Chromium puts cropTo on BrowserCaptureMediaStreamTrack, a SUBCLASS of
+// MediaStreamTrack — probing the base prototype reports "unsupported" on every
+// browser that actually has the API. The base check stays as a fallback for
+// builds that shipped it there.
+const regionSupported = typeof CropTarget !== "undefined" && (
+    (typeof BrowserCaptureMediaStreamTrack !== "undefined" &&
+        "cropTo" in BrowserCaptureMediaStreamTrack.prototype) ||
+    (typeof MediaStreamTrack !== "undefined" && "cropTo" in MediaStreamTrack.prototype));
 
 // shareToggle is the voice-screen button handler: stop when sharing
 // (confirming first, 85), otherwise open the share dialog.
@@ -413,10 +557,12 @@ function openShareDialog() {
     };
     document.body.appendChild(overlay);
     if (!regionSupported) {
-        // (71) honest limitation note.
+        // (71) the radio is disabled, so the dialog has to say why and what to
+        // do instead — a disabled control with no explanation reads as a bug.
         const note = document.createElement("div");
-        note.className = "set-hint";
-        note.textContent = "Region capture requires a newer WebView2 (CropTarget API missing).";
+        note.className = "set-hint warn";
+        note.textContent = "Region of this app needs the Region Capture API (CropTarget), " +
+            "which this WebView2 runtime does not have — update WebView2, or share the whole window.";
         overlay.querySelector(".share-sources").appendChild(note);
     }
 }
@@ -434,16 +580,24 @@ async function startShare({ surface, preset, withAudio }) {
         frameRate: { ideal: p.fps },
     };
     if (surface !== "region") video.displaySurface = surface; // 69: "monitor" | "window"
+    const gdm = { video, audio: !!withAudio };
+    if (surface === "region") {
+        // (71) Region Capture only applies to a self-capture of this app's own
+        // surface. Without these the picker hands back a monitor/window track
+        // and cropTo() rejects it, so the region path could never succeed.
+        gdm.preferCurrentTab = true;
+        gdm.selfBrowserSurface = "include";
+    }
     let display;
     try {
-        display = await navigator.mediaDevices.getDisplayMedia({ video, audio: !!withAudio });
+        display = await navigator.mediaDevices.getDisplayMedia(gdm);
     } catch (e) {
         if (withAudio) {
             // (70) WebView2 may refuse display audio (works on Windows for
             // screen/tab shares) — retry video-only and say so.
             V().sysMsg("system audio not available for this share (" + (e.message || e.name) + "); sharing video only");
             try {
-                display = await navigator.mediaDevices.getDisplayMedia({ video, audio: false });
+                display = await navigator.mediaDevices.getDisplayMedia(Object.assign({}, gdm, { audio: false }));
                 withAudio = false;
             } catch (e2) {
                 V().sysMsg("screen capture failed: " + (e2.message || e2.name));
@@ -490,6 +644,7 @@ async function startShare({ surface, preset, withAudio }) {
             try { tr?.stop(); } catch { /* nothing left to stop */ }
             display.getTracks().forEach((t) => t.stop());
             state.shareStream = null;
+            clearRegionBox(); // (71) nothing is being cropped after this
             return;
         }
     } else if (vs) {
@@ -499,14 +654,23 @@ async function startShare({ surface, preset, withAudio }) {
             V().sysMsg("publishing screen share failed: " + (e.message || e.name));
             display.getTracks().forEach((t) => t.stop());
             state.shareStream = null;
+            clearRegionBox(); // (71)
             return;
         }
     }
+    // (72) bitrate cap per preset — remembered so applySendCaps can restore it
+    // when low-bandwidth mode is switched off while the share runs.
+    sharePresetBitrate = p.bitrate;
     if (vs) {
-        // (72) bitrate cap per preset.
         const params = vs.getParameters();
         if (params.encodings?.length) {
-            params.encodings.forEach((e) => { e.maxBitrate = p.bitrate; });
+            // (88) the mode's 150 kbps ceiling outranks the preset: without the
+            // clamp, starting a share silently uncapped low-bandwidth mode
+            // until the share ended.
+            params.encodings.forEach((e, i) => {
+                e.active = lowBandwidth ? i === 0 : true;
+                e.maxBitrate = lowBandwidth ? LOW_BW_BITRATE : p.bitrate;
+            });
             vs.setParameters(params).catch(() => {});
         }
     }
@@ -552,7 +716,11 @@ async function startShare({ surface, preset, withAudio }) {
 }
 
 // pickRegionAndCrop shows a draggable/resizable box over the app; on confirm
-// the track is cropped to it via the Region Capture API (71).
+// the track is cropped to it via the Region Capture API (71). The box then
+// STAYS in the document: a crop target with no layout box produces no frames,
+// so removing it would blank the share. It is torn down in doStopShare.
+// The crop itself lives on the MediaStreamTrack, so it survives the
+// renegotiation that publishes the share (and any later one).
 function pickRegionAndCrop(track) {
     return new Promise((resolve) => {
         const box = document.createElement("div");
@@ -588,7 +756,13 @@ function pickRegionAndCrop(track) {
             try {
                 const target = await CropTarget.fromElement(box);
                 await track.cropTo(target);
-                box.remove();
+                // the box is inside its own crop rect from now on, so it has to
+                // stop painting anything: .cropping leaves a transparent hole
+                // and marks the region with an outline, which is drawn outside
+                // the border box and therefore outside the captured rect.
+                box.innerHTML = "";
+                box.classList.add("cropping");
+                V().state.regionBox = box;
                 resolve(true);
             } catch (e) {
                 V().sysMsg("region capture failed: " + (e.message || e.name));
@@ -599,33 +773,86 @@ function pickRegionAndCrop(track) {
     });
 }
 
-// confirmStopShare (85): warn when others may be watching.
-async function confirmStopShare() {
+// clearRegionBox drops the persistent crop target (71).
+export function clearRegionBox() {
     const { state } = V();
-    const watchers = state.clients.filter((c) =>
-        c.channel_id === state.myChannelID && c.channel_id !== 0 && c.client_id !== state.myClientID).length;
-    if (watchers === 0) {
-        doStopShare();
+    if (state.regionBox) {
+        state.regionBox.remove();
+        state.regionBox = null;
+    }
+}
+
+// receiverCount is the set of users the SFU could be forwarding my video to:
+// it only fans a publisher out to peers in the publisher's own channel.
+function receiverCount() {
+    const { state } = V();
+    if (!state.myChannelID) return 0;
+    return state.clients.filter((c) =>
+        c.channel_id === state.myChannelID && c.client_id !== state.myClientID).length;
+}
+
+// videoIsBeingDecoded turns "may be watching" into evidence (85). The router
+// relays subscriber PLI/FIR/NACK back to the publisher, so a non-zero count on
+// my video sender means a subscriber's decoder really is consuming this
+// stream; zero only means nobody had to ask, hence the softer wording.
+async function videoIsBeingDecoded() {
+    const sender = videoSender();
+    if (!sender || !V().state.pc) return false;
+    try {
+        const stats = await sender.getStats();
+        let n = 0;
+        stats.forEach((r) => {
+            if (r.type === "outbound-rtp" && (r.kind === "video" || r.mediaType === "video")) {
+                n += (r.pliCount || 0) + (r.firCount || 0) + (r.nackCount || 0);
+            }
+        });
+        return n > 0;
+    } catch {
+        return false;
+    }
+}
+
+// confirmStopPublish (85) asks before cutting a stream others receive; it
+// stops straight away when nobody in the channel can be receiving it.
+async function confirmStopPublish({ heading, what, stopLabel, keepLabel, onStop }) {
+    const n = receiverCount();
+    if (n === 0) {
+        onStop();
         return;
     }
+    const decoded = await videoIsBeingDecoded();
+    const users = n + " user" + (n === 1 ? "" : "s");
+    const text = decoded
+        ? `${users} in your channel — at least one is decoding your ${what} right now.`
+        : `${users} in your channel can receive your ${what}.`;
     const overlay = document.createElement("div");
     overlay.className = "dlg-overlay";
     overlay.innerHTML = `
         <div class="dlg share-dlg">
-            <h3>Stop sharing?</h3>
-            <p class="dlg-text">${watchers} user${watchers === 1 ? "" : "s"} may be watching your screen.</p>
+            <h3>${heading}</h3>
+            <p class="dlg-text">${text}</p>
             <div class="dlg-buttons">
-                <button class="dlg-ok">Stop sharing</button>
-                <button class="dlg-cancel">Keep sharing</button>
+                <button class="dlg-ok">${stopLabel}</button>
+                <button class="dlg-cancel">${keepLabel}</button>
             </div>
         </div>`;
     overlay.querySelector(".dlg-ok").onclick = () => {
         overlay.remove();
-        doStopShare();
+        onStop();
     };
     overlay.querySelector(".dlg-cancel").onclick = () => overlay.remove();
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
     document.body.appendChild(overlay);
+}
+
+function confirmStopShare() {
+    return confirmStopPublish({
+        heading: "Stop sharing?",
+        what: "screen",
+        stopLabel: "Stop sharing",
+        keepLabel: "Keep sharing",
+        onStop: () => doStopShare(),
+    });
 }
 
 // doStopShare restores the camera slot and stops the display tracks.
@@ -647,12 +874,110 @@ async function doStopShare() {
         state.shareStream.getTracks().forEach((t) => t.stop());
         state.shareStream = null;
     }
-    const camera = state.localStream?.getVideoTracks()[0] || null;
+    clearRegionBox(); // (71)
+    sharePresetBitrate = 0;
+    // (85) the camera slot only comes back when the camera is actually on:
+    // restoring a track the user switched off would republish it silently.
+    const camera = cameraOff ? null : (state.localStream?.getVideoTracks()[0] || null);
     const vs = videoSender();
     if (vs) {
         await vs.replaceTrack(camera).catch(() => {});
         applySendCaps(); // restore low-bandwidth/uncapped state
     }
+    syncCameraButton();
+}
+
+// ---------------------------------------------------------------------------
+// Camera on/off (85): the video half of the voice-bar quick button. It only
+// gates a camera captured at join — a session that started without one has no
+// send transceiver, and adding one would need a renegotiation with nothing to
+// send on it.
+// ---------------------------------------------------------------------------
+
+let cameraOff = false;
+
+// syncCameraButton reflects camera availability and state in the voice bar.
+function syncCameraButton() {
+    const { state, $ } = V();
+    const cam = state.localStream?.getVideoTracks()[0] || null;
+    const btn = $("voice-video");
+    if (!btn) return;
+    btn.disabled = !cam;
+    btn.classList.toggle("active", !!cam && !cameraOff);
+    btn.title = !cam ? "No camera in this session"
+        : cameraOff ? "Camera off — click to turn on" : "Camera on — click to turn off";
+    $("local-video").classList.toggle("hidden", !cam || cameraOff);
+}
+
+// resetCameraState clears the toggle for a fresh (or ended) voice session.
+export function resetCameraState() {
+    cameraOff = false;
+    syncCameraButton();
+}
+
+// cameraToggle is the voice-video button handler.
+export async function cameraToggle() {
+    const { state } = V();
+    const cam = state.localStream?.getVideoTracks()[0] || null;
+    if (!cam) {
+        V().sysMsg("no camera in this voice session");
+        return;
+    }
+    if (cameraOff) {
+        await setCameraOff(false);
+        return;
+    }
+    // While sharing, the camera is not on the wire at all — the share owns the
+    // send slot — so there is nothing for anyone to be watching yet.
+    if (state.screenSharing) {
+        await setCameraOff(true);
+        return;
+    }
+    await confirmStopPublish({
+        heading: "Turn camera off?",
+        what: "camera",
+        stopLabel: "Turn off",
+        keepLabel: "Keep on",
+        onStop: () => setCameraOff(true),
+    });
+}
+
+async function setCameraOff(off) {
+    const { state } = V();
+    const cam = state.localStream?.getVideoTracks()[0] || null;
+    cameraOff = off;
+    if (cam) cam.enabled = !off;
+    // (85) replaceTrack(null) as well: a disabled track still occupies the
+    // encoder and keeps sending black frames to every subscriber. While a
+    // share owns the sender the toggle only parks the capture.
+    if (!state.screenSharing) {
+        const vs = videoSender();
+        if (vs) await vs.replaceTrack(off ? null : cam).catch(() => {});
+        if (!off) applySendCaps();
+    }
+    syncCameraButton();
+}
+
+// trackSlots declares which slot each outbound track occupies (70). The router
+// carries one source per slot, so the share's system audio has to be named or
+// it contends with the microphone for the default audio slot and one of the
+// two is dropped for the rest of the session. The declaration REPLACES the
+// previous one, so it must be complete on EVERY offer — including the ICE
+// restart, which would otherwise tear the share's output track off every
+// subscriber exactly when the network is already unstable.
+export function trackSlots() {
+    const { state } = V();
+    if (!state.pc) return [];
+    const shareAudio = state.shareAudioSender?.track || null;
+    const out = [];
+    for (const s of state.pc.getSenders()) {
+        const t = s.track;
+        if (!t) continue;
+        // The screen currently rides the camera sender (one video slot per
+        // publisher), so only the audio side needs distinguishing.
+        out.push({ track_id: t.id, slot: t === shareAudio ? SLOT_SCREEN_AUDIO : t.kind === "audio" ? "mic" : "cam" });
+    }
+    return out;
 }
 
 // renegotiate runs a client-initiated offer/answer round (used after adding a
@@ -664,7 +989,7 @@ async function renegotiate() {
     const offer = await state.pc.createOffer();
     await state.pc.setLocalDescription(offer);
     try {
-        const answerSDP = await window.go.main.App.WebRTCOffer(offer.sdp);
+        const answerSDP = await window.go.main.App.WebRTCOffer(offer.sdp, trackSlots());
         await state.pc.setRemoteDescription({ type: "answer", sdp: answerSDP });
     } catch (e) {
         await state.pc.setLocalDescription({ type: "rollback" }).catch(() => {});

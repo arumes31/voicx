@@ -19,6 +19,7 @@ import {
 import {
     initVideo, videoTrackAdded, videoTrackRemoved, videoSpeaking,
     videoRefreshNames, clearVideoGrid, shareToggle, setLowBandwidth, isLowBandwidth,
+    parseTrackID, SLOT_SCREEN_AUDIO, cameraToggle, resetCameraState, clearRegionBox, trackSlots,
 } from "./video.js";
 import * as chatUI from "./chat-ui.js";
 import { initPermsUI } from "./perms-ui.js";
@@ -76,6 +77,8 @@ const state = {
     trackUsers: new Map(), // media track ID -> {client_id, unique_id, nickname} (per-publisher tracks; wave-3 video tiles)
     shareStream: null,     // getDisplayMedia result while screen sharing
     shareAudioSender: null, // RTCRtpSender of the optional share system-audio track
+    shareAudioTransceiver: null, // its transceiver, reused by the next share in this session
+    regionBox: null,       // (71) crop target element, alive for the whole cropped share
 };
 
 // ---------------------------------------------------------------------------
@@ -453,17 +456,22 @@ window.runtime.EventsOn("snapshot", (json) => {
     // flags over from the previous state (they arrive via
     // priority_speaker_changed events).
     const prioByID = new Map(state.clients.filter((c) => c.priority_speaker).map((c) => [c.client_id, true]));
+    // (73) the same applies to the screen-share flag: it arrives only via
+    // screenshare_changed, so a snapshot would otherwise un-label live shares.
+    const shareByID = new Map(state.clients.filter((c) => c.sharing).map((c) => [c.client_id, true]));
     state.channels = [];
     state.clients = [];
     lastKnownChannel.clear(); // the snapshot is authoritative
     for (const root of snap.root_channels || []) flattenChannel(root);
     for (const c of state.clients) {
         if (prioByID.has(c.client_id)) c.priority_speaker = true;
+        if (shareByID.has(c.client_id)) c.sharing = true;
     }
     // (317) blocked users are locally muted on sight; (318) contact nickname
     // history updates from presence; (383) buddy alerts; (389) channel watch.
     applyBlockAndContacts();
     resolveTrackUsers();
+    videoRefreshNames(); // (61/73) tile labels follow the refreshed client list
     window.__voicxNotify?.checkBuddyOnline();
     window.__voicxNotify?.checkChannelWatch();
     renderTree();
@@ -698,9 +706,16 @@ window.runtime.EventsOn("event", (json) => {
                 sysMsg("client " + d.client_id + " was kicked" + (d.reason ? " (" + d.reason + ")" : ""));
             }
             break;
-        case "screenshare_changed":
+        case "screenshare_changed": {
+            // (73) remember who is sharing: the grid labels those tiles, and
+            // the camera-off detector (61) must not mistake a still desktop
+            // for a switched-off camera.
+            const sharer = state.clients.find((c) => c.client_id === d.client_id);
+            if (sharer) sharer.sharing = !!d.active;
+            videoRefreshNames();
             sysMsg(clientName(d.client_id) + (d.active ? " started" : " stopped") + " screen sharing");
             break;
+        }
         case "avatar_changed":
             state.avatars.delete(d.unique_id);
             fetchAvatar(d.unique_id);
@@ -1241,6 +1256,7 @@ async function startVoice() {
     // track it would just be an empty box over the UI (audio-only fallback).
     $("local-video").srcObject = camTrack ? state.localStream : null;
     $("local-video").classList.toggle("hidden", !camTrack);
+    resetCameraState(); // (85) a fresh session starts with the camera live
 
     // ICE servers delivered by the server at connect (STUN/TURN); an empty
     // list means "client defaults" (plain RTCPeerConnection).
@@ -1285,18 +1301,24 @@ async function startVoice() {
     // backing off 1s, 2s, 5s, 15s before giving up with a warning toast.
     pc.oniceconnectionstatechange = () => onICEStateChange(pc);
     pc.ontrack = (e) => {
-        // The server assigns each per-publisher track an ID equal to the
-        // publisher's client ID (via the MSID track ID), so tracks can be
-        // attributed without SSRC mapping.
-        const publisher = state.clients.find((c) => String(c.client_id) === String(e.track.id)) || null;
+        // The server labels each track with its publisher and slot (see
+        // parseTrackID in video.js), so tracks are attributed without SSRC
+        // mapping and a publisher can own more than one of them.
+        const { clientID, slot } = parseTrackID(e.track.id);
+        const publisher = state.clients.find((c) => String(c.client_id) === clientID) || null;
         state.trackUsers.set(e.track.id, publisher
             ? { client_id: publisher.client_id, unique_id: publisher.unique_id, nickname: publisher.nickname }
-            : { client_id: e.track.id, unique_id: "", nickname: "" });
+            : { client_id: clientID, unique_id: "", nickname: "" });
         e.track.addEventListener("ended", () => state.trackUsers.delete(e.track.id));
         if (e.track.kind === "video") {
-            // (61) one grid tile per publisher video track; removed on ended.
+            // (61/73) one grid tile per publisher video slot; removed on ended.
             videoTrackAdded(e.track.id, e.streams[0], publisher);
             e.track.addEventListener("ended", () => videoTrackRemoved(e.track.id));
+            return;
+        }
+        if (slot === SLOT_SCREEN_AUDIO) {
+            // (70) a sharer's system audio is not a second microphone.
+            attachShareAudio(e.track, clientID, publisher);
             return;
         }
         // Audio: route through the WebAudio chain (per-user gain hook,
@@ -1306,7 +1328,7 @@ async function startVoice() {
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    const answerSDP = await window.go.main.App.WebRTCOffer(offer.sdp);
+    const answerSDP = await window.go.main.App.WebRTCOffer(offer.sdp, trackSlots());
     await pc.setRemoteDescription({ type: "answer", sdp: answerSDP });
 
     applyChannelAudio();
@@ -1359,7 +1381,7 @@ function recomputeDucking() {
             clearTimeout(unduckTimer);
             unduckTimer = null;
         }
-        setDucking(true, prioAll.map((c) => c.unique_id));
+        applyDucking(true, prioAll.map((c) => c.unique_id));
         return;
     }
     if (unduckTimer) clearTimeout(unduckTimer);
@@ -1368,7 +1390,7 @@ function recomputeDucking() {
         const stillTalking = state.clients.some((c) =>
             c.channel_id === state.myChannelID && c.channel_id !== 0 &&
             c.priority_speaker && c.client_id !== state.myClientID && c.is_speaking);
-        if (!stillTalking) setDucking(false, []);
+        if (!stillTalking) applyDucking(false, []);
     }, 500);
 }
 
@@ -1428,7 +1450,7 @@ function scheduleICERestart() {
         try {
             const offer = await pc.createOffer({ iceRestart: true });
             await pc.setLocalDescription(offer);
-            const answerSDP = await window.go.main.App.WebRTCOffer(offer.sdp);
+            const answerSDP = await window.go.main.App.WebRTCOffer(offer.sdp, trackSlots());
             await pc.setRemoteDescription({ type: "answer", sdp: answerSDP });
         } catch (e) {
             sysMsg("ice restart failed: " + e);
@@ -1449,7 +1471,7 @@ function teardownVoice() {
         clearTimeout(unduckTimer);
         unduckTimer = null;
     }
-    setDucking(false, []);
+    applyDucking(false, []);
     clearVideoGrid();
     if (state.shareStream) {
         state.shareStream.getTracks().forEach((t) => t.stop());
@@ -1459,12 +1481,17 @@ function teardownVoice() {
         window.go.main.App.SetScreenShare(false);
         $("voice-screen").classList.remove("active");
     }
+    // the transceiver belongs to the peer connection being closed: keeping the
+    // reference would make the next session's share replaceTrack a dead sender.
+    state.shareAudioTransceiver = null;
+    clearRegionBox(); // (71)
     detachRemoteAudio();
     if (state.pc) { state.pc.close(); state.pc = null; }
     if (state.localStream) {
         for (const t of state.localStream.getTracks()) t.stop();
         state.localStream = null;
     }
+    resetCameraState(); // (85)
     $("local-video").classList.add("hidden");
     $("remote-video").classList.add("hidden");
 }
@@ -1737,7 +1764,8 @@ function attachRemoteAudio(track, publisher) {
 function resolveTrackUsers() {
     for (const [trackID, u] of state.trackUsers) {
         if (u.unique_id) continue;
-        const publisher = state.clients.find((c) => String(c.client_id) === String(trackID));
+        const { clientID } = parseTrackID(trackID);
+        const publisher = state.clients.find((c) => String(c.client_id) === clientID);
         if (!publisher) continue;
         state.trackUsers.set(trackID, {
             client_id: publisher.client_id, unique_id: publisher.unique_id, nickname: publisher.nickname,
@@ -1747,7 +1775,82 @@ function resolveTrackUsers() {
             t.uid = publisher.unique_id;
             registerUserChain(publisher.unique_id, t.gain, t.mute);
         }
+        // (14) the share chain needs the unique ID too, or its publisher can
+        // never be exempted from ducking.
+        const sa = shareAudio.get(clientID);
+        if (sa && !sa.uid && publisher.unique_id) sa.uid = publisher.unique_id;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared system audio (70) — a screen share's audio arrives on its own slot
+// and gets its own chain, NOT the publisher's voice chain.
+//
+// Chosen behaviour: the per-user volume slider and local mute (1/2) are
+// controls for a PERSON's voice and only touch the microphone. A sharer's
+// system audio has its own mute + volume on the screen tile's context menu,
+// because the reason to mute someone is usually that they are noisy while you
+// are watching what they share — killing the show with the talker is wrong.
+// Priority-speaker ducking (14) does apply: it exists to make one voice
+// audible over everything else, program audio included. The two controls are
+// session-local; settings.user_volumes/muted_users stay the voice registry.
+// ---------------------------------------------------------------------------
+
+// shareAudio maps publisher client ID -> {trackID, src, gain, uid, volume, muted}.
+const shareAudio = new Map();
+
+// SHARE_DUCK_FACTOR must match audio.js's DUCK_FACTOR: these chains are not in
+// its per-user registry, so setDucking cannot reach them.
+const SHARE_DUCK_FACTOR = 0.25;
+let shareDuckActive = false;
+let shareDuckExempt = new Set();
+
+// applyDucking is setDucking plus the share chains it cannot see.
+function applyDucking(active, exceptUIDs) {
+    shareDuckActive = active;
+    shareDuckExempt = new Set(exceptUIDs || []);
+    setDucking(active, exceptUIDs);
+    for (const clid of shareAudio.keys()) applyShareAudio(clid);
+}
+
+function applyShareAudio(clientID) {
+    const n = shareAudio.get(String(clientID));
+    if (!n) return;
+    const duck = shareDuckActive && !shareDuckExempt.has(n.uid) ? SHARE_DUCK_FACTOR : 1;
+    n.gain.gain.value = (n.muted ? 0 : n.volume / 100) * duck;
+}
+
+function attachShareAudio(track, clientID, publisher) {
+    const clid = String(clientID);
+    detachShareAudio(clid); // re-attach after an ICE restart replaces the track
+    if (!ensureRemoteChain()) return;
+    try {
+        const ctx = remoteChain.ctx;
+        const src = ctx.createMediaStreamSource(new MediaStream([track]));
+        const gain = ctx.createGain();
+        src.connect(gain);
+        // no auto-level (53) on program audio: it would pump on music and
+        // game sound, which is not a quiet speaker that needs lifting.
+        gain.connect(remoteChain.master);
+        shareAudio.set(clid, {
+            trackID: track.id, src, gain, uid: publisher?.unique_id || "",
+            volume: 100, muted: false,
+        });
+        applyShareAudio(clid);
+        track.addEventListener("ended", () => detachShareAudio(clid));
+    } catch (e) {
+        sysMsg("shared audio chain failed: " + e);
+    }
+}
+
+function detachShareAudio(clientID) {
+    const n = shareAudio.get(String(clientID));
+    if (!n) return;
+    shareAudio.delete(String(clientID));
+    try {
+        n.gain.disconnect();
+        n.src.disconnect();
+    } catch { /* already disconnected */ }
 }
 
 // detachRemoteTrack removes one publisher's nodes from the shared chain.
@@ -1766,6 +1869,7 @@ function detachRemoteTrack(trackID) {
 
 function detachRemoteAudio() {
     for (const trackID of [...remoteTracks.keys()]) detachRemoteTrack(trackID);
+    for (const clid of [...shareAudio.keys()]) detachShareAudio(clid); // (70)
     detachAllUserNormalizers(); // (53) stops the shared auto-level ticker
     if (remoteChain.ctx) {
         remoteChain.ctx.close().catch(() => {});
@@ -1936,6 +2040,8 @@ function updateTalkBanner() {
 
 // Screen share (69-72, 85) + low-bandwidth mode (88) — implemented in video.js.
 
+$("voice-video").onclick = () => cameraToggle();
+
 $("voice-screen").onclick = () => shareToggle();
 
 $("voice-lowbw").onclick = () => setLowBandwidth(!isLowBandwidth(), true);
@@ -1985,6 +2091,25 @@ window.__voicx = {
     connectFromLogin, renderTree,
     clientName, initials, fetchAvatar,
     applyAppearance, toggleCompact, recentChannels,
+    // (70) shared system audio controls for the screen tile's context menu.
+    shareAudioCtl: {
+        get: (clientID) => {
+            const n = shareAudio.get(String(clientID));
+            return n ? { muted: n.muted, volume: n.volume } : null;
+        },
+        setMuted: (clientID, muted) => {
+            const n = shareAudio.get(String(clientID));
+            if (!n) return;
+            n.muted = !!muted;
+            applyShareAudio(clientID);
+        },
+        setVolume: (clientID, pct) => {
+            const n = shareAudio.get(String(clientID));
+            if (!n) return;
+            n.volume = Math.max(0, Math.min(200, pct | 0));
+            applyShareAudio(clientID);
+        },
+    },
 };
 
 initMenu();

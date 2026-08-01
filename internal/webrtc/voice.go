@@ -70,6 +70,14 @@ func (v *Voice) SetVideoQuality(clientID, quality string) error {
 	return v.router.SetVideoQuality(clientID, quality)
 }
 
+// DeclareTrackSlots records which media slot each of the client's outbound
+// tracks occupies, keyed by MSID track ID. It must be called BEFORE the offer
+// that introduces those tracks is handled, so the first answer already carries
+// the matching output tracks. See Router.SetTrackSlots (70).
+func (v *Voice) DeclareTrackSlots(clientID string, slots map[string]string) {
+	v.router.SetTrackSlots(clientID, slots)
+}
+
 // SetOfferSender installs the callback used to deliver server-initiated
 // renegotiation offers to clients (the TCP control channel in production).
 func (v *Voice) SetOfferSender(fn func(clientID, offerSDP string) error) {

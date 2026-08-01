@@ -221,7 +221,7 @@ export function VerifyFile(arg1:number,arg2:string,arg3:string,arg4:string):Prom
 
 export function WebRTCAnswer(arg1:string):Promise<void>;
 
-export function WebRTCOffer(arg1:string):Promise<string>;
+export function WebRTCOffer(arg1:string,arg2:Array<netproto.TrackSlot>):Promise<string>;
 
 export function WhatsNew():Promise<string>;
 

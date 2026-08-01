@@ -200,6 +200,10 @@ body {
 }
 .icon-btn:hover { border-color: var(--border-accent); color: var(--text); }
 .icon-btn.active { border-color: var(--border-accent); color: var(--accent); }
+/* (85) the camera button is disabled in a session captured without a camera:
+   it has to read as unavailable, not as "off". */
+.icon-btn:disabled { opacity: .4; cursor: default; }
+.icon-btn:disabled:hover { border-color: var(--border); color: var(--text-dim); }
 #voice-prio { width: auto; padding: 0 8px; font-size: 10px; font-weight: 700; letter-spacing: .06em; }
 .voice-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 #voice-status { font-size: 13px; color: var(--text-dim); }
@@ -565,6 +569,10 @@ body {
     color: var(--text); pointer-events: none;
 }
 .vtile-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* (73) camera and screen tiles of the same publisher carry the same nickname,
+   so the kind marker is what tells them apart. */
+.vtile-kind { flex: 0 0 auto; font-size: 10px; color: var(--text-faint); white-space: nowrap; }
+.vtile.is-screen { border-color: var(--border-accent); }
 .vtile-badge {
     font-family: var(--font-mono); font-size: 9px; padding: 1px 5px;
     border-radius: 4px; background: var(--accent-dim); color: var(--accent);
@@ -611,6 +619,14 @@ body {
     border-radius: 8px; padding: 6px 12px; cursor: pointer; font-size: 12px;
 }
 .region-box .region-ok { border-color: var(--border-accent); color: var(--accent); }
+/* (71) after the crop is applied the box must stay in the document — a crop
+   target with no layout box produces no frames — and it now sits inside the
+   captured rect, so it stops painting. The outline is drawn outside the border
+   box, i.e. outside the crop, so it marks the region locally only. */
+.region-box.cropping {
+    background: none; border-color: transparent; resize: none; pointer-events: none;
+    outline: 2px dashed var(--accent); outline-offset: 2px;
+}
 
 /* ---------------------------------------------------------------- TOFU fingerprint warning (4a) */
 .fp-warn { border-color: var(--warn, #f0b35a); }

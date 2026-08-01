@@ -1,6 +1,7 @@
 package netproto
 
 import (
+	"reflect"
 	"testing"
 )
 
@@ -176,10 +177,13 @@ func TestCodecRoundTrip(t *testing.T) {
 	})
 
 	t.Run("WebRTCOffer", func(t *testing.T) {
-		in := WebRTCOffer{SDP: "v=0\r\no=- 1 1 IN IP4 0.0.0.0"}
+		in := WebRTCOffer{
+			SDP:    "v=0\r\no=- 1 1 IN IP4 0.0.0.0",
+			Tracks: []TrackSlot{{TrackID: "t-1", Slot: "mic"}, {TrackID: "t-2", Slot: "screenaudio"}},
+		}
 		var out WebRTCOffer
 		roundTrip(t, MsgWebRTCOffer, in, &out)
-		if out != in {
+		if !reflect.DeepEqual(out, in) {
 			t.Errorf("got %+v, want %+v", out, in)
 		}
 	})

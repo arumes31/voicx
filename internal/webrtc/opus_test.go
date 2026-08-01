@@ -157,12 +157,12 @@ func TestEchoChannelSelfHearing(t *testing.T) {
 		t.Fatal("no echo self pair created on join")
 	}
 	pkt := makeAudioPacket(t, 1, -1)
-	if sent := r.ForwardRTP("a", pkt); sent != 1 {
+	if sent := r.ForwardRTP("a", SlotMic, pkt); sent != 1 {
 		t.Fatalf("echo forward sent = %d, want 1 (self)", sent)
 	}
 
 	r.JoinChannel(99, "b")
-	if sent := r.ForwardRTP("a", pkt); sent != 2 {
+	if sent := r.ForwardRTP("a", SlotMic, pkt); sent != 2 {
 		t.Fatalf("echo forward sent = %d, want 2 (self + b)", sent)
 	}
 
@@ -172,7 +172,7 @@ func TestEchoChannelSelfHearing(t *testing.T) {
 	if pubTrackFor(r, "a", "a") != nil {
 		t.Fatal("self pair leaked into normal channel")
 	}
-	if sent := r.ForwardRTP("a", pkt); sent != 0 {
+	if sent := r.ForwardRTP("a", SlotMic, pkt); sent != 0 {
 		t.Fatalf("normal channel forward sent = %d, want 0 (sender excluded)", sent)
 	}
 }
@@ -211,7 +211,7 @@ func TestEchoChannelSelfPairThroughSignaling(t *testing.T) {
 		if pubTrackFor(r, "a", "a") == nil {
 			t.Fatalf("%s: no echo self pair", stage)
 		}
-		if sent := r.ForwardRTP("a", pkt); sent != 1 {
+		if sent := r.ForwardRTP("a", SlotMic, pkt); sent != 1 {
 			t.Fatalf("%s: echo forward sent = %d, want 1 (self)", stage, sent)
 		}
 	}
@@ -305,7 +305,7 @@ func TestReadLoopMusicChannelBypassesTalkGate(t *testing.T) {
 	r.SetHandlers(func(string) bool { return false }, nil)
 
 	track := &fakeTrackReader{packets: []*rtp.Packet{makeAudioPacket(t, 1, 20)}}
-	r.ReadLoop("musician", track, 1)
+	r.ReadLoop("musician", SlotMic, track, 1)
 
 	if w.count() != 1 {
 		t.Fatalf("forwarded = %d, want 1 (music channel bypasses talk gate)", w.count())
@@ -317,7 +317,7 @@ func TestReadLoopMusicChannelBypassesTalkGate(t *testing.T) {
 	r.JoinChannel(8, "listener2")
 	r.AddOutput("listener2", w2)
 	track2 := &fakeTrackReader{packets: []*rtp.Packet{makeAudioPacket(t, 1, 20)}}
-	r.ReadLoop("talker", track2, 1)
+	r.ReadLoop("talker", SlotMic, track2, 1)
 	if w2.count() != 0 {
 		t.Fatalf("forwarded = %d, want 0 (gate applies in normal channel)", w2.count())
 	}

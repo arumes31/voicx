@@ -12,6 +12,7 @@ import (
 
 	"voicx/internal/netproto"
 	"voicx/internal/permissions"
+	"voicx/internal/webrtc"
 )
 
 // Broadcast event types for the voice pipeline.
@@ -33,6 +34,18 @@ const (
 type whisperTargeter interface {
 	WhisperTargets(clientID string) []string
 }
+
+// trackSlotDeclarer is the optional VoiceBackend capability that accepts the
+// media slot of each track in a client's offer (70). webrtc.Voice implements
+// it; a backend that does not routes every track to its kind's default slot.
+type trackSlotDeclarer interface {
+	DeclareTrackSlots(clientID string, slots map[string]string)
+}
+
+// The production backend must satisfy the optional capability: a signature
+// drift would make the type assertion in handleWebRTCOffer miss silently and
+// every screen share would publish its audio into the microphone slot.
+var _ trackSlotDeclarer = (*webrtc.Voice)(nil)
 
 // whisperEvent is the payload of whisper events, emitted to every target of an
 // active whisper when the whisperer's VAD state toggles. FromUniqueID is the
@@ -84,6 +97,19 @@ func (s *TCPServer) handleWebRTCOffer(_ context.Context, client *Client, f *netp
 	}
 	if s.deps == nil || s.deps.Voice == nil {
 		return s.sendError(client, errCodeUnavailable, "voice backend unavailable")
+	}
+
+	// The slot declaration has to land BEFORE the offer is applied: the
+	// backend builds this client's output tracks while answering, and the
+	// other members' extra output tracks are added from here too (70).
+	if d, ok := s.deps.Voice.(trackSlotDeclarer); ok {
+		slots := make(map[string]string, len(msg.Tracks))
+		for _, t := range msg.Tracks {
+			if t.TrackID != "" {
+				slots[t.TrackID] = t.Slot
+			}
+		}
+		d.DeclareTrackSlots(client.ID, slots)
 	}
 
 	answer, err := s.deps.Voice.HandleOffer(client.ID, msg.SDP,

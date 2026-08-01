@@ -294,14 +294,17 @@ func BenchmarkForwardRTP(b *testing.B) {
 					b.Fatalf("NewTrackLocalStaticRTP: %v", err)
 				}
 				r.mu.Lock()
-				r.pubTracks[sub] = map[string]*pubTrack{"pub": {audio: track}}
+				r.pubTracks[sub] = map[string]*pubTrack{"pub": {
+					audio: map[string]*pubSlot{SlotMic: {track: track}},
+					video: map[string]*pubSlot{},
+				}}
 				r.mu.Unlock()
 				r.JoinChannel(1, sub)
 			}
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if sent := r.ForwardRTP("pub", pkt); sent != n {
+				if sent := r.ForwardRTP("pub", SlotMic, pkt); sent != n {
 					b.Fatalf("ForwardRTP sent = %d, want %d", sent, n)
 				}
 			}

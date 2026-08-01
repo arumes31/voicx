@@ -576,6 +576,29 @@ type KickClient struct {
 // from the server it requests renegotiation.
 type WebRTCOffer struct {
 	SDP string `json:"sdp"`
+	// Tracks labels the offer's outbound tracks with the media slot each one
+	// occupies. It replaces the previous declaration on every offer; an
+	// omitted track takes its kind's default slot, so a client that never
+	// sends this field publishes exactly one microphone and one video track
+	// (70). Server -> client renegotiation offers never set it.
+	Tracks []TrackSlot `json:"tracks,omitempty"`
+}
+
+// TrackSlot names the media slot one outbound track of a WebRTC offer
+// occupies, so the server can route a publisher's SECOND audio or video track
+// separately instead of muxing it into the first (70).
+//
+// TrackID is the MediaStreamTrack.id as it appears in the offer's a=msid
+// line. Slot is one of "mic" (default audio: microphone), "cam" (default
+// video: camera or primary shared surface), "screenaudio" (system audio
+// captured with a screen share), or "screen" (a second shared surface).
+// A client publishing more than one track of a kind MUST declare them: an
+// unknown or missing slot puts the track in its kind's default slot, and a
+// slot carries exactly one source, so whichever track arrives first wins and
+// the other is dropped rather than muxed into it.
+type TrackSlot struct {
+	TrackID string `json:"track_id"`
+	Slot    string `json:"slot"`
 }
 
 // WebRTCAnswer carries an SDP answer to a previously received offer.

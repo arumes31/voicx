@@ -255,9 +255,14 @@ func (a *App) GetPermissions() ([]netproto.PermissionEntry, error) {
 }
 
 // WebRTCOffer sends the browser's SDP offer and returns the server's answer.
-func (a *App) WebRTCOffer(sdp string) (string, error) {
+// tracks declares which slot every outbound track occupies (70): the router
+// carries one source per slot, so an undeclared second audio track would
+// contend with the microphone for the default slot and one of them would be
+// dropped. The declaration REPLACES the previous one, so every offer must
+// carry the complete list.
+func (a *App) WebRTCOffer(sdp string, tracks []netproto.TrackSlot) (string, error) {
 	f, err := a.cmLoad().request(netproto.MsgWebRTCOffer, netproto.MsgWebRTCAnswer,
-		netproto.WebRTCOffer{SDP: sdp}, 10*time.Second)
+		netproto.WebRTCOffer{SDP: sdp, Tracks: tracks}, 10*time.Second)
 	if err != nil {
 		return "", err
 	}

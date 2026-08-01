@@ -54,6 +54,13 @@ func (f *fakeTrackReader) ReadRTP() (*rtp.Packet, interceptor.Attributes, error)
 	return p, nil, nil
 }
 
+// reads reports how many packets have been consumed.
+func (f *fakeTrackReader) reads() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.idx
+}
+
 // makeAudioPacket builds an RTP packet; when level >= 0 an ssrc-audio-level
 // header extension with that level is attached at extension ID 1.
 func makeAudioPacket(t *testing.T, seq uint16, level int) *rtp.Packet {
@@ -165,13 +172,13 @@ func TestForwardRTPChannelFanout(t *testing.T) {
 	}
 
 	pkt := makeAudioPacket(t, 1, -1)
-	if sent := r.ForwardRTP("a", pkt); sent != 2 {
+	if sent := r.ForwardRTP("a", SlotMic, pkt); sent != 2 {
 		t.Fatalf("ForwardRTP sent = %d, want 2 (b and c have tracks for a)", sent)
 	}
 
 	// A member without a peer connection is skipped silently.
 	r.JoinChannel(1, "d")
-	if sent := r.ForwardRTP("a", pkt); sent != 2 {
+	if sent := r.ForwardRTP("a", SlotMic, pkt); sent != 2 {
 		t.Fatalf("ForwardRTP sent = %d, want 2 (d has no PC)", sent)
 	}
 }
@@ -182,7 +189,7 @@ func TestForwardRTPNotInChannel(t *testing.T) {
 	r := NewRouter(nil)
 	r.JoinChannel(1, "b")
 
-	if sent := r.ForwardRTP("ghost", makeAudioPacket(t, 1, -1)); sent != 0 {
+	if sent := r.ForwardRTP("ghost", SlotMic, makeAudioPacket(t, 1, -1)); sent != 0 {
 		t.Fatalf("ForwardRTP sent = %d, want 0", sent)
 	}
 }
@@ -206,7 +213,7 @@ func TestForwardRTPTap(t *testing.T) {
 	r.AddOutput("recorder:1", tap)
 	r.JoinChannel(1, "recorder:1")
 
-	if sent := r.ForwardRTP("a", makeAudioPacket(t, 1, -1)); sent != 2 {
+	if sent := r.ForwardRTP("a", SlotMic, makeAudioPacket(t, 1, -1)); sent != 2 {
 		t.Fatalf("ForwardRTP sent = %d, want 2 (b's track + tap)", sent)
 	}
 	if tap.count() != 1 {
@@ -236,13 +243,13 @@ func TestWhisperRouting(t *testing.T) {
 	// a whispers to client c and channel 2 (d), bypassing channel-mate b.
 	r.SetWhisper("a", []string{"c"}, []int64{2}, true)
 	pkt := makeAudioPacket(t, 1, -1)
-	if sent := r.ForwardRTP("a", pkt); sent != 2 {
+	if sent := r.ForwardRTP("a", SlotMic, pkt); sent != 2 {
 		t.Fatalf("whisper forward sent = %d, want 2 (c and d)", sent)
 	}
 
 	// Deactivating the whisper restores normal channel fanout.
 	r.SetWhisper("a", nil, nil, false)
-	if sent := r.ForwardRTP("a", pkt); sent != 2 {
+	if sent := r.ForwardRTP("a", SlotMic, pkt); sent != 2 {
 		t.Fatalf("channel forward sent = %d, want 2 (b and c)", sent)
 	}
 }
@@ -263,7 +270,7 @@ func TestWhisperDedup(t *testing.T) {
 	r.JoinChannel(2, "c")
 
 	r.SetWhisper("a", []string{"c"}, []int64{2}, true)
-	if sent := r.ForwardRTP("a", makeAudioPacket(t, 1, -1)); sent != 1 {
+	if sent := r.ForwardRTP("a", SlotMic, makeAudioPacket(t, 1, -1)); sent != 1 {
 		t.Fatalf("whisper forward sent = %d, want 1 (dedup)", sent)
 	}
 }
@@ -326,7 +333,7 @@ func TestReadLoopSpeakingAndForwarding(t *testing.T) {
 		makeAudioPacket(t, 1, 20), // voice
 		makeAudioPacket(t, 2, 25), // voice
 	}}
-	r.ReadLoop("talker", track, 1)
+	r.ReadLoop("talker", SlotMic, track, 1)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -354,7 +361,7 @@ func TestReadLoopTalkGateMuted(t *testing.T) {
 	track := &fakeTrackReader{packets: []*rtp.Packet{
 		makeAudioPacket(t, 1, 20), // voice, but muted
 	}}
-	r.ReadLoop("muted-talker", track, 1)
+	r.ReadLoop("muted-talker", SlotMic, track, 1)
 
 	if spoke {
 		t.Fatal("muted client entered speaking state")
@@ -443,16 +450,122 @@ func TestPublisherTrackMSID(t *testing.T) {
 		t.Fatal("missing pub tracks on c")
 	}
 
-	if fromA.audio.ID() != "a" || fromA.video.ID() != "a" {
-		t.Fatalf("track IDs = %q/%q, want both %q", fromA.audio.ID(), fromA.video.ID(), "a")
+	mic, cam := fromA.audio[SlotMic], fromA.video[SlotCam]
+	if mic == nil || cam == nil {
+		t.Fatal("publisher a is missing a default slot on c")
 	}
-	if fromA.audio.StreamID() != fromA.video.StreamID() {
+	if mic.track.ID() != "a" || cam.track.ID() != "a" {
+		t.Fatalf("track IDs = %q/%q, want both %q", mic.track.ID(), cam.track.ID(), "a")
+	}
+	if mic.track.StreamID() != cam.track.StreamID() {
 		t.Fatalf("audio/video stream IDs = %q/%q, want one stream per publisher",
-			fromA.audio.StreamID(), fromA.video.StreamID())
+			mic.track.StreamID(), cam.track.StreamID())
 	}
-	if fromA.audio.StreamID() == fromB.audio.StreamID() {
+	if mic.track.StreamID() == fromB.audio[SlotMic].track.StreamID() {
 		t.Fatalf("publishers a and b share stream ID %q; the browser then merges them into one MediaStream",
-			fromA.audio.StreamID())
+			mic.track.StreamID())
+	}
+}
+
+// TestTrackSlotMSID verifies the extra-slot MSID contract clients rely on:
+// a non-default slot gets its own track ID and its own stream ID, so screen
+// audio never lands in the microphone's MediaStream (70).
+func TestTrackSlotMSID(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
+	r := NewRouter(nil)
+
+	for _, id := range []string{"a", "b"} {
+		attachFakePeer(t, e, r, id)
+		r.JoinChannel(1, id)
+	}
+	r.SetTrackSlots("a", map[string]string{"remote-1": SlotScreenAudio})
+
+	fromA := pubTrackFor(r, "b", "a")
+	if fromA == nil {
+		t.Fatal("missing pub tracks on b")
+	}
+	share := fromA.audio[SlotScreenAudio]
+	if share == nil {
+		t.Fatal("declaring the screen-audio slot created no output track")
+	}
+	if got, want := share.track.ID(), "a|screenaudio"; got != want {
+		t.Fatalf("screen audio track ID = %q, want %q", got, want)
+	}
+	if got, want := share.track.StreamID(), "voicx-a|screenaudio"; got != want {
+		t.Fatalf("screen audio stream ID = %q, want %q", got, want)
+	}
+	if share.track.StreamID() == fromA.audio[SlotMic].track.StreamID() {
+		t.Fatal("screen audio shares the microphone's stream ID; the browser then feeds both through one gain chain")
+	}
+
+	// Undeclaring the slot tears the extra track down again.
+	r.SetTrackSlots("a", nil)
+	if pubTrackFor(r, "b", "a").audio[SlotScreenAudio] != nil {
+		t.Fatal("undeclaring the screen-audio slot left its output track behind")
+	}
+	if pubTrackFor(r, "b", "a").audio[SlotMic] == nil {
+		t.Fatal("undeclaring an extra slot dropped the default slot")
+	}
+}
+
+// TestForwardRTPUnknownSlotDropped verifies a packet whose slot has no output
+// track is dropped instead of being written into another slot's track (70).
+func TestForwardRTPUnknownSlotDropped(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
+	r := NewRouter(nil)
+
+	for _, id := range []string{"a", "b"} {
+		attachFakePeer(t, e, r, id)
+		r.JoinChannel(1, id)
+	}
+	pkt := makeAudioPacket(t, 1, -1)
+	if sent := r.ForwardRTP("a", SlotMic, pkt); sent != 1 {
+		t.Fatalf("mic forward sent = %d, want 1", sent)
+	}
+	if sent := r.ForwardRTP("a", SlotScreenAudio, pkt); sent != 0 {
+		t.Fatalf("undeclared screen audio sent = %d, want 0 (no track to carry it)", sent)
+	}
+}
+
+// TestReadLoopSlotClaimedOnce verifies a second inbound track claiming a live
+// slot is dropped, so two sources can never be muxed into one output track
+// (70).
+func TestReadLoopSlotClaimedOnce(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
+	r := NewRouter(nil)
+
+	attachFakePeer(t, e, r, "b")
+	r.JoinChannel(1, "b")
+	r.JoinChannel(1, "a")
+
+	token, ok := r.claimSlot("a", SlotMic)
+	if !ok {
+		t.Fatal("first claim of the mic slot was refused")
+	}
+	second := &fakeTrackReader{packets: []*rtp.Packet{makeAudioPacket(t, 1, 10)}}
+	r.ReadLoop("a", SlotMic, second, 1)
+	if second.reads() != 0 {
+		t.Fatalf("refused track was read %d times, want 0", second.reads())
+	}
+
+	// Releasing the claim lets the next track in.
+	r.releaseSlot("a", SlotMic, token)
+	third := &fakeTrackReader{packets: []*rtp.Packet{makeAudioPacket(t, 1, 10)}}
+	r.ReadLoop("a", SlotMic, third, 1)
+	if third.reads() == 0 {
+		t.Fatal("track was refused after the slot was released")
 	}
 }
 
@@ -485,7 +598,7 @@ func TestEnsurePublishersEchoSelfPair(t *testing.T) {
 	if pubTrackFor(r, "a", "a") == nil {
 		t.Fatal("peer rebuild lost the echo self pair")
 	}
-	if sent := r.ForwardRTP("a", makeAudioPacket(t, 1, -1)); sent != 1 {
+	if sent := r.ForwardRTP("a", SlotMic, makeAudioPacket(t, 1, -1)); sent != 1 {
 		t.Fatalf("ForwardRTP sent = %d, want 1 (echoed back to a)", sent)
 	}
 }
