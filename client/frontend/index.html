@@ -18,6 +18,8 @@
             <label>SERVER PASSWORD <input id="login-serverpw" type="password" placeholder="if required" /></label>
             <button id="login-connect">CONNECT</button>
             <div id="login-error"></div>
+            <div class="pane-head">RECENT SERVERS</div>
+            <div id="login-recents"></div>
             <div class="identity-footnote">
                 Identity auto-generated — stored locally
                 <span class="mono" id="login-identity"></span>
@@ -31,32 +33,73 @@
     <!-- Main three-pane layout -->
     <div id="app" class="hidden">
         <nav id="menubar"></nav>
+        <div id="server-tabs"></div>
         <div id="app-body">
         <aside id="sidebar">
             <div class="brand">
+                <img id="server-icon" class="hidden" alt="" title="server icon" />
                 <span class="wordmark">voicx</span>
+                <span id="alpha-badge" title="alpha software — click for details">α</span>
+                <span id="conn-lock" class="hidden" title="control channel TLS + chat payload encryption on">🔒</span>
+                <button id="notif-bell" class="icon-btn" title="Notifications (346)" aria-label="notifications">🔔<span id="notif-badge" class="hidden"></span></button>
                 <span id="conn-pill" class="pill">offline</span>
             </div>
-            <div class="pane-head">CHANNELS</div>
+            <div class="pane-head">CHANNELS <button id="channel-create-btn" class="icon-btn pane-head-btn" title="Create channel">+</button></div>
+            <div id="tree-tools">
+                <input id="tree-filter" placeholder="filter… (319)" />
+                <button id="tree-collapse" class="icon-btn" title="Collapse all (302)">▾</button>
+                <button id="tree-expand" class="icon-btn" title="Expand all (302)">▸</button>
+            </div>
             <div id="channel-tree"></div>
         </aside>
 
         <main id="center">
+            <div id="center-tabs">
+                <button id="tab-chat" class="active">Chat</button>
+                <button id="tab-files">Files</button>
+                <button id="tab-transfers" class="icon-btn" title="Transfers">⇅</button>
+            </div>
+            <div id="banner-box"></div>
             <div id="voice-bar">
                 <button id="ptt-btn" title="Hold to talk (Space)">🎙</button>
                 <div class="voice-buttons">
                     <button id="voice-join" class="icon-btn" title="Join / leave voice">⏻</button>
                     <button id="voice-mute" class="icon-btn" title="Mute">🔇</button>
+                    <button id="voice-prio" class="icon-btn" title="Priority speaker (duck others while you talk)">PRIO</button>
                     <button id="voice-screen" class="icon-btn" title="Share screen">🖥</button>
+                    <button id="voice-lowbw" class="icon-btn" title="Low-bandwidth mode (receive low quality, send 150 kbps)">📶</button>
                 </div>
                 <div class="voice-info">
                     <div id="voice-status">voice off</div>
                     <div id="mic-status" class="warn"></div>
+                    <div id="mic-meter" class="hidden"><div class="mic-fill cool"></div></div>
                 </div>
                 <span id="hotkey-status" title="global hotkey status"></span>
             </div>
             <div id="talk-banner" class="hidden">● TALKING</div>
-            <div id="chat-log"></div>
+            <div id="video-grid" class="hidden"></div>
+            <div id="chat-head">
+                <span id="chat-head-title">Chat</span>
+                <span id="chat-topic" class="hidden" title=""></span>
+                <span id="chat-head-actions">
+                    <button id="chat-search-btn" class="icon-btn" title="Search chat (Ctrl+F)">🔍</button>
+                    <button id="chat-pins-btn" class="icon-btn" title="Pinned messages">📌</button>
+                    <button id="chat-info-btn" class="icon-btn hidden" title="Channel description">ⓘ</button>
+                    <button id="chat-export-btn" class="icon-btn" title="Export chat transcript">⬇</button>
+                </span>
+            </div>
+            <div id="chat-search-row" class="hidden">
+                <input id="chat-search" placeholder="filter loaded messages… (Esc closes)" />
+                <button id="chat-search-server">search server history</button>
+                <button id="chat-search-close" class="icon-btn" title="Close search">✕</button>
+            </div>
+            <div id="pm-tabs" class="hidden"></div>
+            <div id="chat-wrap">
+                <div id="chat-log"></div>
+                <button id="chat-newpill" class="hidden"></button>
+            </div>
+            <div id="reply-bar" class="hidden"></div>
+            <div id="file-preview-row" class="hidden"></div>
             <div id="chat-input-row">
                 <select id="chat-scope">
                     <option value="channel">channel</option>
@@ -65,8 +108,10 @@
                 </select>
                 <input id="chat-target" class="hidden" placeholder="target unique id" />
                 <input id="chat-text" placeholder="message…" />
+                <button id="chat-emoji" class="icon-btn" title="Emoji picker">😊</button>
                 <button id="chat-send">SEND</button>
             </div>
+            <div id="files-pane" class="hidden"></div>
             <video id="remote-video" autoplay playsinline class="hidden"></video>
             <video id="local-video" autoplay playsinline muted class="hidden"></video>
         </main>
@@ -74,6 +119,8 @@
         <aside id="details">
             <div class="pane-head">DETAILS</div>
             <div id="client-card"></div>
+            <div class="pane-head">SERVER</div>
+            <div id="news-area"></div>
             <div class="pane-head">PERMISSIONS</div>
             <div id="perm-area"></div>
         </aside>

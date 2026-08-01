@@ -114,31 +114,65 @@ func TestRouterJoinLeave(t *testing.T) {
 
 // --- forwarding -------------------------------------------------------------
 
+// attachFakePeer creates a real (unnegotiated) peer connection for clientID
+// and attaches it to the router. Writes to its tracks succeed silently
+// (unbound tracks have no bindings), which is exactly what the fan-out tests
+// need.
+func attachFakePeer(t *testing.T, e *Engine, r *Router, clientID string) {
+	t.Helper()
+	pc, err := e.NewPeerConnection(clientID)
+	if err != nil {
+		t.Fatalf("NewPeerConnection(%s): %v", clientID, err)
+	}
+	if err := r.AttachPeer(clientID, pc); err != nil {
+		t.Fatalf("AttachPeer(%s): %v", clientID, err)
+	}
+}
+
+// pubTrackFor returns the pubTrack for (subscriber, publisher) or nil.
+func pubTrackFor(r *Router, sub, pub string) *pubTrack {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if tracks, ok := r.pubTracks[sub]; ok {
+		return tracks[pub]
+	}
+	return nil
+}
+
 // TestForwardRTPChannelFanout verifies that audio from a channel member is
-// forwarded to every other member with an output track, and never to the
+// forwarded to every other member's per-publisher track, and never to the
 // sender.
 func TestForwardRTPChannelFanout(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
 	r := NewRouter(nil)
-	wb, wc := &fakeTrackWriter{}, &fakeTrackWriter{}
 
+	for _, id := range []string{"a", "b", "c"} {
+		attachFakePeer(t, e, r, id)
+	}
 	r.JoinChannel(1, "a")
 	r.JoinChannel(1, "b")
 	r.JoinChannel(1, "c")
-	r.AddOutput("b", wb)
-	r.AddOutput("c", wc)
+
+	// Pair tracks exist in both directions for every pair.
+	for _, pair := range [][2]string{{"b", "a"}, {"c", "a"}, {"a", "b"}, {"a", "c"}} {
+		if pubTrackFor(r, pair[0], pair[1]) == nil {
+			t.Fatalf("missing pub track %s -> %s", pair[0], pair[1])
+		}
+	}
 
 	pkt := makeAudioPacket(t, 1, -1)
 	if sent := r.ForwardRTP("a", pkt); sent != 2 {
-		t.Fatalf("ForwardRTP sent = %d, want 2", sent)
-	}
-	if wb.count() != 1 || wc.count() != 1 {
-		t.Fatalf("writes: b=%d c=%d, want 1 each", wb.count(), wc.count())
+		t.Fatalf("ForwardRTP sent = %d, want 2 (b and c have tracks for a)", sent)
 	}
 
-	// A member without an output track is skipped silently.
+	// A member without a peer connection is skipped silently.
 	r.JoinChannel(1, "d")
 	if sent := r.ForwardRTP("a", pkt); sent != 2 {
-		t.Fatalf("ForwardRTP sent = %d, want 2 (d has no output)", sent)
+		t.Fatalf("ForwardRTP sent = %d, want 2 (d has no PC)", sent)
 	}
 }
 
@@ -146,15 +180,37 @@ func TestForwardRTPChannelFanout(t *testing.T) {
 // any channel goes nowhere.
 func TestForwardRTPNotInChannel(t *testing.T) {
 	r := NewRouter(nil)
-	w := &fakeTrackWriter{}
 	r.JoinChannel(1, "b")
-	r.AddOutput("b", w)
 
 	if sent := r.ForwardRTP("ghost", makeAudioPacket(t, 1, -1)); sent != 0 {
 		t.Fatalf("ForwardRTP sent = %d, want 0", sent)
 	}
-	if w.count() != 0 {
-		t.Fatalf("writes = %d, want 0", w.count())
+}
+
+// TestForwardRTPTap verifies recorder taps receive channel audio on their
+// single output track alongside per-publisher delivery.
+func TestForwardRTPTap(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
+	r := NewRouter(nil)
+
+	attachFakePeer(t, e, r, "a")
+	attachFakePeer(t, e, r, "b")
+	r.JoinChannel(1, "a")
+	r.JoinChannel(1, "b")
+
+	tap := &fakeTrackWriter{}
+	r.AddOutput("recorder:1", tap)
+	r.JoinChannel(1, "recorder:1")
+
+	if sent := r.ForwardRTP("a", makeAudioPacket(t, 1, -1)); sent != 2 {
+		t.Fatalf("ForwardRTP sent = %d, want 2 (b's track + tap)", sent)
+	}
+	if tap.count() != 1 {
+		t.Fatalf("tap writes = %d, want 1", tap.count())
 	}
 }
 
@@ -162,56 +218,53 @@ func TestForwardRTPNotInChannel(t *testing.T) {
 // audio to the whisper targets (clients and channel members) instead of the
 // sender's channel, and that deactivating restores normal routing.
 func TestWhisperRouting(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
 	r := NewRouter(nil)
-	wb, wc, wd := &fakeTrackWriter{}, &fakeTrackWriter{}, &fakeTrackWriter{}
 
+	for _, id := range []string{"a", "b", "c", "d"} {
+		attachFakePeer(t, e, r, id)
+	}
 	r.JoinChannel(1, "a")
 	r.JoinChannel(1, "b")
 	r.JoinChannel(1, "c")
 	r.JoinChannel(2, "d")
-	r.AddOutput("b", wb)
-	r.AddOutput("c", wc)
-	r.AddOutput("d", wd)
 
 	// a whispers to client c and channel 2 (d), bypassing channel-mate b.
 	r.SetWhisper("a", []string{"c"}, []int64{2}, true)
 	pkt := makeAudioPacket(t, 1, -1)
 	if sent := r.ForwardRTP("a", pkt); sent != 2 {
-		t.Fatalf("whisper forward sent = %d, want 2", sent)
-	}
-	if wb.count() != 0 {
-		t.Fatalf("b received %d packets while whispering, want 0", wb.count())
-	}
-	if wc.count() != 1 || wd.count() != 1 {
-		t.Fatalf("whisper targets: c=%d d=%d, want 1 each", wc.count(), wd.count())
+		t.Fatalf("whisper forward sent = %d, want 2 (c and d)", sent)
 	}
 
 	// Deactivating the whisper restores normal channel fanout.
 	r.SetWhisper("a", nil, nil, false)
 	if sent := r.ForwardRTP("a", pkt); sent != 2 {
-		t.Fatalf("channel forward sent = %d, want 2", sent)
-	}
-	if wb.count() != 1 || wc.count() != 2 {
-		t.Fatalf("channel fanout: b=%d c=%d, want 1 and 2", wb.count(), wc.count())
+		t.Fatalf("channel forward sent = %d, want 2 (b and c)", sent)
 	}
 }
 
 // TestWhisperDedup verifies a target listed both as a client and via a
 // channel receives the packet only once.
 func TestWhisperDedup(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
 	r := NewRouter(nil)
-	wc := &fakeTrackWriter{}
 
+	attachFakePeer(t, e, r, "a")
+	attachFakePeer(t, e, r, "c")
 	r.JoinChannel(1, "a")
 	r.JoinChannel(2, "c")
-	r.AddOutput("c", wc)
 
 	r.SetWhisper("a", []string{"c"}, []int64{2}, true)
 	if sent := r.ForwardRTP("a", makeAudioPacket(t, 1, -1)); sent != 1 {
 		t.Fatalf("whisper forward sent = %d, want 1 (dedup)", sent)
-	}
-	if wc.count() != 1 {
-		t.Fatalf("c received %d packets, want 1", wc.count())
 	}
 }
 
@@ -325,8 +378,9 @@ func TestAudioLevel(t *testing.T) {
 
 // --- peer attach ------------------------------------------------------------
 
-// TestAttachPeer verifies that attaching a peer connection registers an audio
-// output track and that DetachPeer removes all router state.
+// TestAttachPeer verifies that attaching peer connections lets JoinChannel
+// create per-publisher track pairs, and that DetachPeer removes all router
+// state (including the pairs seen from the other side).
 func TestAttachPeer(t *testing.T) {
 	e, err := New(testLogger(), nil, false)
 	if err != nil {
@@ -334,31 +388,36 @@ func TestAttachPeer(t *testing.T) {
 	}
 	defer e.Close()
 
-	pc, err := e.NewPeerConnection("c1")
-	if err != nil {
-		t.Fatalf("NewPeerConnection: %v", err)
-	}
-
 	r := NewRouter(nil)
-	if err := r.AttachPeer("c1", pc); err != nil {
-		t.Fatalf("AttachPeer: %v", err)
-	}
-
-	r.mu.RLock()
-	_, hasOutput := r.outputs["c1"]
-	r.mu.RUnlock()
-	if !hasOutput {
-		t.Fatal("no output track registered after AttachPeer")
-	}
+	attachFakePeer(t, e, r, "c1")
+	attachFakePeer(t, e, r, "c2")
 
 	r.JoinChannel(1, "c1")
+	r.JoinChannel(1, "c2")
+
+	if pubTrackFor(r, "c1", "c2") == nil || pubTrackFor(r, "c2", "c1") == nil {
+		t.Fatal("no per-publisher track pair created after JoinChannel")
+	}
+
 	r.SetWhisper("c1", []string{"x"}, nil, true)
 	r.DetachPeer("c1")
 
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if len(r.outputs) != 0 || len(r.whispers) != 0 || len(r.clientChan) != 0 {
-		t.Fatal("DetachPeer left router state behind")
+	if len(r.outputs) != 0 || len(r.whispers) != 0 || len(r.whisperPairs) != 0 {
+		t.Fatal("DetachPeer left outputs/whisper state behind")
+	}
+	if len(r.clientChan) != 1 {
+		t.Fatalf("clientChan = %v, want only c2", r.clientChan)
+	}
+	if _, ok := r.pubPeers["c1"]; ok {
+		t.Fatal("DetachPeer left pubPeers entry behind")
+	}
+	if _, ok := r.pubTracks["c1"]; ok {
+		t.Fatal("DetachPeer left subscriber pairs behind")
+	}
+	if _, ok := r.pubTracks["c2"]["c1"]; ok {
+		t.Fatal("DetachPeer left publisher pair on c2 behind")
 	}
 }
 

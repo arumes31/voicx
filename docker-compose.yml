@@ -99,6 +99,14 @@ services:
       # --- Writable data on the named volume (read_only root fs) ---
       VOICX_FILE_ROOT: "/data/files"
       VOICX_RECORDING_DIR: "/data/recordings"
+      # TLS cert persists on the volume (stable TOFU fingerprint across restarts)
+      VOICX_TLS_DIR: "/data/tls"
+
+      # --- TURN (optional; must match the coturn service, profile "turn") ---
+      VOICX_TURN_SECRET: ${TURN_SECRET:-}
+      VOICX_TURN_REALM: ${TURN_REALM:-voicx}
+      # Comma-separated client URIs, e.g. turn:localhost:3478?transport=udp
+      VOICX_TURN_URIS: ${VOICX_TURN_URIS:-}
     healthcheck:
       test: [ "CMD-SHELL", "wget -qO- http://127.0.0.1:9090/healthz || exit 1" ]
       interval: 30s
@@ -155,6 +163,45 @@ services:
       timeout: 5s
       retries: 5
       start_period: 5s
+
+  # ---------------------------------------------------------------------------
+  # coturn — TURN server for NAT traversal (445/446; OPTIONAL profile)
+  #
+  # Only needed for clients behind restrictive NATs (symmetric NAT, corporate
+  # firewalls blocking UDP). LAN / direct-WAN deployments can skip it.
+  #
+  # Start with:  docker compose --profile turn up -d
+  #
+  # Uses coturn's REST API auth: voicx mints time-limited credentials from the
+  # shared static auth secret (internal/turn) and delivers them to clients in
+  # the auth response. TURN_SECRET must match VOICX_TURN_SECRET on the voicx
+  # service. Also set on voicx (comma-separated):
+  #   VOICX_TURN_URIS=turn:<host>:3478?transport=udp,turn:<host>:3478?transport=tcp
+  # ---------------------------------------------------------------------------
+  coturn:
+    image: coturn/coturn:latest
+    container_name: voicx-coturn
+    profiles: [ "turn" ]
+    restart: unless-stopped
+    networks:
+      - voicx-net
+    ports:
+      - "3478:3478"
+      - "3478:3478/udp"
+      # Relay ports (must be reachable by clients; widen in production).
+      - "5349:5349"
+      - "49152-49252:49152-49252/udp"
+    command:
+      - "--listening-port=3478"
+      - "--tls-listening-port=5349"
+      - "--realm=${TURN_REALM:-voicx}"
+      - "--use-auth-secret"
+      - "--static-auth-secret=${TURN_SECRET:-change-me-turn-secret}"
+      - "--min-port=49152"
+      - "--max-port=49252"
+      - "--no-multicast-peers"
+      - "--no-cli"
+      - "--log=stdout"
 
 # ---------------------------------------------------------------------------
 # Networks

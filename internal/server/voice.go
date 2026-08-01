@@ -16,9 +16,18 @@ import (
 
 // Broadcast event types for the voice pipeline.
 const (
-	eventSpeakingChanged = "speaking_changed"
-	eventPosition        = "position"
+	eventSpeakingChanged        = "speaking_changed"
+	eventPosition               = "position"
+	eventPrioritySpeakerChanged = "priority_speaker_changed"
 )
+
+// prioritySpeakerEvent is the payload of priority_speaker_changed events,
+// emitted when a client toggles its priority-speaker flag.
+type prioritySpeakerEvent struct {
+	ClientID  string `json:"client_id"`
+	ChannelID int64  `json:"channel_id"`
+	Active    bool   `json:"active"`
+}
 
 // speakingEvent is the payload of speaking_changed events, emitted when a
 // client's VAD speaking state toggles.
@@ -169,6 +178,44 @@ func (s *TCPServer) handlePositionUpdate(_ context.Context, client *Client, f *n
 		return err
 	}
 	s.deps.Broadcast.BroadcastToChannel(sc.ChannelID, payload)
+	return nil
+}
+
+// handlePrioritySpeaker toggles the calling client's priority-speaker flag
+// (TS3-style channel commander). Gated by b_client_priority_speaker (deny on
+// unset; server admins bypass). The flag is broadcast so subscribers can duck
+// other publishers while a priority speaker talks.
+func (s *TCPServer) handlePrioritySpeaker(ctx context.Context, client *Client, f *netproto.Frame) error {
+	var msg netproto.PrioritySpeaker
+	if err := netproto.Decode(f, &msg); err != nil {
+		return s.sendError(client, errCodeMalformed, "malformed priority_speaker: "+err.Error())
+	}
+	if s.deps == nil || s.deps.State == nil {
+		return s.sendError(client, errCodeUnavailable, "state backend unavailable")
+	}
+
+	pc, err := s.permCheckerFor(ctx, client)
+	if err != nil {
+		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+	}
+	if !pc.granted(permissions.PermissionKeyClientPrioritySpeaker) {
+		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyClientPrioritySpeaker))
+	}
+
+	s.deps.State.SetPrioritySpeaker(client.ID, msg.Active)
+	var channelID int64
+	if sc, ok := s.deps.State.GetClient(client.ID); ok {
+		channelID = sc.ChannelID
+	}
+	s.broadcastEvent(eventPrioritySpeakerChanged, prioritySpeakerEvent{
+		ClientID:  client.ID,
+		ChannelID: channelID,
+		Active:    msg.Active,
+	})
+	s.logger.Debug("priority speaker toggled",
+		zap.String("client_id", client.ID),
+		zap.Bool("active", msg.Active),
+	)
 	return nil
 }
 

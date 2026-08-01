@@ -57,24 +57,25 @@ func registerVideoSource(r *Router, publisherID, rid string, ssrc uint32) {
 }
 
 // TestForwardVideoFanout verifies video packets fan out to channel members
-// with video outputs, sender excluded.
+// on their per-publisher video tracks, sender excluded.
 func TestForwardVideoFanout(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
 	r := NewRouter(nil)
-	wb, wc := &fakeTrackWriter{}, &fakeTrackWriter{}
 
-	r.JoinChannel(1, "pub")
+	attachFakePeer(t, e, r, "b")
+	attachFakePeer(t, e, r, "c")
 	r.JoinChannel(1, "b")
 	r.JoinChannel(1, "c")
-	r.addVideoOutput("b", wb)
-	r.addVideoOutput("c", wc)
+	r.JoinChannel(1, "pub") // creates (b,pub) and (c,pub) video tracks
 	registerVideoSource(r, "pub", "", 9001)
 
 	pkt := makeAudioPacket(t, 1, -1) // packet contents don't matter here
 	if sent := r.ForwardVideo("pub", "", pkt); sent != 2 {
 		t.Fatalf("ForwardVideo sent = %d, want 2", sent)
-	}
-	if wb.count() != 1 || wc.count() != 1 {
-		t.Fatalf("writes: b=%d c=%d, want 1 each", wb.count(), wc.count())
 	}
 }
 
@@ -82,22 +83,18 @@ func TestForwardVideoFanout(t *testing.T) {
 // layer matching its preference (default mid), with fallback when the
 // preferred layer is not published.
 func TestSimulcastLayerSelection(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
 	r := NewRouter(nil)
 
+	for _, id := range []string{"hi", "mid", "lo", "def"} {
+		attachFakePeer(t, e, r, id)
+		r.JoinChannel(1, id)
+	}
 	r.JoinChannel(1, "pub")
-	r.JoinChannel(1, "hi")
-	r.JoinChannel(1, "mid")
-	r.JoinChannel(1, "lo")
-	r.JoinChannel(1, "def") // no preference: defaults to mid
-
-	whi := &fakeTrackWriter{}
-	wmid := &fakeTrackWriter{}
-	wlo := &fakeTrackWriter{}
-	wdef := &fakeTrackWriter{}
-	r.addVideoOutput("hi", whi)
-	r.addVideoOutput("mid", wmid)
-	r.addVideoOutput("lo", wlo)
-	r.addVideoOutput("def", wdef)
 
 	if err := r.SetVideoQuality("hi", "high"); err != nil {
 		t.Fatalf("SetVideoQuality: %v", err)
@@ -115,37 +112,33 @@ func TestSimulcastLayerSelection(t *testing.T) {
 	registerVideoSource(r, "pub", "q", 9003)
 
 	pkt := makeAudioPacket(t, 1, -1)
-	for _, rid := range []string{"f", "h", "q"} {
-		r.ForwardVideo("pub", rid, pkt)
+	if sent := r.ForwardVideo("pub", "f", pkt); sent != 1 {
+		t.Errorf("layer f sent = %d, want 1 (high subscriber only)", sent)
 	}
-
-	if got := whi.count(); got != 1 {
-		t.Errorf("high subscriber got %d packets, want 1 (layer f only)", got)
+	if sent := r.ForwardVideo("pub", "h", pkt); sent != 2 {
+		t.Errorf("layer h sent = %d, want 2 (mid + default-mid subscribers)", sent)
 	}
-	if got := wmid.count(); got != 1 {
-		t.Errorf("mid subscriber got %d packets, want 1 (layer h only)", got)
-	}
-	if got := wlo.count(); got != 1 {
-		t.Errorf("low subscriber got %d packets, want 1 (layer q only)", got)
-	}
-	if got := wdef.count(); got != 1 {
-		t.Errorf("default subscriber got %d packets, want 1 (default mid)", got)
+	if sent := r.ForwardVideo("pub", "q", pkt); sent != 1 {
+		t.Errorf("layer q sent = %d, want 1 (low subscriber only)", sent)
 	}
 }
 
 // TestSimulcastFallback verifies the fallback order when the preferred layer
-// is missing: mid prefers low over high; low climbs to mid.
+// is missing: mid prefers low over high; low climbs to mid — both end at the
+// only published layer f.
 func TestSimulcastFallback(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
 	r := NewRouter(nil)
 
-	r.JoinChannel(1, "pub")
+	attachFakePeer(t, e, r, "mid")
+	attachFakePeer(t, e, r, "lo")
 	r.JoinChannel(1, "mid")
 	r.JoinChannel(1, "lo")
-
-	wmid := &fakeTrackWriter{}
-	wlo := &fakeTrackWriter{}
-	r.addVideoOutput("mid", wmid)
-	r.addVideoOutput("lo", wlo)
+	r.JoinChannel(1, "pub")
 
 	if err := r.SetVideoQuality("mid", "mid"); err != nil {
 		t.Fatalf("SetVideoQuality: %v", err)
@@ -159,25 +152,28 @@ func TestSimulcastFallback(t *testing.T) {
 	registerVideoSource(r, "pub", "f", 9001)
 
 	pkt := makeAudioPacket(t, 1, -1)
-	r.ForwardVideo("pub", "f", pkt)
-
-	if got := wmid.count(); got != 1 {
-		t.Errorf("mid subscriber got %d packets, want 1 (fallback to f)", got)
+	if sent := r.ForwardVideo("pub", "f", pkt); sent != 2 {
+		t.Errorf("layer f sent = %d, want 2 (both fall back to f)", sent)
 	}
-	if got := wlo.count(); got != 1 {
-		t.Errorf("low subscriber got %d packets, want 1 (fallback to f)", got)
+	// An unpublished layer is forwarded to nobody.
+	if sent := r.ForwardVideo("pub", "h", pkt); sent != 0 {
+		t.Errorf("layer h sent = %d, want 0 (not published)", sent)
 	}
 }
 
 // TestNonSimulcastAcceptsAll verifies a publisher without RIDs has every
 // packet forwarded regardless of subscriber preferences.
 func TestNonSimulcastAcceptsAll(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
 	r := NewRouter(nil)
 
-	r.JoinChannel(1, "pub")
+	attachFakePeer(t, e, r, "lo")
 	r.JoinChannel(1, "lo")
-	wlo := &fakeTrackWriter{}
-	r.addVideoOutput("lo", wlo)
+	r.JoinChannel(1, "pub")
 	if err := r.SetVideoQuality("lo", "low"); err != nil {
 		t.Fatalf("SetVideoQuality: %v", err)
 	}

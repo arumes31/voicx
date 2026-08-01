@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -142,7 +143,21 @@ func (s *TCPServer) handleChannelIconSet(ctx context.Context, client *Client, f 
 	}
 
 	raw, ext, err := decodeImage(msg.DataBase64)
-	if err != nil {
+	if msg.CopyFromChannelID != 0 && msg.DataBase64 == "" {
+		// (271) icon library: reuse another channel's stored icon.
+		raw = nil
+		ext = ""
+		for _, e := range imageExts {
+			b, rerr := os.ReadFile(filepath.Join(s.iconDir(), strconv.FormatInt(msg.CopyFromChannelID, 10)+e))
+			if rerr == nil {
+				raw, ext = b, e
+				break
+			}
+		}
+		if raw == nil {
+			return s.sendError(client, errCodeNotFound, "source channel has no icon")
+		}
+	} else if err != nil {
 		return s.sendError(client, errCodeMalformed, err.Error())
 	}
 	if err := os.MkdirAll(s.iconDir(), 0o750); err != nil {
@@ -161,6 +176,68 @@ func (s *TCPServer) handleChannelIconSet(ctx context.Context, client *Client, f 
 	}
 	s.broadcastEvent(eventChannelIconChanged, channelEvent{ChannelID: msg.ChannelID})
 	return nil
+}
+
+// --- server icon (270) --------------------------------------------------------
+
+// serverIconPath finds the stored server icon (any accepted extension).
+func (s *TCPServer) serverIconPath() (string, string, bool) {
+	for ct, ext := range imageExts {
+		p := filepath.Join(s.cfg.FileRoot, "server_icon"+ext)
+		if _, err := os.Stat(p); err == nil {
+			return p, ct, true
+		}
+	}
+	return "", "", false
+}
+
+// handleServerIconSet stores the server icon (admin only, 270).
+func (s *TCPServer) handleServerIconSet(ctx context.Context, client *Client, f *netproto.Frame) error {
+	var msg netproto.ServerIconSet
+	if err := netproto.Decode(f, &msg); err != nil {
+		return s.sendError(client, errCodeMalformed, "malformed server_icon_set: "+err.Error())
+	}
+	pc, err := s.permCheckerFor(ctx, client)
+	if err != nil {
+		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+	}
+	if !pc.admin {
+		return s.sendError(client, errCodePermissionDenied, "insufficient permission: server icon is admin-only")
+	}
+	raw, ext, err := decodeImage(msg.DataBase64)
+	if err != nil {
+		return s.sendError(client, errCodeMalformed, err.Error())
+	}
+	if err := os.MkdirAll(s.cfg.FileRoot, 0o750); err != nil {
+		return s.sendError(client, errCodeUnavailable, "icon storage unavailable")
+	}
+	for _, e := range imageExts {
+		_ = os.Remove(filepath.Join(s.cfg.FileRoot, "server_icon"+e))
+	}
+	if err := os.WriteFile(filepath.Join(s.cfg.FileRoot, "server_icon"+ext), raw, 0o640); err != nil {
+		return s.sendError(client, errCodeUnavailable, "icon write failed")
+	}
+	s.audit(ctx, client.UniqueID, "server_icon_set", "", ext)
+	return nil
+}
+
+// handleServerIconGet returns the server icon (empty payload when unset).
+func (s *TCPServer) handleServerIconGet(_ context.Context, client *Client, f *netproto.Frame) error {
+	if err := netproto.Decode(f, &netproto.ServerIconGet{}); err != nil {
+		return s.sendError(client, errCodeMalformed, "malformed server_icon_get: "+err.Error())
+	}
+	p, ct, ok := s.serverIconPath()
+	if !ok {
+		return s.writeMessage(client, netproto.MsgServerIconData, netproto.ServerIconData{})
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		return s.writeMessage(client, netproto.MsgServerIconData, netproto.ServerIconData{})
+	}
+	return s.writeMessage(client, netproto.MsgServerIconData, netproto.ServerIconData{
+		DataBase64:  base64.StdEncoding.EncodeToString(raw),
+		ContentType: ct,
+	})
 }
 
 // handleTokenUse redeems a privilege token: the grant (server group or
@@ -208,6 +285,7 @@ func (s *TCPServer) handleTokenUse(ctx context.Context, client *Client, f *netpr
 		zap.String("client_id", client.ID),
 		zap.Int64("group_id", groupID),
 	)
+	s.audit(ctx, client.UniqueID, "token_use", fmt.Sprintf("group:%d", groupID), "")
 	if s.deps.Broadcast != nil {
 		payload, err := eventEnvelope(eventTokenUsed, struct {
 			ClientID string `json:"client_id"`
@@ -317,7 +395,7 @@ func (s *TCPServer) handlePermissionsQuery(ctx context.Context, client *Client, 
 
 	resp := netproto.PermissionsResponse{}
 	seen := make(map[permissions.PermissionKey]bool)
-	for tier := permissions.Tier(0); tier <= permissions.TierChannelClient; tier++ {
+	for tier := permissions.Tier(0); tier <= permissions.TierChannel; tier++ {
 		set, ok := pc.tp.Get(tier)
 		if !ok || set == nil {
 			continue

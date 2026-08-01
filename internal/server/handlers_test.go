@@ -4,6 +4,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -35,6 +36,8 @@ type fakeAuth struct {
 
 	mu       sync.Mutex
 	bindings [][2]any // (userID, publicKey) recorded by BindPublicKey
+	e2eKeys  map[int64]string
+	e2eByUID map[string]string
 }
 
 func (f *fakeAuth) AuthenticatePassword(_ context.Context, uniqueID, password string) (bool, error) {
@@ -88,6 +91,39 @@ func (f *fakeAuth) BindPublicKey(_ context.Context, userID int64, publicKey stri
 	defer f.mu.Unlock()
 	f.bindings = append(f.bindings, [2]any{userID, publicKey})
 	return nil
+}
+
+// e2eKeys records published X25519 keys per user ID.
+func (f *fakeAuth) SetE2EPublicKey(_ context.Context, userID int64, publicKey string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.e2eKeys == nil {
+		f.e2eKeys = map[int64]string{}
+	}
+	if f.e2eByUID == nil {
+		f.e2eByUID = map[string]string{}
+	}
+	f.e2eKeys[userID] = publicKey
+	for _, u := range f.users {
+		if u.ID == userID {
+			f.e2eByUID[u.UniqueID] = publicKey
+		}
+	}
+	return nil
+}
+
+// GetE2EPublicKey resolves a published key by unique ID.
+func (f *fakeAuth) GetE2EPublicKey(_ context.Context, uniqueID string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.e2eByUID == nil {
+		return "", auth.ErrUserNotFound
+	}
+	key, ok := f.e2eByUID[uniqueID]
+	if !ok {
+		return "", auth.ErrUserNotFound
+	}
+	return key, nil
 }
 
 func (f *fakeAuth) LookupActiveBan(_ context.Context, uniqueID, ip string) (*auth.Ban, error) {
@@ -160,6 +196,35 @@ func (f *fakeChannels) OnClientJoinedChannel(channelID int64) {
 	f.joinLog = append(f.joinLog, channelID)
 }
 
+// UpdateChannel applies the non-nil fields of upd to the in-memory channel.
+func (f *fakeChannels) UpdateChannel(_ context.Context, channelID int64, upd channels.ChannelUpdate) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ch, ok := f.state.GetChannel(channelID)
+	if !ok {
+		return channels.ErrChannelNotFound
+	}
+	if upd.Topic != nil {
+		ch.Topic = *upd.Topic
+	}
+	if upd.MaxClients != nil {
+		ch.MaxClients = *upd.MaxClients
+	}
+	if upd.OpusBitrate != nil {
+		ch.OpusBitrate = *upd.OpusBitrate
+	}
+	if upd.OpusFEC != nil {
+		ch.OpusFEC = *upd.OpusFEC
+	}
+	if upd.OpusDTX != nil {
+		ch.OpusDTX = *upd.OpusDTX
+	}
+	if upd.OpusStereo != nil {
+		ch.OpusStereo = *upd.OpusStereo
+	}
+	return nil
+}
+
 func (f *fakeChannels) OnClientLeftChannel(channelID int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -172,10 +237,183 @@ func (f *fakeChannels) createdCount() int {
 	return len(f.created)
 }
 
+// fakeChat implements ChatStore in memory.
+type fakeChat struct {
+	mu        sync.Mutex
+	nextID    int64
+	messages  map[int64]*store.ChatMessage
+	order     []int64
+	pins      map[int64]map[int64]store.PinnedMessage // channel -> message -> pin
+	reactions map[int64]map[string]map[string]bool    // message -> emoji -> uid -> present
+	settings  map[string]string
+}
+
+func newFakeChat() *fakeChat {
+	return &fakeChat{
+		messages:  map[int64]*store.ChatMessage{},
+		pins:      map[int64]map[int64]store.PinnedMessage{},
+		reactions: map[int64]map[string]map[string]bool{},
+		settings:  map[string]string{},
+	}
+}
+
+func (f *fakeChat) StoreChatMessage(_ context.Context, channelID int64, fromUniqueID, fromNickname, body string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextID++
+	m := &store.ChatMessage{
+		ID:           f.nextID,
+		ChannelID:    channelID,
+		FromUniqueID: fromUniqueID,
+		FromNickname: fromNickname,
+		Body:         body,
+		SentAt:       time.Now(),
+	}
+	f.messages[f.nextID] = m
+	f.order = append(f.order, f.nextID)
+	return f.nextID, nil
+}
+
+func (f *fakeChat) ChatHistory(_ context.Context, channelID, beforeID int64, limit int) ([]store.ChatMessage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	var out []store.ChatMessage
+	for i := len(f.order) - 1; i >= 0 && len(out) < limit; i-- {
+		m := f.messages[f.order[i]]
+		if m.ChannelID != channelID {
+			continue
+		}
+		if beforeID > 0 && m.ID >= beforeID {
+			continue
+		}
+		out = append(out, *m)
+	}
+	return out, nil
+}
+
+func (f *fakeChat) GetChatMessage(_ context.Context, id int64) (*store.ChatMessage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.messages[id], nil
+}
+
+func (f *fakeChat) EditChatMessage(_ context.Context, id int64, newBody string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	m, ok := f.messages[id]
+	if !ok || m.DeletedAt != nil {
+		return fmt.Errorf("chat message not found or deleted")
+	}
+	m.Body = newBody
+	now := time.Now()
+	m.EditedAt = &now
+	return nil
+}
+
+func (f *fakeChat) DeleteChatMessage(_ context.Context, id int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	m, ok := f.messages[id]
+	if !ok || m.DeletedAt != nil {
+		return fmt.Errorf("chat message not found or already deleted")
+	}
+	m.Body = ""
+	now := time.Now()
+	m.DeletedAt = &now
+	return nil
+}
+
+func (f *fakeChat) PinChatMessage(_ context.Context, channelID, messageID int64, pinnedBy string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.pins[channelID] == nil {
+		f.pins[channelID] = map[int64]store.PinnedMessage{}
+	}
+	f.pins[channelID][messageID] = store.PinnedMessage{MessageID: messageID, PinnedBy: pinnedBy, PinnedAt: time.Now()}
+	return nil
+}
+
+func (f *fakeChat) UnpinChatMessage(_ context.Context, channelID, messageID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.pins[channelID], messageID)
+	return nil
+}
+
+func (f *fakeChat) ChatPins(_ context.Context, channelID int64) ([]store.PinnedMessage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []store.PinnedMessage
+	for _, p := range f.pins[channelID] {
+		p.Message = f.messages[p.MessageID]
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+func (f *fakeChat) ToggleReaction(_ context.Context, messageID int64, uniqueID, emoji string) (map[string]int, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.reactions[messageID] == nil {
+		f.reactions[messageID] = map[string]map[string]bool{}
+	}
+	if f.reactions[messageID][emoji] == nil {
+		f.reactions[messageID][emoji] = map[string]bool{}
+	}
+	added := true
+	if f.reactions[messageID][emoji][uniqueID] {
+		delete(f.reactions[messageID][emoji], uniqueID)
+		added = false
+	} else {
+		f.reactions[messageID][emoji][uniqueID] = true
+	}
+	return f.reactionCounts(messageID), added, nil
+}
+
+func (f *fakeChat) reactionCounts(messageID int64) map[string]int {
+	out := map[string]int{}
+	for emoji, users := range f.reactions[messageID] {
+		if len(users) > 0 {
+			out[emoji] = len(users)
+		}
+	}
+	return out
+}
+
+func (f *fakeChat) ReactionsFor(_ context.Context, ids []int64) (map[int64]map[string]int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[int64]map[string]int{}
+	for _, id := range ids {
+		out[id] = f.reactionCounts(id)
+	}
+	return out, nil
+}
+
+func (f *fakeChat) SetServerSetting(_ context.Context, key, value string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.settings[key] = value
+	return nil
+}
+
+func (f *fakeChat) GetServerSetting(_ context.Context, key string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.settings[key], nil
+}
+
 // fakePerms implements PermLoader, returning the same tiered permissions for
 // every client.
 type fakePerms struct {
 	tp permissions.TieredPermissions
+
+	// groupSet, when non-nil, is the canned set served by
+	// LoadGroupPermissions (guest-group tests).
+	groupSet permissions.PermissionSet
 
 	mu            sync.Mutex
 	invalidations [][2]int64
@@ -192,6 +430,21 @@ func (f *fakePerms) Invalidate(userID, channelID int64) {
 	f.invalidations = append(f.invalidations, [2]int64{userID, channelID})
 }
 
+// InvalidateAll records a full invalidation.
+func (f *fakePerms) InvalidateAll() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.invalidations = append(f.invalidations, [2]int64{-1, -1})
+}
+
+// LoadGroupPermissions returns the canned group set.
+func (f *fakePerms) LoadGroupPermissions(context.Context, int64) (permissions.PermissionSet, error) {
+	if f.groupSet != nil {
+		return f.groupSet, nil
+	}
+	return permissions.NewPermissionSet(), nil
+}
+
 // fakeSpool implements SpoolStore in memory.
 type fakeSpool struct {
 	mu        sync.Mutex
@@ -206,17 +459,18 @@ type spooledEntry struct {
 	toUserID int64
 }
 
-func (f *fakeSpool) SpoolMessage(_ context.Context, fromUserID, toUserID int64, message string) error {
+func (f *fakeSpool) SpoolMessage(_ context.Context, fromUserID, toUserID int64, fromUniqueID, message string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.nextID++
 	f.pending = append(f.pending, spooledEntry{
 		SpooledMessage: store.SpooledMessage{
-			ID:         f.nextID,
-			FromUserID: fromUserID,
-			FromName:   fmt.Sprintf("user-%d", fromUserID),
-			Message:    message,
-			SentAt:     time.Now(),
+			ID:           f.nextID,
+			FromUserID:   fromUserID,
+			FromUniqueID: fromUniqueID,
+			FromName:     fmt.Sprintf("user-%d", fromUserID),
+			Message:      message,
+			SentAt:       time.Now(),
 		},
 		toUserID: toUserID,
 	})
@@ -297,7 +551,11 @@ type testEnv struct {
 	perms      *fakePerms
 	tokens     *fakeTokens
 	complaints *fakeComplaints
+	chat       *fakeChat
+	groups     *fakeGroups
+	banAdmin   *fakeBanAdmin
 	deps       *Deps
+	srv        *TCPServer
 	stop       func()
 }
 
@@ -305,6 +563,20 @@ type testEnv struct {
 // backends. perms may be nil, in which case an empty TieredPermissions is
 // served (nothing granted; admins still bypass).
 func startTestEnv(t *testing.T, perms *permissions.TieredPermissions) *testEnv {
+	t.Helper()
+	return startTestEnvFull(t, perms, nil)
+}
+
+// startTestEnvFull is startTestEnv with a hook to adjust the server config
+// (e.g. disable ChatAllowPlaintext for encryption tests).
+func startTestEnvFull(t *testing.T, perms *permissions.TieredPermissions, mutateCfg func(*config.Config)) *testEnv {
+	t.Helper()
+	return startTestEnvDeps(t, perms, mutateCfg, nil)
+}
+
+// startTestEnvDeps is startTestEnvFull with an additional hook to adjust the
+// server deps (e.g. default group IDs for wave-6a tests).
+func startTestEnvDeps(t *testing.T, perms *permissions.TieredPermissions, mutateCfg func(*config.Config), mutateDeps func(*Deps)) *testEnv {
 	t.Helper()
 
 	sm := state.New(testLogger())
@@ -333,6 +605,9 @@ func startTestEnv(t *testing.T, perms *permissions.TieredPermissions) *testEnv {
 	ft := &fakeFileTransfer{}
 	ftk := &fakeTokens{}
 	fcm := &fakeComplaints{}
+	fchat := newFakeChat()
+	fg := newFakeGroups()
+	fba := &fakeBanAdmin{}
 
 	fp := &fakePerms{tp: tp}
 
@@ -349,10 +624,28 @@ func startTestEnv(t *testing.T, perms *permissions.TieredPermissions) *testEnv {
 		FileTransfer: ft,
 		Tokens:       ftk,
 		Complaints:   fcm,
+		Chat:         fchat,
+		Groups:       fg,
+		BanAdmin:     fba,
+	}
+	if mutateDeps != nil {
+		mutateDeps(deps)
 	}
 
 	addr := freePort(t)
-	srv := New(&config.Config{TCPAddr: addr, FileRoot: t.TempDir()}, testLogger(), deps)
+	cfg := &config.Config{
+		TCPAddr:            addr,
+		HealthAddr:         ":9090",
+		FileRoot:           t.TempDir(),
+		TLSEnabled:         true,
+		TLSDir:             t.TempDir(),
+		ChatAllowPlaintext: true, // legacy chat tests send plaintext
+		ChatMaxLength:      2000,
+	}
+	if mutateCfg != nil {
+		mutateCfg(cfg)
+	}
+	srv := New(cfg, testLogger(), deps)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	startErr := make(chan error, 1)
@@ -361,7 +654,7 @@ func startTestEnv(t *testing.T, perms *permissions.TieredPermissions) *testEnv {
 	conn := dialRetry(t, addr)
 	_ = conn.Close() // connectivity probe only
 
-	env := &testEnv{addr: addr, state: sm, channels: fc, auth: fa, spool: fs, voice: fv, recorder: fr, ft: ft, perms: fp, tokens: ftk, complaints: fcm, deps: deps}
+	env := &testEnv{addr: addr, state: sm, channels: fc, auth: fa, spool: fs, voice: fv, recorder: fr, ft: ft, perms: fp, tokens: ftk, complaints: fcm, chat: fchat, groups: fg, banAdmin: fba, deps: deps, srv: srv}
 	env.stop = func() {
 		cancel()
 		if err := <-startErr; err != nil {
@@ -373,12 +666,16 @@ func startTestEnv(t *testing.T, perms *permissions.TieredPermissions) *testEnv {
 	return env
 }
 
-// dialRetry dials addr until the server accepts or the deadline passes.
+// dialRetry dials addr with TLS (the test servers enable TLS with a
+// self-signed cert) until the server accepts or the deadline passes.
+// Certificate verification is skipped — test clients pin nothing.
 func dialRetry(t *testing.T, addr string) net.Conn {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
+	dialer := &net.Dialer{Timeout: 300 * time.Millisecond}
+	tlsCfg := &tls.Config{InsecureSkipVerify: true} //nolint:gosec // test client
 	for time.Now().Before(deadline) {
-		conn, err := net.Dial("tcp", addr)
+		conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsCfg)
 		if err == nil {
 			return conn
 		}
@@ -1173,7 +1470,7 @@ func TestSpooledMessagesDeliveredOnLogin(t *testing.T) {
 	defer env.stop()
 
 	// Seed the spool while the user is offline (user-uid has user ID 2).
-	if err := env.spool.SpoolMessage(context.Background(), 1, 2, "while you were away"); err != nil {
+	if err := env.spool.SpoolMessage(context.Background(), 1, 2, "", "while you were away"); err != nil {
 		t.Fatalf("seed spool: %v", err)
 	}
 

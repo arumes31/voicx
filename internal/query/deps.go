@@ -26,13 +26,33 @@ type ClientInfo struct {
 	ChannelID int64
 }
 
-// ChannelInfo describes a channel (channellist row).
+// ChannelInfo describes a channel (channellist/channelinfo rows).
 type ChannelInfo struct {
 	ChannelID   int64
 	ParentID    int64
 	Name        string
+	Topic       string
 	Type        int // 0=temporary, 1=semi-permanent, 2=permanent
+	MaxClients  int // 0 = unlimited
 	ClientCount int
+	// Per-channel Opus audio quality (0 bitrate = server default 32k).
+	OpusBitrate     int
+	OpusFEC         bool
+	OpusDTX         bool
+	OpusStereo      bool
+	SlowModeSeconds int
+}
+
+// ChannelEditParams carries channeledit arguments. Nil pointers leave the
+// field unchanged.
+type ChannelEditParams struct {
+	Topic           *string
+	MaxClients      *int
+	OpusBitrate     *int
+	OpusFEC         *bool
+	OpusDTX         *bool
+	OpusStereo      *bool
+	SlowModeSeconds *int
 }
 
 // Info describes the server (serverinfo row).
@@ -42,6 +62,9 @@ type Info struct {
 	ClientsOnline  int
 	MaxClients     int
 	ChannelsOnline int
+	// TLSFingerprint is the control-channel certificate fingerprint (empty
+	// when TLS is disabled).
+	TLSFingerprint string
 }
 
 // Complaint describes one complaint row (complaintlist).
@@ -60,6 +83,54 @@ type Token struct {
 	GroupID int64
 	Uses    int
 	MaxUses int
+}
+
+// AuditEntry describes one audit log row (auditlog).
+type AuditEntry struct {
+	ID        int64
+	Actor     string
+	Action    string
+	Target    string
+	Detail    string
+	CreatedAt time.Time
+}
+
+// PermLine is one resolved permission of a user (permoverview).
+type PermLine struct {
+	Key   string
+	Value int
+	Grant int
+	Tier  string
+}
+
+// ChannelPerm is one channel-tier permission entry (220).
+type ChannelPerm struct {
+	Key    string
+	Value  int
+	Grant  int
+	Skip   bool
+	Negate bool
+}
+
+// GroupInfo is one server group (221).
+type GroupInfo struct {
+	ID          int64
+	Name        string
+	SortID      int
+	MemberCount int
+}
+
+// GroupMemberInfo is one server-group member (221).
+type GroupMemberInfo struct {
+	UniqueID  string
+	Nickname  string
+	ExpiresAt int64 // unix; 0 = permanent
+}
+
+// CustomProp is one custom client property (222).
+type CustomProp struct {
+	Key   string
+	Value string
 }
 
 // Backend bundles the capabilities the query server needs. All methods are
@@ -84,6 +155,13 @@ type Backend interface {
 	// 0=temporary, 1=semi-permanent, 2=permanent.
 	CreateChannel(ctx context.Context, name, topic string, channelType int) (int64, error)
 	DeleteChannel(ctx context.Context, channelID int64) error
+	// ChannelInfo returns one channel's details (ok=false when unknown).
+	ChannelInfo(ctx context.Context, channelID int64) (ChannelInfo, bool)
+	// EditChannel applies non-nil fields of params to a channel.
+	EditChannel(ctx context.Context, channelID int64, params ChannelEditParams) error
+	// ServerSet stores a server setting (motd, announcement); setting
+	// "announcement" additionally broadcasts it to online clients.
+	ServerSet(ctx context.Context, key, value string) error
 	// BanClient bans a client by unique ID (seconds <= 0 = permanent) and
 	// kicks it from the server.
 	BanClient(ctx context.Context, clientID string, seconds int64, reason string) error
@@ -96,4 +174,33 @@ type Backend interface {
 	TokenAdd(ctx context.Context, tokenType int, groupID int64) (string, error)
 	TokenList(ctx context.Context) ([]Token, error)
 	TokenDelete(ctx context.Context, key string) error
+	// AuditLog returns the newest audit entries (limit <= 0 = default page).
+	AuditLog(ctx context.Context, limit int) ([]AuditEntry, error)
+
+	// Wave 10a (217-223).
+	// ServerEdit updates the server name, welcome message (MOTD), and the
+	// max-clients override (0 = keep current). Empty name/welcome = keep.
+	ServerEdit(ctx context.Context, name, welcome string, maxClients int) error
+	// Shutdown gracefully stops the server; restart=true documents that a
+	// supervisor (docker restart policy) brings it back.
+	Shutdown(ctx context.Context, restart bool) error
+	// PermOverview returns the resolved permissions of a user (219).
+	PermOverview(ctx context.Context, uniqueID string, channelID int64) ([]PermLine, error)
+	// Channel tier permissions (220). actor is the query user (audit).
+	ChannelPermList(ctx context.Context, channelID int64) ([]ChannelPerm, error)
+	ChannelAddPerm(ctx context.Context, actor string, channelID int64, key string, value, grant int, skip, negate bool) error
+	ChannelDelPerm(ctx context.Context, actor string, channelID int64, key string) error
+	// Server groups (221). durationSeconds 0 = permanent membership.
+	ServerGroupAdd(ctx context.Context, actor, name string, sortID int) (int64, error)
+	ServerGroupDel(ctx context.Context, actor string, groupID int64, force bool) error
+	ServerGroupAddClient(ctx context.Context, actor string, groupID int64, uniqueID string, durationSeconds int64) error
+	ServerGroupDelClient(ctx context.Context, actor string, groupID int64, uniqueID string) error
+	ServerGroupList(ctx context.Context) ([]GroupInfo, error)
+	ServerGroupClientList(ctx context.Context, groupID int64) ([]GroupMemberInfo, error)
+	// Custom client properties (222).
+	CustomSet(ctx context.Context, uniqueID, key, value string) error
+	CustomDel(ctx context.Context, uniqueID, key string) error
+	CustomInfo(ctx context.Context, uniqueID string) ([]CustomProp, error)
+	// LogView returns recent server log lines (223).
+	LogView(ctx context.Context, lines int, filter string) ([]string, error)
 }

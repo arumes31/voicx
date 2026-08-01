@@ -17,6 +17,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"net"
@@ -26,20 +27,22 @@ import (
 	"time"
 
 	"voicx/internal/netproto"
+	"voicx/internal/tlscert"
 )
 
 // options holds the load-test parameters.
 type options struct {
-	addr      string
-	udpAddr   string
-	clients   int
-	duration  time.Duration
-	ramp      time.Duration
-	uniqueID  string
-	password  string
-	channel   int64
-	udp       bool
-	anonymous bool
+	addr        string
+	udpAddr     string
+	clients     int
+	duration    time.Duration
+	ramp        time.Duration
+	uniqueID    string
+	password    string
+	channel     int64
+	udp         bool
+	anonymous   bool
+	tlsInsecure bool
 }
 
 // stats accumulates load-test results.
@@ -101,6 +104,7 @@ func main() {
 	flag.Int64Var(&opts.channel, "channel", 1, "channel ID to join (0 = don't join)")
 	flag.BoolVar(&opts.udp, "udp", false, "also send UDP pings to exercise the UDP path")
 	flag.BoolVar(&opts.anonymous, "anonymous", false, "connect as anonymous guests (loadtest-N nicknames; -unique-id/-password not needed)")
+	flag.BoolVar(&opts.tlsInsecure, "tls-insecure", false, "dial with TLS but skip certificate verification (self-signed certs), logging the fingerprint once")
 	flag.Parse()
 
 	if !opts.anonymous && (opts.uniqueID == "" || opts.password == "") {
@@ -148,9 +152,32 @@ func run(ctx context.Context, opts options, st *stats) error {
 	return nil
 }
 
+// loggedFP prints the server fingerprint only on the first TLS dial.
+var loggedFP sync.Once
+
+// dialControl dials the control channel, honoring -tls-insecure (TLS with
+// certificate verification skipped for self-signed server certs; the
+// presented fingerprint is logged once).
+func dialControl(opts options) (net.Conn, error) {
+	if !opts.tlsInsecure {
+		return net.DialTimeout("tcp", opts.addr, 5*time.Second)
+	}
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", opts.addr,
+		&tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}) //nolint:gosec // loadtest flag
+	if err != nil {
+		return nil, err
+	}
+	loggedFP.Do(func() {
+		if pc := conn.ConnectionState().PeerCertificates; len(pc) > 0 {
+			fmt.Printf("loadtest: server TLS fingerprint: %s\n", tlscert.FingerprintDER(pc[0].Raw))
+		}
+	})
+	return conn, nil
+}
+
 // simulateClient is one simulated client connection lifecycle.
 func simulateClient(ctx context.Context, opts options, st *stats, index int) {
-	conn, err := net.DialTimeout("tcp", opts.addr, 5*time.Second)
+	conn, err := dialControl(opts)
 	if err != nil {
 		st.connectsFail.Add(1)
 		return

@@ -25,3 +25,6 @@ coverage.txt
 # Go
 vendor/
 go.work.sum
+
+# Docs
+BACKLOG.md

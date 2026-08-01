@@ -33,6 +33,46 @@ type Config struct {
 	RedisPassword      string `mapstructure:"redis_password"`
 	RedisEnabled       bool   `mapstructure:"redis_enabled"`
 	MaxClients         int    `mapstructure:"max_clients"`
+	// EchoChannelName is the name of the loopback test channel: the server
+	// ensures it exists at startup, and publishers in it hear their own audio
+	// routed back (the echo channel is the only channel with self-fan-out).
+	EchoChannelName string `mapstructure:"echo_channel_name"`
+
+	// TLS protects the TCP control channel (wave 4a). Enabled by default;
+	// when CertFile/KeyFile are empty a self-signed ECDSA P-256 certificate
+	// is generated into TLSDir on first start and reused afterwards (TOFU
+	// pinning on clients needs a stable fingerprint).
+	TLSEnabled  bool   `mapstructure:"tls_enabled"`
+	TLSDir      string `mapstructure:"tls_dir"`
+	TLSCertFile string `mapstructure:"tls_cert_file"`
+	TLSKeyFile  string `mapstructure:"tls_key_file"`
+
+	// ChatAllowPlaintext permits unencrypted chat messages (wave 4b dev
+	// escape hatch; default false — chat payloads are encrypted).
+	ChatAllowPlaintext bool `mapstructure:"chat_allow_plaintext"`
+
+	// DefaultGroupsEnabled auto-creates the Guest/Member server groups and
+	// auto-assigns them (143/144). Guests virtually hold the Guest group's
+	// permissions; registered users get Member at first login.
+	DefaultGroupsEnabled bool `mapstructure:"default_groups_enabled"`
+
+	// Chat moderation/limits (wave 5a). MaxLength is in plaintext characters
+	// post-decrypt. RateMsgs/RateWindowSeconds is a per-user token bucket.
+	// WordFilter/LinkBlacklist/LinkWhitelist are comma-separated,
+	// case-insensitive substrings; a non-empty whitelist means ONLY those
+	// domains may be linked. Filters apply to channel/global scopes only
+	// (DMs are E2EE and exempt).
+	ChatMaxLength         int    `mapstructure:"chat_max_length"`
+	ChatRateMsgs          int    `mapstructure:"chat_rate_msgs"`
+	ChatRateWindowSeconds int    `mapstructure:"chat_rate_window_seconds"`
+	ChatWordFilter        string `mapstructure:"chat_word_filter"`
+	ChatLinkBlacklist     string `mapstructure:"chat_link_blacklist"`
+	ChatLinkWhitelist     string `mapstructure:"chat_link_whitelist"`
+
+	// TURN holds TURN server settings for NAT traversal (445/446). When
+	// Secret is set, the server mints time-limited coturn REST API
+	// credentials and delivers them to clients in the auth response.
+	TURN TURNConfig `mapstructure:"turn"`
 
 	// Database connection pool tuning.
 	DBMaxOpenConns    int           `mapstructure:"db_max_open_conns"`
@@ -64,6 +104,22 @@ type RecordingConfig struct {
 	VideoArgs []string `mapstructure:"video_args"`
 	// AudioArgs are the ffmpeg audio output options.
 	AudioArgs []string `mapstructure:"audio_args"`
+}
+
+// TURNConfig holds TURN server settings (coturn REST API auth, 445/446).
+// TURN is only needed for clients behind restrictive NATs; when Secret is
+// empty no TURN entries are delivered to clients.
+type TURNConfig struct {
+	// Secret is the coturn static auth secret (use-auth-secret). Empty
+	// disables TURN credential minting.
+	Secret string `mapstructure:"secret"`
+	// Realm is the TURN realm (informational; must match the coturn realm).
+	Realm string `mapstructure:"realm"`
+	// URIs are the TURN server URIs given to clients, e.g.
+	// ["turn:turn.example.com:3478?transport=udp", "turn:...?transport=tcp"].
+	URIs []string `mapstructure:"uris"`
+	// CredentialsTTL is how long minted credentials stay valid.
+	CredentialsTTL time.Duration `mapstructure:"credentials_ttl"`
 }
 
 // WebRTCConfig holds configuration for the Pion WebRTC engine.
@@ -104,6 +160,28 @@ func Load() (*Config, error) {
 	v.SetDefault("redis_password", "")
 	v.SetDefault("redis_enabled", true)
 	v.SetDefault("max_clients", 1024)
+	v.SetDefault("echo_channel_name", "Echo Test")
+
+	// TLS defaults: on, self-signed cert under ./data/tls (the Docker image
+	// points tls_dir at the /data volume).
+	v.SetDefault("tls_enabled", true)
+	v.SetDefault("tls_dir", "./data/tls")
+	v.SetDefault("tls_cert_file", "")
+	v.SetDefault("tls_key_file", "")
+	v.SetDefault("chat_allow_plaintext", false)
+	v.SetDefault("default_groups_enabled", true)
+	v.SetDefault("chat_max_length", 2000)
+	v.SetDefault("chat_rate_msgs", 5)
+	v.SetDefault("chat_rate_window_seconds", 3)
+	v.SetDefault("chat_word_filter", "")
+	v.SetDefault("chat_link_blacklist", "")
+	v.SetDefault("chat_link_whitelist", "")
+
+	// TURN defaults: disabled (no secret) until coturn is deployed.
+	v.SetDefault("turn.secret", "")
+	v.SetDefault("turn.realm", "voicx")
+	v.SetDefault("turn.uris", []string{})
+	v.SetDefault("turn.credentials_ttl", 24*time.Hour)
 
 	// Database pool defaults -------------------------------------------------
 	v.SetDefault("db_max_open_conns", 25)

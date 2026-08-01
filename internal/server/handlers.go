@@ -35,6 +35,7 @@ const (
 	eventChannelDeleted = "channel_deleted"
 	eventKicked         = "kicked"
 	eventChat           = "chat"
+	eventChannelUpdated = "channel_updated"
 )
 
 // userEvent is the payload of user_joined / user_left / user_moved events.
@@ -50,6 +51,20 @@ type channelEvent struct {
 	ChannelID int64  `json:"channel_id"`
 	Name      string `json:"name,omitempty"`
 	ParentID  int64  `json:"parent_id,omitempty"`
+}
+
+// channelUpdatedEvent is the payload of channel_updated events, carrying the
+// editable channel fields after a ChannelEdit.
+type channelUpdatedEvent struct {
+	ChannelID       int64  `json:"channel_id"`
+	Topic           string `json:"topic"`
+	MaxClients      int    `json:"max_clients"`
+	OpusBitrate     int    `json:"opus_bitrate"`
+	OpusFEC         bool   `json:"opus_fec"`
+	OpusDTX         bool   `json:"opus_dtx"`
+	OpusStereo      bool   `json:"opus_stereo"`
+	SlowModeSeconds int    `json:"slow_mode_seconds"`
+	Description     string `json:"description"`
 }
 
 // kickEvent is the payload of kicked events.
@@ -353,6 +368,13 @@ type authIdentity struct {
 func (s *TCPServer) finishAuth(ctx context.Context, client *Client, id authIdentity) error {
 	client.setIdentity(id.uniqueID, id.nickname, id.userID, id.admin)
 
+	// Default groups (143/144): a registered user with no server-group
+	// memberships joins the Member group on first login. Guests virtually
+	// hold the Guest group (see permCheckerFor).
+	if !id.guest {
+		s.assignDefaultGroup(ctx, client)
+	}
+
 	s.logger.Info("client authenticated",
 		zap.String("client_id", client.ID),
 		zap.String("unique_id", id.uniqueID),
@@ -383,17 +405,32 @@ func (s *TCPServer) finishAuth(ctx context.Context, client *Client, id authIdent
 	}
 
 	// Reply first, then send the snapshot, then announce the join.
-	if err := s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{
-		OK:       true,
-		ClientID: client.ID,
-		UniqueID: id.uniqueID,
-		Nickname: id.nickname,
-	}); err != nil {
+	resp := netproto.AuthResponse{
+		OK:             true,
+		ClientID:       client.ID,
+		UniqueID:       id.uniqueID,
+		Nickname:       id.nickname,
+		TLSFingerprint: s.tlsFingerprint,
+		MOTD:           s.serverSetting(ctx, "motd"),
+		IsAdmin:        id.admin,
+	}
+	if s.deps.ICEServers != nil {
+		resp.ICEServers = s.deps.ICEServers(id.uniqueID)
+	}
+	if err := s.writeMessage(client, netproto.MsgAuthResponse, resp); err != nil {
 		return err
 	}
 
 	if err := s.sendSnapshot(client); err != nil {
 		return err
+	}
+
+	// (133) active announcement, if any — after the snapshot so clients
+	// process it as the first live event.
+	if ann := s.serverSetting(ctx, "announcement"); ann != "" {
+		if payload, err := eventEnvelope(eventAnnouncement, map[string]any{"text": ann}); err == nil {
+			_ = s.writeFrame(client, &netproto.Frame{Type: uint16(netproto.MsgEvent), Payload: payload})
+		}
 	}
 
 	// Guests have no users row, so no offline spool (spool inserts require a
@@ -498,6 +535,10 @@ func (s *TCPServer) handleCreateChannel(ctx context.Context, client *Client, f *
 		Password:        msg.Password,
 		NeededJoinPower: msg.NeededJoinPower,
 		CreatedBy:       client.UserID,
+		OpusBitrate:     msg.OpusBitrate,
+		OpusFEC:         msg.OpusFEC,
+		OpusDTX:         msg.OpusDTX,
+		OpusStereo:      msg.OpusStereo,
 	})
 	if err != nil {
 		s.logger.Warn("create channel failed",
@@ -512,6 +553,7 @@ func (s *TCPServer) handleCreateChannel(ctx context.Context, client *Client, f *
 		Name:      msg.Name,
 		ParentID:  msg.ParentID,
 	})
+	s.audit(ctx, client.UniqueID, "channel_create", fmt.Sprintf("%d", channelID), msg.Name)
 	if s.deps.State != nil {
 		s.metricsSink().SetChannelsActive(s.deps.State.ChannelCount())
 	}
@@ -550,10 +592,99 @@ func (s *TCPServer) handleDeleteChannel(ctx context.Context, client *Client, f *
 	}
 
 	s.broadcastEvent(eventChannelDeleted, channelEvent{ChannelID: msg.ChannelID})
+	s.audit(ctx, client.UniqueID, "channel_delete", fmt.Sprintf("%d", msg.ChannelID), "")
 	if s.deps.State != nil {
 		s.metricsSink().SetChannelsActive(s.deps.State.ChannelCount())
 	}
 	return nil
+}
+
+// handleChannelEdit edits a channel's settings (topic, max clients, Opus
+// audio quality) after a b_channel_modify check, persists them, and
+// announces the change to all clients.
+func (s *TCPServer) handleChannelEdit(ctx context.Context, client *Client, f *netproto.Frame) error {
+	var msg netproto.ChannelEdit
+	if err := netproto.Decode(f, &msg); err != nil {
+		return s.sendError(client, errCodeMalformed, "malformed channel_edit: "+err.Error())
+	}
+	if s.deps == nil || s.deps.Channels == nil || s.deps.State == nil {
+		return s.sendError(client, errCodeUnavailable, "channel backend unavailable")
+	}
+	if _, ok := s.deps.State.GetChannel(msg.ChannelID); !ok {
+		return s.sendError(client, errCodeNotFound, "channel not found")
+	}
+
+	pc, err := s.permCheckerFor(ctx, client)
+	if err != nil {
+		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+	}
+	if !pc.granted(permissions.PermissionKeyChannelModify) {
+		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyChannelModify))
+	}
+
+	if err := s.deps.Channels.UpdateChannel(ctx, msg.ChannelID, channels.ChannelUpdate{
+		Topic:           msg.Topic,
+		MaxClients:      msg.MaxClients,
+		OpusBitrate:     msg.OpusBitrate,
+		OpusFEC:         msg.OpusFEC,
+		OpusDTX:         msg.OpusDTX,
+		OpusStereo:      msg.OpusStereo,
+		SlowModeSeconds: msg.SlowModeSeconds,
+		Description:     msg.Description,
+	}); err != nil {
+		if errors.Is(err, channels.ErrChannelNotFound) {
+			return s.sendError(client, errCodeNotFound, "channel not found")
+		}
+		s.logger.Warn("channel edit failed",
+			zap.String("client_id", client.ID),
+			zap.Int64("channel_id", msg.ChannelID),
+			zap.Error(err),
+		)
+		return s.sendError(client, errCodeMalformed, "channel edit failed: "+err.Error())
+	}
+
+	if ch, ok := s.deps.State.GetChannel(msg.ChannelID); ok {
+		s.broadcastEvent(eventChannelUpdated, channelUpdatedEvent{
+			ChannelID:       ch.ChannelID,
+			Topic:           ch.Topic,
+			MaxClients:      ch.MaxClients,
+			OpusBitrate:     ch.OpusBitrate,
+			OpusFEC:         ch.OpusFEC,
+			OpusDTX:         ch.OpusDTX,
+			OpusStereo:      ch.OpusStereo,
+			SlowModeSeconds: ch.SlowModeSeconds,
+			Description:     ch.Description,
+		})
+	}
+	topic := ""
+	if msg.Topic != nil {
+		topic = *msg.Topic
+	}
+	s.audit(ctx, client.UniqueID, "channel_edit", fmt.Sprintf("%d", msg.ChannelID), topic)
+	return nil
+}
+
+// BroadcastChannelUpdated announces a channel's current editable fields to
+// all clients (used by out-of-band edits, e.g. ServerQuery channeledit).
+func (s *TCPServer) BroadcastChannelUpdated(channelID int64) {
+	if s.deps == nil || s.deps.State == nil {
+		return
+	}
+	ch, ok := s.deps.State.GetChannel(channelID)
+	if !ok {
+		return
+	}
+	s.broadcastEvent(eventChannelUpdated, channelUpdatedEvent{
+		ChannelID:       ch.ChannelID,
+		Topic:           ch.Topic,
+		MaxClients:      ch.MaxClients,
+		OpusBitrate:     ch.OpusBitrate,
+		OpusFEC:         ch.OpusFEC,
+		OpusDTX:         ch.OpusDTX,
+		OpusStereo:      ch.OpusStereo,
+		SlowModeSeconds: ch.SlowModeSeconds,
+		Description:     ch.Description,
+	})
 }
 
 // handleJoinChannel moves the calling client into the target channel. Joining
@@ -653,7 +784,7 @@ func (s *TCPServer) handleKickClient(ctx context.Context, client *Client, f *net
 	}
 
 	if msg.Ban {
-		if err := s.recordBan(ctx, client, target, msg.Reason); err != nil {
+		if err := s.recordBan(ctx, client, target, msg.Reason, msg.DurationSeconds); err != nil {
 			s.logger.Warn("recording ban failed",
 				zap.String("client_id", client.ID),
 				zap.String("target_id", target.ID),
@@ -666,13 +797,28 @@ func (s *TCPServer) handleKickClient(ctx context.Context, client *Client, f *net
 	if err := s.performKick(client.ID, target.ID, msg.FromServer || msg.Ban, msg.Ban, msg.Reason); err != nil {
 		return s.sendError(client, errCodeNotFound, err.Error())
 	}
+	action := "kick"
+	if msg.Ban {
+		action = "ban"
+	}
+	s.audit(ctx, client.UniqueID, action, target.UniqueID,
+		fmt.Sprintf("from_server=%t duration_seconds=%d reason=%s", msg.FromServer || msg.Ban, msg.DurationSeconds, msg.Reason))
 	return nil
 }
+
+// maxChatBytes caps the chat body size (for encrypted messages this is the
+// base64 ciphertext length).
+const maxChatBytes = 16 * 1024
 
 // handleChatSend routes a chat message: channel chat to the channel's
 // members, a direct message to a user by unique ID (spooled when offline), a
 // direct message to an online connection by client ID (echoed back to the
 // sender), or a global message to all clients.
+//
+// Encryption (4b): plaintext is rejected unless chat_allow_plaintext is set.
+// For encrypted messages the server validates the scope key id (channel and
+// global scopes only; direct messages are true E2EE and unverifiable by
+// design) and the ciphertext size — it cannot read the body.
 func (s *TCPServer) handleChatSend(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.ChatSend
 	if err := netproto.Decode(f, &msg); err != nil {
@@ -682,11 +828,54 @@ func (s *TCPServer) handleChatSend(ctx context.Context, client *Client, f *netpr
 		return s.sendError(client, errCodeUnavailable, "broadcast backend unavailable")
 	}
 
+	if len(msg.Text) > maxChatBytes {
+		return s.sendError(client, errCodeMalformed, "chat message too large")
+	}
+	if !msg.Enc && !s.cfg.ChatAllowPlaintext {
+		return s.sendError(client, errCodePermissionDenied, "plaintext chat is disabled on this server — update your client (chat encryption is mandatory)")
+	}
+	if msg.Enc && msg.KeyID == 0 && msg.ChannelID != "" {
+		return s.sendError(client, errCodeMalformed, "channel chat requires a scope key id")
+	}
+	if msg.Enc && msg.ChannelID != "" {
+		channelID, err := strconv.ParseInt(msg.ChannelID, 10, 64)
+		if err != nil {
+			return s.sendError(client, errCodeMalformed, "invalid channel_id: "+msg.ChannelID)
+		}
+		if s.chatKeys != nil {
+			currentID, _ := s.chatKeys.current(channelID)
+			if msg.KeyID != currentID {
+				return s.sendError(client, errCodeMalformed, "stale chat key for channel (key rotated; wait for re-key)")
+			}
+		}
+	}
+	if msg.Enc && msg.ChannelID == "" && msg.ToUniqueID == "" && msg.ToClientID == "" && s.chatKeys != nil {
+		// Global scope: validate against the global key generation.
+		currentID, _ := s.chatKeys.current(globalChatScope)
+		if msg.KeyID != currentID {
+			return s.sendError(client, errCodeMalformed, "stale chat key for global scope (key rotated; wait for re-key)")
+		}
+	}
+
+	isDM := msg.ToUniqueID != "" || msg.ToClientID != ""
+
+	// Channel/global scopes run the moderation pipeline (wave 5a): rate
+	// limit, slow mode, decrypt, filters, spam, mentions, store, relay.
+	if !isDM {
+		return s.routeScopedChat(ctx, client, msg, parseChannelID(msg.ChannelID))
+	}
+
+	// Direct messages are true E2EE: relay/spool only, no moderation.
 	chat := netproto.ChatBroadcast{
 		ChannelID:    msg.ChannelID,
 		FromClientID: client.ID,
+		FromUniqueID: client.UniqueID,
 		From:         client.Username,
 		Text:         msg.Text,
+		Enc:          msg.Enc,
+		KeyID:        msg.KeyID,
+		E2E:          msg.Enc,
+		ClientMsgID:  msg.ClientMsgID,
 	}
 	payload, err := eventEnvelope(eventChat, chat)
 	if err != nil {
@@ -694,29 +883,15 @@ func (s *TCPServer) handleChatSend(ctx context.Context, client *Client, f *netpr
 	}
 
 	switch {
-	case msg.ChannelID != "":
-		channelID, err := strconv.ParseInt(msg.ChannelID, 10, 64)
-		if err != nil {
-			return s.sendError(client, errCodeMalformed, "invalid channel_id: "+msg.ChannelID)
-		}
-		s.deps.Broadcast.BroadcastToChannel(channelID, payload)
-		s.metricsSink().IncChatMessage("channel")
 	case msg.ToUniqueID != "":
 		return s.sendDirectByUniqueID(ctx, client, msg.ToUniqueID, payload, msg.Text)
-	case msg.ToClientID != "":
+	default: // msg.ToClientID != ""
 		if err := s.deps.Broadcast.BroadcastToClient(msg.ToClientID, payload); err != nil {
 			return s.sendError(client, errCodeNotFound, "target client not reachable")
 		}
 		// Echo the direct message back to the sender.
 		_ = s.deps.Broadcast.BroadcastToClient(client.ID, payload)
 		s.metricsSink().IncChatMessage("direct")
-	default:
-		raw, err := json.Marshal(chat)
-		if err != nil {
-			return err
-		}
-		s.deps.Broadcast.BroadcastEvent(eventChat, raw)
-		s.metricsSink().IncChatMessage("global")
 	}
 	return nil
 }
@@ -753,7 +928,9 @@ func (s *TCPServer) sendDirectByUniqueID(ctx context.Context, client *Client, to
 	if s.deps.Spool == nil {
 		return s.sendError(client, errCodeNotFound, "target user is offline")
 	}
-	if err := s.deps.Spool.SpoolMessage(ctx, client.UserID, target.ID, text); err != nil {
+	// E2EE DMs are spooled as ciphertext the server cannot read; the sender's
+	// unique ID travels along so the recipient can fetch the public key.
+	if err := s.deps.Spool.SpoolMessage(ctx, client.UserID, target.ID, client.UniqueID, text); err != nil {
 		s.logger.Warn("spooling message failed",
 			zap.String("client_id", client.ID),
 			zap.Error(err),
@@ -787,11 +964,17 @@ func (s *TCPServer) deliverSpooled(ctx context.Context, client *Client, userID i
 
 	ids := make([]int64, 0, len(msgs))
 	for _, m := range msgs {
+		// Messages spooled with a from_unique_id are E2EE DMs (ciphertext);
+		// older rows are plaintext and delivered as-is.
+		e2e := m.FromUniqueID != ""
 		payload, err := eventEnvelope(eventChat, netproto.ChatBroadcast{
 			FromClientID: strconv.FormatInt(m.FromUserID, 10),
+			FromUniqueID: m.FromUniqueID,
 			From:         m.FromName,
 			Text:         m.Message,
 			Offline:      true,
+			Enc:          e2e,
+			E2E:          e2e,
 		})
 		if err != nil {
 			continue
@@ -856,6 +1039,14 @@ func (s *TCPServer) moveClient(clientID string, channelID int64) error {
 		}
 		s.deps.Voice.JoinChannel(clientID, channelID)
 	}
+	// Chat keys (4b): the client gets the new channel's key; the channel it
+	// left rotates so ex-members cannot read new messages.
+	if oldChannelID != 0 && oldChannelID != channelID {
+		s.rotateScopeKey(oldChannelID)
+	}
+	if client, ok := s.clientByID(clientID); ok {
+		s.deliverScopeKey(client, channelID)
+	}
 	s.broadcastEvent(eventUserMoved, userEvent{ClientID: clientID, ChannelID: channelID})
 	return nil
 }
@@ -881,14 +1072,18 @@ func (s *TCPServer) checkPowerOver(ctx context.Context, caller, target *Client, 
 	return nil
 }
 
-// recordBan inserts a permanent unique-ID ban for the target into the bans
-// table.
-func (s *TCPServer) recordBan(ctx context.Context, caller, target *Client, reason string) error {
+// recordBan inserts a unique-ID ban for the target. durationSeconds > 0 makes
+// the ban temporary (171); 0 is permanent.
+func (s *TCPServer) recordBan(ctx context.Context, caller, target *Client, reason string, durationSeconds int64) error {
 	var bannedBy any
 	if caller.UserID != 0 {
 		bannedBy = caller.UserID
 	}
-	return s.insertBan(ctx, target.UniqueID, reason, bannedBy, nil)
+	var expiresAt any
+	if durationSeconds > 0 {
+		expiresAt = time.Now().Add(time.Duration(durationSeconds) * time.Second)
+	}
+	return s.insertBan(ctx, target.UniqueID, reason, bannedBy, expiresAt)
 }
 
 // insertBan inserts a unique-ID ban into the bans table. expiresAt nil (or
@@ -911,7 +1106,7 @@ func (s *TCPServer) sendSnapshot(client *Client) error {
 	if s.deps == nil || s.deps.State == nil {
 		return nil
 	}
-	snap := broadcast.BuildSnapshot(s.deps.State)
+	snap := broadcast.BuildSnapshot(s.deps.State, client.isAdmin(), client.UniqueID)
 	payload, err := json.Marshal(snap)
 	if err != nil {
 		return err
@@ -934,6 +1129,25 @@ func (s *TCPServer) broadcastEvent(eventType string, payload any) {
 		return
 	}
 	s.deps.Broadcast.BroadcastEvent(eventType, raw)
+}
+
+// broadcastToAdmins sends an event to every online server admin (used by
+// the invisible-status semantics, 381).
+func (s *TCPServer) broadcastToAdmins(eventType string, payload any) {
+	if s.deps == nil || s.deps.Broadcast == nil {
+		return
+	}
+	raw, err := eventEnvelope(eventType, payload)
+	if err != nil {
+		return
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, c := range s.clients {
+		if c.isAdmin() {
+			_ = s.deps.Broadcast.BroadcastToClient(c.ID, raw)
+		}
+	}
 }
 
 // eventEnvelope wraps payload in the {"type": ..., "data": ...} envelope used

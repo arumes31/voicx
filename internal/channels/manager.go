@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -120,8 +121,9 @@ func (m *ChannelManager) CreateChannel(ctx context.Context, spec ChannelSpec) (i
 	}
 
 	const q = `INSERT INTO channels
-	          (parent_id, name, topic, order_index, channel_type, max_clients, password_hash, created_by, needed_join_power)
-	          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	          (parent_id, name, topic, order_index, channel_type, max_clients, password_hash, created_by, needed_join_power,
+	           opus_bitrate, opus_fec, opus_dtx, opus_stereo)
+	          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 	          RETURNING id, created_at`
 	var (
 		channelID int64
@@ -137,6 +139,10 @@ func (m *ChannelManager) CreateChannel(ctx context.Context, spec ChannelSpec) (i
 		passwordHash,
 		createdBy,
 		spec.NeededJoinPower,
+		spec.OpusBitrate,
+		spec.OpusFEC,
+		spec.OpusDTX,
+		spec.OpusStereo,
 	).Scan(&channelID, &createdAt)
 	if err != nil {
 		return 0, fmt.Errorf("inserting channel: %w", err)
@@ -154,6 +160,10 @@ func (m *ChannelManager) CreateChannel(ctx context.Context, spec ChannelSpec) (i
 		CreatedAt:       createdAt,
 		PasswordHash:    passwordHash.String,
 		NeededJoinPower: spec.NeededJoinPower,
+		OpusBitrate:     spec.OpusBitrate,
+		OpusFEC:         spec.OpusFEC,
+		OpusDTX:         spec.OpusDTX,
+		OpusStereo:      spec.OpusStereo,
 	})
 
 	m.logger.Info("channel created",
@@ -182,7 +192,9 @@ func (m *ChannelManager) CreateChannel(ctx context.Context, spec ChannelSpec) (i
 func (m *ChannelManager) LoadIntoState(ctx context.Context) (int, error) {
 	const q = `SELECT id, COALESCE(parent_id, 0), name, COALESCE(topic, ''),
 	          order_index, channel_type, COALESCE(max_clients, 0), created_at,
-	          COALESCE(password_hash, ''), COALESCE(needed_join_power, 0)
+	          COALESCE(password_hash, ''), COALESCE(needed_join_power, 0),
+	          opus_bitrate, opus_fec, opus_dtx, opus_stereo, slow_mode_seconds,
+	          COALESCE(description, '')
 	          FROM channels ORDER BY id`
 	rows, err := m.store.DB().QueryContext(ctx, q)
 	if err != nil {
@@ -196,7 +208,9 @@ func (m *ChannelManager) LoadIntoState(ctx context.Context) (int, error) {
 		var channelType int16
 		if err := rows.Scan(&ch.ChannelID, &ch.ParentID, &ch.Name, &ch.Topic,
 			&ch.OrderIndex, &channelType, &ch.MaxClients, &ch.CreatedAt,
-			&ch.PasswordHash, &ch.NeededJoinPower); err != nil {
+			&ch.PasswordHash, &ch.NeededJoinPower,
+			&ch.OpusBitrate, &ch.OpusFEC, &ch.OpusDTX, &ch.OpusStereo, &ch.SlowModeSeconds,
+			&ch.Description); err != nil {
 			return count, fmt.Errorf("scanning channel row: %w", err)
 		}
 		ch.ChannelType = int(channelType)
@@ -294,6 +308,106 @@ func (m *ChannelManager) SetChannelType(ctx context.Context, channelID int64, ne
 		zap.Int64("channel_id", channelID),
 		zap.String("from", ChannelType(currentType).String()),
 		zap.String("to", newType.String()),
+	)
+	return nil
+}
+
+// UpdateChannel applies the non-nil fields of upd to the channel in the
+// database and the in-memory state. It returns ErrChannelNotFound for unknown
+// channels and validates the resulting values (bitrate must be non-negative,
+// max clients non-negative).
+func (m *ChannelManager) UpdateChannel(ctx context.Context, channelID int64, upd ChannelUpdate) error {
+	if upd.OpusBitrate != nil && *upd.OpusBitrate < 0 {
+		return fmt.Errorf("%w: opus bitrate must be >= 0", ErrInvalidSpec)
+	}
+	if upd.MaxClients != nil && *upd.MaxClients < 0 {
+		return fmt.Errorf("%w: max clients must be >= 0", ErrInvalidSpec)
+	}
+
+	// Build the SET clause from the non-nil fields only.
+	var sets []string
+	var args []any
+	add := func(col string, val any) {
+		args = append(args, val)
+		sets = append(sets, fmt.Sprintf("%s = $%d", col, len(args)))
+	}
+	if upd.Topic != nil {
+		add("topic", *upd.Topic)
+	}
+	if upd.MaxClients != nil {
+		if *upd.MaxClients > 0 {
+			add("max_clients", *upd.MaxClients)
+		} else {
+			add("max_clients", nil)
+		}
+	}
+	if upd.OpusBitrate != nil {
+		add("opus_bitrate", *upd.OpusBitrate)
+	}
+	if upd.OpusFEC != nil {
+		add("opus_fec", *upd.OpusFEC)
+	}
+	if upd.OpusDTX != nil {
+		add("opus_dtx", *upd.OpusDTX)
+	}
+	if upd.OpusStereo != nil {
+		add("opus_stereo", *upd.OpusStereo)
+	}
+	if upd.SlowModeSeconds != nil {
+		if *upd.SlowModeSeconds < 0 {
+			return fmt.Errorf("%w: slow mode must be >= 0", ErrInvalidSpec)
+		}
+		add("slow_mode_seconds", *upd.SlowModeSeconds)
+	}
+	if upd.Description != nil {
+		add("description", *upd.Description)
+	}
+	if len(sets) == 0 {
+		return nil // nothing to do
+	}
+
+	args = append(args, channelID)
+	q := fmt.Sprintf("UPDATE channels SET %s WHERE id = $%d",
+		strings.Join(sets, ", "), len(args))
+	res, err := m.store.DB().ExecContext(ctx, q, args...)
+	if err != nil {
+		return fmt.Errorf("updating channel: %w", err)
+	}
+	if rows, _ := res.RowsAffected(); rows == 0 {
+		return ErrChannelNotFound
+	}
+
+	// Mirror the change into the in-memory state.
+	if ch, ok := m.state.GetChannel(channelID); ok {
+		if upd.Topic != nil {
+			ch.Topic = *upd.Topic
+		}
+		if upd.MaxClients != nil {
+			ch.MaxClients = *upd.MaxClients
+		}
+		if upd.OpusBitrate != nil {
+			ch.OpusBitrate = *upd.OpusBitrate
+		}
+		if upd.OpusFEC != nil {
+			ch.OpusFEC = *upd.OpusFEC
+		}
+		if upd.OpusDTX != nil {
+			ch.OpusDTX = *upd.OpusDTX
+		}
+		if upd.OpusStereo != nil {
+			ch.OpusStereo = *upd.OpusStereo
+		}
+		if upd.SlowModeSeconds != nil {
+			ch.SlowModeSeconds = *upd.SlowModeSeconds
+		}
+		if upd.Description != nil {
+			ch.Description = *upd.Description
+		}
+	}
+
+	m.logger.Info("channel updated",
+		zap.Int64("channel_id", channelID),
+		zap.Int("fields", len(sets)),
 	)
 	return nil
 }

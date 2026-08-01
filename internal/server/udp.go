@@ -1,9 +1,9 @@
 // Package server hosts the long-running voicx server components. This file
-// implements the UDP media/signaling listener: it reads datagrams into pooled
+// implements the UDP keepalive listener: it reads datagrams into pooled
 // buffers, dispatches them by a 1-byte message-type header to a bounded worker
-// pool, and exposes basic atomic counters via Stats(). Real WebRTC/Pion wiring
-// is deferred to a later phase; for now non-ping packets are logged and
-// dropped.
+// pool, and exposes basic atomic counters via Stats(). The UDP surface is a
+// ping/pong connectivity probe only — media runs over WebRTC (DTLS-SRTP) and
+// signaling over the TCP control channel; anything else is dropped.
 package server
 
 import (
@@ -53,7 +53,7 @@ type UDPStats struct {
 	PacketsRateLimited uint64
 }
 
-// UDPServer reads and dispatches UDP media/signaling datagrams. It uses a
+// UDPServer reads and dispatches UDP keepalive datagrams. It uses a
 // sync.Pool of MTU-sized buffers to avoid per-packet allocations and a
 // bounded worker pool to avoid unbounded goroutine creation under load.
 type UDPServer struct {
@@ -236,15 +236,6 @@ func (s *UDPServer) dispatch(pkt udpPacket) {
 	case netproto.UDPMsgPing:
 		s.metric().IncUDPPackets("ping")
 		s.handlePing(pkt.remote, payload)
-	case netproto.UDPMsgMedia:
-		s.metric().IncUDPPackets("media")
-		s.handleMedia(pkt.remote, payload)
-	case netproto.UDPMsgSignal:
-		s.metric().IncUDPPackets("signal")
-		s.handleSignal(pkt.remote, payload)
-	case netproto.UDPMsgSpeaking:
-		s.metric().IncUDPPackets("speaking")
-		s.handleSpeaking(pkt.remote, payload)
 	case netproto.UDPMsgPong:
 		s.metric().IncUDPPackets("pong")
 		// Unsolicited pong from a peer; nothing to do.
@@ -277,33 +268,6 @@ func (s *UDPServer) handlePing(remote *net.UDPAddr, _ []byte) {
 			)
 		}
 	}
-}
-
-// handleMedia logs the packet size and drops it. Real media routing lands
-// with the Pion integration in a later phase.
-func (s *UDPServer) handleMedia(remote *net.UDPAddr, payload []byte) {
-	s.logger.Debug("udp media packet (dropped)",
-		zap.String("remote", remote.String()),
-		zap.Int("payload_len", len(payload)),
-	)
-}
-
-// handleSignal logs the signaling fragment and drops it. Real WebRTC
-// signaling handling lands in a later phase.
-func (s *UDPServer) handleSignal(remote *net.UDPAddr, payload []byte) {
-	s.logger.Debug("udp signal packet (dropped)",
-		zap.String("remote", remote.String()),
-		zap.Int("payload_len", len(payload)),
-	)
-}
-
-// handleSpeaking logs the speaking-state change and drops it. Real speaking
-// event routing lands in a later phase.
-func (s *UDPServer) handleSpeaking(remote *net.UDPAddr, payload []byte) {
-	s.logger.Debug("udp speaking packet (dropped)",
-		zap.String("remote", remote.String()),
-		zap.Int("payload_len", len(payload)),
-	)
 }
 
 // Shutdown closes the UDP socket and signals the read loop to exit. It is

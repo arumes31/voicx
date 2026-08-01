@@ -102,8 +102,8 @@ func (a *App) RegenerateIdentity() string {
 	if err != nil {
 		return err.Error()
 	}
-	if a.cm != nil {
-		a.cm.id = id
+	if a.cmLoad() != nil {
+		a.cmLoad().id = id
 	}
 	uid, err := id.uniqueID()
 	if err != nil {
@@ -170,8 +170,8 @@ func (a *App) ImportIdentity() string {
 	if _, err := loadOrCreateIdentityAt(dest); err != nil {
 		return err.Error()
 	}
-	if a.cm != nil {
-		a.cm.id = nil // reload on next connect
+	if a.cmLoad() != nil {
+		a.cmLoad().id = nil // reload on next connect
 	}
 	log.Printf("identity imported from %s", src)
 	return ""

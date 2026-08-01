@@ -37,16 +37,22 @@ type permChecker struct {
 
 // permCheckerFor loads the client's tiered permissions (in the context of the
 // channel the client currently occupies) and wraps them in a permChecker.
-// Guests (userID 0, no users row) short-circuit to an empty set without any
-// database access: deny-on-unset semantics then apply like for everyone else.
+// Guests (userID 0, no users row) need no database access: they virtually
+// hold the default Guest server group when one is configured (144), and
+// otherwise fall back to an empty set; deny-on-unset semantics then apply
+// like for everyone else.
 func (s *TCPServer) permCheckerFor(ctx context.Context, client *Client) (*permChecker, error) {
 	if s.deps == nil || s.deps.Perms == nil || s.deps.Resolver == nil {
 		return nil, errPermsUnavailable
 	}
 	if client.UserID == 0 {
+		tp := permissions.NewTieredPermissions()
+		if set, ok := s.guestGroupSet(ctx); ok {
+			tp.Set(permissions.TierServerGroup, set)
+		}
 		return &permChecker{
 			resolver: s.deps.Resolver,
-			tp:       permissions.NewTieredPermissions(),
+			tp:       tp,
 			admin:    false,
 		}, nil
 	}

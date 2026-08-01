@@ -12,6 +12,7 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 	"voicx/internal/config"
 	"voicx/internal/metrics"
 	"voicx/internal/netproto"
+	"voicx/internal/tlscert"
 )
 
 // Error codes sent in MsgError frames.
@@ -207,8 +209,24 @@ type TCPServer struct {
 
 	listener net.Listener
 
+	// tlsFingerprint is the SHA-256 fingerprint of the control-channel
+	// certificate (empty when TLS is disabled). Set in Start.
+	tlsFingerprint string
+
+	// chatKeys manages the per-scope chat encryption keys (wave 4b).
+	chatKeys *chatKeyManager
+
+	// Chat infrastructure (wave 5a): rate limiter, spam tracker, slow-mode
+	// tracker.
+	chatRate *chatRateLimiter
+	chatSpam *spamTracker
+	chatSlow *slowTracker
+
 	mu      sync.RWMutex
 	clients map[string]*Client
+
+	// startedAt feeds the public server-info uptime (313).
+	startedAt time.Time
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -220,30 +238,59 @@ type TCPServer struct {
 // missing dependency reply with an "unavailable" error.
 func New(cfg *config.Config, logger *zap.Logger, deps *Deps) *TCPServer {
 	s := &TCPServer{
-		cfg:     cfg,
-		logger:  logger,
-		deps:    deps,
-		clients: make(map[string]*Client),
-		stopCh:  make(chan struct{}),
+		cfg:       cfg,
+		logger:    logger,
+		deps:      deps,
+		clients:   make(map[string]*Client),
+		stopCh:    make(chan struct{}),
+		startedAt: time.Now(),
+		chatKeys:  newChatKeyManager(),
+		chatRate:  newChatRateLimiter(cfg.ChatRateMsgs, time.Duration(cfg.ChatRateWindowSeconds)*time.Second),
+		chatSpam:  newSpamTracker(),
+		chatSlow:  newSlowTracker(),
 	}
-	// Install the voice pipeline callbacks (talk/video permission gates and
-	// speaking-state announcements) on the voice backend.
+	// Install the voice pipeline callbacks (talk/video permission gates,
+	// speaking-state announcements, and renegotiation offer delivery).
 	if deps != nil && deps.Voice != nil {
 		deps.Voice.SetHandlers(s.canTalk, s.onSpeakingChanged)
 		deps.Voice.SetVideoHandlers(s.canPublishVideo)
+		deps.Voice.SetOfferSender(func(clientID, offerSDP string) error {
+			client, ok := s.clientByID(clientID)
+			if !ok {
+				return errors.New("client not connected")
+			}
+			return s.writeMessage(client, netproto.MsgWebRTCOffer, netproto.WebRTCOffer{SDP: offerSDP})
+		})
 	}
 	return s
 }
 
 // Start binds the TCP listener and serves connections until ctx is cancelled
-// or Shutdown is called. It returns when the accept loop exits.
+// or Shutdown is called. It returns when the accept loop exits. When
+// tls_enabled is set the listener is wrapped in TLS (self-signed cert from
+// tls_dir or the configured cert/key files).
 func (s *TCPServer) Start(ctx context.Context) error {
 	ln, err := net.Listen("tcp", s.cfg.TCPAddr)
 	if err != nil {
 		return fmt.Errorf("tcp listen on %s: %w", s.cfg.TCPAddr, err)
 	}
+	if s.cfg.TLSEnabled {
+		cert, fp, err := tlscert.Ensure(s.cfg.TLSDir, s.cfg.TLSCertFile, s.cfg.TLSKeyFile,
+			[]string{"localhost", s.cfg.ServerName})
+		if err != nil {
+			_ = ln.Close()
+			return fmt.Errorf("preparing control-channel TLS: %w", err)
+		}
+		s.tlsFingerprint = fp
+		ln = tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
+		s.logger.Info("TCP control listener started (TLS)",
+			zap.String("addr", s.cfg.TCPAddr),
+			zap.String("tls_fingerprint", fp),
+		)
+	} else {
+		s.logger.Info("TCP control listener started (plaintext!)", zap.String("addr", s.cfg.TCPAddr))
+	}
 	s.listener = ln
-	s.logger.Info("TCP control listener started", zap.String("addr", s.cfg.TCPAddr))
 
 	// Close the listener when the context is cancelled so Accept unblocks.
 	go func() {
@@ -269,6 +316,12 @@ func (s *TCPServer) Start(ctx context.Context) error {
 		s.metricsSink().IncTCPConnections()
 		go s.handleConn(ctx, conn)
 	}
+}
+
+// TLSFingerprint returns the SHA-256 fingerprint of the control-channel
+// certificate, or "" when TLS is disabled.
+func (s *TCPServer) TLSFingerprint() string {
+	return s.tlsFingerprint
 }
 
 // Shutdown stops accepting new connections and closes the listener. Existing
@@ -298,6 +351,13 @@ func (s *TCPServer) handleConn(ctx context.Context, conn net.Conn) {
 		s.unregister(client.ID)
 		s.onDisconnect(client)
 	}()
+
+	// (217) max-clients enforcement: config max_clients, tightened by the
+	// serveredit override. 0 = unlimited.
+	if max := s.EffectiveMaxClients(ctx); max > 0 && s.clientCount() > max {
+		_ = s.sendError(client, errCodeUnavailable, "server is full")
+		return
+	}
 
 	s.logger.Info("client connected",
 		zap.String("client_id", client.ID),
@@ -365,6 +425,8 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 		return s.handleAuthSignature(ctx, client, f)
 	case netproto.MsgCreateChannel:
 		return s.handleCreateChannel(ctx, client, f)
+	case netproto.MsgChannelEdit:
+		return s.handleChannelEdit(ctx, client, f)
 	case netproto.MsgDeleteChannel:
 		return s.handleDeleteChannel(ctx, client, f)
 	case netproto.MsgJoinChannel:
@@ -387,12 +449,32 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 		return s.handlePositionUpdate(ctx, client, f)
 	case netproto.MsgVideoQuality:
 		return s.handleVideoQuality(ctx, client, f)
+	case netproto.MsgPrioritySpeaker:
+		return s.handlePrioritySpeaker(ctx, client, f)
 	case netproto.MsgRecordingControl:
 		return s.handleRecordingControl(ctx, client, f)
 	case netproto.MsgFileTransferInit:
 		return s.handleFileTransferInit(ctx, client, f)
 	case netproto.MsgFileList:
 		return s.handleFileList(ctx, client, f)
+	case netproto.MsgFileDelete:
+		return s.handleFileDelete(ctx, client, f)
+	case netproto.MsgFileRename:
+		return s.handleFileRename(ctx, client, f)
+	case netproto.MsgFileVersions:
+		return s.handleFileVersions(ctx, client, f)
+	case netproto.MsgFileLink:
+		return s.handleFileLink(ctx, client, f)
+	case netproto.MsgServerIconSet:
+		return s.handleServerIconSet(ctx, client, f)
+	case netproto.MsgServerIconGet:
+		return s.handleServerIconGet(ctx, client, f)
+	case netproto.MsgSetStatus:
+		return s.handleSetStatus(ctx, client, f)
+	case netproto.MsgPoke:
+		return s.handlePoke(ctx, client, f)
+	case netproto.MsgServerInfoQuery:
+		return s.handleServerInfoQuery(ctx, client, f)
 	case netproto.MsgAvatarSet:
 		return s.handleAvatarSet(ctx, client, f)
 	case netproto.MsgAvatarGet:
@@ -407,8 +489,70 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 		return s.handleScreenShare(ctx, client, f)
 	case netproto.MsgPermissionsQuery:
 		return s.handlePermissionsQuery(ctx, client, f)
+	case netproto.MsgKeyPublish:
+		return s.handleKeyPublish(ctx, client, f)
+	case netproto.MsgKeyRequest:
+		return s.handleKeyRequest(ctx, client, f)
+	case netproto.MsgChatHistory:
+		return s.handleChatHistory(ctx, client, f)
+	case netproto.MsgChatEdit:
+		return s.handleChatEdit(ctx, client, f)
+	case netproto.MsgChatDelete:
+		return s.handleChatDelete(ctx, client, f)
+	case netproto.MsgChatPin:
+		return s.handleChatPin(ctx, client, f)
+	case netproto.MsgChatPins:
+		return s.handleChatPins(ctx, client, f)
+	case netproto.MsgChatReact:
+		return s.handleChatReact(ctx, client, f)
+	case netproto.MsgTyping:
+		return s.handleTyping(ctx, client, f)
+	case netproto.MsgChatDelivered:
+		return s.handleChatDelivered(ctx, client, f)
+	case netproto.MsgChatRead:
+		return s.handleChatRead(ctx, client, f)
+	case netproto.MsgEmojiUpload:
+		return s.handleEmojiUpload(ctx, client, f)
+	case netproto.MsgEmojiList:
+		return s.handleEmojiList(ctx, client, f)
+	case netproto.MsgEmojiGet:
+		return s.handleEmojiGet(ctx, client, f)
 	case netproto.MsgClientInfoQuery:
 		return s.handleClientInfoQuery(ctx, client, f)
+	case netproto.MsgGroupList:
+		return s.handleGroupList(ctx, client, f)
+	case netproto.MsgGroupCreate:
+		return s.handleGroupCreate(ctx, client, f)
+	case netproto.MsgGroupRename:
+		return s.handleGroupRename(ctx, client, f)
+	case netproto.MsgGroupDelete:
+		return s.handleGroupDelete(ctx, client, f)
+	case netproto.MsgGroupAssign:
+		return s.handleGroupAssign(ctx, client, f)
+	case netproto.MsgGroupUnassign:
+		return s.handleGroupUnassign(ctx, client, f)
+	case netproto.MsgGroupIconSet:
+		return s.handleGroupIconSet(ctx, client, f)
+	case netproto.MsgPermSet:
+		return s.handlePermSet(ctx, client, f)
+	case netproto.MsgPermList:
+		return s.handlePermList(ctx, client, f)
+	case netproto.MsgPermUnset:
+		return s.handlePermUnset(ctx, client, f)
+	case netproto.MsgPermTemplateApply:
+		return s.handlePermTemplateApply(ctx, client, f)
+	case netproto.MsgPermTrace:
+		return s.handlePermTrace(ctx, client, f)
+	case netproto.MsgAuditLog:
+		return s.handleAuditLog(ctx, client, f)
+	case netproto.MsgGroupIconGet:
+		return s.handleGroupIconGet(ctx, client, f)
+	case netproto.MsgGroupMembers:
+		return s.handleGroupMembers(ctx, client, f)
+	case netproto.MsgBanList:
+		return s.handleBanList(ctx, client, f)
+	case netproto.MsgBanRemove:
+		return s.handleBanRemove(ctx, client, f)
 	case netproto.MsgPing:
 		return s.handlePing(ctx, client, f)
 	case netproto.MsgPong:
@@ -453,24 +597,41 @@ func (s *TCPServer) onDisconnect(client *Client) {
 	}
 
 	var channelID int64
+	var wasInvisible bool
 	if s.deps.State != nil {
 		if sc, ok := s.deps.State.GetClient(client.ID); ok {
 			channelID = sc.ChannelID
+			wasInvisible = sc.Status == "invisible"
 		}
 		s.deps.State.RemoveClient(client.ID)
 	}
 
 	if s.deps.Broadcast != nil {
 		s.deps.Broadcast.Unregister(client.ID)
-		s.broadcastEvent(eventUserLeft, userEvent{
-			ClientID: client.ID,
-			UniqueID: client.UniqueID,
-			Nickname: client.Username,
-		})
+		if wasInvisible {
+			// Invisible users were never visible to non-admins; their leave
+			// is admin-only too (381).
+			s.broadcastToAdmins(eventUserLeft, userEvent{
+				ClientID: client.ID,
+				UniqueID: client.UniqueID,
+				Nickname: client.Username,
+			})
+		} else {
+			s.broadcastEvent(eventUserLeft, userEvent{
+				ClientID: client.ID,
+				UniqueID: client.UniqueID,
+				Nickname: client.Username,
+			})
+		}
 	}
 
 	if channelID != 0 && s.deps.Channels != nil {
 		s.deps.Channels.OnClientLeftChannel(channelID)
+	}
+
+	// Rotate the chat key of the channel the client left (4b).
+	if channelID != 0 {
+		s.rotateScopeKey(channelID)
 	}
 
 	// Tear down the client's voice session (peer connection, router state).
@@ -544,6 +705,13 @@ func (s *TCPServer) unregister(id string) {
 	s.mu.Lock()
 	delete(s.clients, id)
 	s.mu.Unlock()
+}
+
+// clientCount returns the number of registered connections (217).
+func (s *TCPServer) clientCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.clients)
 }
 
 // clientByID returns the registered client with the given ID, if any.

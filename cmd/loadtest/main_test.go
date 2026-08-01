@@ -47,6 +47,14 @@ func (fakeAuth) BindPublicKey(context.Context, int64, string) error {
 	return nil
 }
 
+func (fakeAuth) SetE2EPublicKey(context.Context, int64, string) error {
+	return nil
+}
+
+func (fakeAuth) GetE2EPublicKey(context.Context, string) (string, error) {
+	return "", auth.ErrUserNotFound
+}
+
 // fakePerms implements server.PermLoader with an empty permission set.
 type fakePerms struct{}
 
@@ -55,6 +63,12 @@ func (fakePerms) LoadForClient(context.Context, int64, int64) (permissions.Tiere
 }
 
 func (fakePerms) Invalidate(int64, int64) {}
+
+func (fakePerms) InvalidateAll() {}
+
+func (fakePerms) LoadGroupPermissions(context.Context, int64) (permissions.PermissionSet, error) {
+	return permissions.NewPermissionSet(), nil
+}
 
 // TestLoadtestSmoke runs the simulator against a real in-process server and
 // verifies clients connect, authenticate, and send chat.
@@ -71,7 +85,7 @@ func TestLoadtestSmoke(t *testing.T) {
 	bc := broadcast.New(logger, sm)
 	defer bc.Close()
 
-	srv := server.New(&config.Config{TCPAddr: addr}, logger, &server.Deps{
+	srv := server.New(&config.Config{TCPAddr: addr, ChatAllowPlaintext: true}, logger, &server.Deps{
 		Auth:      fakeAuth{},
 		State:     sm,
 		Broadcast: bc,

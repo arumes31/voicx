@@ -153,6 +153,15 @@ func (l *Loader) Invalidate(userID int64, channelID int64) {
 	l.cache.Delete(cacheKey{userID: userID, channelID: channelID})
 }
 
+// InvalidateAll clears the whole cache. It is used after permission writes
+// that may affect many users (group permission changes, template applies).
+func (l *Loader) InvalidateAll() {
+	l.cache.Range(func(k, _ any) bool {
+		l.cache.Delete(k)
+		return true
+	})
+}
+
 // loadFromDB performs the actual queries and assembles the
 // TieredPermissions without consulting the cache.
 func (l *Loader) loadFromDB(ctx context.Context, userID int64, channelID int64) (TieredPermissions, error) {
@@ -186,6 +195,13 @@ func (l *Loader) loadFromDB(ctx context.Context, userID int64, channelID int64) 
 		return TieredPermissions{}, fmt.Errorf("loading channel-specific permissions for user %d channel %d: %w", userID, channelID, err)
 	}
 	tp.Set(TierChannelSpecific, channelSpecificSet)
+
+	// 3b. Channel tier (permissions on the channel object itself, 009).
+	channelSet, err := l.loadChannelPermissions(ctx, channelID)
+	if err != nil {
+		return TieredPermissions{}, fmt.Errorf("loading channel permissions for channel %d: %w", channelID, err)
+	}
+	tp.Set(TierChannel, channelSet)
 
 	// 4. ChannelGroup tier.
 	channelGroupIDs, err := l.LoadChannelGroupsForUser(ctx, userID, channelID)
@@ -275,6 +291,12 @@ func (l *Loader) LoadChannelGroupsForUser(ctx context.Context, userID int64, cha
 	return ids, rows.Err()
 }
 
+// LoadGroupPermissions returns the permission set of one server group
+// (used for the guest default group and group inspection).
+func (l *Loader) LoadGroupPermissions(ctx context.Context, groupID int64) (PermissionSet, error) {
+	return l.loadServerGroupPermissions(ctx, groupID)
+}
+
 // loadServerGroupPermissions loads all permissions attached to a
 // server group via server_group_permissions JOIN permissions.
 func (l *Loader) loadServerGroupPermissions(ctx context.Context, groupID int64) (PermissionSet, error) {
@@ -328,6 +350,16 @@ func (l *Loader) loadChannelClientPermissions(ctx context.Context, userID int64,
 		JOIN permissions p ON p.id = ccp.permission_id
 		WHERE ccp.user_id = $1 AND ccp.channel_id = $2`
 	return l.loadPermissionRows(ctx, q, userID, channelID)
+}
+
+// loadChannelPermissions loads permissions assigned to the channel object
+// itself (channel_permissions, migration 009).
+func (l *Loader) loadChannelPermissions(ctx context.Context, channelID int64) (PermissionSet, error) {
+	const q = `SELECT p.permission_key, p.value, p.grant_value, p.skip_flag, p.negate_flag
+		FROM channel_permissions cp
+		JOIN permissions p ON p.id = cp.permission_id
+		WHERE cp.channel_id = $1`
+	return l.loadPermissionRows(ctx, q, channelID)
 }
 
 // loadPermissionRows runs a query that returns the standard five

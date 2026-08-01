@@ -132,6 +132,31 @@ func (w *PeerConnectionWrapper) HandleAnswer(sdp string) error {
 	return nil
 }
 
+// CreateOffer creates a local offer (server-initiated renegotiation) and
+// returns its SDP. It returns an error when the connection is not in the
+// stable signaling state (e.g. a previous offer is still unanswered).
+func (w *PeerConnectionWrapper) CreateOffer() (string, error) {
+	if w.pc.SignalingState() != webrtc.SignalingStateStable {
+		return "", fmt.Errorf("signaling state %s is not stable", w.pc.SignalingState())
+	}
+	offer, err := w.pc.CreateOffer(nil)
+	if err != nil {
+		return "", fmt.Errorf("creating offer: %w", err)
+	}
+	if err := w.pc.SetLocalDescription(offer); err != nil {
+		return "", fmt.Errorf("setting local offer: %w", err)
+	}
+	select {
+	case w.localSDP <- offer:
+	default:
+	}
+	w.logger.Info("webrtc renegotiation offer created",
+		zap.String("client_id", w.clientID),
+		zap.Int("sdp_len", len(offer.SDP)),
+	)
+	return offer.SDP, nil
+}
+
 // AddICECandidate enqueues a remote ICE candidate for application to the
 // underlying PeerConnection. Candidates are applied asynchronously by an
 // internal goroutine to avoid blocking the signaling path.
@@ -174,16 +199,15 @@ func (w *PeerConnectionWrapper) OnTrack(fn func(track *webrtc.TrackRemote, recei
 // Close closes the underlying PeerConnection and releases all resources. It is
 // safe to call multiple times.
 //
-// Note: localCandidates is deliberately NOT closed here. Pion's ICE gatherer
-// may invoke the candidate callback concurrently with Close, and sending on a
-// closed channel would race/panic. Consumers should select on Done() instead;
-// sends from the gatherer fall through the <-w.closed branch once closed.
+// Note: localCandidates, localSDP, and remoteSDP are deliberately NOT closed
+// here. Pion's ICE gatherer and late signaling calls (e.g. a renegotiation
+// answer racing with Close) may send on them concurrently with Close, and
+// sending on a closed channel would race/panic. Consumers should select on
+// Done() instead; sends fall through the non-blocking default once closed.
 func (w *PeerConnectionWrapper) Close() error {
 	var err error
 	w.closeOnce.Do(func() {
 		close(w.closed)
-		close(w.localSDP)
-		close(w.remoteSDP)
 		err = w.pc.Close()
 		w.logger.Info("webrtc peer connection closed",
 			zap.String("client_id", w.clientID), zap.Error(err))

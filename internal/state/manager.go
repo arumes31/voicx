@@ -103,6 +103,19 @@ func (m *Manager) GetClient(clientID string) (*Client, bool) {
 	return c, ok
 }
 
+// GetClientByUniqueID returns the online client with the given unique ID and
+// whether it was found.
+func (m *Manager) GetClientByUniqueID(uniqueID string) (*Client, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, c := range m.clients {
+		if c.UniqueID == uniqueID {
+			return c, true
+		}
+	}
+	return nil, false
+}
+
 // ClientCount returns the number of registered clients.
 func (m *Manager) ClientCount() int {
 	m.mu.RLock()
@@ -405,6 +418,37 @@ func (m *Manager) SetSpeaking(clientID string, speaking bool) {
 
 	c.IsSpeaking = false
 	delete(m.speaking, clientID)
+}
+
+// SetPrioritySpeaker updates the client's PrioritySpeaker flag. It is a no-op
+// for unknown clients.
+func (m *Manager) SetPrioritySpeaker(clientID string, active bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c, ok := m.clients[clientID]; ok {
+		c.PrioritySpeaker = active
+	}
+}
+
+// SetE2EPublicKey records the client's X25519 public key. It is a no-op for
+// unknown clients.
+func (m *Manager) SetE2EPublicKey(clientID, publicKey string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c, ok := m.clients[clientID]; ok {
+		c.E2EPublicKey = publicKey
+	}
+}
+
+// SetStatus updates the client's presence status and message (wave 8b). It
+// is a no-op for unknown clients.
+func (m *Manager) SetStatus(clientID, status, message string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c, ok := m.clients[clientID]; ok {
+		c.Status = status
+		c.StatusMessage = message
+	}
 }
 
 // SpeakingClients returns a snapshot slice of all current SpeakingStates.
