@@ -250,3 +250,42 @@ func TestSettingsWave9(t *testing.T) {
 		t.Fatalf("keywords/alpha = %+v %q", back.Keywords, back.AlphaDismissed)
 	}
 }
+
+// TestDefaultsThatMustNotBeZero pins the settings whose zero value disables a
+// feature. A reader added without its default is how the master sound gate
+// silenced every notification (28); merging a file onto the defaults means an
+// older file's false wins, which is what migrateSettings repairs.
+func TestDefaultsThatMustNotBeZero(t *testing.T) {
+	raw, err := json.Marshal(DefaultSettings())
+	if err != nil {
+		t.Fatalf("marshal defaults: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("unmarshal defaults: %v", err)
+	}
+	for _, key := range []string{"play_sounds", "warn_muted_talking", "warn_empty_channel", "voice_limiter"} {
+		if m[key] != true {
+			t.Errorf("%s default = %v, want true", key, m[key])
+		}
+	}
+}
+
+// TestMigrateSettingsRestoresPlaySounds covers both directions: a pre-version
+// file gets sound back, a current file keeps a deliberate opt-out.
+func TestMigrateSettingsRestoresPlaySounds(t *testing.T) {
+	old := DefaultSettings()
+	old.SettingsVersion = 0
+	old.PlaySounds = false
+	if got := migrateSettings(old); !got.PlaySounds {
+		t.Error("pre-version file did not get play_sounds restored")
+	} else if got.SettingsVersion != settingsVersion {
+		t.Errorf("version = %d, want %d", got.SettingsVersion, settingsVersion)
+	}
+
+	cur := DefaultSettings()
+	cur.PlaySounds = false
+	if migrateSettings(cur).PlaySounds {
+		t.Error("migration overrode a deliberate opt-out")
+	}
+}

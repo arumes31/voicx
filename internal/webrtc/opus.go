@@ -50,13 +50,19 @@ func (c ChannelAudio) IsMusic() bool {
 
 // fmtp builds the Opus fmtp parameter string for SDP munging. minptime=10 is
 // preserved from the engine's codec registration.
+//
+// sprop-stereo mirrors stereo (RFC 7587): stereo=1 only tells the peer the SFU
+// is willing to RECEIVE stereo, so with sprop-stereo absent (default 0) the
+// peer builds a mono decoder and a music channel plays back mono no matter what
+// the publisher sends. The SFU forwards packets untouched, so what it accepts
+// is exactly what it emits (25).
 func (c ChannelAudio) fmtp() string {
 	bitrate := c.Bitrate
 	if bitrate <= 0 {
 		bitrate = defaultOpusBitrate
 	}
-	return fmt.Sprintf("minptime=10;maxaveragebitrate=%d;useinbandfec=%s;usedtx=%s;stereo=%s",
-		bitrate, bool01(c.FEC), bool01(c.DTX), bool01(c.Stereo))
+	return fmt.Sprintf("minptime=10;maxaveragebitrate=%d;useinbandfec=%s;usedtx=%s;stereo=%s;sprop-stereo=%s",
+		bitrate, bool01(c.FEC), bool01(c.DTX), bool01(c.Stereo), bool01(c.Stereo))
 }
 
 func bool01(b bool) string {

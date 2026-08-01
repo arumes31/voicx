@@ -90,8 +90,18 @@ type HotkeyProfile struct {
 	Deafen       string `json:"deafen_toggle,omitempty"`
 }
 
+// settingsVersion is the generation of the settings file. Bump it whenever a
+// default flips from the zero value, and add the repair to migrateSettings:
+// loading merges the file ONTO the defaults, so a field an older client always
+// wrote wins over the new default unless it is explicitly repaired.
+const settingsVersion = 1
+
 // Settings holds all user preferences.
 type Settings struct {
+	// SettingsVersion is the generation this file was written by (0 = before
+	// versioning). See migrateSettings.
+	SettingsVersion int `json:"settings_version"`
+
 	Bookmarks []Bookmark     `json:"bookmarks"`
 	Recents   []RecentServer `json:"recents"` // (282) last 10 servers
 
@@ -210,6 +220,8 @@ type Settings struct {
 // DefaultSettings returns the defaults used when no settings file exists.
 func DefaultSettings() Settings {
 	return Settings{
+		SettingsVersion:    settingsVersion,
+		PlaySounds:         true,
 		ActivationMode:     "ptt",
 		VADThreshold:       50,
 		EchoCancellation:   true,
@@ -273,6 +285,19 @@ func loadSettingsAt(path string) Settings {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return DefaultSettings()
 	}
+	return migrateSettings(s)
+}
+
+// migrateSettings repairs a file written by an older client. A field the older
+// client always serialised takes precedence over its new default, so any
+// default that flips from the zero value has to be restored explicitly here.
+func migrateSettings(s Settings) Settings {
+	if s.SettingsVersion < 1 {
+		// Every client before the master sound gate wrote play_sounds:false,
+		// which would now mute every notification sound (28).
+		s.PlaySounds = true
+	}
+	s.SettingsVersion = settingsVersion
 	return s
 }
 

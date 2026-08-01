@@ -345,6 +345,12 @@ func (v *Voice) SetWhisper(clientID string, clients []string, channels []int64, 
 	v.router.SetWhisper(clientID, clients, channels, active)
 }
 
+// WhisperTargets returns the client IDs the client's active whisper reaches
+// (nil when it is not whispering). See Router.WhisperTargets (32/33).
+func (v *Voice) WhisperTargets(clientID string) []string {
+	return v.router.WhisperTargets(clientID)
+}
+
 // PeerCount returns the number of active peer connections.
 func (v *Voice) PeerCount() int {
 	return v.engine.PeerCount()

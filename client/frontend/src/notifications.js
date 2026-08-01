@@ -13,6 +13,7 @@ export const MATRIX_EVENTS = [
     ["mention", "mention"],
     ["keyword", "keyword highlight"],
     ["dm", "direct message"],
+    ["whisper", "voice whisper"],
     ["poke", "poke"],
     ["join_leave", "join/leave (your channel)"],
     ["buddy_online", "watched contact online"],
@@ -29,11 +30,13 @@ const TOAST_CATEGORY = {
 };
 
 // matrixRow returns the effective outputs for an event (defaults: all on
-// except native for chatty events).
+// except native for chatty events). (32) whisper defaults to sound + flash +
+// native: an incoming voice whisper is addressed at you personally.
 function matrixRow(event) {
     const m = V().state.settings?.notify_matrix?.[event];
     if (m) return m;
-    return { toast: true, sound: true, flash: event !== "join_leave" && event !== "buddy_online", native: event === "mention" || event === "poke" || event === "dm" };
+    const direct = event === "mention" || event === "poke" || event === "dm" || event === "whisper";
+    return { toast: true, sound: true, flash: event !== "join_leave" && event !== "buddy_online", native: direct };
 }
 
 // channelKey builds the per-channel override key ("addr#channelID").

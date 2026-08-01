@@ -11,9 +11,10 @@ import { initClientInfo } from "./clientinfo.js";
 import { initUpdater } from "./updater.js";
 import { playEvent, beep, testAll } from "./sounds.js";
 import {
-    startMicMeter, stopMicMeter, pttRelease, makeLimiter, makeNormalizer,
+    startMicMeter, stopMicMeter, pttRelease, makeLimiter,
     getUserVolume, isUserMuted, setUserMuted, registerUserChain, unregisterUserChain,
-    setDucking,
+    setDucking, attachUserNormalizer, detachUserNormalizer, detachAllUserNormalizers,
+    captureConstraints, markCaptureProfile, applyCaptureProfile,
 } from "./audio.js";
 import {
     initVideo, videoTrackAdded, videoTrackRemoved, videoSpeaking,
@@ -60,6 +61,9 @@ const state = {
     multiSelect: new Set(),       // (306) ctrl/shift-selected client IDs
     myStatus: "",                 // (307) own presence status
     micState: "unknown", // ok | none | denied
+    lastWhispererUID: "", // (33) last user who whispered to me (voice or DM)
+    whisperArmed: false,  // (33) whisper-reply hotkey is overriding the whisper list
+    whisperPrev: null,    // (33) {clients, channels, active} the hotkey replaced
     avatars: new Map(),  // unique_id -> data url | null
     avatarPending: new Set(),
     settings: null,
@@ -291,6 +295,11 @@ async function disconnect() {
 window.runtime.EventsOn("disconnected", () => {
     if (state.settings?.notify_connection !== false) toast("Connection lost", "warn", "conn");
     sysMsg("disconnected from server");
+    // (32/33) whisper state is per-connection: client IDs and the server-side
+    // whisper list do not survive a reconnect.
+    activeWhisperers.clear();
+    state.whisperArmed = false;
+    state.whisperPrev = null;
     teardownVoice();
     resetVoiceUI();
     stopQualitySampler();
@@ -550,6 +559,7 @@ window.runtime.EventsOn("event", (json) => {
         case "user_left": {
             const was = state.clients.find((c) => c.client_id === d.client_id);
             state.clients = state.clients.filter((c) => c.client_id !== d.client_id);
+            activeWhisperers.delete(d.client_id); // (32) a re-join whispers afresh
             if (was) {
                 if (was.channel_id) {
                     lastKnownChannel.set(d.client_id, was.channel_id);
@@ -630,6 +640,13 @@ window.runtime.EventsOn("event", (json) => {
             window.__voicxNotify?.notify("poke",
                 `poke from ${d.from_nickname || "someone"}${d.message ? ": " + d.message : ""}`,
                 { className: "messages", kind: "warn" });
+            break;
+        // (32) directed whisper signal — the server sends it only to the
+        // targets of an active whisper, so its mere arrival means "whispered
+        // at me". speaking_changed's broadcast whisper flag cannot say that.
+        case "whisper":
+            setWhisperActive(d.from_client_id || "", d.from_unique_id || "",
+                d.from_nickname || "", !!d.speaking);
             break;
         case "speaking_changed": {
             const c = state.clients.find((c) => c.client_id === d.client_id);
@@ -983,6 +1000,52 @@ function clientName(clientID) {
     return c ? (c.nickname || c.unique_id) : clientID;
 }
 
+// uidName resolves a unique ID to a nickname (whisper targets are addressed by
+// unique ID, not client ID).
+function uidName(uniqueID) {
+    const c = state.clients.find((c) => c.unique_id === uniqueID);
+    return c ? (c.nickname || c.unique_id) : uniqueID;
+}
+
+// ---------------------------------------------------------------------------
+// Incoming voice whispers (32/33)
+// ---------------------------------------------------------------------------
+
+// activeWhisperers holds the senders currently whispering to me: the signal
+// repeats (it rides every speaking transition), so notifying on the rising
+// edge only keeps one burst to one sound + flash.
+const activeWhisperers = new Set();
+
+// setWhisperActive records a whisper start/stop from the server's receive-side
+// whisper signal and fires the notification on the rising edge (32).
+function setWhisperActive(clientID, uniqueID, nickname, active) {
+    const key = clientID || uniqueID;
+    if (!key) return;
+    if (clientID === state.myClientID || (uniqueID && uniqueID === state.myUniqueID)) return;
+    if (!active) {
+        activeWhisperers.delete(key);
+        return;
+    }
+    if (activeWhisperers.has(key)) return;
+    activeWhisperers.add(key);
+    onWhisperReceived(clientID, uniqueID, nickname);
+}
+
+// onWhisperReceived plays the whisper sound and flashes the taskbar through
+// the notification matrix (32), and remembers the sender so the whisper-reply
+// hotkey has a target (33).
+function onWhisperReceived(clientID, uniqueID, nickname) {
+    const c = state.clients.find((x) => x.client_id === clientID) ||
+        state.clients.find((x) => x.unique_id === uniqueID);
+    const uid = uniqueID || c?.unique_id || "";
+    // (317) blocked users stay silent here too.
+    if (uid && (state.settings?.blocked_users || []).includes(uid)) return;
+    if (uid) state.lastWhispererUID = uid;
+    const who = nickname || c?.nickname || uid || clientID || "someone";
+    window.__voicxNotify?.notify("whisper", who + " is whispering to you",
+        { uid, className: "messages", kind: "warn", noSound: !state.settings?.whisper_sound });
+}
+
 // ---------------------------------------------------------------------------
 // Avatars
 // ---------------------------------------------------------------------------
@@ -1123,13 +1186,11 @@ $("voice-join").onclick = async () => {
     }
 };
 
+// (25) Capture follows the joined channel's audio profile: a music channel is
+// captured stereo with the browser's speech DSP off, everything else uses the
+// user's own settings.
 function audioConstraints() {
-    const s = state.settings || {};
-    return {
-        echoCancellation: s.echo_cancellation !== false,
-        noiseSuppression: s.noise_suppression !== false,
-        ...(s.capture_device_id ? { deviceId: { exact: s.capture_device_id } } : {}),
-    };
+    return captureConstraints(state.channels.find((c) => c.ChannelID === state.myChannelID));
 }
 
 // (78) Camera frame rate from settings (15/30/60, default 30).
@@ -1166,6 +1227,10 @@ async function startVoice() {
         }
     }
     setMicState(micErr === null ? "ok" : micErr.name === "NotAllowedError" ? "denied" : "none");
+    // (25) record which profile this capture was taken with, so a later move
+    // only re-captures when the profile actually changes.
+    markCaptureProfile(state.localStream.getAudioTracks()[0],
+        state.channels.find((c) => c.ChannelID === state.myChannelID));
     if (state.localStream.getVideoTracks().length === 0) {
         sysMsg("no camera found; joined voice audio-only");
     }
@@ -1251,7 +1316,7 @@ async function startVoice() {
     startMicMeter(state.localStream);
     applyVoiceState();
     $("voice-join").classList.add("active");
-    $("voice-status").textContent = "voice on";
+    setVoiceStatus("voice on");
 }
 
 // (24) applyChannelAudio applies the current channel's Opus settings to the
@@ -1271,8 +1336,11 @@ async function applyChannelAudio() {
             await sender.setParameters(p).catch(() => {});
         }
     }
-    const track = state.localStream?.getAudioTracks()[0];
-    if (track) track.contentHint = ch.OpusStereo ? "music" : "speech";
+    // (25) A move into or out of a music channel needs a fresh capture: the
+    // stereo/DSP constraints cannot be changed on a live track.
+    const { track, changed } = await applyCaptureProfile(state.pc, state.localStream, ch);
+    if (changed) startMicMeter(state.localStream);
+    if (track && !changed) track.contentHint = ch.OpusStereo ? "music" : "speech";
 }
 
 // (13/14) Priority-speaker ducking: while another priority speaker in my
@@ -1401,9 +1469,24 @@ function teardownVoice() {
     $("remote-video").classList.add("hidden");
 }
 
+// voiceStatusBase is the plain voice on/off text. renderVoiceStatus appends the
+// whisper-reply marker (33): an armed reply reroutes every transmission, so it
+// must not be invisible.
+let voiceStatusBase = "voice off";
+
+function setVoiceStatus(text) {
+    voiceStatusBase = text;
+    renderVoiceStatus();
+}
+
+function renderVoiceStatus() {
+    $("voice-status").textContent = voiceStatusBase +
+        (state.whisperArmed ? " · whisper → " + uidName(state.lastWhispererUID) : "");
+}
+
 function resetVoiceUI() {
     $("voice-join").classList.remove("active");
-    $("voice-status").textContent = "voice off";
+    setVoiceStatus("voice off");
     state.pttActive = false;
     $("ptt-btn").classList.remove("live");
     state.myPriority = false;
@@ -1572,11 +1655,11 @@ function applyOutputSettings(el) {
 }
 
 // Remote audio WebAudio chain. One shared context carries every publisher:
-// per-track source -> per-user gain -> per-user mute -> master gain (volume)
-// -> [normalizer] -> [limiter] -> destination. Per-publisher tracks (track ID
-// = publisher client ID) make per-user volume/mute audible; the registry
-// itself lives in audio.js.
-const remoteChain = { ctx: null, master: null, interval: null };
+// per-track source -> [per-track normalizer] -> per-user gain -> per-user mute
+// -> master gain (volume) -> [limiter] -> destination. Per-publisher tracks
+// (track ID = publisher client ID) make per-user volume/mute/auto-level
+// audible; the registries themselves live in audio.js.
+const remoteChain = { ctx: null, master: null };
 // remoteTracks maps media track ID -> {src, gain, mute, uid} for per-track
 // teardown when a publisher leaves or voice is stopped.
 const remoteTracks = new Map();
@@ -1591,25 +1674,12 @@ function ensureRemoteChain() {
         remoteChain.master = master;
         master.gain.value = Math.min(2, (state.settings?.volume ?? 100) / 100);
 
-        let node = master;
-
-        // (53) gain normalization (optional).
-        if (state.settings?.gain_normalize) {
-            const analyser = ctx.createAnalyser();
-            analyser.fftSize = 512;
-            master.connect(analyser);
-            const norm = makeNormalizer(ctx, analyser);
-            master.disconnect();
-            master.connect(norm.gain);
-            node = norm.gain;
-            remoteChain.interval = setInterval(norm.tick, 100);
-        }
-
-        // (52) voice limiter/compressor (default on).
-        let out = node;
+        // (52) voice limiter/compressor (default on). Gain normalization (53)
+        // is per publisher and lives in attachRemoteAudio.
+        let out = master;
         if (state.settings?.voice_limiter !== false) {
             const comp = makeLimiter(ctx);
-            node.connect(comp);
+            master.connect(comp);
             out = comp;
         }
         out.connect(ctx.destination);
@@ -1641,7 +1711,12 @@ function attachRemoteAudio(track, publisher) {
         const src = ctx.createMediaStreamSource(new MediaStream([track]));
         const gain = ctx.createGain();
         const mute = ctx.createGain();
-        src.connect(gain);
+        // (53) auto-level per publisher: keyed by track ID, inserted behind
+        // this publisher's source and returning src unchanged when the setting
+        // is off. A master-bus normalizer could not lift a quiet speaker out
+        // of a loud one.
+        const head = attachUserNormalizer(ctx, track.id, src);
+        head.connect(gain);
         gain.connect(mute);
         mute.connect(remoteChain.master);
 
@@ -1681,6 +1756,7 @@ function detachRemoteTrack(trackID) {
     if (!t) return;
     remoteTracks.delete(trackID);
     if (t.uid) unregisterUserChain(t.uid);
+    detachUserNormalizer(trackID); // (53) no-op when normalization is off
     try {
         t.mute.disconnect();
         t.gain.disconnect();
@@ -1690,10 +1766,7 @@ function detachRemoteTrack(trackID) {
 
 function detachRemoteAudio() {
     for (const trackID of [...remoteTracks.keys()]) detachRemoteTrack(trackID);
-    if (remoteChain.interval) {
-        clearInterval(remoteChain.interval);
-        remoteChain.interval = null;
-    }
+    detachAllUserNormalizers(); // (53) stops the shared auto-level ticker
     if (remoteChain.ctx) {
         remoteChain.ctx.close().catch(() => {});
         remoteChain.ctx = null;
@@ -1761,14 +1834,31 @@ window.runtime.EventsOn("hotkey", (action) => {
         window.__voicxPolish?.toggleZen();
         return;
     }
-    // (33) Whisper reply: activate whisper targeting the last whisperer.
+    // (33) Whisper reply: arm whisper at the last whisperer, re-press restores
+    // the whisper list it replaced (arming permanently would silently reroute
+    // every later transmission).
     if (action === "whisper_reply") {
-        if (state.lastWhispererUID) {
-            window.go.main.App.WhisperSet([state.lastWhispererUID], [], true);
-            sysMsg("whisper reply armed → " + clientName(state.lastWhispererUID) || state.lastWhispererUID);
-        } else {
-            toast("no whisper to reply to", "info", "alert");
+        if (state.whisperArmed) {
+            const prev = state.whisperPrev || { clients: [], channels: [], active: false };
+            window.go.main.App.WhisperSet(prev.clients, prev.channels, prev.active);
+            state.whisperArmed = false;
+            state.whisperPrev = null;
+            renderVoiceStatus();
+            sysMsg("whisper reply disarmed");
+            return;
         }
+        if (!state.lastWhispererUID) {
+            toast("no whisper to reply to", "info", "alert");
+            return;
+        }
+        const s = state.settings || {};
+        state.whisperPrev = {
+            clients: s.whisper_clients || [], channels: s.whisper_channels || [], active: !!s.whisper_active,
+        };
+        window.go.main.App.WhisperSet([state.lastWhispererUID], [], true);
+        state.whisperArmed = true;
+        renderVoiceStatus();
+        sysMsg("whisper reply armed → " + uidName(state.lastWhispererUID));
         return;
     }
     if (document.hasFocus() && document.activeElement === $("chat-text")) return;

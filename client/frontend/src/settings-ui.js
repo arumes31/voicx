@@ -1,5 +1,6 @@
 // settings-ui.js — TS3-style settings dialog with left icon nav.
 import { t } from "./i18n.js";
+import { SOUND_EVENTS } from "./sounds.js";
 
 const V = () => window.__voicx;
 
@@ -243,6 +244,9 @@ function pageCapture() {
 
     el.appendChild(row("PTT release delay (ms)", slider(s.ptt_release_delay_ms || 0, 0, 2000, (v) => { s.ptt_release_delay_ms = v; })));
     el.appendChild(hint("Capture changes apply on the next Join Voice."));
+    // (25) the music profile overrides these two, so say so where they live.
+    el.appendChild(hint("Music channels (stereo, 96 kbit/s or more) capture in stereo with echo cancellation, "
+        + "noise suppression and auto gain off; your settings above apply everywhere else."));
 
     // Mic test meter (3) + loopback playback (4).
     const testWrap = document.createElement("div");
@@ -356,7 +360,9 @@ function pagePlayback() {
     })));
     el.appendChild(row("Voice limiter (compressor)", checkbox(s.voice_limiter !== false, (v) => { s.voice_limiter = v; })));
     el.appendChild(row("Per-user gain normalization (cap 4x)", checkbox(s.gain_normalize, (v) => { s.gain_normalize = v; })));
-    el.appendChild(hint("Limiter/normalizer apply on the next Join Voice."));
+    // (53) each publisher is levelled on its own chain, so a loud speaker no
+    // longer sets the gain for a quiet one.
+    el.appendChild(hint("Normalization levels every speaker separately. Limiter and normalizer apply on the next Join Voice."));
     const testBtn = document.createElement("button");
     testBtn.textContent = "Play Test Sound";
     testBtn.onclick = () => V().beep(660, 0.25);
@@ -739,7 +745,8 @@ function pageNotifications() {
         prev.title = "preview";
         prev.onclick = async () => {
             const { play } = await import("./sounds.js");
-            if (spec.freq > 0) play("sine", spec.freq, (spec.duration_ms || 200) / 1000, 1);
+            // force: a preview must be audible even with the master toggle off.
+            if (spec.freq > 0) play("sine", spec.freq, (spec.duration_ms || 200) / 1000, 1, true);
         };
         td.append(freq, dur, prev);
         tr.appendChild(td);
@@ -767,7 +774,9 @@ function pageNotifications() {
     el.appendChild(row("Warn when talking while muted", checkbox(s.warn_muted_talking !== false, (v) => { s.warn_muted_talking = v; })));
     el.appendChild(row("Hint when talking to an empty channel", checkbox(s.warn_empty_channel !== false, (v) => { s.warn_empty_channel = v; })));
 
-    el.appendChild(row("Play sounds (master)", checkbox(s.play_sounds, (v) => { s.play_sounds = v; })));
+    // (28) master gate, now actually read by sounds.js: only an explicit
+    // false silences playback, so a settings blob without the field is on.
+    el.appendChild(row("Play sounds (master)", checkbox(s.play_sounds !== false, (v) => { s.play_sounds = v; })));
 
     // (28) Sound pack system.
     const packSel = document.createElement("select");
@@ -786,9 +795,10 @@ function pageNotifications() {
     sub.className = "set-subhead";
     sub.textContent = "Event sounds";
     el.appendChild(sub);
-    for (const ev of ["join", "leave", "mention", "dm", "whisper", "poke", "mic_on", "mic_off"]) {
+    // (28) driven by the pack's event list so every matrix event is togglable.
+    for (const ev of SOUND_EVENTS) {
         const enabled = !s.event_sounds || s.event_sounds[ev] !== false;
-        el.appendChild(row(ev.replace("_", " "), checkbox(enabled, (v) => {
+        el.appendChild(row(ev.replace(/_/g, " "), checkbox(enabled, (v) => {
             s.event_sounds = s.event_sounds || {};
             s.event_sounds[ev] = v;
         })));

@@ -883,7 +883,7 @@ func startTestEnvLogger(t *testing.T, perms *permissions.TieredPermissions, muta
 // Certificate verification is skipped — test clients pin nothing.
 func dialRetry(t *testing.T, addr string) net.Conn {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(waitDeadline)
 	dialer := &net.Dialer{Timeout: 300 * time.Millisecond}
 	tlsCfg := &tls.Config{InsecureSkipVerify: true} //nolint:gosec // test client
 	for time.Now().Before(deadline) {
@@ -912,7 +912,7 @@ func send(t *testing.T, conn net.Conn, mt netproto.MessageType, msg any) {
 // readFrame reads a single frame with a deadline.
 func readFrame(t *testing.T, conn net.Conn) *netproto.Frame {
 	t.Helper()
-	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(waitDeadline))
 	f, err := netproto.ReadFrame(conn)
 	if err != nil {
 		t.Fatalf("read frame: %v", err)
@@ -924,7 +924,7 @@ func readFrame(t *testing.T, conn net.Conn) *netproto.Frame {
 // asynchronous event/snapshot frames.
 func readOfType(t *testing.T, conn net.Conn, mt netproto.MessageType) *netproto.Frame {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(waitDeadline)
 	for time.Now().Before(deadline) {
 		f := readFrame(t, conn)
 		if netproto.MessageType(f.Type) == mt {
@@ -997,7 +997,7 @@ func decodeEvent(t *testing.T, f *netproto.Frame) (string, json.RawMessage) {
 // user_joined announcement).
 func readEventOfType(t *testing.T, conn net.Conn, want string) json.RawMessage {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(waitDeadline)
 	for time.Now().Before(deadline) {
 		f := readOfType(t, conn, netproto.MsgEvent)
 		typ, data := decodeEvent(t, f)
@@ -1009,10 +1009,16 @@ func readEventOfType(t *testing.T, conn net.Conn, want string) json.RawMessage {
 	return nil
 }
 
+// waitDeadline is how long the polling helpers give a condition. It is
+// generous because these are wall-clock waits on real sockets: under a full
+// `go test ./...` the whole suite competes for cores, and a tight budget turns
+// scheduling latency into a flaky failure that hides real regressions.
+const waitDeadline = 15 * time.Second
+
 // waitFor polls cond until it holds or the deadline passes.
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(waitDeadline)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return

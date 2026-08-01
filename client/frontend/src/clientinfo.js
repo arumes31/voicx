@@ -175,10 +175,28 @@ function openBatchMenu(x, y, clientIDs) {
     document.body.appendChild(menuEl);
 }
 
+// inboundAudioByPublisher maps a publisher's client ID -> its inbound-rtp
+// audio stat. The SFU gives every publisher its own MediaStream and sets the
+// track ID to the publisher's client ID, so a stat is attributable via
+// trackIdentifier (or the legacy "track" stat it references) (57).
+function inboundAudioByPublisher(stats) {
+    const byID = new Map();
+    stats.forEach((r) => byID.set(r.id, r));
+    const map = new Map();
+    stats.forEach((r) => {
+        if (r.type !== "inbound-rtp") return;
+        if (r.kind !== "audio" && r.mediaType !== "audio") return;
+        const tid = r.trackIdentifier || (r.trackId ? byID.get(r.trackId)?.trackIdentifier : "");
+        if (tid) map.set(String(tid), r);
+    });
+    return map;
+}
+
 // refreshVoiceStats fills the Voice section from RTCPeerConnection.getStats()
-// (inbound/outbound RTP). Aggregate over the shared track today; per-user
-// breakdown lands with per-publisher tracks.
-async function refreshVoiceStats(overlay) {
+// for the ONE client the dialog was opened for (57): the receive stream
+// published by that client, or — when the dialog is our own — the outgoing
+// stream as the server's RTCP receiver reports describe it.
+async function refreshVoiceStats(overlay, client) {
     const { state } = V();
     const setVal = (f, text, cls) => {
         const el = overlay.querySelector(`[data-f="${f}"]`);
@@ -187,43 +205,97 @@ async function refreshVoiceStats(overlay) {
             if (cls) el.className = "ci-val " + cls;
         }
     };
-    if (!state.pc) {
-        setVal("loss", "— (no voice)");
+    const blank = (loss) => {
+        setVal("loss", loss);
         setVal("jitter", "—");
         setVal("jbd", "—");
+        setVal("conceal", "—");
         setVal("packets", "—");
         setVal("level", "—");
+    };
+    if (!state.pc) {
+        blank("— (no voice)");
         return;
     }
     try {
         const stats = await state.pc.getStats();
-        let inbound = null, outbound = null;
-        stats.forEach((r) => {
-            if (r.type === "inbound-rtp" && (r.kind === "audio" || r.mediaType === "audio") && !inbound) inbound = r;
-            if (r.type === "outbound-rtp" && (r.kind === "audio" || r.mediaType === "audio") && !outbound) outbound = r;
-        });
-        if (inbound) {
-            const lost = inbound.packetsLost || 0;
-            const recv = inbound.packetsReceived || 0;
-            const total = lost + recv;
-            const pct = total > 0 ? (lost / total * 100).toFixed(1) : "0.0";
-            setVal("loss", pct + "%");
-            setVal("jitter", ((inbound.jitter || 0) * 1000).toFixed(1) + " ms");
-            const jbd = inbound.jitterBufferDelay ?? inbound.jitterBuffer?.delay;
-            setVal("jbd", jbd != null ? (jbd * 1000).toFixed(0) + " ms" : "—");
-            setVal("packets", recv + " recv / " + lost + " lost");
+        if (client.client_id === state.myClientID) {
+            refreshOwnVoiceStats(stats, setVal, blank);
+            return;
+        }
+        const byPub = inboundAudioByPublisher(stats);
+        let inbound = byPub.get(String(client.client_id));
+        // fall back to the track registry: a reconnect can leave the dialog's
+        // client ID stale while the attributed track is still live.
+        if (!inbound && client.unique_id) {
+            for (const [trackID, u] of state.trackUsers || []) {
+                if (u.unique_id === client.unique_id && byPub.has(String(trackID))) {
+                    inbound = byPub.get(String(trackID));
+                    break;
+                }
+            }
+        }
+        if (!inbound) {
+            blank("— no stream from this user");
+            return;
+        }
+        const lost = inbound.packetsLost || 0;
+        const recv = inbound.packetsReceived || 0;
+        const total = lost + recv;
+        setVal("loss", (total > 0 ? (lost / total * 100).toFixed(1) : "0.0") + " %");
+        setVal("jitter", ((inbound.jitter || 0) * 1000).toFixed(1) + " ms");
+        // (58) jitterBufferDelay/jitterBufferTargetDelay are CUMULATIVE sums of
+        // seconds: the average delay is the sum over jitterBufferEmittedCount.
+        const emitted = inbound.jitterBufferEmittedCount || 0;
+        if (inbound.jitterBufferDelay != null && emitted > 0) {
+            let txt = (inbound.jitterBufferDelay / emitted * 1000).toFixed(0) + " ms avg";
+            if (inbound.jitterBufferTargetDelay != null) {
+                txt += " (target " + (inbound.jitterBufferTargetDelay / emitted * 1000).toFixed(0) + " ms)";
+            }
+            setVal("jbd", txt);
         } else {
-            setVal("loss", "—");
-            setVal("jitter", "—");
             setVal("jbd", "—");
-            setVal("packets", "—");
         }
-        if (outbound && outbound.audioLevel != null) {
-            setVal("level", (outbound.audioLevel * 100).toFixed(0) + "%");
-        } else {
-            setVal("level", "—");
-        }
+        // (58) concealment is what the loss actually cost: samples the jitter
+        // buffer had to invent.
+        const samples = inbound.totalSamplesReceived || 0;
+        setVal("conceal", samples > 0
+            ? ((inbound.concealedSamples || 0) / samples * 100).toFixed(2) + " % (" + (inbound.concealmentEvents || 0) + " events)"
+            : "—");
+        setVal("packets", recv + " recv / " + lost + " lost");
+        setVal("level", inbound.audioLevel != null ? (inbound.audioLevel * 100).toFixed(0) + " %" : "—");
     } catch { /* stats unavailable */ }
+}
+
+// refreshOwnVoiceStats fills the Voice section for our own row: there is no
+// inbound stream for oneself, so loss/jitter come from the server's receiver
+// reports (remote-inbound-rtp) and the level from the local media source.
+function refreshOwnVoiceStats(stats, setVal, blank) {
+    let outbound = null, remoteIn = null, source = null;
+    stats.forEach((r) => {
+        const audio = r.kind === "audio" || r.mediaType === "audio";
+        if (r.type === "outbound-rtp" && audio && !outbound) outbound = r;
+        if (r.type === "remote-inbound-rtp" && audio && !remoteIn) remoteIn = r;
+        if (r.type === "media-source" && audio && !source) source = r;
+    });
+    if (!outbound && !source) {
+        blank("— not publishing");
+        return;
+    }
+    if (remoteIn) {
+        const lost = remoteIn.packetsLost || 0;
+        const sent = outbound?.packetsSent || 0;
+        setVal("loss", sent > 0 ? (lost / sent * 100).toFixed(1) + " % (reported by server)" : "—");
+        setVal("jitter", ((remoteIn.jitter || 0) * 1000).toFixed(1) + " ms");
+    } else {
+        setVal("loss", "— (no receiver report yet)");
+        setVal("jitter", "—");
+    }
+    setVal("jbd", "— (outgoing)");
+    setVal("conceal", "— (outgoing)");
+    setVal("packets", (outbound?.packetsSent || 0) + " sent");
+    const level = source?.audioLevel ?? outbound?.audioLevel;
+    setVal("level", level != null ? (level * 100).toFixed(0) + " %" : "—");
 }
 
 // --- Client Info dialog --------------------------------------------------------
@@ -275,6 +347,7 @@ function openClientInfo(client) {
                 <div class="ci-label">Packet loss</div><div class="ci-val" data-f="loss"></div>
                 <div class="ci-label">Jitter</div><div class="ci-val" data-f="jitter"></div>
                 <div class="ci-label">Jitter buffer</div><div class="ci-val" data-f="jbd"></div>
+                <div class="ci-label">Concealment</div><div class="ci-val" data-f="conceal"></div>
                 <div class="ci-label">Packets</div><div class="ci-val" data-f="packets"></div>
                 <div class="ci-label">Audio level</div><div class="ci-val" data-f="level"></div>
             </div>
@@ -339,8 +412,8 @@ function openClientInfo(client) {
         setVal("bin", humanBytes(info.bytes_in));
         setVal("bout", humanBytes(info.bytes_out));
 
-        // (57/58) Voice stats from getStats() — refreshed with the dialog.
-        refreshVoiceStats(overlay);
+        // (57/58) Voice stats from getStats(), scoped to this dialog's client.
+        refreshVoiceStats(overlay, client);
     };
 
     const close = () => {

@@ -425,6 +425,12 @@ func (r *Router) addPublisherLocked(subscriberID, publisherID string) bool {
 		audio: audioTrack, audioSender: audioSender,
 		video: videoTrack, videoSender: videoSender,
 	}
+	// RTCP coming back from the subscriber only reaches the interceptor chain
+	// when the sender is READ: without these loops NACKs never trigger a
+	// retransmission (inflating the loss the client info dialog reports, 57)
+	// and a subscriber's PLI/FIR never reaches the publisher.
+	go r.rtcpRelayLoop(subscriberID, audioSender)
+	go r.rtcpRelayLoop(subscriberID, videoSender)
 	r.logger.Debug("router: publisher track added",
 		zap.String("subscriber_id", subscriberID),
 		zap.String("publisher_id", publisherID),
@@ -596,6 +602,29 @@ func (r *Router) SetWhisper(clientID string, clients []string, channels []int64,
 		zap.Int("clients", len(clients)),
 		zap.Int("channels", len(channels)),
 	)
+}
+
+// WhisperTargets returns the client IDs an ACTIVE whisper by clientID reaches
+// right now (nil when the client is not whispering). The control server needs
+// it to tell the RECEIVING side that a transmission was a whisper and who sent
+// it — a whisper is otherwise indistinguishable from ordinary channel audio
+// once it leaves the router (32/33).
+func (r *Router) WhisperTargets(clientID string) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	cfg, ok := r.whispers[clientID]
+	if !ok || !cfg.active {
+		return nil
+	}
+	targets := r.whisperTargetsLocked(clientID, cfg)
+	if len(targets) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(targets))
+	for id := range targets {
+		out = append(out, id)
+	}
+	return out
 }
 
 // whisperTargetsLocked computes the subscriber IDs a whisper configuration
@@ -1215,9 +1244,11 @@ func (r *Router) RequestKeyframe(publisherID, rid string) {
 	}
 }
 
-// rtcpRelayLoop reads RTCP from a subscriber's video sender and relays
+// rtcpRelayLoop drains RTCP from one of a subscriber's senders and relays
 // keyframe requests (PLI/FIR) to the publisher that owns the referenced SSRC.
-// It exits when the sender errors (peer connection closed).
+// Draining is the point even for audio senders: the read is what feeds the
+// interceptor chain (NACK responder, receiver-report bookkeeping). It exits
+// when the sender errors (track removed or peer connection closed).
 func (r *Router) rtcpRelayLoop(clientID string, sender *webrtc.RTPSender) {
 	for {
 		pkts, _, err := sender.ReadRTCP()

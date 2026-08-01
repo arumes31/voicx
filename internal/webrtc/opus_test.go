@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/pion/rtp"
+	"github.com/pion/webrtc/v3"
 )
 
 // --- ChannelAudio ------------------------------------------------------------
@@ -59,20 +60,20 @@ func TestRewriteOpusFMTP(t *testing.T) {
 			name: "rewrite opus fmtp only",
 			sdp:  sampleSDP,
 			cfg:  ChannelAudio{Bitrate: 64000, FEC: true},
-			want: []string{"a=fmtp:111 minptime=10;maxaveragebitrate=64000;useinbandfec=1;usedtx=0;stereo=0"},
+			want: []string{"a=fmtp:111 minptime=10;maxaveragebitrate=64000;useinbandfec=1;usedtx=0;stereo=0;sprop-stereo=0"},
 			keep: []string{"a=fmtp:0 some=thing", "a=fmtp:96 max-fs=3600", "a=rtpmap:111 opus/48000/2"},
 		},
 		{
 			name: "music preset",
 			sdp:  sampleSDP,
 			cfg:  ChannelAudio{Bitrate: 128000, Stereo: true},
-			want: []string{"a=fmtp:111 minptime=10;maxaveragebitrate=128000;useinbandfec=0;usedtx=0;stereo=1"},
+			want: []string{"a=fmtp:111 minptime=10;maxaveragebitrate=128000;useinbandfec=0;usedtx=0;stereo=1;sprop-stereo=1"},
 		},
 		{
 			name: "dtx",
 			sdp:  sampleSDP,
 			cfg:  ChannelAudio{DTX: true},
-			want: []string{"a=fmtp:111 minptime=10;maxaveragebitrate=32000;useinbandfec=0;usedtx=1;stereo=0"},
+			want: []string{"a=fmtp:111 minptime=10;maxaveragebitrate=32000;useinbandfec=0;usedtx=1;stereo=0;sprop-stereo=0"},
 		},
 		{
 			name: "missing fmtp inserted after rtpmap",
@@ -80,7 +81,7 @@ func TestRewriteOpusFMTP(t *testing.T) {
 				"a=rtpmap:111 opus/48000/2\r\n" +
 				"a=rtcp-fb:111 nack\r\n",
 			cfg:  ChannelAudio{Bitrate: 48000},
-			want: []string{"a=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;maxaveragebitrate=48000;useinbandfec=0;usedtx=0;stereo=0\r\na=rtcp-fb:111 nack"},
+			want: []string{"a=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;maxaveragebitrate=48000;useinbandfec=0;usedtx=0;stereo=0;sprop-stereo=0\r\na=rtcp-fb:111 nack"},
 		},
 		{
 			name: "LF endings preserved",
@@ -88,7 +89,7 @@ func TestRewriteOpusFMTP(t *testing.T) {
 				"a=rtpmap:111 opus/48000/2\n" +
 				"a=fmtp:111 minptime=10;useinbandfec=1\n",
 			cfg:  ChannelAudio{Bitrate: 64000},
-			want: []string{"a=fmtp:111 minptime=10;maxaveragebitrate=64000;useinbandfec=0;usedtx=0;stereo=0\n"},
+			want: []string{"a=fmtp:111 minptime=10;maxaveragebitrate=64000;useinbandfec=0;usedtx=0;stereo=0;sprop-stereo=0\n"},
 		},
 		{
 			name: "no audio section untouched",
@@ -127,7 +128,7 @@ func TestRewriteOpusFMTPMultipleAudioSections(t *testing.T) {
 		"a=fmtp:112 minptime=10;useinbandfec=1\r\n"
 	got := RewriteOpusFMTP(sdp, ChannelAudio{Bitrate: 96000})
 	for _, pt := range []string{"111", "112"} {
-		want := "a=fmtp:" + pt + " minptime=10;maxaveragebitrate=96000;useinbandfec=0;usedtx=0;stereo=0"
+		want := "a=fmtp:" + pt + " minptime=10;maxaveragebitrate=96000;useinbandfec=0;usedtx=0;stereo=0;sprop-stereo=0"
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in:\n%s", want, got)
 		}
@@ -173,6 +174,111 @@ func TestEchoChannelSelfHearing(t *testing.T) {
 	}
 	if sent := r.ForwardRTP("a", pkt); sent != 0 {
 		t.Fatalf("normal channel forward sent = %d, want 0 (sender excluded)", sent)
+	}
+}
+
+// TestEchoChannelSelfPairThroughSignaling walks item 15 the way a user does:
+// the control server puts the client in the echo channel BEFORE it joins voice,
+// then the client offers, re-offers, and finally restarts ICE. Every rebuild
+// drops the peer connection (and with it the self pair track), so the self pair
+// has to be recreated from EnsurePublishers each time or the user stops hearing
+// themselves after the first reconnect.
+func TestEchoChannelSelfPairThroughSignaling(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
+	r := NewRouter(nil)
+	r.SetEchoChannel(99)
+	v := NewVoice(e, r, testLogger())
+	defer v.ClosePeer("a")
+
+	// Joined the echo channel with no peer connection yet: nothing to pair to.
+	r.JoinChannel(99, "a")
+	if pubTrackFor(r, "a", "a") != nil {
+		t.Fatal("self pair created without a peer connection")
+	}
+
+	clientPC := newClientPC(t)
+	pkt := makeAudioPacket(t, 1, -1)
+
+	assertEcho := func(stage string) {
+		t.Helper()
+		if ch, ok := r.ChannelOf("a"); !ok || ch != 99 {
+			t.Fatalf("%s: channel membership = %d (present %v), want 99", stage, ch, ok)
+		}
+		if pubTrackFor(r, "a", "a") == nil {
+			t.Fatalf("%s: no echo self pair", stage)
+		}
+		if sent := r.ForwardRTP("a", pkt); sent != 1 {
+			t.Fatalf("%s: echo forward sent = %d, want 1 (self)", stage, sent)
+		}
+	}
+
+	establishVoiceSession(t, v, clientPC, "a")
+	assertEcho("fresh join")
+
+	// Plain re-offer (the client renegotiates from the same peer connection).
+	establishVoiceSession(t, v, clientPC, "a")
+	assertEcho("re-offer")
+
+	// ICE restart (59): same peer connection, iceRestart offer.
+	offer, err := clientPC.CreateOffer(&webrtc.OfferOptions{ICERestart: true})
+	if err != nil {
+		t.Fatalf("client CreateOffer(iceRestart): %v", err)
+	}
+	if err := clientPC.SetLocalDescription(offer); err != nil {
+		t.Fatalf("client SetLocalDescription: %v", err)
+	}
+	answer, err := v.HandleOffer("a", offer.SDP, nil)
+	if err != nil {
+		t.Fatalf("HandleOffer(iceRestart): %v", err)
+	}
+	if err := clientPC.SetRemoteDescription(webrtc.SessionDescription{
+		Type: webrtc.SDPTypeAnswer, SDP: answer,
+	}); err != nil {
+		t.Fatalf("client SetRemoteDescription: %v", err)
+	}
+	assertEcho("ice restart")
+}
+
+// --- whisper receive-side signal ---------------------------------------------
+
+// TestWhisperTargetsReportsActiveWhisper verifies the router reports who an
+// active whisper reaches (the receive-side signal of 32/33) and reports nothing
+// once the whisper is off.
+func TestWhisperTargetsReportsActiveWhisper(t *testing.T) {
+	r := NewRouter(nil)
+	r.JoinChannel(5, "listener1")
+	r.JoinChannel(5, "listener2")
+	r.JoinChannel(9, "whisperer")
+
+	if got := r.WhisperTargets("whisperer"); got != nil {
+		t.Fatalf("targets without a whisper = %v, want nil", got)
+	}
+
+	// A direct target plus a whole channel; the whisperer never targets itself.
+	r.SetWhisper("whisperer", []string{"direct"}, []int64{5}, true)
+	got := map[string]bool{}
+	for _, id := range r.WhisperTargets("whisperer") {
+		got[id] = true
+	}
+	want := map[string]bool{"direct": true, "listener1": true, "listener2": true}
+	if len(got) != len(want) {
+		t.Fatalf("whisper targets = %v, want %v", got, want)
+	}
+	for id := range want {
+		if !got[id] {
+			t.Fatalf("whisper targets = %v, missing %q", got, id)
+		}
+	}
+
+	// An inactive configuration must not report targets: the receiving client
+	// would otherwise flash the taskbar for ordinary channel audio.
+	r.SetWhisper("whisperer", []string{"direct"}, []int64{5}, false)
+	if got := r.WhisperTargets("whisperer"); got != nil {
+		t.Fatalf("targets after deactivation = %v, want nil", got)
 	}
 }
 
