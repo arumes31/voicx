@@ -394,6 +394,9 @@ func (a *App) RecordRecent(addr, nickname string) {
 		out = out[:10]
 	}
 	a.settings.Recents = out
-	_ = a.save()
+	if err := a.save(); err != nil {
+		log.Printf("saving settings recents failed: %v", err)
+		return
+	}
 	a.emitSettingsUpdate()
 }

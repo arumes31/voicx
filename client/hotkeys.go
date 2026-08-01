@@ -138,6 +138,7 @@ func (a *App) hotkeyLoop(action string, mods []hotkey.Modifier, key hotkey.Key) 
 	log.Printf("hotkey %s registered", action)
 
 	cancel := make(chan struct{})
+	reg := &hotkeyReg{hk: hk, cancel: cancel}
 	a.hkMu.Lock()
 	// A newer registration may already have replaced us.
 	if _, exists := a.hotkeys[action]; exists {
@@ -145,8 +146,25 @@ func (a *App) hotkeyLoop(action string, mods []hotkey.Modifier, key hotkey.Key) 
 		_ = hk.Unregister()
 		return
 	}
-	a.hotkeys[action] = &hotkeyReg{hk: hk, cancel: cancel}
+	a.hotkeys[action] = reg
 	a.hkMu.Unlock()
+
+	defer func() {
+		if r := recover(); r != nil {
+			a.hkMu.Lock()
+			if cur, ok := a.hotkeys[action]; ok && cur == reg {
+				_ = hk.Unregister()
+				select {
+				case <-cancel:
+				default:
+					close(cancel)
+				}
+				delete(a.hotkeys, action)
+			}
+			a.hkMu.Unlock()
+			panic(r)
+		}
+	}()
 
 	a.emitHotkeyStatus(hotkeyStatus{Action: action, Registered: true})
 

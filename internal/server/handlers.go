@@ -843,7 +843,7 @@ func (s *TCPServer) handleChatSend(ctx context.Context, client *Client, f *netpr
 			return s.sendError(client, errCodeMalformed, "invalid channel_id: "+msg.ChannelID)
 		}
 		if s.chatKeys != nil {
-			currentID, _ := s.chatKeys.current(channelID)
+			currentID, _, _ := s.chatKeys.current(ctx, channelID)
 			if msg.KeyID != currentID {
 				return s.sendError(client, errCodeMalformed, "stale chat key for channel (key rotated; wait for re-key)")
 			}
@@ -851,7 +851,7 @@ func (s *TCPServer) handleChatSend(ctx context.Context, client *Client, f *netpr
 	}
 	if msg.Enc && msg.ChannelID == "" && msg.ToUniqueID == "" && msg.ToClientID == "" && s.chatKeys != nil {
 		// Global scope: validate against the global key generation.
-		currentID, _ := s.chatKeys.current(globalChatScope)
+		currentID, _, _ := s.chatKeys.current(ctx, globalChatScope)
 		if msg.KeyID != currentID {
 			return s.sendError(client, errCodeMalformed, "stale chat key for global scope (key rotated; wait for re-key)")
 		}
@@ -1042,10 +1042,10 @@ func (s *TCPServer) moveClient(clientID string, channelID int64) error {
 	// Chat keys (4b): the client gets the new channel's key; the channel it
 	// left rotates so ex-members cannot read new messages.
 	if oldChannelID != 0 && oldChannelID != channelID {
-		s.rotateScopeKey(oldChannelID)
+		s.rotateScopeKey(context.Background(), oldChannelID)
 	}
 	if client, ok := s.clientByID(clientID); ok {
-		s.deliverScopeKey(client, channelID)
+		s.deliverScopeKey(context.Background(), client, channelID)
 	}
 	s.broadcastEvent(eventUserMoved, userEvent{ClientID: clientID, ChannelID: channelID})
 	return nil

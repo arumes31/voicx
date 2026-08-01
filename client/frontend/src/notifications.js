@@ -165,7 +165,7 @@ export function checkChannelWatch() {
         const prev = watchCounts.get(key) ?? count;
         if (prev < ov.watch_threshold && count >= ov.watch_threshold) {
             const ch = V().state.channels.find((c) => c.ChannelID === channelID);
-            notify("channel_watch", `#${ch ? ch.Name : channelID} now has ${count} user(s)`, { className: "joins", kind: "info" });
+            notify("channel_watch", `#${ch ? ch.Name : channelID} now has ${count} user(s)`, { channelID, className: "joins", kind: "info" });
         }
         watchCounts.set(key, count);
     }

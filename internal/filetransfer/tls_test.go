@@ -237,8 +237,9 @@ func TestCreateLinkRefusesEncryptedAttachment(t *testing.T) {
 	fs := newFakeFileStore()
 	addr, s := startServer(t, fs)
 
-	const name = "9f86d081884c7d659a2feaa0c55ad015.vcx"
-	uploadOne(t, addr, s, "", name, []byte("sealed bytes"))
+	content := []byte("sealed bytes")
+	name := sha256Hex(content) + encryptedSuffix
+	uploadOne(t, addr, s, "", name, content)
 
 	if _, _, err := s.CreateLink(context.Background(), 7, "", name); !errors.Is(err, ErrEncryptedAttachment) {
 		t.Fatalf("CreateLink(%s) = %v, want ErrEncryptedAttachment", name, err)
@@ -257,8 +258,9 @@ func TestEncryptedAttachmentFlagged(t *testing.T) {
 	fs := newFakeFileStore()
 	addr, s := startServer(t, fs)
 
-	const sealed = "e3b0c44298fc1c149afbf4c8996fb924.vcx"
-	uploadOne(t, addr, s, "", sealed, []byte("ciphertext"))
+	content := []byte("ciphertext")
+	sealed := sha256Hex(content) + encryptedSuffix
+	uploadOne(t, addr, s, "", sealed, content)
 	uploadOne(t, addr, s, "", "readme.md", []byte("plain"))
 
 	rec, err := fs.GetFile(context.Background(), 7, "", sealed)
@@ -274,5 +276,41 @@ func TestEncryptedAttachmentFlagged(t *testing.T) {
 	}
 	if rec.Encrypted {
 		t.Fatal("ordinary upload flagged encrypted")
+	}
+}
+
+// TestEncryptedAttachmentNameMismatch asserts that uploading a .vcx file whose name
+// does not match its ciphertext digest is rejected.
+func TestEncryptedAttachmentNameMismatch(t *testing.T) {
+	fs := newFakeFileStore()
+	addr, s := startServer(t, fs)
+
+	content := []byte("ciphertext")
+	mismatchedName := "mismatched_hash.vcx"
+
+	id, token, err := s.InitUpload(context.Background(), 7, "", mismatchedName, int64(len(content)), "uid-1")
+	if err != nil {
+		t.Fatalf("InitUpload: %v", err)
+	}
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	if err := writeJSON(conn, frameInit, initMsg{Token: token, TransferID: id}); err != nil {
+		t.Fatalf("writeInit: %v", err)
+	}
+	if err := writeJSON(conn, frameDigest, digestMsg{SHA256: sha256Hex(content)}); err != nil {
+		t.Fatalf("writeDigest: %v", err)
+	}
+	if _, err := conn.Write(content); err != nil {
+		t.Fatalf("writeBytes: %v", err)
+	}
+
+	status := readStatus(t, conn)
+	if status.OK {
+		t.Fatalf("uploading mismatched .vcx name succeeded, want rejection")
 	}
 }

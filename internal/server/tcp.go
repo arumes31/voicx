@@ -251,6 +251,8 @@ type TCPServer struct {
 	chatSpam *spamTracker
 	chatSlow *slowTracker
 
+	permWriteMu sync.Mutex
+
 	mu      sync.RWMutex
 	clients map[string]*Client
 

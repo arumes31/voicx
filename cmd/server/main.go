@@ -746,7 +746,7 @@ func (q *queryBackend) AuditLog(ctx context.Context, limit int) ([]query.AuditEn
 
 // effectiveName returns the effective server name (217 serveredit override).
 func (q *queryBackend) effectiveName(ctx context.Context) string {
-	if name, err := q.db.GetServerSetting(ctx, "server_name"); err == nil && name != "" {
+	if name, _, err := q.db.GetServerSetting(ctx, "server_name"); err == nil && name != "" {
 		return name
 	}
 	return q.serverName
@@ -754,17 +754,17 @@ func (q *queryBackend) effectiveName(ctx context.Context) string {
 
 func (q *queryBackend) ServerEdit(ctx context.Context, name, welcome string, maxClients int) error {
 	if name != "" {
-		if err := q.db.SetServerSetting(ctx, "server_name", name); err != nil {
+		if err := q.db.SetServerSetting(ctx, "server_name", name, 0); err != nil {
 			return err
 		}
 	}
 	if welcome != "" {
-		if err := q.db.SetServerSetting(ctx, "motd", welcome); err != nil {
+		if err := q.db.SetServerSetting(ctx, "motd", welcome, 0); err != nil {
 			return err
 		}
 	}
 	if maxClients > 0 {
-		if err := q.db.SetServerSetting(ctx, "max_clients_override", fmt.Sprint(maxClients)); err != nil {
+		if err := q.db.SetServerSetting(ctx, "max_clients_override", fmt.Sprint(maxClients), 0); err != nil {
 			return err
 		}
 	}

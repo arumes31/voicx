@@ -311,7 +311,26 @@ func (m *connManager) connectWith(addr string, authMsg netproto.Authenticate, si
 	}
 
 	// recover is per-goroutine: the read loop needs its own guard (331).
-	go guardCrash("readLoop", func() { m.readLoop(conn) })
+	go guardCrash("readLoop", func() {
+		defer func() {
+			if r := recover(); r != nil {
+				m.mu.Lock()
+				owned := (m.conn == conn)
+				intentional := m.closed
+				m.mu.Unlock()
+				if owned {
+					if !intentional {
+						m.emit("disconnected", "")
+					}
+					m.disconnect()
+				} else {
+					_ = conn.Close()
+				}
+				panic(r)
+			}
+		}()
+		m.readLoop(conn)
+	})
 	return ""
 }
 

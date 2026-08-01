@@ -165,6 +165,13 @@ const maxFileVersions = 3
 // rotation nor dedup is reachable for them.
 func (s *Server) finalizeUpload(ctx context.Context, tr *transfer, tmpPath, finalPath string, size int64, sum string) error {
 	encrypted := isEncryptedAttachment(tr.Name)
+	if encrypted {
+		wantName := sum + encryptedSuffix
+		if tr.Name != wantName {
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("encrypted attachment name mismatch: got %q, want %q", tr.Name, wantName)
+		}
+	}
 
 	// Identical re-upload of the current file: keep the blob, refresh the row.
 	if cur, err := s.store.GetFile(ctx, tr.ChannelID, tr.Folder, tr.Name); err == nil && cur.SHA256 == sum {

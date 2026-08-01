@@ -66,7 +66,7 @@ function initResizablePanes() {
 // ---------------------------------------------------------------------------
 
 let chatPop = null;
-let chatHome = null; // {parent, wrapNext, rowNext}: where the panes dock back
+let chatHome = null; // {wrapMarker, inputMarker}: where the panes dock back
 
 function toggleChatPopout() {
     if (chatPop) {
@@ -74,8 +74,12 @@ function toggleChatPopout() {
         const inputRow = document.getElementById("chat-input-row");
         // The panes live inside the popout: dock them before removing it, or
         // remove() takes the whole chat pane with it.
-        chatHome.parent.insertBefore(wrap, chatHome.wrapNext);
-        chatHome.parent.insertBefore(inputRow, chatHome.rowNext);
+        if (chatHome?.wrapMarker?.parentNode) {
+            chatHome.wrapMarker.parentNode.replaceChild(wrap, chatHome.wrapMarker);
+        }
+        if (chatHome?.inputMarker?.parentNode) {
+            chatHome.inputMarker.parentNode.replaceChild(inputRow, chatHome.inputMarker);
+        }
         chatPop.remove();
         chatPop = null;
         chatHome = null;
@@ -88,7 +92,11 @@ function toggleChatPopout() {
     chatPop.innerHTML = `<div class="chat-pop-head">chat — drag me <button class="icon-btn chat-pop-close">✕</button></div>`;
     const wrap = document.getElementById("chat-wrap");
     const inputRow = document.getElementById("chat-input-row");
-    chatHome = { parent: wrap.parentNode, wrapNext: wrap.nextSibling, rowNext: inputRow.nextSibling };
+    const wrapMarker = document.createComment("chat-wrap-marker");
+    const inputMarker = document.createComment("chat-input-row-marker");
+    wrap.parentNode.replaceChild(wrapMarker, wrap);
+    inputRow.parentNode.replaceChild(inputMarker, inputRow);
+    chatHome = { wrapMarker, inputMarker };
     chatPop.appendChild(wrap);
     chatPop.appendChild(inputRow);
     wrap.classList.remove("hidden");

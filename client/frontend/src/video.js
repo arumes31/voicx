@@ -493,7 +493,14 @@ async function startShare({ surface, preset, withAudio }) {
             return;
         }
     } else if (vs) {
-        await vs.replaceTrack(screenTrack).catch(() => {});
+        try {
+            await vs.replaceTrack(screenTrack);
+        } catch (e) {
+            V().sysMsg("publishing screen share failed: " + (e.message || e.name));
+            display.getTracks().forEach((t) => t.stop());
+            state.shareStream = null;
+            return;
+        }
     }
     if (vs) {
         // (72) bitrate cap per preset.
@@ -509,21 +516,33 @@ async function startShare({ surface, preset, withAudio }) {
     // fans out every publisher audio track) + renegotiate.
     const displayAudio = withAudio ? display.getAudioTracks()[0] : null;
     if (displayAudio && state.pc) {
-        let tr = null;
-        try {
-            // addTrack would recycle one of the server's recvonly audio
-            // m-lines and publish the share on a subscriber slot, so take a
-            // dedicated sendonly transceiver.
-            tr = state.pc.addTransceiver(displayAudio, { direction: "sendonly", streams: [display] });
-            state.shareAudioSender = tr.sender;
-            await renegotiate();
-        } catch (e) {
-            V().sysMsg("publishing share audio failed: " + (e.message || e.name));
-            // a rollback keeps this transceiver, so without the stop() the
-            // dead track is re-offered on the next renegotiation.
-            try { tr?.stop(); } catch { /* nothing left to stop */ }
-            displayAudio.stop();
-            state.shareAudioSender = null;
+        if (!state.shareAudioTransceiver) {
+            let tr = null;
+            try {
+                // addTrack would recycle one of the server's recvonly audio
+                // m-lines and publish the share on a subscriber slot, so take a
+                // dedicated sendonly transceiver.
+                tr = state.pc.addTransceiver(displayAudio, { direction: "sendonly", streams: [display] });
+                state.shareAudioTransceiver = tr;
+                state.shareAudioSender = tr.sender;
+                await renegotiate();
+            } catch (e) {
+                V().sysMsg("publishing share audio failed: " + (e.message || e.name));
+                // a rollback keeps this transceiver, so without the stop() the
+                // dead track is re-offered on the next renegotiation.
+                try { tr?.stop(); } catch { /* nothing left to stop */ }
+                displayAudio.stop();
+                state.shareAudioTransceiver = null;
+                state.shareAudioSender = null;
+            }
+        } else {
+            try {
+                state.shareAudioSender = state.shareAudioTransceiver.sender;
+                await state.shareAudioSender.replaceTrack(displayAudio);
+            } catch (e) {
+                V().sysMsg("publishing share audio failed: " + (e.message || e.name));
+                displayAudio.stop();
+            }
         }
     }
 
@@ -621,6 +640,7 @@ async function doStopShare() {
         // The transceiver stays (stopping the track silences it); removing it
         // would need another renegotiation.
         state.shareAudioSender.track?.stop();
+        state.shareAudioSender.replaceTrack(null).catch(() => {});
         state.shareAudioSender = null;
     }
     if (state.shareStream) {

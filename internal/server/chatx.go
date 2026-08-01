@@ -8,6 +8,7 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -21,6 +22,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"go.uber.org/zap"
 
 	"voicx/internal/netproto"
 	"voicx/internal/permissions"
@@ -274,8 +277,12 @@ func (s *TCPServer) routeScopedChat(ctx context.Context, client *Client, msg net
 	// Relay the ciphertext (clients decrypt with the scope key). The relay is
 	// encrypted regardless of chat_allow_plaintext, so the wire format is
 	// uniform and no config can fan plaintext out to a scope.
+	var channelIDStr string
+	if channelID != 0 {
+		channelIDStr = strconv.FormatInt(channelID, 10)
+	}
 	chat := netproto.ChatBroadcast{
-		ChannelID:    msg.ChannelID,
+		ChannelID:    channelIDStr,
 		FromClientID: client.ID,
 		FromUniqueID: uid,
 		From:         client.Username,
@@ -447,7 +454,8 @@ func chatHistoryEntry(m store.ChatMessage, reactions map[string]int) netproto.Ch
 		ID:           m.ID,
 		FromUniqueID: m.FromUniqueID,
 		FromNickname: m.FromNickname,
-		Body:         m.Body,
+		BodyEnc:      m.BodyEnc,
+		KeyID:        m.KeyID,
 		SentAt:       m.SentAt.Unix(),
 		Reactions:    reactions,
 	}
@@ -456,7 +464,8 @@ func chatHistoryEntry(m store.ChatMessage, reactions map[string]int) netproto.Ch
 	}
 	if m.DeletedAt != nil {
 		e.Deleted = true
-		e.Body = ""
+		e.BodyEnc = ""
+		e.KeyID = 0
 	}
 	return e
 }
@@ -492,7 +501,7 @@ func (s *TCPServer) handleChatEdit(ctx context.Context, client *Client, f *netpr
 		if s.chatKeys == nil {
 			return s.sendError(client, errCodeUnavailable, "chat key manager unavailable")
 		}
-		p, err := s.chatKeys.open(stored.ChannelID, msg.NewText)
+		p, err := s.chatKeys.open(ctx, stored.ChannelID, msg.KeyID, msg.NewText)
 		if err != nil {
 			return s.sendError(client, errCodeMalformed, "message decryption failed (stale key?)")
 		}
@@ -505,21 +514,25 @@ func (s *TCPServer) handleChatEdit(ctx context.Context, client *Client, f *netpr
 		return s.sendError(client, errCodeMalformed, err.Error())
 	}
 
-	if err := s.deps.Chat.EditChatMessage(ctx, msg.MessageID, plain); err != nil {
+	bodyEnc, keyID := plain, uint32(0)
+	if msg.Enc && s.chatKeys != nil {
+		id, ct, err := s.chatKeys.seal(ctx, stored.ChannelID, plain)
+		if err != nil {
+			return s.sendError(client, errCodeUnavailable, "chat key unavailable")
+		}
+		bodyEnc, keyID = ct, id
+	}
+
+	if err := s.deps.Chat.EditChatMessage(ctx, msg.MessageID, bodyEnc, keyID); err != nil {
 		return s.sendError(client, errCodeNotFound, "edit failed: "+err.Error())
 	}
 
 	// Broadcast the edit re-sealed with the current scope key (uniform wire
 	// format: clients decrypt like normal chat).
-	outText := plain
-	var keyID uint32
-	if msg.Enc && s.chatKeys != nil {
-		keyID, outText = s.chatKeys.seal(stored.ChannelID, plain)
-	}
 	s.broadcastScope(stored.ChannelID, eventChatEdited, map[string]any{
 		"message_id": msg.MessageID,
 		"channel_id": stored.ChannelID,
-		"body":       outText,
+		"body":       bodyEnc,
 		"enc":        msg.Enc,
 		"key_id":     keyID,
 		"edited_by":  client.UniqueID,
@@ -886,7 +899,7 @@ func (s *TCPServer) serverSetting(ctx context.Context, key string) string {
 	if s.deps == nil || s.deps.Chat == nil {
 		return ""
 	}
-	v, err := s.deps.Chat.GetServerSetting(ctx, key)
+	v, _, err := s.deps.Chat.GetServerSetting(ctx, key)
 	if err != nil {
 		return ""
 	}
@@ -899,11 +912,18 @@ func (s *TCPServer) SetServerSettingAndAnnounce(ctx context.Context, key, value 
 	if s.deps == nil || s.deps.Chat == nil {
 		return errors.New("chat store unavailable")
 	}
-	if err := s.deps.Chat.SetServerSetting(ctx, key, value); err != nil {
+	keyID := uint32(0)
+	if key == "announcement" && value != "" && s.chatKeys != nil {
+		id, ct, err := s.chatKeys.seal(ctx, 0, value)
+		if err == nil {
+			value, keyID = ct, id
+		}
+	}
+	if err := s.deps.Chat.SetServerSetting(ctx, key, value, keyID); err != nil {
 		return err
 	}
 	if key == "announcement" && value != "" {
-		s.broadcastEvent(eventAnnouncement, map[string]any{"text": value})
+		s.broadcastEvent(eventAnnouncement, map[string]any{"text": value, "enc": keyID > 0, "key_id": keyID})
 	}
 	return nil
 }

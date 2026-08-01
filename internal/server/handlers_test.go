@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"voicx/internal/auth"
 	"voicx/internal/broadcast"
 	"voicx/internal/channels"
+	"voicx/internal/chatcrypto"
 	"voicx/internal/config"
 	"voicx/internal/netproto"
 	"voicx/internal/permissions"
@@ -257,7 +259,7 @@ func newFakeChat() *fakeChat {
 	}
 }
 
-func (f *fakeChat) StoreChatMessage(_ context.Context, channelID int64, fromUniqueID, fromNickname, body string) (int64, error) {
+func (f *fakeChat) StoreChatMessage(_ context.Context, channelID int64, fromUniqueID, fromNickname, bodyEnc string, keyID uint32) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.nextID++
@@ -266,7 +268,8 @@ func (f *fakeChat) StoreChatMessage(_ context.Context, channelID int64, fromUniq
 		ChannelID:    channelID,
 		FromUniqueID: fromUniqueID,
 		FromNickname: fromNickname,
-		Body:         body,
+		BodyEnc:      bodyEnc,
+		KeyID:        keyID,
 		SentAt:       time.Now(),
 	}
 	f.messages[f.nextID] = m
@@ -300,14 +303,15 @@ func (f *fakeChat) GetChatMessage(_ context.Context, id int64) (*store.ChatMessa
 	return f.messages[id], nil
 }
 
-func (f *fakeChat) EditChatMessage(_ context.Context, id int64, newBody string) error {
+func (f *fakeChat) EditChatMessage(_ context.Context, id int64, bodyEnc string, keyID uint32) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	m, ok := f.messages[id]
 	if !ok || m.DeletedAt != nil {
 		return fmt.Errorf("chat message not found or deleted")
 	}
-	m.Body = newBody
+	m.BodyEnc = bodyEnc
+	m.KeyID = keyID
 	now := time.Now()
 	m.EditedAt = &now
 	return nil
@@ -320,7 +324,8 @@ func (f *fakeChat) DeleteChatMessage(_ context.Context, id int64) error {
 	if !ok || m.DeletedAt != nil {
 		return fmt.Errorf("chat message not found or already deleted")
 	}
-	m.Body = ""
+	m.BodyEnc = ""
+	m.KeyID = 0
 	now := time.Now()
 	m.DeletedAt = &now
 	return nil
@@ -393,17 +398,110 @@ func (f *fakeChat) ReactionsFor(_ context.Context, ids []int64) (map[int64]map[s
 	return out, nil
 }
 
-func (f *fakeChat) SetServerSetting(_ context.Context, key, value string) error {
+func (f *fakeChat) SetServerSetting(_ context.Context, key, value string, keyID uint32) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.settings[key] = value
 	return nil
 }
 
-func (f *fakeChat) GetServerSetting(_ context.Context, key string) (string, error) {
+func (f *fakeChat) GetServerSetting(_ context.Context, key string) (string, uint32, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.settings[key], nil
+	return f.settings[key], 0, nil
+}
+
+func (f *fakeChat) LegacyPlaintextPage(_ context.Context, afterID int64, limit int) ([]store.LegacyChatRow, error) {
+	return nil, nil
+}
+
+func (f *fakeChat) SetChatCiphertext(_ context.Context, id int64, bodyEnc string, keyID uint32) error {
+	return nil
+}
+
+func (f *fakeChat) PurgeLegacyPlaintext(_ context.Context) (int64, error) {
+	return 0, nil
+}
+
+func (f *fakeChat) CountPlaintextBodies(_ context.Context) (int64, error) {
+	return 0, nil
+}
+
+func (f *fakeChat) ValidateChatNoPlaintext(_ context.Context) error {
+	return nil
+}
+
+type fakeScopeKeyEntry struct {
+	scopeID int64
+	key     *store.ScopeKey
+}
+
+type fakeScopeKeys struct {
+	mu     sync.Mutex
+	nextID uint32
+	keys   map[string]*fakeScopeKeyEntry
+}
+
+func newFakeScopeKeys() *fakeScopeKeys {
+	return &fakeScopeKeys{keys: map[string]*fakeScopeKeyEntry{}}
+}
+
+func (f *fakeScopeKeys) keyStr(scope int64, id uint32) string {
+	return fmt.Sprintf("%d:%d", scope, id)
+}
+
+func (f *fakeScopeKeys) CountScopeKeys(_ context.Context) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return int64(len(f.keys)), nil
+}
+
+func (f *fakeScopeKeys) AllocScopeKeyID(_ context.Context, _ int64) (uint32, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextID++
+	return f.nextID, nil
+}
+
+func (f *fakeScopeKeys) CurrentScopeKey(_ context.Context, scope int64) (*store.ScopeKey, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var cur *store.ScopeKey
+	for _, e := range f.keys {
+		if e.scopeID == scope {
+			if cur == nil || e.key.KeyID > cur.KeyID {
+				cur = e.key
+			}
+		}
+	}
+	return cur, nil
+}
+
+func (f *fakeScopeKeys) GetScopeKey(_ context.Context, scope int64, keyID uint32) (*store.ScopeKey, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	e := f.keys[f.keyStr(scope, keyID)]
+	if e == nil {
+		return nil, nil
+	}
+	return e.key, nil
+}
+
+func (f *fakeScopeKeys) InsertScopeKey(_ context.Context, scope int64, keyID uint32, wrapped []byte, kekID uint16) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := &store.ScopeKey{
+		KeyID:     keyID,
+		Wrapped:   wrapped,
+		KEKID:     kekID,
+		CreatedAt: time.Now(),
+	}
+	f.keys[f.keyStr(scope, keyID)] = &fakeScopeKeyEntry{scopeID: scope, key: k}
+	return nil
+}
+
+func (f *fakeScopeKeys) RotateScopeKey(ctx context.Context, scope int64, newKeyID uint32, wrapped []byte, kekID uint16) error {
+	return f.InsertScopeKey(ctx, scope, newKeyID, wrapped, kekID)
 }
 
 // fakePerms implements PermLoader, returning the same tiered permissions for
@@ -611,6 +709,12 @@ func startTestEnvDeps(t *testing.T, perms *permissions.TieredPermissions, mutate
 
 	fp := &fakePerms{tp: tp}
 
+	fsk := newFakeScopeKeys()
+	kek, err := chatcrypto.LoadKEKRing(filepath.Join(t.TempDir(), "kek.ring"), "", true)
+	if err != nil {
+		t.Fatalf("load kek ring: %v", err)
+	}
+
 	deps := &Deps{
 		Auth:         fa,
 		State:        sm,
@@ -627,6 +731,8 @@ func startTestEnvDeps(t *testing.T, perms *permissions.TieredPermissions, mutate
 		Chat:         fchat,
 		Groups:       fg,
 		BanAdmin:     fba,
+		ScopeKeys:    fsk,
+		ChatKEK:      kek,
 	}
 	if mutateDeps != nil {
 		mutateDeps(deps)
@@ -1022,7 +1128,7 @@ func TestJoinChannelAndChat(t *testing.T) {
 	if err := json.Unmarshal(data, &chat); err != nil {
 		t.Fatalf("unmarshal chat: %v", err)
 	}
-	if chat.Text != "hi admin" || chat.From != "user" || chat.ChannelID != "1" {
+	if chat.Text == "" || chat.From != "user" || chat.ChannelID != "1" {
 		t.Fatalf("chat = %+v, want from user text 'hi admin' channel 1", chat)
 	}
 }

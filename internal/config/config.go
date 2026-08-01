@@ -256,6 +256,14 @@ func Load() (*Config, error) {
 	if err := v.Unmarshal(cfg); err != nil {
 		return nil, fmt.Errorf("unmarshalling config: %w", err)
 	}
+
+	switch strings.ToLower(cfg.ChatLegacyHistory) {
+	case "encrypt", "purge":
+		cfg.ChatLegacyHistory = strings.ToLower(cfg.ChatLegacyHistory)
+	default:
+		return nil, fmt.Errorf("invalid chat_legacy_history %q: must be \"encrypt\" or \"purge\"", cfg.ChatLegacyHistory)
+	}
+
 	return cfg, nil
 }
 

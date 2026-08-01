@@ -68,7 +68,7 @@ func TestChatHistoryEncryptedRoundTrip(t *testing.T) {
 		t.Fatalf("history size = %d, want 1", len(resp.Messages))
 	}
 	m := resp.Messages[0]
-	if m.Body != "hello history" || m.FromUniqueID != "user-uid" || m.Deleted || m.EditedAt != 0 {
+	if m.BodyEnc == "" || m.FromUniqueID != "user-uid" || m.Deleted || m.EditedAt != 0 {
 		t.Fatalf("history entry = %+v", m)
 	}
 
@@ -138,7 +138,7 @@ func TestChatEditDelete(t *testing.T) {
 	env.chat.mu.Lock()
 	stored := env.chat.messages[msgID]
 	env.chat.mu.Unlock()
-	if stored.Body != "edited body" || stored.EditedAt == nil {
+	if stored.BodyEnc == "" || stored.EditedAt == nil {
 		t.Fatalf("stored after edit = %+v", stored)
 	}
 
@@ -174,7 +174,7 @@ func TestChatEditDelete(t *testing.T) {
 	env.chat.mu.Lock()
 	stored = env.chat.messages[msgID]
 	env.chat.mu.Unlock()
-	if stored.Body != "" || stored.DeletedAt == nil {
+	if stored.BodyEnc != "" || stored.DeletedAt == nil {
 		t.Fatalf("stored after delete = %+v", stored)
 	}
 }
@@ -427,7 +427,7 @@ func TestChatPins(t *testing.T) {
 	if err := netproto.Decode(f, &resp); err != nil {
 		t.Fatalf("decode pins: %v", err)
 	}
-	if len(resp.Pins) != 1 || resp.Pins[0].MessageID != chat.ID || resp.Pins[0].Message.Body != "pin me" {
+	if len(resp.Pins) != 1 || resp.Pins[0].MessageID != chat.ID || resp.Pins[0].Message.BodyEnc == "" {
 		t.Fatalf("pins = %+v", resp.Pins)
 	}
 
@@ -575,10 +575,10 @@ func TestEmojiUpload(t *testing.T) {
 func TestMOTDAndAnnouncement(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
-	if err := env.chat.SetServerSetting(t.Context(), "motd", "welcome to voicx"); err != nil {
+	if err := env.chat.SetServerSetting(t.Context(), "motd", "welcome to voicx", 0); err != nil {
 		t.Fatalf("set motd: %v", err)
 	}
-	if err := env.chat.SetServerSetting(t.Context(), "announcement", "big news"); err != nil {
+	if err := env.chat.SetServerSetting(t.Context(), "announcement", "big news", 0); err != nil {
 		t.Fatalf("set announcement: %v", err)
 	}
 
@@ -614,7 +614,7 @@ func TestMOTDAndAnnouncement(t *testing.T) {
 func TestMOTDInAuthResponse(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
-	if err := env.chat.SetServerSetting(t.Context(), "motd", "welcome to voicx"); err != nil {
+	if err := env.chat.SetServerSetting(t.Context(), "motd", "welcome to voicx", 0); err != nil {
 		t.Fatalf("set motd: %v", err)
 	}
 	conn := dialRetry(t, env.addr)

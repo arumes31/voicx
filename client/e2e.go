@@ -45,6 +45,8 @@ const (
 	// refusedPlainText marks a history body the server handed over in the
 	// clear. No server config may downgrade this client (91-135).
 	refusedPlainText = "[refused: server sent plaintext history]"
+	// decryptFailedText is PERMANENT: key is available but payload decryption failed.
+	decryptFailedText = "[encrypted message — decryption failed]"
 )
 
 // maxKeyRequest caps one MsgChatKeyRequest; the server caps the answer at the
@@ -89,13 +91,19 @@ func (c *pubKeyCache) put(uid string, key [32]byte) {
 	c.keys[uid] = key
 }
 
+type scopeKeyPullKey struct {
+	scope int64
+	keyID uint32
+}
+
 // scopeKeyStore keeps the chat key generations per scope (channelID, 0 =
 // global) plus the generations the server permanently refused.
 type scopeKeyStore struct {
-	mu      sync.Mutex
-	keys    map[int64]map[uint32][32]byte
-	latest  map[int64]uint32
-	refused map[int64]map[uint32]bool
+	mu       sync.Mutex
+	keys     map[int64]map[uint32][32]byte
+	latest   map[int64]uint32
+	refused  map[int64]map[uint32]bool
+	inFlight map[scopeKeyPullKey]bool
 	// updated is closed and replaced whenever a generation lands, so a waiter
 	// blocked on a missing generation wakes without polling.
 	updated chan struct{}
@@ -103,10 +111,11 @@ type scopeKeyStore struct {
 
 func newScopeKeyStore() *scopeKeyStore {
 	return &scopeKeyStore{
-		keys:    map[int64]map[uint32][32]byte{},
-		latest:  map[int64]uint32{},
-		refused: map[int64]map[uint32]bool{},
-		updated: make(chan struct{}),
+		keys:     map[int64]map[uint32][32]byte{},
+		latest:   map[int64]uint32{},
+		refused:  map[int64]map[uint32]bool{},
+		inFlight: map[scopeKeyPullKey]bool{},
+		updated:  make(chan struct{}),
 	}
 }
 
@@ -204,6 +213,28 @@ func (s *scopeKeyStore) waitCh() <-chan struct{} {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.updated
+}
+
+// claimPull attempts to claim in-flight pull ownership for (scope, keyID).
+// It returns true if claimed, or false if a pull is already in flight.
+func (s *scopeKeyStore) claimPull(scope int64, keyID uint32) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pk := scopeKeyPullKey{scope: scope, keyID: keyID}
+	if s.inFlight[pk] {
+		return false
+	}
+	s.inFlight[pk] = true
+	return true
+}
+
+// releasePull releases in-flight pull ownership for (scope, keyID) and wakes waiters.
+func (s *scopeKeyStore) releasePull(scope int64, keyID uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pk := scopeKeyPullKey{scope: scope, keyID: keyID}
+	delete(s.inFlight, pk)
+	s.wake()
 }
 
 // --- seal / open -------------------------------------------------------------
@@ -579,7 +610,7 @@ func (m *connManager) resolveScopeText(scope int64, keyID uint32, blob string) (
 	}
 	plain, err := openScope(blob, key)
 	if err != nil {
-		return missingKeyText, true
+		return decryptFailedText, true
 	}
 	return plain, true
 }
@@ -588,6 +619,24 @@ func (m *connManager) resolveScopeText(scope int64, keyID uint32, blob string) (
 // lands. It MUST run off the read loop: the bundle arrives on that loop, and
 // connManager.request holds a process-global mutex while waiting on it.
 func (m *connManager) awaitScopeText(scope int64, keyID uint32, blob string) string {
+	if !m.scopeKeys.claimPull(scope, keyID) {
+		deadline := time.Now().Add(scopeKeyWait)
+		for {
+			ch := m.scopeKeys.waitCh()
+			if text, ok := m.resolveScopeText(scope, keyID, blob); ok {
+				return text
+			}
+			if time.Now().After(deadline) {
+				return missingKeyText
+			}
+			select {
+			case <-ch:
+			case <-time.After(scopeKeyRetry):
+			}
+		}
+	}
+	defer m.scopeKeys.releasePull(scope, keyID)
+
 	deadline := time.Now().Add(scopeKeyWait)
 	for {
 		if text, ok := m.resolveScopeText(scope, keyID, blob); ok {

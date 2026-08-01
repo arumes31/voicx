@@ -53,9 +53,10 @@ ALTER TABLE files
 -- 5. Pre-4b plaintext spool rows --------------------------------------------
 -- deliverSpooled treats from_unique_id='' rows as plaintext and replays them
 -- as chat. They predate E2EE and cannot be re-sealed (no recipient key at
--- rest). Undelivered ones are dropped.
+-- rest). Undelivered ones are dropped; delivered legacy message bodies are cleared.
 -- Safe because the ledger runs this file exactly once.
 DELETE FROM offline_messages WHERE from_unique_id = '' AND delivered_at IS NULL;
+UPDATE offline_messages SET message = '' WHERE from_unique_id = '';
 
 -- Tombstoned messages carry no body to seal; normalise them once so the
 -- backfill only ever has to consider live rows.
@@ -65,7 +66,7 @@ UPDATE chat_messages SET body = '', body_enc = '', key_id = 0 WHERE deleted_at I
 -- NOT VALID: existing rows still hold plaintext until the Go backfill runs.
 -- New/updated rows are checked immediately, which is the point: from this
 -- moment no code path can write a plaintext body, present or future.
--- The backfill VALIDATEs both constraints when it finishes.
+-- The backfill VALIDATEs constraints when it finishes.
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chat_messages_no_plaintext') THEN
@@ -80,6 +81,6 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'offline_messages_sealed') THEN
         ALTER TABLE offline_messages
             ADD CONSTRAINT offline_messages_sealed
-            CHECK (from_unique_id <> '' OR message = '');
+            CHECK (from_unique_id <> '' OR message = '') NOT VALID;
     END IF;
 END $$;

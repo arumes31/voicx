@@ -91,7 +91,7 @@ func (s *TCPServer) handleKeyRequest(_ context.Context, client *Client, f *netpr
 // established that the client belongs to the scope, so a first generation may
 // be created here.
 func (s *TCPServer) deliverScopeKey(ctx context.Context, client *Client, scope int64) {
-	if s.deps == nil || s.deps.State == nil || s.chatKeys == nil {
+	if s.deps == nil || s.deps.State == nil || s.chatKeys == nil || !s.chatKeys.configured() {
 		return
 	}
 	sc, ok := s.deps.State.GetClient(client.ID)
@@ -148,7 +148,7 @@ func (s *TCPServer) scopeReadable(client *Client, scope int64) bool {
 // a client flapping on a bad link would otherwise mint one persisted
 // generation per reconnect.
 func (s *TCPServer) rotateScopeKey(ctx context.Context, channelID int64) {
-	if channelID == 0 || s.deps == nil || s.deps.State == nil || s.chatKeys == nil {
+	if channelID == 0 || s.deps == nil || s.deps.State == nil || s.chatKeys == nil || !s.chatKeys.configured() {
 		return
 	}
 	window := time.Duration(0)
@@ -193,4 +193,41 @@ func (s *TCPServer) doRotateScopeKey(ctx context.Context, channelID int64) {
 		}
 	}
 	s.logger.Debug("chat key rotated", zap.Int64("channel_id", channelID))
+}
+
+// handleChatKeyRequest responds to a client's request for missing scope chat key generations.
+func (s *TCPServer) handleChatKeyRequest(ctx context.Context, client *Client, f *netproto.Frame) error {
+	var msg netproto.ChatKeyRequest
+	if err := netproto.Decode(f, &msg); err != nil {
+		return s.sendError(client, errCodeMalformed, "malformed chat_key_request: "+err.Error())
+	}
+	if len(msg.KeyIDs) == 0 || len(msg.KeyIDs) > 64 {
+		return s.sendError(client, errCodeMalformed, "key_ids count must be 1..64")
+	}
+	if s.deps == nil || s.deps.State == nil || s.chatKeys == nil {
+		return s.sendError(client, errCodeUnavailable, "chat key manager unavailable")
+	}
+	sc, ok := s.deps.State.GetClient(client.ID)
+	if !ok || sc.E2EPublicKey == "" {
+		return s.sendError(client, errCodePermissionDenied, "e2e public key not published")
+	}
+	if !s.scopeReadable(client, msg.ChannelID) {
+		return s.writeMessage(client, netproto.MsgChatKeyBundle, netproto.ChatKeyBundle{
+			ChannelID: msg.ChannelID,
+			Refused:   msg.KeyIDs,
+		})
+	}
+	bundle := netproto.ChatKeyBundle{
+		ChannelID: msg.ChannelID,
+		Keys:      []netproto.ChannelKey{},
+	}
+	for _, id := range msg.KeyIDs {
+		ck, err := s.chatKeys.sealFor(ctx, msg.ChannelID, id, sc.E2EPublicKey)
+		if err != nil {
+			bundle.Refused = append(bundle.Refused, id)
+		} else {
+			bundle.Keys = append(bundle.Keys, *ck)
+		}
+	}
+	return s.writeMessage(client, netproto.MsgChatKeyBundle, bundle)
 }

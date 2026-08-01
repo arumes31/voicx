@@ -144,11 +144,23 @@ func createRing(path string) (*KEKRing, error) {
 		return nil, fmt.Errorf("creating chat master key %s: %w", path, err)
 	}
 	if _, err := f.WriteString(line); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, fmt.Errorf("writing chat master key %s: %w", path, err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("syncing chat master key %s: %w", path, err)
 	}
 	if err := f.Close(); err != nil {
 		return nil, fmt.Errorf("writing chat master key %s: %w", path, err)
+	}
+	dirPath := filepath.Dir(path)
+	if dirPath == "" {
+		dirPath = "."
+	}
+	if d, err := os.Open(dirPath); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
 	}
 	return &KEKRing{keys: map[uint16][32]byte{1: key}, newest: 1}, nil
 }

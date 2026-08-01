@@ -538,16 +538,21 @@ func (s *TCPServer) handlePermSet(ctx context.Context, client *Client, f *netpro
 	if err != nil {
 		return s.sendError(client, errCodeMalformed, err.Error())
 	}
+	s.permWriteMu.Lock()
 	current, err := s.currentPerms(ctx, pc, tier, target)
 	if err != nil {
+		s.permWriteMu.Unlock()
 		return s.sendError(client, errCodeUnavailable, "perm lookup failed")
 	}
 	if !s.grantCapOkWrite(pc, current, msg.Key, msg.Value, msg.Grant) {
+		s.permWriteMu.Unlock()
 		return s.sendError(client, errCodePermissionDenied, "grant cap exceeded: you may only set values <= your own grant for this key")
 	}
 	if err := s.deps.Groups.SetPermission(ctx, tier, target, msg.Key, msg.Value, msg.Grant, msg.Skip, msg.Negate); err != nil {
+		s.permWriteMu.Unlock()
 		return s.sendError(client, errCodeUnavailable, "perm set failed: "+err.Error())
 	}
+	s.permWriteMu.Unlock()
 	s.audit(ctx, client.UniqueID, "perm_set", fmt.Sprintf("%s/%s", msg.Tier, msg.Key),
 		fmt.Sprintf("value=%d grant=%d skip=%t negate=%t target=%+v", msg.Value, msg.Grant, msg.Skip, msg.Negate, target))
 	if s.deps.Perms != nil {
@@ -613,16 +618,21 @@ func (s *TCPServer) handlePermUnset(ctx context.Context, client *Client, f *netp
 	// Removing an entry is a write like setting it, and the cap has to be
 	// measured against the entry being deleted: otherwise a low-power operator
 	// could delete entries far above their own level.
+	s.permWriteMu.Lock()
 	current, err := s.currentPerms(ctx, pc, tier, target)
 	if err != nil {
+		s.permWriteMu.Unlock()
 		return s.sendError(client, errCodeUnavailable, "perm lookup failed")
 	}
 	if !s.grantCapOkWrite(pc, current, msg.Key, 0, 0) {
+		s.permWriteMu.Unlock()
 		return s.sendError(client, errCodePermissionDenied, "grant cap exceeded: you may only unset entries within your own grant for this key")
 	}
 	if err := s.deps.Groups.UnsetPermission(ctx, tier, target, msg.Key); err != nil {
+		s.permWriteMu.Unlock()
 		return s.sendError(client, errCodeUnavailable, "perm unset failed: "+err.Error())
 	}
+	s.permWriteMu.Unlock()
 	s.audit(ctx, client.UniqueID, "perm_unset", fmt.Sprintf("%s/%s", msg.Tier, msg.Key), fmt.Sprintf("target=%+v", target))
 	if s.deps.Perms != nil {
 		s.deps.Perms.InvalidateAll()
