@@ -35,6 +35,13 @@ type App struct {
 
 	hkMu    sync.Mutex
 	hotkeys map[string]*hotkeyReg
+
+	// readMu guards settings.LastReadChannels: server pushes from the read
+	// loop race the frontend's own mark-read calls (121).
+	readMu sync.Mutex
+	// dmMu serialises the local DM logs — every append rewrites a whole
+	// file, so two concurrent DMs with one peer would otherwise lose one (122).
+	dmMu sync.Mutex
 }
 
 // NewApp creates a new App.
@@ -194,7 +201,7 @@ func (a *App) SetPrioritySpeaker(active bool) string {
 // ChannelEdit edits a channel's settings (gated server-side by
 // b_channel_modify). The dialog always sends the full form, so every field
 // is set explicitly. It returns "" on success or the failure reason.
-func (a *App) ChannelEdit(channelID int64, topic string, maxClients int, opusBitrate int, opusFEC bool, opusDTX bool, opusStereo bool, description string) string {
+func (a *App) ChannelEdit(channelID int64, topic string, maxClients int, opusBitrate int, opusFEC bool, opusDTX bool, opusStereo bool, description string, slowModeSeconds int) string {
 	if err := a.cmLoad().write(netproto.MsgChannelEdit, netproto.ChannelEdit{
 		ChannelID:   channelID,
 		Topic:       &topic,
@@ -204,6 +211,9 @@ func (a *App) ChannelEdit(channelID int64, topic string, maxClients int, opusBit
 		OpusDTX:     &opusDTX,
 		OpusStereo:  &opusStereo,
 		Description: &description,
+		// (114) the dialog always sends the full form, so 0 means "off"
+		// rather than "unchanged".
+		SlowModeSeconds: &slowModeSeconds,
 	}); err != nil {
 		return err.Error()
 	}

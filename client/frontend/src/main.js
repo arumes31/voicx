@@ -37,7 +37,7 @@ window.__voicxChat = chatUI;
 const $ = (id) => document.getElementById(id);
 
 const state = {
-    channels: [],   // flat: {ChannelID, ParentID, Name, HasIcon, Topic, MaxClients, OpusBitrate, OpusFEC, OpusDTX, OpusStereo}
+    channels: [],   // flat: {ChannelID, ParentID, Name, HasIcon, Topic, MaxClients, OpusBitrate, OpusFEC, OpusDTX, OpusStereo, SlowModeSeconds}
     clients: [],    // flat: {client_id, unique_id, nickname, channel_id, is_speaking, priority_speaker}
     myClientID: "",
     myUniqueID: "",
@@ -527,6 +527,10 @@ function flattenChannel(node) {
         OpusFEC: !!node.OpusFEC,
         OpusDTX: !!node.OpusDTX,
         OpusStereo: !!node.OpusStereo,
+        // (114) the snapshot marshals Go field names, so slow mode arrives as
+        // SlowModeSeconds. Dropping it here is why the client could never show
+        // or edit the rate limit it is subject to.
+        SlowModeSeconds: node.SlowModeSeconds || 0,
     });
     for (const c of node.clients || []) state.clients.push(c);
     for (const child of node.children || []) flattenChannel(child);
@@ -618,6 +622,7 @@ window.runtime.EventsOn("event", (json) => {
                 ch.OpusFEC = !!d.opus_fec;
                 ch.OpusDTX = !!d.opus_dtx;
                 ch.OpusStereo = !!d.opus_stereo;
+                ch.SlowModeSeconds = d.slow_mode_seconds || 0; // (114)
                 if (d.channel_id === state.myChannelID) applyChannelAudio();
             }
             break;
@@ -685,6 +690,12 @@ window.runtime.EventsOn("event", (json) => {
             return;
         case "chat_reaction":
             chatUI.onChatReaction(d);
+            return;
+        // (120) typing relay. Returns early like the other chat events: an
+        // indicator changes nothing in the tree and must not trigger a redraw
+        // of it on every keystroke of every user.
+        case "typing":
+            chatUI.onTyping(d);
             return;
         case "dm_delivered":
             chatUI.onDelivered(d);

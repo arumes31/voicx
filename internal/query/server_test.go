@@ -1018,11 +1018,20 @@ func TestServerstopConfirm(t *testing.T) {
 	if got := lastErr(t, lines); got != "error id=0 msg=ok" {
 		t.Fatalf("serverrestart = %q", got)
 	}
-	backend.mu.Lock()
-	called = backend.shutdownCalled
-	backend.mu.Unlock()
-	if !called {
-		t.Fatal("shutdown not called with confirm=1")
+	// The handler acknowledges BEFORE shutting down, so the reply does not
+	// prove Shutdown ran yet — reading the flag straight away is a race.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		backend.mu.Lock()
+		called = backend.shutdownCalled
+		backend.mu.Unlock()
+		if called {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("shutdown not called with confirm=1")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

@@ -366,6 +366,9 @@ func (a *App) emitSettingsUpdate() {
 func mergeGoOwned(cur, incoming Settings) Settings {
 	incoming.Recents = cur.Recents
 	incoming.LastSeenVersion = cur.LastSeenVersion
+	// LastReadChannels is deliberately NOT listed: the frontend still owns it
+	// (121 has no server half yet). It has to move here the moment the Go side
+	// starts writing pointers, or one save discards them.
 	return incoming
 }
 

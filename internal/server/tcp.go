@@ -254,10 +254,11 @@ type TCPServer struct {
 	rotPending map[int64]bool
 
 	// Chat infrastructure (wave 5a): rate limiter, spam tracker, slow-mode
-	// tracker.
-	chatRate *chatRateLimiter
-	chatSpam *spamTracker
-	chatSlow *slowTracker
+	// tracker, and the memoised runtime moderation lists (117/118).
+	chatRate    *chatRateLimiter
+	chatSpam    *spamTracker
+	chatSlow    *slowTracker
+	chatFilters *chatFilterCache
 
 	permWriteMu sync.Mutex
 
@@ -293,6 +294,8 @@ func New(cfg *config.Config, logger *zap.Logger, deps *Deps) *TCPServer {
 		chatRate:   newChatRateLimiter(cfg.ChatRateMsgs, time.Duration(cfg.ChatRateWindowSeconds)*time.Second),
 		chatSpam:   newSpamTracker(),
 		chatSlow:   newSlowTracker(),
+
+		chatFilters: &chatFilterCache{},
 	}
 	// Install the voice pipeline callbacks (talk/video permission gates,
 	// speaking-state announcements, and renegotiation offer delivery).
@@ -574,6 +577,10 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 		return s.handleChatKeyRequest(ctx, client, f)
 	case netproto.MsgChatReact:
 		return s.handleChatReact(ctx, client, f)
+	case netproto.MsgChatFilterGet:
+		return s.handleChatFilterGet(ctx, client, f)
+	case netproto.MsgChatFilterSet:
+		return s.handleChatFilterSet(ctx, client, f)
 	case netproto.MsgTyping:
 		return s.handleTyping(ctx, client, f)
 	case netproto.MsgChatDelivered:

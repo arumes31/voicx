@@ -15,7 +15,7 @@ export function BanRemove(arg1:number):Promise<string>;
 
 export function CancelTransfer(arg1:string):Promise<void>;
 
-export function ChannelEdit(arg1:number,arg2:string,arg3:number,arg4:number,arg5:boolean,arg6:boolean,arg7:boolean,arg8:string):Promise<string>;
+export function ChannelEdit(arg1:number,arg2:string,arg3:number,arg4:number,arg5:boolean,arg6:boolean,arg7:boolean,arg8:string,arg9:number):Promise<string>;
 
 export function ChannelIconSet(arg1:number,arg2:string,arg3:number):Promise<string>;
 
@@ -23,13 +23,21 @@ export function ChatDeleteMessage(arg1:number):Promise<string>;
 
 export function ChatEditMessage(arg1:number,arg2:number,arg3:string):Promise<string>;
 
+export function ChatFilterGet():Promise<{word_filter:string,link_blacklist:string,link_whitelist:string,from_config?:boolean}>;
+
+export function ChatFilterSet(arg1:string,arg2:string,arg3:string):Promise<{word_filter:string,link_blacklist:string,link_whitelist:string,from_config?:boolean}>;
+
 export function ChatHistory(arg1:number,arg2:number,arg3:number):Promise<netproto.ChatHistoryResponse>;
+
+export function ChatExportHistory(arg1:number,arg2:number):Promise<main.ChatExportResult>;
 
 export function ChatPinMessage(arg1:number,arg2:number,arg3:boolean):Promise<string>;
 
 export function ChatPins(arg1:number):Promise<netproto.ChatPinsResponse>;
 
 export function ChatReact(arg1:number,arg2:string):Promise<string>;
+
+export function ChatSearch(arg1:number,arg2:string,arg3:number):Promise<main.ChatSearchResult>;
 
 export function CheckForUpdate():Promise<main.UpdateInfo>;
 
@@ -65,11 +73,25 @@ export function Disconnect():Promise<void>;
 
 export function DownloadAndApply(arg1:main.UpdateInfo):Promise<string>;
 
+export function DMExportHistory(arg1:string):Promise<main.ChatExportResult>;
+
+export function DMHistoryAppend(arg1:string,arg2:string,arg3:main.DMEntry):Promise<string>;
+
+export function DMHistoryClear(arg1:string):Promise<string>;
+
+export function DMHistoryLoad(arg1:string):Promise<Array<main.DMEntry>>;
+
+export function DMHistoryPeers():Promise<Array<main.DMPeer>>;
+
+export function DMSearch(arg1:string,arg2:string,arg3:number):Promise<main.ChatSearchResult>;
+
 export function DownloadFile(arg1:number,arg2:string):Promise<string>;
 
 export function DownloadFileProgress(arg1:string,arg2:number,arg3:string,arg4:string,arg5:string):Promise<string>;
 
 export function EmojiGet(arg1:string):Promise<netproto.EmojiData>;
+
+export function EmojiUpload(arg1:string,arg2:string):Promise<string>;
 
 export function EmojiList():Promise<netproto.EmojiListResponse>;
 
@@ -141,6 +163,8 @@ export function LogChat(arg1:string):Promise<void>;
 
 export function MOTD():Promise<string>;
 
+export function MarkChannelRead(arg1:number,arg2:number):Promise<string>;
+
 export function MoveClient(arg1:string,arg2:number):Promise<string>;
 
 export function Notify(arg1:string,arg2:string):Promise<string>;
@@ -164,6 +188,8 @@ export function PickSavePath(arg1:string):Promise<string>;
 export function Poke(arg1:string,arg2:string):Promise<string>;
 
 export function RecordRecent(arg1:string,arg2:string):Promise<void>;
+
+export function ReadStateSnapshot():Promise<{[key: string]: number}>;
 
 export function RegenerateIdentity():Promise<string>;
 

@@ -421,6 +421,10 @@ export function initMenu() {
             if (!V().state.myClientID) return V().toast("not connected", "warn");
             window.__voicxPerms.openBanList();
         }),
+        menuAction("Chat filters…", () => {
+            if (!V().state.myClientID) return V().toast("not connected", "warn");
+            window.__voicxPerms.openChatFilters();
+        }),
         divider(),
         menuAction(t("menu.debugConsole"), () => {
             if (!V().state.myClientID) return V().toast("not connected", "warn");

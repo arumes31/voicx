@@ -107,6 +107,10 @@ const (
 	PermissionKeyChatMentionAll     PermissionKey = "b_chat_mention_all"
 	PermissionKeyChatSlowmodeBypass PermissionKey = "b_chat_slowmode_bypass"
 	PermissionKeyEmojiManage        PermissionKey = "b_emoji_manage"
+	// PermissionKeyChatFilterManage gates reading AND writing the runtime
+	// word/link moderation lists (117/118): the word list tells an evader
+	// exactly what to avoid, so the read is as sensitive as the write.
+	PermissionKeyChatFilterManage PermissionKey = "b_chat_filter_manage"
 
 	// --- Group & permission management (wave 6a) ---
 	PermissionKeyServerGroupManage  PermissionKey = "b_server_group_manage"

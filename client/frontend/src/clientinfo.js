@@ -754,6 +754,8 @@ function openChannelEdit(channel) {
             <textarea class="dlg-input ce-desc" rows="2"></textarea>
             <label class="dlg-label">Max clients (0 = unlimited)</label>
             <input type="number" class="dlg-input ce-maxclients" min="0" />
+            <label class="dlg-label">Slow mode seconds (0 = off)</label>
+            <input type="number" class="dlg-input ce-slowmode" min="0" title="minimum seconds between messages; holders of b_chat_slowmode_bypass are exempt" />
             <label class="dlg-label">Quality preset</label>
             <select class="dlg-input ce-preset">
                 <option value="voice">${QUALITY_PRESETS.voice.label}</option>
@@ -786,6 +788,7 @@ function openChannelEdit(channel) {
     q(".ce-topic").value = channel.Topic || "";
     q(".ce-desc").value = channel.Description || "";
     q(".ce-maxclients").value = channel.MaxClients || 0;
+    q(".ce-slowmode").value = channel.SlowModeSeconds || 0;
     // OpusBitrate 0 means the server default (32000); show the effective value.
     q(".ce-bitrate").value = channel.OpusBitrate || 32000;
     q(".ce-fec").checked = !!channel.OpusFEC;
@@ -843,7 +846,8 @@ function openChannelEdit(channel) {
             q(".ce-fec").checked,
             q(".ce-dtx").checked,
             q(".ce-stereo").checked,
-            q(".ce-desc").value);
+            q(".ce-desc").value,
+            parseInt(q(".ce-slowmode").value, 10) || 0);
         overlay.remove();
         if (err) V().sysMsg("channel edit failed: " + err);
         // On success the server broadcasts channel_updated, which refreshes

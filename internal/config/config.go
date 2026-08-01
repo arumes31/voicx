@@ -84,10 +84,18 @@ type Config struct {
 
 	// Chat moderation/limits (wave 5a). MaxLength is in plaintext characters
 	// post-decrypt. RateMsgs/RateWindowSeconds is a per-user token bucket.
-	// WordFilter/LinkBlacklist/LinkWhitelist are comma-separated,
-	// case-insensitive substrings; a non-empty whitelist means ONLY those
-	// domains may be linked. Filters apply to channel/global scopes only
-	// (DMs are E2EE and exempt).
+	//
+	// WordFilter/LinkBlacklist/LinkWhitelist are comma-separated and
+	// case-insensitive. WordFilter entries are SUBSTRINGS of the message; the
+	// link lists are HOSTS compared against the hostname of each http(s) URL
+	// in the message (exact or subdomain), and a non-empty whitelist means
+	// ONLY those hosts may be linked. Filters apply to channel/global scopes
+	// only (DMs are E2EE and exempt).
+	//
+	// These three are BOOT DEFAULTS only (117/118): they apply until an
+	// operator stores a runtime override through MsgChatFilterSet, after which
+	// the persisted chat_filters server setting wins and editing config.yaml
+	// has no effect. Restarting does not restore them.
 	ChatMaxLength         int    `mapstructure:"chat_max_length"`
 	ChatRateMsgs          int    `mapstructure:"chat_rate_msgs"`
 	ChatRateWindowSeconds int    `mapstructure:"chat_rate_window_seconds"`

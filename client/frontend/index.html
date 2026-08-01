@@ -82,16 +82,17 @@
             <div id="chat-head">
                 <span id="chat-head-title">Chat</span>
                 <span id="chat-topic" class="hidden" title=""></span>
+                <span id="chat-slowmode" class="hidden" title=""></span>
                 <span id="chat-head-actions">
                     <button id="chat-search-btn" class="icon-btn" title="Search chat (Ctrl+F)">🔍</button>
                     <button id="chat-pins-btn" class="icon-btn" title="Pinned messages">📌</button>
                     <button id="chat-info-btn" class="icon-btn hidden" title="Channel description">ⓘ</button>
-                    <button id="chat-export-btn" class="icon-btn" title="Export chat transcript">⬇</button>
+                    <button id="chat-export-btn" class="icon-btn" title="Export the full stored history (not just what is loaded)">⬇</button>
                 </span>
             </div>
             <div id="chat-search-row" class="hidden">
                 <input id="chat-search" placeholder="filter loaded messages… (Esc closes)" />
-                <button id="chat-search-server">search server history</button>
+                <button id="chat-search-server" title="Decrypt and scan the whole scope history in this client">search all history</button>
                 <button id="chat-search-close" class="icon-btn" title="Close search">✕</button>
             </div>
             <div id="pm-tabs" class="hidden"></div>
@@ -99,6 +100,7 @@
                 <div id="chat-log"></div>
                 <button id="chat-newpill" class="hidden"></button>
             </div>
+            <div id="chat-typing" class="hidden"></div>
             <div id="reply-bar" class="hidden"></div>
             <div id="file-preview-row" class="hidden"></div>
             <div id="chat-input-row">
@@ -109,6 +111,8 @@
                 </select>
                 <input id="chat-target" class="hidden" placeholder="target unique id" />
                 <input id="chat-text" placeholder="message…" />
+                <input id="chat-file" type="file" multiple class="hidden" />
+                <button id="chat-attach" class="icon-btn" title="Attach files (or paste / drop them here)">📎</button>
                 <button id="chat-emoji" class="icon-btn" title="Emoji picker">😊</button>
                 <button id="chat-send">SEND</button>
             </div>

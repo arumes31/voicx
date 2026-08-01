@@ -18,6 +18,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -301,6 +302,24 @@ func sealFile(data []byte, key [32]byte) ([]byte, error) {
 		return nil, err
 	}
 	return secretbox.Seal(nonce[:], data, &nonce, &key), nil
+}
+
+// dmHistoryKeyLabel domain-separates the local DM log key from every other use
+// of the identity's X25519 secret, so no future reuse of that secret can ever
+// produce the same key by accident.
+const dmHistoryKeyLabel = "voicx/dm-history/v1"
+
+// dmHistoryKey derives the at-rest key for the local DM log (122) from the
+// identity's X25519 PRIVATE key. Binding the log to that secret means it is
+// readable by exactly the identity that opened those messages in the first
+// place: a copied log file is worth nothing without identity.json, and a
+// different identity can never read it.
+func dmHistoryKey(id *identity) ([32]byte, error) {
+	_, priv, err := id.x25519()
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return sha256.Sum256(append([]byte(dmHistoryKeyLabel+"|key|"), priv[:]...)), nil
 }
 
 // openFile decrypts an attachment blob produced by sealFile.

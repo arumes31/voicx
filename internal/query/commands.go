@@ -4,6 +4,8 @@ package query
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -447,14 +449,49 @@ func parseBoolArg(v string) (bool, error) {
 	}
 }
 
-// cmdServerset stores a server setting (wave 5a: motd, announcement):
-// serverset key=<motd|announcement> value=<text>
-// Setting "announcement" also broadcasts it to all online clients.
+// chatFiltersDoc mirrors the moderation document the chat server stores under
+// "chat_filters" (117/118). It exists here only to reject a malformed value:
+// the server falls back to the config.yaml lists when the stored document does
+// not parse, so a typo would silently stop applying the operator's filters.
+type chatFiltersDoc struct {
+	WordFilter    string `json:"word_filter"`
+	LinkBlacklist string `json:"link_blacklist"`
+	LinkWhitelist string `json:"link_whitelist"`
+}
+
+// chatFiltersUsage is the error text for a bad chat_filters document.
+const chatFiltersUsage = `chat_filters value must be a JSON document with the three comma-separated lists, e.g. {"word_filter":"badword","link_blacklist":"evil.tld","link_whitelist":""}`
+
+// validateChatFilters parses value as a chat_filters document. Unknown fields
+// are rejected: a misspelled key would otherwise decode into an empty document
+// and clear all three lists.
+func validateChatFilters(value string) error {
+	dec := json.NewDecoder(strings.NewReader(value))
+	dec.DisallowUnknownFields()
+	var doc chatFiltersDoc
+	if err := dec.Decode(&doc); err != nil {
+		return errors.New(chatFiltersUsage)
+	}
+	return nil
+}
+
+// cmdServerset stores a server setting (wave 5a: motd, announcement; 117/118:
+// chat_filters):
+// serverset key=<motd|announcement|chat_filters> value=<text>
+// Setting "announcement" also broadcasts it to all online clients; setting
+// chat_filters drops the server's memoised lists, so it takes effect on the
+// next message rather than at the next restart.
 func (s *Server) cmdServerset(ctx context.Context, sess *session, cmd command) bool {
 	key := cmd.args["key"]
 	value := cmd.args["value"]
-	if key != "motd" && key != "announcement" {
-		return s.write(sess, errorLine(errInvalidParameter, "usage: serverset key=<motd|announcement> value=<text>"))
+	switch key {
+	case "motd", "announcement":
+	case "chat_filters":
+		if err := validateChatFilters(value); err != nil {
+			return s.write(sess, errorLine(errInvalidParameter, err.Error()))
+		}
+	default:
+		return s.write(sess, errorLine(errInvalidParameter, "usage: serverset key=<motd|announcement|chat_filters> value=<text>"))
 	}
 	if err := s.backend.ServerSet(ctx, key, value); err != nil {
 		return s.write(sess, errorLine(errServerError, err.Error()))
@@ -613,7 +650,7 @@ channelcreate channel_name=<name> [channel_topic=<t>] [channel_flag_permanent=1|
 channeldelete cid=<id> [force=1]
 channelinfo cid=<id>
 channeledit cid=<id> [channel_topic=<t>] [channel_maxclients=<n>] [opus_bitrate=<bps>] [opus_fec=0|1] [opus_dtx=0|1] [opus_stereo=0|1] [slow_mode_seconds=<n>]
-serverset key=<motd|announcement> value=<text>
+serverset key=<motd|announcement|chat_filters> value=<text>
 banclient clid=<id> [time=<seconds>] [banreason=<text>]
 complaintlist
 complaintdel id=<id>

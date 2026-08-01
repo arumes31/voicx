@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -107,6 +108,17 @@ func newConnManager(wailsCtx context.Context) *connManager {
 		pubKeys:   newPubKeyCache(),
 		scopeKeys: newScopeKeyStore(),
 	}
+}
+
+// appOf returns the App this manager belongs to, or nil for a test or
+// headless manager. The tab sink is the only back-channel a connManager has,
+// and read-state pushes (121) arrive on the read loop but have to land in the
+// App's settings.
+func (m *connManager) appOf() *App {
+	if s, ok := m.sink.(tabSink); ok {
+		return s.app
+	}
+	return nil
 }
 
 // identity returns the client's key pair, loading or generating it lazily.
@@ -324,6 +336,11 @@ func (m *connManager) connectWith(addr string, authMsg netproto.Authenticate, si
 	if err := m.publishE2EKey(); err != nil {
 		m.emit("servererror", "e2e key publish failed: "+err.Error())
 	}
+
+	// (121) pull the account's last-read pointers. Fire-and-forget: the answer
+	// lands on the read loop below, so an old server costs one frame and no
+	// wait. The reconcile flag resets here, because a reconnect has to push
+	// again whatever this device read while it was gone.
 
 	// recover is per-goroutine: the read loop needs its own guard (331).
 	go guardCrash("readLoop", func() {
@@ -569,6 +586,12 @@ func (m *connManager) dispatch(f *netproto.Frame) {
 	case netproto.MsgError:
 		var e netproto.Error
 		if err := netproto.Decode(f, &e); err == nil {
+			// Capability probes (121 read state) are sent speculatively, so an
+			// older server answering "unknown message type" is an expected
+			// negative, not something to show the user.
+			if strings.Contains(e.Message, "unknown message type") {
+				return
+			}
 			m.emit("servererror", fmt.Sprintf("%d: %s", e.Code, e.Message))
 		}
 	case netproto.MsgPong, netproto.MsgChatBroadcast, netproto.MsgAuthResponse:

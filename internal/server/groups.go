@@ -652,11 +652,15 @@ var permTemplates = map[string]map[string]int{
 		"b_chat_delete_any":         1,
 		"b_channel_modify":          1,
 		"b_client_priority_speaker": 1,
+		// moderating chat means owning the word/link lists too, or 117/118
+		// stay admin-only in practice.
+		"b_chat_filter_manage": 1,
 	},
 	"admin": {
 		"b_chat_delete_any":         1,
 		"b_channel_modify":          1,
 		"b_client_priority_speaker": 1,
+		"b_chat_filter_manage":      1,
 		"b_emoji_manage":            1,
 		"b_permission_manage":       1,
 		"b_server_group_manage":     1,

@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -97,7 +99,10 @@ func openChatEntry(m *connManager, scope int64, e *netproto.ChatHistoryEntry, re
 	default:
 		plain, err := openScope(e.BodyEnc, key)
 		if err != nil {
-			e.Body = missingKeyText
+			// The key IS held and it still did not open: tampered or corrupt,
+			// which no retry fixes. Saying "key unavailable" here would park a
+			// permanent failure behind a pull that can never succeed (103).
+			e.Body = decryptFailedText
 			return
 		}
 		e.Body, e.EncVerified = plain, true
@@ -165,6 +170,48 @@ func (a *App) ChatPins(channelID int64) (netproto.ChatPinsResponse, error) {
 }
 
 // ---------------------------------------------------------------------------
+// Chat moderation lists (117/118)
+// ---------------------------------------------------------------------------
+
+// ChatFilterGet reads the word/link moderation lists in force. Reading is
+// gated server-side by b_chat_filter_manage exactly like writing, because the
+// word list tells an evader what to avoid; a caller without the permission
+// gets an error frame instead of a response and this call times out.
+func (a *App) ChatFilterGet() (netproto.ChatFilterResponse, error) {
+	f, err := a.cmLoad().request(netproto.MsgChatFilterGet, netproto.MsgChatFilterResponse,
+		netproto.ChatFilterGet{}, 5*time.Second)
+	if err != nil {
+		return netproto.ChatFilterResponse{}, err
+	}
+	var resp netproto.ChatFilterResponse
+	if err := decodeJSON(f, &resp); err != nil {
+		return netproto.ChatFilterResponse{}, err
+	}
+	return resp, nil
+}
+
+// ChatFilterSet replaces all three lists and returns the state now in force.
+// The dialog always submits the whole form, so every list is sent explicitly:
+// the wire form treats a missing list as "leave unchanged", which cannot say
+// "clear it" (117/118).
+func (a *App) ChatFilterSet(wordFilter, linkBlacklist, linkWhitelist string) (netproto.ChatFilterResponse, error) {
+	f, err := a.cmLoad().request(netproto.MsgChatFilterSet, netproto.MsgChatFilterResponse,
+		netproto.ChatFilterSet{
+			WordFilter:    &wordFilter,
+			LinkBlacklist: &linkBlacklist,
+			LinkWhitelist: &linkWhitelist,
+		}, 5*time.Second)
+	if err != nil {
+		return netproto.ChatFilterResponse{}, err
+	}
+	var resp netproto.ChatFilterResponse
+	if err := decodeJSON(f, &resp); err != nil {
+		return netproto.ChatFilterResponse{}, err
+	}
+	return resp, nil
+}
+
+// ---------------------------------------------------------------------------
 // Search (110)
 // ---------------------------------------------------------------------------
 
@@ -184,6 +231,45 @@ type ChatSearchResult struct {
 	Undecryptable int                         `json:"undecryptable"`
 }
 
+// chatScan pages a scope's history backwards from newest, decrypting each
+// page with the generations the server bundles alongside it, and hands every
+// entry to visit. Search (110) and export (125) both need the WHOLE scope
+// rather than the window the view happens to hold, so they share one pager —
+// two copies would drift apart on exactly the key handling that decides
+// whether a gap reads as "no access" or as data loss (103).
+//
+// It reports how many entries were scanned and whether it reached the
+// beginning of history; complete=false means maxMessages or a mid-scan page
+// error stopped it, so the caller must present a partial result as partial.
+func (a *App) chatScan(channelID int64, maxMessages int, progress string, visit func(netproto.ChatHistoryEntry)) (int, bool, error) {
+	scanned := 0
+	before := int64(0)
+	for scanned < maxMessages {
+		resp, err := a.ChatHistory(channelID, before, chatSearchPage)
+		if err != nil {
+			if scanned == 0 {
+				return 0, false, err // nothing to show; surface it
+			}
+			return scanned, false, nil // partial beats losing the pages we have
+		}
+		if len(resp.Messages) == 0 {
+			return scanned, true, nil
+		}
+		for _, m := range resp.Messages {
+			scanned++
+			visit(m)
+		}
+		before = resp.Messages[len(resp.Messages)-1].ID // pages are newest-first
+		if len(resp.Messages) < chatSearchPage {
+			return scanned, true, nil
+		}
+		if progress != "" {
+			a.emitPlain(progress, scanned)
+		}
+	}
+	return scanned, false, nil
+}
+
 // ChatSearch pages the scope's history backwards, decrypting each page with
 // the keys the server bundles alongside it, and returns matching messages
 // newest-first. Search runs entirely client-side: the server stores only
@@ -194,39 +280,350 @@ func (a *App) ChatSearch(channelID int64, query string, maxMessages int) (ChatSe
 		maxMessages = chatSearchDefaultMax
 	}
 	var out []netproto.ChatHistoryEntry
-	undecryptable, scanned := 0, 0
-	before := int64(0)
-	for scanned < maxMessages {
-		resp, err := a.ChatHistory(channelID, before, chatSearchPage)
-		if err != nil {
-			if scanned == 0 {
-				return ChatSearchResult{}, err // nothing to show; surface it
-			}
-			break // partial result is better than losing the pages we have
+	undecryptable := 0
+	scanned, _, err := a.chatScan(channelID, maxMessages, "chatsearch:progress", func(m netproto.ChatHistoryEntry) {
+		if m.Deleted {
+			return
 		}
-		if len(resp.Messages) == 0 {
-			break
+		if !m.EncVerified {
+			undecryptable++
+			return
 		}
-		for _, m := range resp.Messages {
-			scanned++
-			if m.Deleted {
-				continue
-			}
-			if !m.EncVerified {
-				undecryptable++
-				continue
-			}
-			if q != "" && strings.Contains(strings.ToLower(m.Body), q) {
-				out = append(out, m)
-			}
+		if q != "" && strings.Contains(strings.ToLower(m.Body), q) {
+			out = append(out, m)
 		}
-		before = resp.Messages[len(resp.Messages)-1].ID // pages are newest-first
-		if len(resp.Messages) < chatSearchPage {
-			break
-		}
-		a.emitPlain("chatsearch:progress", scanned)
+	})
+	if err != nil {
+		return ChatSearchResult{}, err
 	}
 	return ChatSearchResult{Messages: out, Scanned: scanned, Undecryptable: undecryptable}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Local DM history (122)
+// ---------------------------------------------------------------------------
+
+// DMs are true E2EE and the server never stores them, so a DM "history" can
+// only ever be local. It is treated exactly the way wave 1 treats
+// chat_messages: ciphertext at rest, opened only here in Go, never handed to
+// the webview sealed. One file per peer, sealed with a key derived from the
+// identity's X25519 PRIVATE key — the same secret that opened the messages in
+// the first place — so a log that leaves the device (a synced config folder, a
+// backup, a stolen disk image) is worth nothing without identity.json, and no
+// other identity can ever read it.
+const (
+	// dmHistoryMax caps a peer's log. The whole file is rewritten per append,
+	// so this bounds write cost as well as disk.
+	dmHistoryMax = 5000
+	dmHistoryExt = ".vcxdm"
+)
+
+// DMEntry is one direct message in the local log: what the DM tab needs to
+// re-render after a restart, and nothing the server ever saw.
+type DMEntry struct {
+	Seq          int64  `json:"seq"`
+	FromUniqueID string `json:"from_unique_id"`
+	FromNickname string `json:"from_nickname"`
+	Body         string `json:"body"`
+	SentAt       int64  `json:"sent_at"` // unix seconds
+	Self         bool   `json:"self,omitempty"`
+	ClientMsgID  string `json:"client_msg_id,omitempty"`
+	Offline      bool   `json:"offline,omitempty"`
+}
+
+// DMPeer summarises one stored conversation, so PM tabs can be restored on
+// start without opening every log.
+type DMPeer struct {
+	UniqueID string `json:"unique_id"`
+	Nickname string `json:"nickname,omitempty"`
+	Messages int    `json:"messages"`
+	LastAt   int64  `json:"last_at"`
+}
+
+// dmLog is the sealed file's plaintext. The peer id lives INSIDE the
+// ciphertext: the file name is a hash, so the directory cannot be listed to
+// learn who this user talks to.
+type dmLog struct {
+	Peer     string    `json:"peer"`
+	Nickname string    `json:"nickname,omitempty"`
+	Messages []DMEntry `json:"messages"` // oldest first
+}
+
+// dmHistoryDir returns the per-device log directory. An App with no settings
+// path (tests, with the default-path fallback disarmed) gets an error rather
+// than a write into the developer's real config directory.
+func (a *App) dmHistoryDir() (string, error) {
+	base := a.settingsFile()
+	if base == "" {
+		return "", errors.New("no local storage path for DM history")
+	}
+	return filepath.Join(filepath.Dir(base), "dmhistory"), nil
+}
+
+// dmIdentity resolves the key material the logs are bound to. It prefers the
+// active tab's already-loaded identity and falls back to the file, so PM tabs
+// can be restored before the client has connected to anything. Every caller
+// resolves the storage directory first, so an App with no settings path (a
+// test) can never reach this and touch the real identity.json.
+func (a *App) dmIdentity() (*identity, error) {
+	if m := a.cmLoad(); m != nil {
+		return m.identity()
+	}
+	return loadOrCreateIdentity()
+}
+
+// dmHistoryPath names a peer's log from a hash of (own public key, peer), so
+// the file name leaks neither the peer nor the owner.
+func (a *App) dmHistoryPath(peer string) (string, error) {
+	dir, err := a.dmHistoryDir()
+	if err != nil {
+		return "", err
+	}
+	id, err := a.dmIdentity()
+	if err != nil {
+		return "", err
+	}
+	pub, _, err := id.x25519()
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(append(append([]byte(dmHistoryKeyLabel+"|name|"), pub[:]...), peer...))
+	return filepath.Join(dir, hex.EncodeToString(sum[:])[:32]+dmHistoryExt), nil
+}
+
+// dmFileKey derives the at-rest key for the local DM logs.
+func (a *App) dmFileKey() ([32]byte, error) {
+	id, err := a.dmIdentity()
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return dmHistoryKey(id)
+}
+
+// dmLoadLog opens a peer's log. A missing file is an empty log, not an error:
+// the first DM with someone is the normal case.
+func (a *App) dmLoadLog(peer string) (dmLog, error) {
+	path, err := a.dmHistoryPath(peer)
+	if err != nil {
+		return dmLog{}, err
+	}
+	blob, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return dmLog{Peer: peer}, nil
+		}
+		return dmLog{}, err
+	}
+	return a.dmOpenBlob(blob)
+}
+
+// dmOpenBlob unseals and decodes a log file's bytes.
+func (a *App) dmOpenBlob(blob []byte) (dmLog, error) {
+	key, err := a.dmFileKey()
+	if err != nil {
+		return dmLog{}, err
+	}
+	plain, err := openFile(blob, key)
+	if err != nil {
+		// A log this identity cannot open is not this identity's log. Failing
+		// closed keeps a corrupt or foreign file from being silently replaced.
+		return dmLog{}, errors.New("DM history unreadable with this identity")
+	}
+	var l dmLog
+	if err := json.Unmarshal(plain, &l); err != nil {
+		return dmLog{}, err
+	}
+	return l, nil
+}
+
+// dmSaveLog seals and writes a peer's log, trimming it to the newest
+// dmHistoryMax messages.
+func (a *App) dmSaveLog(l dmLog) error {
+	if n := len(l.Messages); n > dmHistoryMax {
+		l.Messages = append([]DMEntry(nil), l.Messages[n-dmHistoryMax:]...)
+	}
+	path, err := a.dmHistoryPath(l.Peer)
+	if err != nil {
+		return err
+	}
+	key, err := a.dmFileKey()
+	if err != nil {
+		return err
+	}
+	raw, err := json.Marshal(l)
+	if err != nil {
+		return err
+	}
+	blob, err := sealFile(raw, key)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, blob, 0o600)
+}
+
+// DMHistoryLoad returns a peer's stored conversation, oldest first, decrypted.
+func (a *App) DMHistoryLoad(peer string) ([]DMEntry, error) {
+	if peer == "" {
+		return nil, errors.New("peer is required")
+	}
+	a.dmMu.Lock()
+	defer a.dmMu.Unlock()
+	l, err := a.dmLoadLog(peer)
+	if err != nil {
+		return nil, err
+	}
+	if l.Messages == nil {
+		l.Messages = []DMEntry{}
+	}
+	return l.Messages, nil
+}
+
+// DMHistoryAppend records one DM (sent or received) in the peer's local log
+// and returns "" or the error. Seq is assigned here when the caller leaves it
+// zero, so the log keeps a stable local order the server never provided.
+func (a *App) DMHistoryAppend(peer, nickname string, e DMEntry) string {
+	if peer == "" {
+		return "peer is required"
+	}
+	a.dmMu.Lock()
+	defer a.dmMu.Unlock()
+	l, err := a.dmLoadLog(peer)
+	if err != nil {
+		return err.Error()
+	}
+	l.Peer = peer
+	if nickname != "" {
+		l.Nickname = nickname
+	}
+	if e.Seq == 0 {
+		if n := len(l.Messages); n > 0 {
+			e.Seq = l.Messages[n-1].Seq + 1
+		} else {
+			e.Seq = 1
+		}
+	}
+	if e.SentAt == 0 {
+		e.SentAt = time.Now().Unix()
+	}
+	if e.ClientMsgID != "" {
+		// Re-delivery of the same message (a reconnect replaying an offline
+		// spool) must not duplicate the log.
+		for _, old := range l.Messages {
+			if old.ClientMsgID == e.ClientMsgID && old.Self == e.Self {
+				return ""
+			}
+		}
+	}
+	l.Messages = append(l.Messages, e)
+	if err := a.dmSaveLog(l); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+// DMHistoryClear deletes a peer's stored conversation (explicit user action).
+func (a *App) DMHistoryClear(peer string) string {
+	if peer == "" {
+		return "peer is required"
+	}
+	a.dmMu.Lock()
+	defer a.dmMu.Unlock()
+	path, err := a.dmHistoryPath(peer)
+	if err != nil {
+		return err.Error()
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err.Error()
+	}
+	return ""
+}
+
+// DMHistoryPeers lists the stored conversations, most recent first, so PM tabs
+// survive a restart. Logs sealed to a different identity are skipped rather
+// than reported: they are not this user's conversations.
+func (a *App) DMHistoryPeers() []DMPeer {
+	a.dmMu.Lock()
+	defer a.dmMu.Unlock()
+	out := []DMPeer{}
+	dir, err := a.dmHistoryDir()
+	if err != nil {
+		return out
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return out
+	}
+	for _, ent := range ents {
+		if ent.IsDir() || !strings.HasSuffix(ent.Name(), dmHistoryExt) {
+			continue
+		}
+		blob, err := os.ReadFile(filepath.Join(dir, ent.Name()))
+		if err != nil {
+			continue
+		}
+		l, err := a.dmOpenBlob(blob)
+		if err != nil || l.Peer == "" {
+			continue
+		}
+		p := DMPeer{UniqueID: l.Peer, Nickname: l.Nickname, Messages: len(l.Messages)}
+		if n := len(l.Messages); n > 0 {
+			p.LastAt = l.Messages[n-1].SentAt
+		}
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].LastAt > out[j].LastAt })
+	return out
+}
+
+// DMSearch searches the local DM logs and answers in the SAME shape as
+// ChatSearch, so the existing client-side search UI renders DM hits with no
+// second code path (122/110). An empty peer searches every stored
+// conversation. EncVerified is true because these bodies were opened by this
+// client from true-E2EE ciphertext before they were ever written down.
+func (a *App) DMSearch(peer, query string, maxMessages int) (ChatSearchResult, error) {
+	q := strings.ToLower(strings.TrimSpace(query))
+	if maxMessages <= 0 {
+		maxMessages = chatSearchDefaultMax
+	}
+	peers := []string{peer}
+	if peer == "" {
+		peers = nil
+		for _, p := range a.DMHistoryPeers() {
+			peers = append(peers, p.UniqueID)
+		}
+	}
+
+	a.dmMu.Lock()
+	defer a.dmMu.Unlock()
+	res := ChatSearchResult{Messages: []netproto.ChatHistoryEntry{}}
+	for _, uid := range peers {
+		l, err := a.dmLoadLog(uid)
+		if err != nil {
+			continue
+		}
+		for i := len(l.Messages) - 1; i >= 0; i-- { // newest first, like ChatSearch
+			if res.Scanned >= maxMessages {
+				return res, nil
+			}
+			m := l.Messages[i]
+			res.Scanned++
+			if q != "" && !strings.Contains(strings.ToLower(m.Body), q) {
+				continue
+			}
+			res.Messages = append(res.Messages, netproto.ChatHistoryEntry{
+				ID:           m.Seq,
+				FromUniqueID: m.FromUniqueID,
+				FromNickname: m.FromNickname,
+				Body:         m.Body,
+				SentAt:       m.SentAt,
+				EncVerified:  true,
+			})
+		}
+	}
+	return res, nil
 }
 
 // ChatReact toggles a reaction on a message.
@@ -274,6 +671,18 @@ func (a *App) SendChatRead(toUniqueID, clientMsgID string) string {
 // ---------------------------------------------------------------------------
 
 // EmojiList lists the server's custom emojis.
+// EmojiUpload uploads a custom server emoji (96). The server gates it on
+// b_emoji_upload and rejects oversized images, so failures come back as an
+// error frame rather than a return value here.
+func (a *App) EmojiUpload(name, dataBase64 string) string {
+	if err := a.cmLoad().write(netproto.MsgEmojiUpload, netproto.EmojiUpload{
+		Name: name, DataBase64: dataBase64,
+	}); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
 func (a *App) EmojiList() (netproto.EmojiListResponse, error) {
 	f, err := a.cmLoad().request(netproto.MsgEmojiList, netproto.MsgEmojiListResponse,
 		netproto.EmojiList{}, 10*time.Second)
@@ -666,6 +1075,106 @@ func ftReadStatus(conn net.Conn) error {
 // ---------------------------------------------------------------------------
 // Export (125)
 // ---------------------------------------------------------------------------
+
+// chatExportDefaultMax bounds a full-history export. It is far above a
+// search's cap on purpose: an export that quietly stops after 2000 messages is
+// the very "only what the view happened to hold" gap 125 exists to close.
+const chatExportDefaultMax = 100000
+
+// ChatExportResult is a rendered full-channel transcript, ready to hand to
+// ExportChat or ExportChatEncrypted.
+type ChatExportResult struct {
+	Text          string `json:"text"`
+	Messages      int    `json:"messages"`
+	Undecryptable int    `json:"undecryptable"`
+	Complete      bool   `json:"complete"`
+}
+
+// ChatExportHistory pages and decrypts a scope's ENTIRE stored history and
+// renders it oldest-first, instead of exporting the window the chat view
+// happens to hold (125). It runs on the search pager, so export and search can
+// never disagree about which generations they could open. Progress lands on
+// the "chatexport:progress" event as the running scanned count.
+func (a *App) ChatExportHistory(channelID int64, maxMessages int) (ChatExportResult, error) {
+	if maxMessages <= 0 {
+		maxMessages = chatExportDefaultMax
+	}
+	var lines []string
+	undecryptable := 0
+	scanned, complete, err := a.chatScan(channelID, maxMessages, "chatexport:progress", func(m netproto.ChatHistoryEntry) {
+		if !m.Deleted && !m.EncVerified {
+			undecryptable++
+		}
+		lines = append(lines, chatExportLine(m))
+	})
+	if err != nil {
+		return ChatExportResult{}, err
+	}
+	// chatScan walks newest-first; a transcript reads oldest-first.
+	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
+		lines[i], lines[j] = lines[j], lines[i]
+	}
+	if !complete || undecryptable > 0 {
+		// The notice rides INSIDE the file: a caller that writes Text straight
+		// out must not be able to produce a partial transcript that looks whole.
+		reach := "complete"
+		if !complete {
+			reach = "TRUNCATED at the export limit"
+		}
+		lines = append([]string{fmt.Sprintf(
+			"# voicx export — %d messages, %d unreadable (no key), %s",
+			scanned, undecryptable, reach)}, lines...)
+	}
+	text := ""
+	if len(lines) > 0 {
+		text = strings.Join(lines, "\n") + "\n"
+	}
+	return ChatExportResult{
+		Text: text, Messages: scanned, Undecryptable: undecryptable, Complete: complete,
+	}, nil
+}
+
+// chatExportLine renders one transcript line. A body this client could not
+// open keeps its placeholder rather than vanishing, so a gap in the export is
+// visible as a gap instead of looking like a quiet channel.
+func chatExportLine(m netproto.ChatHistoryEntry) string {
+	body := m.Body
+	if m.Deleted {
+		body = "(deleted)"
+	}
+	if m.EditedAt != 0 {
+		body += " (edited)"
+	}
+	name := m.FromNickname
+	if name == "" {
+		name = m.FromUniqueID
+	}
+	return "[" + time.Unix(m.SentAt, 0).Format("2006-01-02 15:04:05") + "] " + name + ": " + body
+}
+
+// DMExportHistory renders a stored DM conversation into the same transcript
+// shape as ChatExportHistory, so exporting a PM tab reaches the whole local
+// log rather than the loaded window (122/125).
+func (a *App) DMExportHistory(peer string) (ChatExportResult, error) {
+	msgs, err := a.DMHistoryLoad(peer)
+	if err != nil {
+		return ChatExportResult{}, err
+	}
+	lines := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		lines = append(lines, chatExportLine(netproto.ChatHistoryEntry{
+			FromUniqueID: m.FromUniqueID,
+			FromNickname: m.FromNickname,
+			Body:         m.Body,
+			SentAt:       m.SentAt,
+		}))
+	}
+	text := ""
+	if len(lines) > 0 {
+		text = strings.Join(lines, "\n") + "\n"
+	}
+	return ChatExportResult{Text: text, Messages: len(msgs), Complete: true}, nil
+}
 
 // ExportChat saves text to a user-chosen file via the native save dialog.
 // Returns "" on success or when the user cancels, or the error.

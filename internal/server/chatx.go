@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -229,7 +230,7 @@ func (s *TCPServer) routeScopedChat(ctx context.Context, client *Client, msg net
 	moderated := stripAttachmentRefs(plain)
 
 	// (117/118) word + link filters.
-	if err := s.moderateBody(moderated); err != nil {
+	if err := s.moderateBody(ctx, moderated); err != nil {
 		s.metricsSink().IncChatMessage("rejected")
 		return s.sendError(client, errCodeMalformed, err.Error())
 	}
@@ -313,42 +314,300 @@ func (s *TCPServer) routeScopedChat(ctx context.Context, client *Client, msg net
 	return nil
 }
 
-// moderateBody applies the word filter (117) and link filters (118).
-func (s *TCPServer) moderateBody(body string) error {
+// ---------------------------------------------------------------------------
+// Runtime moderation lists (117/118)
+// ---------------------------------------------------------------------------
+
+// chatFiltersKey is the server_settings row holding the runtime moderation
+// lists. One JSON document rather than three rows makes "an operator has taken
+// the lists over" a single observable fact: while the row is absent the
+// config.yaml values apply, and the first write stores all three, so a
+// half-migrated state where one list is runtime and two are config cannot
+// exist (117/118). It is NOT sealed — moderation configuration is not message
+// content, so sealedSetting deliberately excludes it.
+const chatFiltersKey = "chat_filters"
+
+// permissionKeyChatFilterManage gates reading and writing the moderation
+// lists. Admins bypass every check, so the lists are manageable out of the box
+// and delegable once the key is granted (117/118).
+const permissionKeyChatFilterManage = permissions.PermissionKey("b_chat_filter_manage")
+
+// maxFilterListBytes caps one stored list. moderateBody re-scans every list on
+// every send and every edit, so an unbounded list is a self-inflicted DoS.
+const maxFilterListBytes = 4096
+
+// chatFilters holds the three comma-separated moderation lists. The JSON tags
+// are both the stored document's shape and netproto.ChatFilterResponse's;
+// keeping them identical stops the row and the wire form from drifting.
+type chatFilters struct {
+	WordFilter    string `json:"word_filter"`
+	LinkBlacklist string `json:"link_blacklist"`
+	LinkWhitelist string `json:"link_whitelist"`
+}
+
+// chatFilterCache memoises the lists: moderateBody runs on every moderated
+// message, and reloading the setting each time would put a database read on
+// the send path. Writers call invalidateFilters.
+type chatFilterCache struct {
+	mu         sync.Mutex
+	loaded     bool
+	fromConfig bool
+	filters    chatFilters
+
+	// writeMu serialises the read-modify-write in handleChatFilterSet. A set
+	// carries only the lists it changes, so two concurrent operators editing
+	// different lists would otherwise each store their own view and one edit
+	// would vanish.
+	writeMu sync.Mutex
+}
+
+// configFilters is the boot-time fallback, in force until an operator stores
+// a runtime document.
+func (s *TCPServer) configFilters() chatFilters {
 	if s.cfg == nil {
+		return chatFilters{}
+	}
+	return chatFilters{
+		WordFilter:    s.cfg.ChatWordFilter,
+		LinkBlacklist: s.cfg.ChatLinkBlacklist,
+		LinkWhitelist: s.cfg.ChatLinkWhitelist,
+	}
+}
+
+// effectiveFilters returns the lists in force and whether they are still the
+// config defaults. A store failure falls back to config WITHOUT caching, so a
+// transient error cannot pin moderation to the wrong lists for the lifetime of
+// the process.
+func (s *TCPServer) effectiveFilters(ctx context.Context) (chatFilters, bool) {
+	c := s.chatFilters
+	if c == nil || s.deps == nil || s.deps.Chat == nil {
+		return s.configFilters(), true
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.loaded {
+		return c.filters, c.fromConfig
+	}
+	raw, _, err := s.deps.Chat.GetServerSetting(ctx, chatFiltersKey)
+	if err != nil {
+		s.logger.Warn("reading chat filter settings failed", zap.Error(err))
+		return s.configFilters(), true
+	}
+	f, fromConfig := s.configFilters(), true
+	if raw != "" {
+		var stored chatFilters
+		if err := json.Unmarshal([]byte(raw), &stored); err != nil {
+			// A hand-edited row must not silently disable moderation.
+			s.logger.Warn("stored chat filter document is malformed; using config defaults", zap.Error(err))
+		} else {
+			f, fromConfig = stored, false
+		}
+	}
+	c.filters, c.fromConfig, c.loaded = f, fromConfig, true
+	return f, fromConfig
+}
+
+// invalidateFilters drops the memoised lists so the next moderated message
+// reloads them.
+func (s *TCPServer) invalidateFilters() {
+	if s.chatFilters == nil {
+		return
+	}
+	s.chatFilters.mu.Lock()
+	s.chatFilters.loaded = false
+	s.chatFilters.mu.Unlock()
+}
+
+// splitList parses a comma-separated list into trimmed, lowercased, non-empty
+// entries (matching is case-insensitive on both sides).
+func splitList(raw string) []string {
+	if raw == "" {
 		return nil
 	}
+	var out []string
+	for _, e := range strings.Split(raw, ",") {
+		if e = strings.TrimSpace(strings.ToLower(e)); e != "" {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// normalizeList re-joins a list with the entries trimmed and the empties
+// dropped, so what is stored is what is matched. Case is preserved: the
+// operator sees back what they typed and splitList lowercases at match time.
+func normalizeList(raw string) string {
+	var out []string
+	for _, e := range strings.Split(raw, ",") {
+		if e = strings.TrimSpace(e); e != "" {
+			out = append(out, e)
+		}
+	}
+	return strings.Join(out, ",")
+}
+
+// linkURLRe matches the http(s) URLs the client renders as clickable links
+// (markdown.js linkifies exactly this shape). Matching real URLs instead of
+// raw substrings is the whole point of 118: substring matching rejected prose
+// that merely NAMED a blocked domain, and accepted
+// "http://evil.tld/?q=good.example" because a whitelist entry appeared
+// somewhere in the body.
+var linkURLRe = regexp.MustCompile(`(?i)https?://[^\s<>"'\])}]+`)
+
+// linkHosts returns the lowercased hostname of every link in body, in order.
+// An unparseable URL yields "" — it still reads as a link to a human, so it
+// must not slip past a whitelist.
+func linkHosts(body string) []string {
+	matches := linkURLRe.FindAllString(body, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(matches))
+	for _, raw := range matches {
+		u, err := url.Parse(raw)
+		if err != nil {
+			out = append(out, "")
+			continue
+		}
+		// Hostname drops the port and any user:pass@ prefix, so
+		// "http://good.example@evil.tld/" is correctly read as evil.tld.
+		out = append(out, strings.Trim(strings.ToLower(u.Hostname()), "."))
+	}
+	return out
+}
+
+// hostInList reports whether host equals a list entry or is a subdomain of
+// one: "evil.tld" matches "a.b.evil.tld" but never "notevil.tld".
+func hostInList(host string, list []string) bool {
+	if host == "" {
+		return false
+	}
+	for _, e := range list {
+		if e = strings.Trim(e, "."); e == "" {
+			continue
+		}
+		if host == e || strings.HasSuffix(host, "."+e) {
+			return true
+		}
+	}
+	return false
+}
+
+// moderateBody applies the word filter (117) and the link filters (118) that
+// are currently in force.
+func (s *TCPServer) moderateBody(ctx context.Context, body string) error {
+	f, _ := s.effectiveFilters(ctx)
+
 	lower := strings.ToLower(body)
-	if s.cfg.ChatWordFilter != "" {
-		for _, w := range strings.Split(s.cfg.ChatWordFilter, ",") {
-			w = strings.TrimSpace(strings.ToLower(w))
-			if w != "" && strings.Contains(lower, w) {
-				return errors.New("message rejected by the server word filter")
-			}
+	for _, w := range splitList(f.WordFilter) {
+		if strings.Contains(lower, w) {
+			return errors.New("message rejected by the server word filter")
 		}
 	}
-	if s.cfg.ChatLinkBlacklist != "" {
-		for _, d := range strings.Split(s.cfg.ChatLinkBlacklist, ",") {
-			d = strings.TrimSpace(strings.ToLower(d))
-			if d != "" && strings.Contains(lower, d) {
-				return errors.New("message contains a blocked link")
-			}
+
+	black, white := splitList(f.LinkBlacklist), splitList(f.LinkWhitelist)
+	if len(black) == 0 && len(white) == 0 {
+		return nil
+	}
+	hosts := linkHosts(body)
+	for _, h := range hosts {
+		if hostInList(h, black) {
+			return errors.New("message contains a blocked link")
 		}
 	}
-	if s.cfg.ChatLinkWhitelist != "" && strings.Contains(lower, "http") {
-		allowed := false
-		for _, d := range strings.Split(s.cfg.ChatLinkWhitelist, ",") {
-			d = strings.TrimSpace(strings.ToLower(d))
-			if d != "" && strings.Contains(lower, d) {
-				allowed = true
-				break
+	// A non-empty whitelist means ONLY those hosts may be linked, so EVERY
+	// link has to match — one matching link must not license the rest (118).
+	if len(white) > 0 {
+		for _, h := range hosts {
+			if !hostInList(h, white) {
+				return errors.New("message contains a link outside the allowed domains")
 			}
-		}
-		if !allowed {
-			return errors.New("message contains a link outside the allowed domains")
 		}
 	}
 	return nil
+}
+
+// handleChatFilterGet returns the moderation lists in force. Reads are gated
+// like writes: the word list tells an attacker exactly what to evade.
+func (s *TCPServer) handleChatFilterGet(ctx context.Context, client *Client, _ *netproto.Frame) error {
+	pc, err := s.permCheckerFor(ctx, client)
+	if err != nil {
+		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+	}
+	if !pc.granted(permissionKeyChatFilterManage) {
+		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissionKeyChatFilterManage))
+	}
+	f, fromConfig := s.effectiveFilters(ctx)
+	return s.writeMessage(client, netproto.MsgChatFilterResponse, netproto.ChatFilterResponse{
+		WordFilter:    f.WordFilter,
+		LinkBlacklist: f.LinkBlacklist,
+		LinkWhitelist: f.LinkWhitelist,
+		FromConfig:    fromConfig,
+	})
+}
+
+// handleChatFilterSet replaces the runtime moderation lists (117/118) and
+// replies with the new effective state.
+func (s *TCPServer) handleChatFilterSet(ctx context.Context, client *Client, f *netproto.Frame) error {
+	var msg netproto.ChatFilterSet
+	if err := netproto.Decode(f, &msg); err != nil {
+		return s.sendError(client, errCodeMalformed, "malformed chat_filter_set: "+err.Error())
+	}
+	if s.deps == nil || s.deps.Chat == nil {
+		return s.sendError(client, errCodeUnavailable, "chat store unavailable")
+	}
+	pc, err := s.permCheckerFor(ctx, client)
+	if err != nil {
+		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+	}
+	if !pc.granted(permissionKeyChatFilterManage) {
+		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissionKeyChatFilterManage))
+	}
+
+	if s.chatFilters != nil {
+		s.chatFilters.writeMu.Lock()
+		defer s.chatFilters.writeMu.Unlock()
+	}
+
+	// Every set writes the FULL triple, so the first one snapshots whatever
+	// config.yaml still supplied and the lists can never be half-stored.
+	next, _ := s.effectiveFilters(ctx)
+	for _, upd := range []struct {
+		in  *string
+		out *string
+	}{
+		{msg.WordFilter, &next.WordFilter},
+		{msg.LinkBlacklist, &next.LinkBlacklist},
+		{msg.LinkWhitelist, &next.LinkWhitelist},
+	} {
+		if upd.in == nil {
+			continue
+		}
+		if len(*upd.in) > maxFilterListBytes {
+			return s.sendError(client, errCodeMalformed,
+				fmt.Sprintf("filter list too long (max %d bytes)", maxFilterListBytes))
+		}
+		*upd.out = normalizeList(*upd.in)
+	}
+
+	raw, err := json.Marshal(next)
+	if err != nil {
+		return s.sendError(client, errCodeUnavailable, "encoding chat filters failed")
+	}
+	if err := s.deps.Chat.SetServerSetting(ctx, chatFiltersKey, string(raw), 0); err != nil {
+		s.logger.Warn("storing chat filters failed", zap.Error(err))
+		return s.sendError(client, errCodeUnavailable, "storing chat filters failed")
+	}
+	s.invalidateFilters()
+	s.audit(ctx, client.UniqueID, "chat_filter_set", chatFiltersKey,
+		fmt.Sprintf("words=%d blacklist=%d whitelist=%d",
+			len(splitList(next.WordFilter)), len(splitList(next.LinkBlacklist)), len(splitList(next.LinkWhitelist))))
+
+	return s.writeMessage(client, netproto.MsgChatFilterResponse, netproto.ChatFilterResponse{
+		WordFilter:    next.WordFilter,
+		LinkBlacklist: next.LinkBlacklist,
+		LinkWhitelist: next.LinkWhitelist,
+	})
 }
 
 // mentionRe matches @word mentions (letters, digits, _, -).
@@ -363,13 +622,14 @@ func (s *TCPServer) parseMentions(ctx context.Context, client *Client, channelID
 	}
 	out := map[string]bool{}
 
+	// (105) @channel, @here and @everyone all mass-notify, so all three sit
+	// behind the same permission — gating only two of them let any user reach
+	// every member by picking the ungated spelling.
 	mentionAll := false
 	if mentionRe.MatchString(body) {
 		lower := strings.ToLower(body)
 		if strings.Contains(lower, "@channel") || strings.Contains(lower, "@here") || strings.Contains(lower, "@everyone") {
-			if strings.Contains(lower, "@channel") {
-				mentionAll = true
-			} else if pc, err := s.permCheckerFor(ctx, client); err == nil && pc.granted(permissions.PermissionKeyChatMentionAll) {
+			if pc, err := s.permCheckerFor(ctx, client); err == nil && pc.granted(permissions.PermissionKeyChatMentionAll) {
 				mentionAll = true
 			}
 		}
@@ -573,10 +833,13 @@ func (s *TCPServer) handleChatEdit(ctx context.Context, client *Client, f *netpr
 		}
 		plain = p
 	}
-	if utf8.RuneCountInString(plain) > s.cfg.ChatMaxLength && s.cfg.ChatMaxLength > 0 {
+	// (119) same cap as the send path. The nil guard leads: this function
+	// already treats s.cfg as possibly nil above, so testing ChatMaxLength
+	// first would panic on exactly the path that guard exists for.
+	if s.cfg != nil && s.cfg.ChatMaxLength > 0 && utf8.RuneCountInString(plain) > s.cfg.ChatMaxLength {
 		return s.sendError(client, errCodeMalformed, fmt.Sprintf("message too long (max %d characters)", s.cfg.ChatMaxLength))
 	}
-	if err := s.moderateBody(stripAttachmentRefs(plain)); err != nil {
+	if err := s.moderateBody(ctx, stripAttachmentRefs(plain)); err != nil {
 		return s.sendError(client, errCodeMalformed, err.Error())
 	}
 
@@ -795,8 +1058,24 @@ func (s *TCPServer) handleChatReact(ctx context.Context, client *Client, f *netp
 // Typing (120) + DM receipts (124)
 // ---------------------------------------------------------------------------
 
-// handleTyping relays a typing indicator (not stored). Clients throttle to
-// ~3s between sends.
+// typingEvent is the payload of the "typing" event (120). It is the whole
+// contract clients render against, so it is a struct rather than an ad-hoc
+// map: the JSON tags cannot then drift from what the frontend reads.
+// ChannelID is 0 for global and DM indicators.
+type typingEvent struct {
+	ClientID  string `json:"client_id"`
+	UniqueID  string `json:"unique_id"`
+	Nickname  string `json:"nickname"`
+	ChannelID int64  `json:"channel_id"`
+}
+
+// handleTyping relays a typing indicator. It is never stored — there is no
+// body to seal, so it sits outside the ciphertext-at-rest path entirely (91).
+// Clients throttle to ~3s between sends.
+//
+// A relay the sender is not entitled to is DROPPED rather than answered with
+// an error: an indicator is fire-and-forget, and a client that left a channel
+// mid-keystroke should not get an error frame for it.
 func (s *TCPServer) handleTyping(_ context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.Typing
 	if err := netproto.Decode(f, &msg); err != nil {
@@ -805,11 +1084,11 @@ func (s *TCPServer) handleTyping(_ context.Context, client *Client, f *netproto.
 	if s.deps == nil || s.deps.Broadcast == nil {
 		return s.sendError(client, errCodeUnavailable, "broadcast backend unavailable")
 	}
-	data := map[string]any{
-		"client_id":  client.ID,
-		"unique_id":  client.UniqueID,
-		"nickname":   client.Username,
-		"channel_id": msg.ChannelID,
+	data := typingEvent{
+		ClientID:  client.ID,
+		UniqueID:  client.UniqueID,
+		Nickname:  client.Username,
+		ChannelID: msg.ChannelID,
 	}
 	switch {
 	case msg.ToUniqueID != "":
@@ -821,6 +1100,12 @@ func (s *TCPServer) handleTyping(_ context.Context, client *Client, f *netproto.
 			_ = s.deps.Broadcast.BroadcastToClient(tc.ID, payload)
 		}
 	case msg.ChannelID != 0:
+		// Same gate as history: without it any client could fake "X is
+		// typing" into a channel it never joined, which is the metadata half
+		// of the leak scopeReadable closes for bodies.
+		if !s.scopeReadable(client, msg.ChannelID) {
+			return nil
+		}
 		payload, err := eventEnvelope(eventTyping, data)
 		if err != nil {
 			return err
@@ -1090,6 +1375,12 @@ func (s *TCPServer) SetServerSettingAndAnnounce(ctx context.Context, key, value 
 	}
 	if err := s.deps.Chat.SetServerSetting(ctx, key, value, keyID); err != nil {
 		return err
+	}
+	if key == chatFiltersKey {
+		// This path is reachable from ServerQuery, which does not go through
+		// handleChatFilterSet, so the memoised lists have to be dropped here
+		// too or the write applies only after a restart (117/118).
+		s.invalidateFilters()
 	}
 	if key == "announcement" && value != "" {
 		s.broadcastEvent(eventAnnouncement, map[string]any{"text": value, "enc": keyID > 0, "key_id": keyID})

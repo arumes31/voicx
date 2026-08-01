@@ -131,6 +131,10 @@ const (
 
 	MsgChatKeyRequest MessageType = 99  // client -> server: request specific scope key generations
 	MsgChatKeyBundle  MessageType = 100 // server -> client: sealed generations (+ refusals)
+
+	MsgChatFilterGet      MessageType = 101 // client -> server: read the runtime chat moderation lists
+	MsgChatFilterSet      MessageType = 102 // client -> server: replace the runtime chat moderation lists
+	MsgChatFilterResponse MessageType = 103 // server -> client: the moderation lists in force
 )
 
 // String returns a human-readable name for the message type.
@@ -336,6 +340,12 @@ func (m MessageType) String() string {
 		return "ChatKeyRequest"
 	case MsgChatKeyBundle:
 		return "ChatKeyBundle"
+	case MsgChatFilterGet:
+		return "ChatFilterGet"
+	case MsgChatFilterSet:
+		return "ChatFilterSet"
+	case MsgChatFilterResponse:
+		return "ChatFilterResponse"
 	default:
 		return fmt.Sprintf("Unknown(%d)", uint16(m))
 	}
@@ -997,8 +1007,44 @@ type ChatKeyBundle struct {
 	Truncated bool         `json:"truncated,omitempty"`
 }
 
+// ChatFilterGet requests the chat moderation lists currently in force
+// (117/118). Gated by b_chat_filter_manage; admins bypass.
+type ChatFilterGet struct{}
+
+// ChatFilterSet replaces the runtime chat moderation lists. A nil field is
+// left unchanged; a non-nil pointer to "" clears that list. Every set writes
+// all three lists, so the first one snapshots the config.yaml defaults into
+// the database and config stops being consulted (117/118).
+//
+// Each list is comma-separated. WordFilter entries are case-insensitive
+// SUBSTRINGS of the message; the link lists are HOSTS matched against the
+// hostname of each http(s) URL in the message (exact or subdomain).
+type ChatFilterSet struct {
+	WordFilter    *string `json:"word_filter,omitempty"`
+	LinkBlacklist *string `json:"link_blacklist,omitempty"`
+	LinkWhitelist *string `json:"link_whitelist,omitempty"`
+}
+
+// ChatFilterResponse carries the moderation lists in force. It answers both
+// ChatFilterGet and a successful ChatFilterSet.
+type ChatFilterResponse struct {
+	WordFilter    string `json:"word_filter"`
+	LinkBlacklist string `json:"link_blacklist"`
+	LinkWhitelist string `json:"link_whitelist"`
+	// FromConfig reports that no runtime override is stored yet, so these are
+	// the config.yaml values. It is false for every response to a set.
+	FromConfig bool `json:"from_config,omitempty"`
+}
+
 // Typing is a typing indicator. Exactly one of ChannelID / ToUniqueID is
-// set (channel scope or DM); neither set means global. Relayed, not stored.
+// set (channel scope or DM); neither set means global. Relayed, not stored —
+// there is no body, so it never enters the ciphertext-at-rest path (91).
+//
+// The relay emits a "typing" event whose data shape is fixed by the server
+// (see typingEvent): client_id, unique_id, nickname, channel_id. A channel
+// or global relay reaches the SENDER too, so receivers must drop their own
+// unique_id. A ToUniqueID naming an offline user, or a ChannelID the sender
+// is not currently in, is dropped without an error frame.
 type Typing struct {
 	ChannelID  int64  `json:"channel_id,omitempty"`
 	ToUniqueID string `json:"to_unique_id,omitempty"`

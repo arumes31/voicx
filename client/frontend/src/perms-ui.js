@@ -30,7 +30,8 @@ const PERMISSION_KEYS = [
     "b_virtualserver_info_view", "b_virtualserver_connectioninfo_view", "b_virtualserver_recording",
     "b_virtualserver_token_list", "b_virtualserver_token_add", "b_virtualserver_token_use",
     "b_virtualserver_token_delete",
-    "b_chat_delete_any", "b_chat_mention_all", "b_chat_slowmode_bypass", "b_emoji_manage",
+    "b_chat_delete_any", "b_chat_mention_all", "b_chat_slowmode_bypass", "b_chat_filter_manage",
+    "b_emoji_manage",
     "b_server_group_manage", "b_channel_group_manage", "b_permission_manage", "b_audit_view",
 ];
 
@@ -62,6 +63,7 @@ function hasPower(key) {
 
 const canPermManage = () => hasPerm("b_permission_manage");
 const canAuditView = () => hasPerm("b_audit_view");
+const canChatFilterManage = () => hasPerm("b_chat_filter_manage");
 const canGroupManage = (type) => hasPerm(type === "channel" ? "b_channel_group_manage" : "b_server_group_manage");
 const canBan = () => hasPerm("b_client_ban") || hasPower("i_client_ban_power");
 const canKickChannel = () => hasPower("i_client_kick_from_channel_power");
@@ -743,6 +745,76 @@ async function openAuditViewer() {
     load();
 }
 
+// --- chat filter manager (117/118) ------------------------------------------------
+
+// openChatFilters edits the runtime word/link moderation lists. Values are put
+// into textareas through .value, never interpolated into HTML: the lists are
+// operator-authored text and the whole point of the dialog is to type into it.
+async function openChatFilters() {
+    const { overlay, q } = modal("audit", `
+        <div class="pm-head">
+            <h3>Chat Filters</h3>
+            <button class="icon-btn cf-close" title="Close">✕</button>
+        </div>
+        <div class="cf-source empty-state"></div>
+        <div class="cf-body">
+            <div class="cf-field">
+                <b>Word filter</b>
+                <div class="pm-dim">comma-separated; each entry is a case-insensitive substring of the message</div>
+                <textarea class="dlg-input cf-words" rows="3"></textarea>
+            </div>
+            <div class="cf-field">
+                <b>Link blacklist</b>
+                <div class="pm-dim">comma-separated hosts; matches the host itself or any subdomain of it</div>
+                <textarea class="dlg-input cf-black" rows="3"></textarea>
+            </div>
+            <div class="cf-field">
+                <b>Link whitelist</b>
+                <div class="pm-dim">comma-separated hosts; while non-empty EVERY link in a message must match one</div>
+                <textarea class="dlg-input cf-white" rows="3"></textarea>
+            </div>
+        </div>
+        <div class="dlg-buttons">
+            <button class="dlg-cancel cf-reload">Reload</button>
+            <button class="dlg-ok cf-save">Save</button>
+        </div>`);
+    q(".cf-close").onclick = () => overlay.remove();
+    if (!canChatFilterManage()) {
+        q(".cf-body").innerHTML = denyNotice("b_chat_filter_manage");
+        q(".cf-source").remove();
+        q(".dlg-buttons").remove();
+        return;
+    }
+    const fill = (resp) => {
+        q(".cf-words").value = resp.word_filter || "";
+        q(".cf-black").value = resp.link_blacklist || "";
+        q(".cf-white").value = resp.link_whitelist || "";
+        // from_config is the honest answer to "does my config.yaml still
+        // apply?" — the first save snapshots it into the server database and
+        // config.yaml stops being read entirely (117/118).
+        q(".cf-source").textContent = resp.from_config
+            ? "In force from config.yaml — no runtime override stored yet. Saving copies these lists into the server database, after which config.yaml is ignored."
+            : "In force from the server database (runtime override). The chat filter settings in config.yaml are no longer applied.";
+    };
+    const load = async () => {
+        try {
+            fill(await App().ChatFilterGet());
+        } catch (err) {
+            q(".cf-source").textContent = "loading filters failed: " + err;
+        }
+    };
+    q(".cf-reload").onclick = load;
+    q(".cf-save").onclick = async () => {
+        try {
+            fill(await App().ChatFilterSet(q(".cf-words").value, q(".cf-black").value, q(".cf-white").value));
+            toastAudit("chat filters updated");
+        } catch (err) {
+            V().toast("chat filter save failed: " + err, "warn");
+        }
+    };
+    load();
+}
+
 // --- ban list dialog (172) --------------------------------------------------------
 
 async function openBanList() {
@@ -807,9 +879,10 @@ export function initPermsUI() {
         }
     });
     window.__voicxPerms = {
-        openPermissionManager, openAuditViewer, openBanList,
+        openPermissionManager, openAuditViewer, openBanList, openChatFilters,
         refreshGroups, groupColorFor, primaryGroup, hoistedGroups, groupIconURL,
         canPermManage, canAuditView, canGroupManage, canBan, canKickChannel, canKickServer,
+        canChatFilterManage,
         esc,
     };
 }

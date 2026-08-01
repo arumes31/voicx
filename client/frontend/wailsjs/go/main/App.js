@@ -26,8 +26,8 @@ export function CancelTransfer(arg1) {
   return window['go']['main']['App']['CancelTransfer'](arg1);
 }
 
-export function ChannelEdit(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8) {
-  return window['go']['main']['App']['ChannelEdit'](arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8);
+export function ChannelEdit(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9) {
+  return window['go']['main']['App']['ChannelEdit'](arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9);
 }
 
 export function ChannelIconSet(arg1, arg2, arg3) {
@@ -42,8 +42,20 @@ export function ChatEditMessage(arg1, arg2, arg3) {
   return window['go']['main']['App']['ChatEditMessage'](arg1, arg2, arg3);
 }
 
+export function ChatFilterGet() {
+  return window['go']['main']['App']['ChatFilterGet']();
+}
+
+export function ChatFilterSet(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ChatFilterSet'](arg1, arg2, arg3);
+}
+
 export function ChatHistory(arg1, arg2, arg3) {
   return window['go']['main']['App']['ChatHistory'](arg1, arg2, arg3);
+}
+
+export function ChatExportHistory(arg1, arg2) {
+  return window['go']['main']['App']['ChatExportHistory'](arg1, arg2);
 }
 
 export function ChatPinMessage(arg1, arg2, arg3) {
@@ -56,6 +68,10 @@ export function ChatPins(arg1) {
 
 export function ChatReact(arg1, arg2) {
   return window['go']['main']['App']['ChatReact'](arg1, arg2);
+}
+
+export function ChatSearch(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ChatSearch'](arg1, arg2, arg3);
 }
 
 export function CheckForUpdate() {
@@ -126,6 +142,30 @@ export function DownloadAndApply(arg1) {
   return window['go']['main']['App']['DownloadAndApply'](arg1);
 }
 
+export function DMExportHistory(arg1) {
+  return window['go']['main']['App']['DMExportHistory'](arg1);
+}
+
+export function DMHistoryAppend(arg1, arg2, arg3) {
+  return window['go']['main']['App']['DMHistoryAppend'](arg1, arg2, arg3);
+}
+
+export function DMHistoryClear(arg1) {
+  return window['go']['main']['App']['DMHistoryClear'](arg1);
+}
+
+export function DMHistoryLoad(arg1) {
+  return window['go']['main']['App']['DMHistoryLoad'](arg1);
+}
+
+export function DMHistoryPeers() {
+  return window['go']['main']['App']['DMHistoryPeers']();
+}
+
+export function DMSearch(arg1, arg2, arg3) {
+  return window['go']['main']['App']['DMSearch'](arg1, arg2, arg3);
+}
+
 export function DownloadFile(arg1, arg2) {
   return window['go']['main']['App']['DownloadFile'](arg1, arg2);
 }
@@ -136,6 +176,10 @@ export function DownloadFileProgress(arg1, arg2, arg3, arg4, arg5) {
 
 export function EmojiGet(arg1) {
   return window['go']['main']['App']['EmojiGet'](arg1);
+}
+
+export function EmojiUpload(arg1, arg2) {
+  return window['go']['main']['App']['EmojiUpload'](arg1, arg2);
 }
 
 export function EmojiList() {
@@ -278,6 +322,10 @@ export function MOTD() {
   return window['go']['main']['App']['MOTD']();
 }
 
+export function MarkChannelRead(arg1, arg2) {
+  return window['go']['main']['App']['MarkChannelRead'](arg1, arg2);
+}
+
 export function MoveClient(arg1, arg2) {
   return window['go']['main']['App']['MoveClient'](arg1, arg2);
 }
@@ -324,6 +372,10 @@ export function Poke(arg1, arg2) {
 
 export function RecordRecent(arg1, arg2) {
   return window['go']['main']['App']['RecordRecent'](arg1, arg2);
+}
+
+export function ReadStateSnapshot() {
+  return window['go']['main']['App']['ReadStateSnapshot']();
 }
 
 export function RegenerateIdentity() {

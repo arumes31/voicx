@@ -570,6 +570,33 @@ func TestSlowMode(t *testing.T) {
 	if !strings.Contains(e.Message, "slow mode") {
 		t.Fatalf("error = %q, want slow mode rejection", e.Message)
 	}
+
+	// The bypass is b_chat_slowmode_bypass, and alice (admin) holds it by
+	// bypassing every check: two messages back to back both land.
+	sendEncChat(t, alice, key, ck.KeyID, "3", "bypass one")
+	readEventOfType(t, bob, eventChat)
+	sendEncChat(t, alice, key, ck.KeyID, "3", "bypass two")
+	readEventOfType(t, bob, eventChat)
+}
+
+// TestSlowModeBypassPermission pins the documented bypass key for a
+// non-admin: without b_chat_slowmode_bypass the second message is rejected,
+// with it both land (114).
+func TestSlowModeBypassPermission(t *testing.T) {
+	perms := tieredWith(boolPerm(permissions.PermissionKeyChatSlowmodeBypass, true))
+	env := startTestEnv(t, &perms)
+	defer env.stop()
+	alice, bob, key, keyID, _ := chatPair(t, env)
+	defer alice.Close()
+	defer bob.Close()
+
+	if ch, ok := env.state.GetChannel(1); ok {
+		ch.SlowModeSeconds = 60
+	}
+	sendEncChat(t, bob, key, keyID, "1", "first")
+	readEventOfType(t, alice, eventChat)
+	sendEncChat(t, bob, key, keyID, "1", "second, would be slow-moded")
+	readEventOfType(t, alice, eventChat)
 }
 
 // readChatOutcome reads frames until a chat event (accepted) or an error
@@ -663,6 +690,186 @@ func TestWordAndLinkFilters(t *testing.T) {
 	// A whitelisted link passes.
 	sendEncChat(t, bob, key, keyID, "1", "visit http://good.example/x")
 	readEventOfType(t, alice, eventChat)
+}
+
+// TestChatMaxLength pins the 119 cap on BOTH paths that enforce it. The limit
+// counts plaintext RUNES post-decrypt, so a multi-byte body at the limit must
+// be accepted rather than rejected for its byte length.
+func TestChatMaxLength(t *testing.T) {
+	const limit = 32
+	env := startTestEnvFull(t, nil, func(c *config.Config) { c.ChatMaxLength = limit })
+	defer env.stop()
+	alice, bob, key, keyID, _ := chatPair(t, env)
+	defer alice.Close()
+	defer bob.Close()
+
+	// Exactly at the limit, in two-byte runes: accepted.
+	atLimit := strings.Repeat("é", limit)
+	sendEncChat(t, bob, key, keyID, "1", atLimit)
+	data := readEventOfType(t, alice, eventChat)
+	var chat netproto.ChatBroadcast
+	if err := json.Unmarshal(data, &chat); err != nil {
+		t.Fatalf("unmarshal chat: %v", err)
+	}
+	msgID := chat.ID
+
+	// One rune over on the send path: rejected, and never stored.
+	before := env.chat.messageCount()
+	sendEncChat(t, bob, key, keyID, "1", strings.Repeat("a", limit+1))
+	expectChatError(t, bob, "message too long (max 32 characters)")
+	if got := env.chat.messageCount(); got != before {
+		t.Fatalf("over-length message was stored: count %d -> %d", before, got)
+	}
+
+	// The edit path enforces the same cap and leaves the message untouched.
+	send(t, bob, netproto.MsgChatEdit, netproto.ChatEdit{
+		MessageID: msgID, NewText: sealScopeTest(t, key, strings.Repeat("b", limit+1)), Enc: true, KeyID: keyID,
+	})
+	expectChatError(t, bob, "message too long (max 32 characters)")
+	env.chat.mu.Lock()
+	stored := env.chat.messages[msgID]
+	env.chat.mu.Unlock()
+	if stored.EditedAt != nil {
+		t.Fatal("over-length edit was applied")
+	}
+
+	// An edit at the limit is accepted.
+	send(t, bob, netproto.MsgChatEdit, netproto.ChatEdit{
+		MessageID: msgID, NewText: sealScopeTest(t, key, atLimit), Enc: true, KeyID: keyID,
+	})
+	readEventOfType(t, alice, "chat_edited")
+}
+
+// TestLinkFilterIsURLAware pins the 118 rewrite: the lists match the HOST of
+// each http(s) URL, not raw substrings of the body. Substring matching made
+// the whitelist a formality (any body mentioning an allowed domain passed) and
+// the blacklist a prose filter (a message naming a domain with no link at all
+// was rejected).
+func TestLinkFilterIsURLAware(t *testing.T) {
+	env := startTestEnvFull(t, nil, func(c *config.Config) {
+		c.ChatLinkBlacklist = "evil.example"
+		c.ChatLinkWhitelist = "good.example"
+		c.ChatRateMsgs = 100
+	})
+	defer env.stop()
+	alice, bob, key, keyID, _ := chatPair(t, env)
+	defer alice.Close()
+	defer bob.Close()
+
+	for _, tc := range []struct {
+		name string
+		body string
+		want string // "" = accepted
+	}{
+		{"whitelist entry in a query string does not license the link",
+			"look http://evil.tld/?q=good.example", "allowed domains"},
+		{"prose naming a blocked domain is not a link",
+			"evil.example is a bad site, do not go there", ""},
+		{"subdomain of a whitelisted host is allowed",
+			"docs at http://docs.good.example/x", ""},
+		{"suffix match must land on a label boundary",
+			"look http://notgood.example/x", "allowed domains"},
+		{"userinfo cannot disguise the real host",
+			"look http://good.example@evil.example/x", "blocked link"},
+		{"one allowed link does not license the others",
+			"see http://good.example/a and http://other.tld/b", "allowed domains"},
+		{"subdomain of a blacklisted host is blocked",
+			"see http://cdn.evil.example/x", "blocked link"},
+		{"a whitelisted link passes",
+			"see http://good.example/x", ""},
+	} {
+		sendEncChat(t, bob, key, keyID, "1", tc.body)
+		got := readChatOutcome(t, bob)
+		if tc.want == "" && got != "" {
+			t.Fatalf("%s: rejected with %q, want accepted", tc.name, got)
+		}
+		if tc.want != "" && !strings.Contains(got, tc.want) {
+			t.Fatalf("%s: outcome %q, want substring %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// readFilterResponse reads one ChatFilterResponse.
+func readFilterResponse(t *testing.T, conn net.Conn) netproto.ChatFilterResponse {
+	t.Helper()
+	f := readOfType(t, conn, netproto.MsgChatFilterResponse)
+	var resp netproto.ChatFilterResponse
+	if err := netproto.Decode(f, &resp); err != nil {
+		t.Fatalf("decode chat_filter_response: %v", err)
+	}
+	return resp
+}
+
+// TestChatFiltersRuntimeManaged verifies 117/118 are manageable without a
+// restart: gated reads, a persisted+audited write, the new list applying to
+// the very next message, and the config value it replaced going quiet.
+func TestChatFiltersRuntimeManaged(t *testing.T) {
+	env := startTestEnvFull(t, nil, func(c *config.Config) {
+		c.ChatWordFilter = "bootword"
+		c.ChatRateMsgs = 100
+	})
+	defer env.stop()
+	alice, bob, key, keyID, _ := chatPair(t, env) // alice is admin, bob is not
+	defer alice.Close()
+	defer bob.Close()
+
+	// Reading the lists is gated too: they say exactly what to evade.
+	send(t, bob, netproto.MsgChatFilterGet, netproto.ChatFilterGet{})
+	expectChatError(t, bob, string(permissionKeyChatFilterManage))
+
+	// The admin sees the config defaults, flagged as not yet overridden.
+	send(t, alice, netproto.MsgChatFilterGet, netproto.ChatFilterGet{})
+	if got := readFilterResponse(t, alice); got.WordFilter != "bootword" || !got.FromConfig {
+		t.Fatalf("filters = %+v, want the config defaults", got)
+	}
+
+	words := " runtimeword , , "
+	send(t, alice, netproto.MsgChatFilterSet, netproto.ChatFilterSet{WordFilter: &words})
+	if got := readFilterResponse(t, alice); got.WordFilter != "runtimeword" || got.FromConfig {
+		t.Fatalf("set reply = %+v, want the normalised runtime list", got)
+	}
+
+	// The new list applies immediately...
+	sendEncChat(t, bob, key, keyID, "1", "this has RuntimeWord in it")
+	expectChatError(t, bob, "word filter")
+
+	// ...and the config value it replaced no longer applies.
+	sendEncChat(t, bob, key, keyID, "1", "this has bootword in it")
+	readEventOfType(t, alice, eventChat)
+
+	// The write is persisted unsealed (moderation config, not message content)
+	// and audited like other admin actions.
+	v, keyGen, err := env.chat.GetServerSetting(t.Context(), chatFiltersKey)
+	if err != nil || keyGen != 0 || !strings.Contains(v, "runtimeword") {
+		t.Fatalf("chat_filters row = %q gen=%d err=%v", v, keyGen, err)
+	}
+	env.groups.mu.Lock()
+	audited := false
+	for _, a := range env.groups.audit {
+		if a.Action == "chat_filter_set" && a.Actor == "admin-uid" {
+			audited = true
+		}
+	}
+	env.groups.mu.Unlock()
+	if !audited {
+		t.Fatal("chat_filter_set was not audited")
+	}
+}
+
+// TestChatFilterManageIsDelegable proves the gate is the permission and not
+// admin-ness: a non-admin holding b_chat_filter_manage may manage the lists.
+func TestChatFilterManageIsDelegable(t *testing.T) {
+	perms := tieredWith(boolPerm(permissionKeyChatFilterManage, true))
+	env := startTestEnv(t, &perms)
+	defer env.stop()
+	bob, _ := dialAuthed(t, env.addr, "user-uid")
+	defer bob.Close()
+
+	words := "delegated"
+	send(t, bob, netproto.MsgChatFilterSet, netproto.ChatFilterSet{WordFilter: &words})
+	if got := readFilterResponse(t, bob); got.WordFilter != "delegated" || got.FromConfig {
+		t.Fatalf("filters = %+v", got)
+	}
 }
 
 func expectChatError(t *testing.T, conn net.Conn, want string) {
@@ -1016,6 +1223,30 @@ func TestAnnouncementSealed(t *testing.T) {
 	}
 	if !ann2.Enc || ann2.Text != ann.Text {
 		t.Fatalf("replayed announcement = %+v, want the same ciphertext", ann2)
+	}
+
+	// A client that JUST joined must be able to READ the replay, not merely
+	// receive it: the generation it names has to be the one the same auth
+	// response handed over, or the banner renders a placeholder forever.
+	lpub, lpriv := testX25519(t)
+	keyed, keyedResp := dialAuthedX25519(t, env.addr, "user-uid", lpub)
+	defer keyed.Close()
+	if len(keyedResp.ChatKeys) != 1 {
+		t.Fatalf("late joiner got %d chat keys, want 1", len(keyedResp.ChatKeys))
+	}
+	var ann3 struct {
+		Text  string `json:"text"`
+		KeyID uint32 `json:"key_id"`
+	}
+	if err := json.Unmarshal(readEventOfType(t, keyed, eventAnnouncement), &ann3); err != nil {
+		t.Fatalf("unmarshal late-joiner announcement: %v", err)
+	}
+	if ann3.KeyID != keyedResp.ChatKeys[0].KeyID {
+		t.Fatalf("replay names generation %d, auth response carried %d", ann3.KeyID, keyedResp.ChatKeys[0].KeyID)
+	}
+	lateKey := unsealScopeKey(t, keyedResp.ChatKeys[0], lpub, lpriv)
+	if got := openScopeTest(t, lateKey, ann3.Text); got != canary {
+		t.Fatalf("late joiner opens the announcement to %q, want %q", got, canary)
 	}
 }
 
