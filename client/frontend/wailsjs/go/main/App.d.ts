@@ -43,7 +43,11 @@ export function CloseTab(arg1:string):Promise<void>;
 
 export function Connect(arg1:string,arg2:string,arg3:string,arg4:string):Promise<string>;
 
+export function ConnectBookmarkTab(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string):Promise<string>;
+
 export function ConnectGuest(arg1:string,arg2:string):Promise<string>;
+
+export function ConnectGuestBookmarkTab(arg1:string,arg2:string,arg3:string):Promise<string>;
 
 export function ConnectGuestTab(arg1:string,arg2:string):Promise<string>;
 

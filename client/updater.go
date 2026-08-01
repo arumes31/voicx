@@ -257,9 +257,10 @@ func (a *App) ApplyAndRestart() string {
 	if err := cmd.Start(); err != nil {
 		return err.Error()
 	}
-	go func() {
+	// recover is per-goroutine: the restart worker needs its own guard (331).
+	go guardCrash("updater", func() {
 		time.Sleep(500 * time.Millisecond)
 		os.Exit(0)
-	}()
+	})
 	return ""
 }

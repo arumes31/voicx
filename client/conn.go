@@ -310,7 +310,8 @@ func (m *connManager) connectWith(addr string, authMsg netproto.Authenticate, si
 		m.emit("servererror", "e2e key publish failed: "+err.Error())
 	}
 
-	go m.readLoop(conn)
+	// recover is per-goroutine: the read loop needs its own guard (331).
+	go guardCrash("readLoop", func() { m.readLoop(conn) })
 	return ""
 }
 

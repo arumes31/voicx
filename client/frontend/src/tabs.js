@@ -91,12 +91,16 @@ function onTabReset() {
 async function autoConnectBookmarks() {
     const flagged = (V().state.settings?.bookmarks || []).filter((b) => b.auto_connect);
     for (const b of flagged) {
-        const err = await App().ConnectGuestTab(b.addr, b.nickname);
+        // (334) the per-server nickname override is what gets sent, so the
+        // bookmark must be named explicitly for the backend to find it.
+        const nick = b.nickname_override || b.nickname;
+        const err = await App().ConnectGuestBookmarkTab(b.name, b.addr, nick);
         if (err !== "") {
             // Account login needed: prefill for the user.
             const { $ } = V();
             $("login-addr").value = b.addr;
-            $("login-nick").value = b.nickname;
+            $("login-nick").value = nick;
+            V().state.pendingBookmark = { name: b.name, addr: b.addr };
             V().sysMsg?.("auto-connect needs your password for " + b.addr);
         }
     }
@@ -113,13 +117,18 @@ async function quickConnectLast() {
         return;
     }
     // Passwords are never stored: guest logins connect directly, account
-    // bookmarks prefill the login dialog.
-    const err = await App().ConnectGuestTab(target.addr, target.nickname);
+    // bookmarks prefill the login dialog. (334) the override is the nickname
+    // actually sent, so the bookmark name goes along; recents have neither.
+    const nick = target.nickname_override || target.nickname;
+    const err = await App().ConnectGuestBookmarkTab(target.name || "", target.addr, nick);
     if (err !== "") {
         const { $ } = V();
         $("login-addr").value = target.addr;
-        $("login-nick").value = target.nickname;
+        $("login-nick").value = nick;
         V().showLogin();
+        // stashed after showLogin, which drops the previous login's stash: a
+        // recent has no bookmark name and must leave none behind (334).
+        if (target.name) V().state.pendingBookmark = { name: target.name, addr: target.addr };
     }
 }
 
@@ -151,7 +160,9 @@ function renderRecents() {
             }
             const err = await App().SaveSettings(s);
             if (err) V().toast("save failed: " + err, "warn");
-            else V().state.settings = s;
+            // (282) re-read the merged truth: recents recorded while the save
+            // was in flight are not in the copy we sent.
+            else V().state.settings = await App().GetSettings();
             renderRecents();
         };
         area.appendChild(row);

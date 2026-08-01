@@ -1863,10 +1863,10 @@ func checkQueryWave10a(c *checkCtx) error {
 	}
 
 	// (222) custom property cycle.
-	if _, err := q.cmd("customset cldbid="+c.opts.aliceUID+" ident=role value=tester"); err != nil {
+	if _, err := q.cmd("customset cldbid=" + c.opts.aliceUID + " ident=role value=tester"); err != nil {
 		return fmt.Errorf("customset: %w", err)
 	}
-	defer q.cmd("customdel cldbid="+c.opts.aliceUID+" ident=role")
+	defer q.cmd("customdel cldbid=" + c.opts.aliceUID + " ident=role")
 	lines, err = q.cmd("custominfo cldbid=" + c.opts.aliceUID)
 	if err != nil || len(lines) == 0 || !strings.Contains(lines[0], "ident=role") {
 		return fmt.Errorf("custominfo = %v, %v", lines, err)

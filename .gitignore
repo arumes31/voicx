@@ -28,3 +28,7 @@ go.work.sum
 
 # Docs
 BACKLOG.md
+GOAL.md
+
+# Graphify
+graphify-out/

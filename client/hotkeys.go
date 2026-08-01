@@ -15,6 +15,11 @@ import (
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
+// allowHotkeyRegistration gates the real OS-level registration. Tests clear
+// it (see main_test.go): a `go test` run would otherwise grab Space, Ctrl+M
+// and friends system-wide for the lifetime of the test binary.
+var allowHotkeyRegistration = true
+
 // hotkeyStatus is emitted as a hotkey_status event so the UI can show
 // whether global capture is live.
 type hotkeyStatus struct {
@@ -114,7 +119,11 @@ func (a *App) applyHotkey(action, spec string) {
 		a.emitHotkeyStatus(hotkeyStatus{Action: action, Error: err.Error()})
 		return
 	}
-	go a.hotkeyLoop(action, mods, key)
+	if !allowHotkeyRegistration {
+		return
+	}
+	// recover is per-goroutine: hotkey callbacks need their own guard (331).
+	go guardCrash("hotkey "+action, func() { a.hotkeyLoop(action, mods, key) })
 }
 
 // hotkeyLoop registers one hotkey (retrying once on failure) and forwards

@@ -3,23 +3,28 @@
 package main
 
 import (
+	"path/filepath"
 	"testing"
 
 	"voicx/internal/netproto"
 )
 
 // newTabApp returns an App with a fresh tab registry (no Wails context).
-func newTabApp() *App {
+// settingsPath must always be set so persistence stays inside the test's temp
+// dir even if the package-wide path gate is ever rearmed.
+func newTabApp(t *testing.T) *App {
+	t.Helper()
 	return &App{
-		settings: DefaultSettings(),
-		hotkeys:  map[string]*hotkeyReg{},
-		tabs:     map[string]*tabState{},
+		settings:     DefaultSettings(),
+		hotkeys:      map[string]*hotkeyReg{},
+		tabs:         map[string]*tabState{},
+		settingsPath: filepath.Join(t.TempDir(), "settings.json"),
 	}
 }
 
 // TestTabLifecycle covers creation, activation, and closing.
 func TestTabLifecycle(t *testing.T) {
-	a := newTabApp()
+	a := newTabApp(t)
 
 	id1, ts1 := a.newTab()
 	id2, _ := a.newTab()
@@ -59,7 +64,7 @@ func TestTabLifecycle(t *testing.T) {
 // TestTabJournalAndBadges covers background-event journaling, badge
 // counting, and journal reset on a fresh snapshot.
 func TestTabJournalAndBadges(t *testing.T) {
-	a := newTabApp()
+	a := newTabApp(t)
 	id1, _ := a.newTab()
 	_, ts2 := a.newTab()
 	a.activate(id1) // tab 2 stays in the background
@@ -98,7 +103,7 @@ func TestTabJournalAndBadges(t *testing.T) {
 // TestTabReplayUsesCachedFrames verifies activation replays the cached
 // snapshot/list frames through the connManager itself (281 replay source).
 func TestTabReplayUsesCachedFrames(t *testing.T) {
-	a := newTabApp()
+	a := newTabApp(t)
 	_, ts := a.newTab()
 	// Simulate frames that arrived while the tab was in the background.
 	ts.cm.dispatch(&netproto.Frame{Type: uint16(netproto.MsgSnapshot), Payload: []byte(`{"root_channels":[]}`)})
@@ -110,9 +115,8 @@ func TestTabReplayUsesCachedFrames(t *testing.T) {
 
 // TestRecordRecent verifies dedup, ordering, and the 10-entry cap (282).
 func TestRecordRecent(t *testing.T) {
-	a := newTabApp()
+	a := newTabApp(t)
 	a.settings.Recents = nil
-	a.settingsPath = t.TempDir() + "/settings.json"
 
 	for i := 0; i < 12; i++ {
 		a.RecordRecent("srv-"+string(rune('a'+i)), "nick")
@@ -131,9 +135,83 @@ func TestRecordRecent(t *testing.T) {
 	}
 }
 
+// TestLookupBookmark verifies the bookmark a connection belongs to is found
+// by name, that the name must agree with the address (names are not unique),
+// and that the nameless fallback only resolves an unambiguous match.
+func TestLookupBookmark(t *testing.T) {
+	a := newTabApp(t)
+	a.settings.Bookmarks = []Bookmark{
+		{Name: "work", Addr: "srv:10011", Nickname: "alice", NicknameOverride: "alice-work", Profile: "work"},
+		{Name: "home", Addr: "srv:10011", Nickname: "alice"},
+		{Name: "work", Addr: "other:10011", Nickname: "carol"},
+	}
+
+	if b := a.lookupBookmark("home", "srv:10011", "alice-work"); b == nil || b.Name != "home" {
+		t.Fatalf("explicit name lookup = %+v", b)
+	}
+	// A duplicated name resolves per address, not first-wins.
+	if b := a.lookupBookmark("work", "other:10011", "carol"); b == nil || b.Nickname != "carol" {
+		t.Fatalf("duplicate name lookup = %+v", b)
+	}
+	// The override is what was sent as the login nickname.
+	if b := a.lookupBookmark("", "srv:10011", "alice-work"); b == nil || b.Name != "work" {
+		t.Fatalf("override lookup = %+v", b)
+	}
+	// Two bookmarks answer to "alice" on that server: guessing would apply
+	// the wrong profile/avatar override, so neither is returned.
+	if b := a.lookupBookmark("", "srv:10011", "alice"); b != nil {
+		t.Fatalf("ambiguous nickname matched %+v", b)
+	}
+	if b := a.lookupBookmark("", "nowhere:10011", "alice"); b != nil {
+		t.Fatalf("unknown server matched %+v", b)
+	}
+	if b := a.lookupBookmark("gone", "srv:10011", "alice"); b != nil {
+		t.Fatalf("unknown bookmark name matched %+v", b)
+	}
+	if b := a.lookupBookmark("work", "nowhere:10011", "alice-work"); b != nil {
+		t.Fatalf("name matched a foreign address: %+v", b)
+	}
+}
+
+// TestLookupBookmarkNicknameCollision covers the shape that broke: one
+// bookmark's override is another bookmark's plain nickname on the same
+// server, so only the explicit name can tell them apart.
+func TestLookupBookmarkNicknameCollision(t *testing.T) {
+	a := newTabApp(t)
+	a.settings.Bookmarks = []Bookmark{
+		{Name: "X", Addr: "srv", Nickname: "alice", NicknameOverride: "bob", AvatarOverrideB64: "xxx"},
+		{Name: "Y", Addr: "srv", Nickname: "bob"},
+	}
+
+	if b := a.lookupBookmark("Y", "srv", "bob"); b == nil || b.Name != "Y" {
+		t.Fatalf("connect via Y resolved %+v", b)
+	}
+	if b := a.lookupBookmark("X", "srv", "bob"); b == nil || b.Name != "X" {
+		t.Fatalf("connect via X resolved %+v", b)
+	}
+}
+
+// TestLookupBookmarkDuplicateName covers two bookmarks on one server renamed
+// to the same name: nothing enforces name uniqueness, and the pair carries
+// different profiles/avatar overrides, so neither may win.
+func TestLookupBookmarkDuplicateName(t *testing.T) {
+	a := newTabApp(t)
+	a.settings.Bookmarks = []Bookmark{
+		{Name: "work", Addr: "srv:10011", Nickname: "alice", Profile: "alice", AvatarOverrideB64: "aaa"},
+		{Name: "work", Addr: "srv:10011", Nickname: "bob", Profile: "bob", AvatarOverrideB64: "bbb"},
+	}
+
+	if b := a.lookupBookmark("work", "srv:10011", "bob"); b != nil {
+		t.Fatalf("ambiguous name matched %+v", b)
+	}
+	if b := a.lookupBookmark("work", "srv:10011", "alice"); b != nil {
+		t.Fatalf("ambiguous name matched %+v", b)
+	}
+}
+
 // TestHotkeyProfiles verifies profile merging over defaults (300).
 func TestHotkeyProfiles(t *testing.T) {
-	a := newTabApp()
+	a := newTabApp(t)
 	a.settings.HotkeyPTT = "Space"
 	a.settings.HotkeyMute = "Ctrl+M"
 	a.settings.HotkeyProfiles = map[string]HotkeyProfile{
@@ -156,8 +234,7 @@ func TestHotkeyProfiles(t *testing.T) {
 
 // TestSetHotkeyValidation verifies the per-action rebind API (299).
 func TestSetHotkeyValidation(t *testing.T) {
-	a := newTabApp()
-	a.settingsPath = t.TempDir() + "/settings.json"
+	a := newTabApp(t)
 
 	if err := a.SetHotkey("nope", "F1"); err == "" {
 		t.Fatal("unknown action accepted")

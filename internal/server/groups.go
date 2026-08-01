@@ -486,6 +486,38 @@ func (s *TCPServer) grantCapOk(pc *permChecker, key string, value, grant int) bo
 	return own.Grant >= value && own.Grant >= grant
 }
 
+// currentPerms indexes a target's existing entries by key so a write can be
+// capped against what it replaces or removes. Admins skip the lookup: the cap
+// never applies to them.
+func (s *TCPServer) currentPerms(ctx context.Context, pc *permChecker, tier store.PermTier, target store.PermTarget) (map[string]store.PermEntry, error) {
+	if pc.admin {
+		return nil, nil
+	}
+	entries, err := s.deps.Groups.ListPermissions(ctx, tier, target)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]store.PermEntry, len(entries))
+	for _, e := range entries {
+		out[e.Key] = e
+	}
+	return out, nil
+}
+
+// grantCapOkWrite caps a write against both what it writes and the entry it
+// replaces or removes. The second half matters: capping only the new
+// value/grant lets a caller holding a grant of 0 wipe or overwrite an entry
+// (e.g. the admin group's b_permission_manage) it could never set itself.
+func (s *TCPServer) grantCapOkWrite(pc *permChecker, current map[string]store.PermEntry, key string, value, grant int) bool {
+	if !s.grantCapOk(pc, key, value, grant) {
+		return false
+	}
+	if e, ok := current[key]; ok {
+		return s.grantCapOk(pc, key, e.Value, e.Grant)
+	}
+	return true
+}
+
 // handlePermSet writes a permission entry on a tier.
 func (s *TCPServer) handlePermSet(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.PermSet
@@ -502,12 +534,16 @@ func (s *TCPServer) handlePermSet(ctx context.Context, client *Client, f *netpro
 	if !pc.granted(permissions.PermissionKeyPermissionManage) {
 		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyPermissionManage))
 	}
-	if !s.grantCapOk(pc, msg.Key, msg.Value, msg.Grant) {
-		return s.sendError(client, errCodePermissionDenied, "grant cap exceeded: you may only set values <= your own grant for this key")
-	}
 	tier, target, err := s.permTarget(ctx, msg.Tier, msg.UniqueID, msg.GroupID, msg.ChannelID)
 	if err != nil {
 		return s.sendError(client, errCodeMalformed, err.Error())
+	}
+	current, err := s.currentPerms(ctx, pc, tier, target)
+	if err != nil {
+		return s.sendError(client, errCodeUnavailable, "perm lookup failed")
+	}
+	if !s.grantCapOkWrite(pc, current, msg.Key, msg.Value, msg.Grant) {
+		return s.sendError(client, errCodePermissionDenied, "grant cap exceeded: you may only set values <= your own grant for this key")
 	}
 	if err := s.deps.Groups.SetPermission(ctx, tier, target, msg.Key, msg.Value, msg.Grant, msg.Skip, msg.Negate); err != nil {
 		return s.sendError(client, errCodeUnavailable, "perm set failed: "+err.Error())
@@ -574,6 +610,16 @@ func (s *TCPServer) handlePermUnset(ctx context.Context, client *Client, f *netp
 	if err != nil {
 		return s.sendError(client, errCodeMalformed, err.Error())
 	}
+	// Removing an entry is a write like setting it, and the cap has to be
+	// measured against the entry being deleted: otherwise a low-power operator
+	// could delete entries far above their own level.
+	current, err := s.currentPerms(ctx, pc, tier, target)
+	if err != nil {
+		return s.sendError(client, errCodeUnavailable, "perm lookup failed")
+	}
+	if !s.grantCapOkWrite(pc, current, msg.Key, 0, 0) {
+		return s.sendError(client, errCodePermissionDenied, "grant cap exceeded: you may only unset entries within your own grant for this key")
+	}
 	if err := s.deps.Groups.UnsetPermission(ctx, tier, target, msg.Key); err != nil {
 		return s.sendError(client, errCodeUnavailable, "perm unset failed: "+err.Error())
 	}
@@ -635,6 +681,18 @@ func (s *TCPServer) handlePermTemplateApply(ctx context.Context, client *Client,
 	}
 	if tier != store.PermTierServerGroup && tier != store.PermTierClient {
 		return s.sendError(client, errCodeMalformed, "templates apply to server_group or client tiers")
+	}
+	// A template is a batch of perm_set writes: cap every key it carries
+	// against the value it writes and the entry it would replace, or the admin
+	// template becomes a privilege-escalation shortcut.
+	current, err := s.currentPerms(ctx, pc, tier, target)
+	if err != nil {
+		return s.sendError(client, errCodeUnavailable, "perm lookup failed")
+	}
+	for key, value := range tmpl {
+		if !s.grantCapOkWrite(pc, current, key, value, 0) {
+			return s.sendError(client, errCodePermissionDenied, "grant cap exceeded: the template's "+key+" is outside your own grant")
+		}
 	}
 	for key, value := range tmpl {
 		if err := s.deps.Groups.SetPermission(ctx, tier, target, key, value, 0, false, false); err != nil {

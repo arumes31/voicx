@@ -159,14 +159,19 @@ const maxFileVersions = 3
 
 // finalizeUpload places a verified upload: it rotates the replaced file into
 // <name>.v1..v3 (264), hard-links to an identical existing blob when one
-// exists (275 dedup), and records the row.
+// exists (275 dedup), and records the row. Client-encrypted chat attachments
+// are flagged so the file browser can refuse to hand out a blob it has no key
+// for (91-135); their content-derived names never collide, so neither
+// rotation nor dedup is reachable for them.
 func (s *Server) finalizeUpload(ctx context.Context, tr *transfer, tmpPath, finalPath string, size int64, sum string) error {
+	encrypted := isEncryptedAttachment(tr.Name)
+
 	// Identical re-upload of the current file: keep the blob, refresh the row.
 	if cur, err := s.store.GetFile(ctx, tr.ChannelID, tr.Folder, tr.Name); err == nil && cur.SHA256 == sum {
 		_ = os.Remove(tmpPath)
 		return s.store.AddFile(ctx, store.FileRecord{
 			ChannelID: tr.ChannelID, Folder: tr.Folder, Name: tr.Name,
-			Size: size, SHA256: sum, Uploader: tr.Uploader,
+			Size: size, SHA256: sum, Uploader: tr.Uploader, Encrypted: encrypted,
 		})
 	}
 
@@ -189,7 +194,7 @@ func (s *Server) finalizeUpload(ctx context.Context, tr *transfer, tmpPath, fina
 	}
 	return s.store.AddFile(ctx, store.FileRecord{
 		ChannelID: tr.ChannelID, Folder: tr.Folder, Name: tr.Name,
-		Size: size, SHA256: sum, Uploader: tr.Uploader,
+		Size: size, SHA256: sum, Uploader: tr.Uploader, Encrypted: encrypted,
 	})
 }
 

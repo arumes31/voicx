@@ -12,12 +12,24 @@
 // and atomically renamed on success; a same-name upload replaces the
 // previous file (both on disk and in the files table).
 //
+// The port speaks TLS (91-135). The single-use token is minted on the TLS
+// control channel and then presented here, so a plaintext data port leaks the
+// token as well as the bytes: an on-path observer could lift it and pull the
+// file itself. The certificate is the one the control channel already
+// presents, so clients re-use the fingerprint they have already pinned.
+//
+// The package has no awareness of chat-attachment encryption: it moves opaque
+// bytes. Chat attachments are sealed by the client before upload and arrive
+// here under a content-derived ".vcx" name; the only two places that care are
+// the files.encrypted flag and the download-link refusal in links.go.
+//
 // Per-channel file passwords (TS3 b_ft_ignore_password) are out of scope.
 package filetransfer
 
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -49,6 +61,23 @@ var ErrTooLarge = errors.New("filetransfer: file too large")
 // ErrInvalidName is returned when a file name fails sanitization.
 var ErrInvalidName = errors.New("filetransfer: invalid file name")
 
+// ErrEncryptedAttachment is returned when an expiring download link (267) is
+// requested for a client-encrypted chat attachment.
+var ErrEncryptedAttachment = errors.New("encrypted chat attachment — open it in the client")
+
+// encryptedSuffix marks a client-encrypted chat attachment (91-135): the blob
+// is nonce||secretbox and its key lives only inside the encrypted chat body,
+// so nothing server-side can ever read it back.
+const encryptedSuffix = ".vcx"
+
+// isEncryptedAttachment reports whether a stored name is a client-encrypted
+// chat attachment. The name is content-derived by the client
+// (sha256(ciphertext) + ".vcx"), which is why these never collide with an
+// existing name and so never reach the .v1..v3 rotation path.
+func isEncryptedAttachment(name string) bool {
+	return strings.HasSuffix(name, encryptedSuffix)
+}
+
 // FileStore is the subset of the store the file-transfer server needs. It is
 // satisfied by *store.Store.
 type FileStore interface {
@@ -77,6 +106,16 @@ type Config struct {
 	ChannelQuotaMB int64
 	// MaxSizeMB is the per-transfer size cap in MiB. 0 = unlimited.
 	MaxSizeMB int64
+	// TLSEnabled wraps the listener in TLS (91-135). False is a dev-only
+	// escape hatch: it leaks both the file bytes and the transfer token.
+	TLSEnabled bool
+	// Cert is the certificate presented on the data port. It is the same
+	// certificate as the control channel, so clients need no second trust
+	// decision.
+	Cert tls.Certificate
+	// Fingerprint is Cert's SHA-256 fingerprint, handed to clients in
+	// FileTransferInitResponse so they can pin it.
+	Fingerprint string
 }
 
 // transfer is a pending (token-issued, not yet consumed) file transfer.
@@ -141,6 +180,17 @@ func New(cfg Config, st FileStore, logger *zap.Logger) *Server {
 // numeric port), used in FileTransferInitResponse.
 func (s *Server) Port() int {
 	return s.port
+}
+
+// Fingerprint returns the SHA-256 fingerprint of the certificate this port
+// presents, empty when TLS is disabled. Clients cross-check it against the
+// control-channel pin so a hostile server cannot redirect transfers to a
+// third-party host.
+func (s *Server) Fingerprint() string {
+	if !s.cfg.TLSEnabled {
+		return ""
+	}
+	return s.cfg.Fingerprint
 }
 
 // InitUpload issues a single-use upload token after validating the folder
@@ -439,8 +489,23 @@ func (s *Server) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("filetransfer listen on %s: %w", s.cfg.Addr, err)
 	}
+	if s.cfg.TLSEnabled {
+		ln = tls.NewListener(ln, &tls.Config{
+			Certificates: []tls.Certificate{s.cfg.Cert},
+			MinVersion:   tls.VersionTLS12,
+		})
+	}
 	s.listener = ln
-	s.logger.Info("file transfer listener started", zap.String("addr", s.cfg.Addr))
+	if s.cfg.TLSEnabled {
+		s.logger.Info("file transfer listener started",
+			zap.String("addr", s.cfg.Addr),
+			zap.String("fingerprint", s.cfg.Fingerprint),
+		)
+	} else {
+		// same shape as the control channel's plaintext warning: the token is
+		// minted over TLS and then replayed here in the clear (91-135).
+		s.logger.Warn("file transfer listener started (PLAINTEXT!)", zap.String("addr", s.cfg.Addr))
+	}
 
 	go func() {
 		select {

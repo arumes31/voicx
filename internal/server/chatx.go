@@ -84,10 +84,12 @@ func (l *chatRateLimiter) allow(uid string, now time.Time) bool {
 	return true
 }
 
-// spamEntry is one recently seen message body for spam detection.
+// spamEntry is one recently seen message body for spam detection. Only the
+// digest is retained: the heuristic compares bodies for exact equality, so a
+// hash is a drop-in that keeps no plaintext in server memory (91).
 type spamEntry struct {
-	body string
-	at   time.Time
+	sum [32]byte
+	at  time.Time
 }
 
 // spamTracker rejects the third identical message within 30 seconds (116).
@@ -100,8 +102,9 @@ func newSpamTracker() *spamTracker {
 	return &spamTracker{recent: map[string][]spamEntry{}}
 }
 
-// record notes a message and reports whether it trips the spam heuristic.
-func (t *spamTracker) record(uid, body string, now time.Time) bool {
+// record notes a message digest and reports whether it trips the spam
+// heuristic.
+func (t *spamTracker) record(uid string, sum [32]byte, now time.Time) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	cutoff := now.Add(-30 * time.Second)
@@ -112,12 +115,29 @@ func (t *spamTracker) record(uid, body string, now time.Time) bool {
 			continue
 		}
 		keep = append(keep, e)
-		if e.body == body {
+		if e.sum == sum {
 			same++
 		}
 	}
-	t.recent[uid] = append(keep, spamEntry{body: body, at: now})
+	t.recent[uid] = append(keep, spamEntry{sum: sum, at: now})
 	return same >= 2 // this is the 3rd identical message in 30s
+}
+
+// bodyDigest is the spam tracker's key for a moderated body.
+func bodyDigest(body string) [32]byte {
+	return sha256.Sum256([]byte(body))
+}
+
+// attachmentRefRe matches the chat attachment token
+// [file:<storage>#<base64 file key>#<display name>] (12).
+var attachmentRefRe = regexp.MustCompile(`\[file:([^\]#]*)#([^\]#]*)#([^\]]*)\]`)
+
+// stripAttachmentRefs rewrites attachment tokens to [file:<display name>].
+// The per-file key is fresh random base64 on every paste, so without this no
+// two image posts are ever equal and the "same message 3x in 30s" heuristic
+// (116) stops catching image spam. The word filter still sees the file name.
+func stripAttachmentRefs(body string) string {
+	return attachmentRefRe.ReplaceAllString(body, "[file:$3]")
 }
 
 // slowTracker records each user's last send time per channel (114).
@@ -182,14 +202,12 @@ func (s *TCPServer) routeScopedChat(ctx context.Context, client *Client, msg net
 		}
 	}
 
-	// Decrypt with the scope's current key (the key id was validated by the
-	// caller). The server holds the scope keys so it can moderate and store.
+	// Decrypt with the generation the sender named (validated by the caller).
+	// The server holds the scope keys so it can moderate; the plaintext lives
+	// only for the length of this function.
 	plain := msg.Text
 	if msg.Enc {
-		if s.chatKeys == nil {
-			return s.sendError(client, errCodeUnavailable, "chat key manager unavailable")
-		}
-		p, err := s.chatKeys.open(channelID, msg.Text)
+		p, err := s.chatKeys.open(ctx, channelID, msg.KeyID, msg.Text)
 		if err != nil {
 			return s.sendError(client, errCodeMalformed, "message decryption failed (stale key?)")
 		}
@@ -202,42 +220,68 @@ func (s *TCPServer) routeScopedChat(ctx context.Context, client *Client, msg net
 		return s.sendError(client, errCodeMalformed, fmt.Sprintf("message too long (max %d characters)", s.cfg.ChatMaxLength))
 	}
 
+	// Attachment tokens carry a fresh random key per upload; the filters and
+	// the spam heuristic see the display name instead (12/116).
+	moderated := stripAttachmentRefs(plain)
+
 	// (117/118) word + link filters.
-	if err := s.moderateBody(plain); err != nil {
+	if err := s.moderateBody(moderated); err != nil {
 		s.metricsSink().IncChatMessage("rejected")
 		return s.sendError(client, errCodeMalformed, err.Error())
 	}
 
 	// (116) anti-spam: identical message x3 in 30s.
-	if s.chatSpam != nil && s.chatSpam.record(uid, plain, time.Now()) {
+	if s.chatSpam != nil && s.chatSpam.record(uid, bodyDigest(moderated), time.Now()) {
 		s.metricsSink().IncChatMessage("rejected")
 		return s.sendError(client, errCodeMalformed, "possible spam detected — please vary your messages")
 	}
 	// (105) mention parsing.
 	mentions := s.parseMentions(ctx, client, channelID, plain)
 
-	// (103) store decrypted (history/search/moderation need readable bodies).
-	var messageID int64
-	if s.deps.Chat != nil {
-		id, err := s.deps.Chat.StoreChatMessage(ctx, channelID, uid, client.Username, plain)
-		if err != nil {
-			s.logger.Warn("storing chat message failed")
-			// Storage failure is not fatal for relay.
-		} else {
-			messageID = id
+	// (91) store the sender's ORIGINAL ciphertext verbatim: handleChatSend has
+	// already proved the key id is current, so the bytes that were moderated
+	// are exactly the bytes that are stored. A message that arrived through
+	// the plaintext escape hatch is sealed here, so neither storage nor the
+	// relay is ever plaintext.
+	bodyEnc, keyID := msg.Text, msg.KeyID
+	if !msg.Enc {
+		// The sender is provably in this scope (handleChatSend checked
+		// membership, and everyone is in the global scope), so ensuring the
+		// scope's first generation here is authorised.
+		if _, _, err := s.chatKeys.EnsureScope(ctx, channelID); err != nil {
+			return s.sendError(client, errCodeUnavailable, "chat key unavailable")
 		}
+		id, ct, err := s.chatKeys.seal(ctx, channelID, plain)
+		if err != nil {
+			return s.sendError(client, errCodeUnavailable, "chat key unavailable")
+		}
+		bodyEnc, keyID = ct, id
 	}
 
-	// Relay the ORIGINAL ciphertext (clients decrypt with the scope key);
-	// history reads the decrypted body from the store.
+	var messageID int64
+	if s.deps.Chat != nil {
+		id, err := s.deps.Chat.StoreChatMessage(ctx, channelID, uid, client.Username, bodyEnc, keyID)
+		if err != nil {
+			// Relaying anyway would turn a constraint violation into
+			// invisible, indefinite history loss; fail the send instead.
+			s.logger.Warn("storing chat message failed", zap.Error(err))
+			s.metricsSink().IncChatMessage("rejected")
+			return s.sendError(client, errCodeUnavailable, "message not stored — not delivered")
+		}
+		messageID = id
+	}
+
+	// Relay the ciphertext (clients decrypt with the scope key). The relay is
+	// encrypted regardless of chat_allow_plaintext, so the wire format is
+	// uniform and no config can fan plaintext out to a scope.
 	chat := netproto.ChatBroadcast{
 		ChannelID:    msg.ChannelID,
 		FromClientID: client.ID,
 		FromUniqueID: uid,
 		From:         client.Username,
-		Text:         msg.Text,
-		Enc:          msg.Enc,
-		KeyID:        msg.KeyID,
+		Text:         bodyEnc,
+		Enc:          true,
+		KeyID:        keyID,
 		ID:           messageID,
 		Mentions:     mentions,
 		ClientMsgID:  msg.ClientMsgID,

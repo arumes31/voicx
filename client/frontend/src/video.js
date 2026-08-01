@@ -4,7 +4,9 @@
 // namespace (window.__voicx) populated by main.js.
 const V = () => window.__voicx;
 
-// tiles maps publisher clientID -> {el, video, nameEl, badgeEl, stream}.
+// tiles maps publisher clientID -> {el, video, nameEl, badgeEl, track, stream}.
+// track is that publisher's own video track and stream the per-tile
+// MediaStream wrapping it (never the shared stream from ontrack).
 const tiles = new Map();
 let focusedID = null;
 
@@ -15,6 +17,7 @@ let focusedID = null;
 // -> low.
 let qualityPref = "auto"; // auto | high | mid | low
 let lastSentQuality = "";
+let idleOverride = false; // (342) window idle: force low without losing the pref
 let statsTimer = null;
 
 // ---------------------------------------------------------------------------
@@ -44,6 +47,15 @@ export function videoTrackAdded(trackID, stream, publisher) {
         const video = el.querySelector("video");
         const nameEl = el.querySelector(".vtile-name");
         const badgeEl = el.querySelector(".vtile-badge");
+        // The fallback panel is opaque and paints over the <video>, so the
+        // has-video class has to follow the element's decode state.
+        video.onloadeddata = video.onplaying = video.onemptied = () => {
+            updateTileVideo(t);
+            // (88) low-bandwidth stops rendering only once a frame is decoded,
+            // so the tile freezes on a still image; pausing an element that has
+            // never decoded leaves it on the avatar forever.
+            if (lowBandwidth && t.video.readyState >= 2) t.video.pause();
+        };
         // (340) fullscreen video tile.
         el.querySelector(".vtile-fullscreen").onclick = (e) => {
             e.stopPropagation();
@@ -55,13 +67,21 @@ export function videoTrackAdded(trackID, stream, publisher) {
             e.preventDefault();
             openQualityMenu(e.clientX, e.clientY);
         };
-        t = { el, video, nameEl, badgeEl, stream: null };
+        t = { el, video, nameEl, badgeEl, track: null, stream: null };
         tiles.set(clid, t);
         gridEl().appendChild(el);
     }
-    t.stream = stream;
-    t.video.srcObject = stream;
-    if (lowBandwidth) t.video.pause();
+    // (61) select by track id (it is the publisher's client id) and render from
+    // a private stream, so a tile can never follow another publisher even if
+    // the ontrack stream ever carries more than one.
+    const vt = stream?.getVideoTracks().find((tr) => tr.id === clid) || null;
+    t.track = vt;
+    t.stream = vt ? new MediaStream([vt]) : null;
+    t.video.srcObject = t.stream;
+    // A publisher turning the camera off arrives as a muted receiver track,
+    // not as a removed track — that flips the tile back to the avatar.
+    if (vt) vt.onmute = vt.onunmute = vt.onended = () => updateTileVideo(t);
+    updateTileVideo(t);
     applyTileIdentity(t, clid);
     layoutGrid();
     startStatsPoll();
@@ -120,6 +140,15 @@ function applyTileIdentity(t, clid) {
     t.el.classList.toggle("speaking", !!(c && c.is_speaking));
 }
 
+// updateTileVideo toggles has-video, which hides the avatar fallback. Frames
+// have to be decoded (readyState >= HAVE_CURRENT_DATA) *and* the track live:
+// a paused low-bandwidth tile still shows its last frame, a muted one does not.
+function updateTileVideo(t) {
+    const track = t.track;
+    const live = !!track && track.readyState === "live" && track.enabled && !track.muted;
+    t.el.classList.toggle("has-video", live && t.video.readyState >= 2);
+}
+
 // layoutGrid recomputes the auto-layout class (1→full, 2→half, 3-4→2x2,
 // more→scrollable) and hides the grid when empty so chat keeps the space.
 function layoutGrid() {
@@ -159,9 +188,18 @@ export function initVideo() {
 // effectiveQuality maps the preference to a concrete layer. Auto heuristic:
 // focused view -> high, grid view -> mid, low-bandwidth mode -> low.
 function effectiveQuality() {
-    if (lowBandwidth) return "low";
+    if (lowBandwidth || idleOverride) return "low";
     if (qualityPref !== "auto") return qualityPref;
     return focusedID ? "high" : "mid";
+}
+
+// setIdleQualityOverride is the idle-pause hook (342). It goes through the
+// state machine so lastSentQuality stays in sync with the server and the
+// user's preference comes back on resume.
+export function setIdleQualityOverride(on) {
+    if (idleOverride === on) return;
+    idleOverride = on;
+    pushQuality();
 }
 
 // pushQuality sends MsgVideoQuality when the effective layer changed.
@@ -232,9 +270,9 @@ async function refreshBadges() {
             }
         });
         for (const [clid, t] of tiles) {
+            updateTileVideo(t); // WebView2 does not always fire track mute/unmute
             let w = 0;
-            const track = t.stream?.getVideoTracks()[0];
-            if (track) w = byTrack.get(track.id) || 0;
+            if (t.track) w = byTrack.get(t.track.id) || 0;
             if (!w) {
                 t.badgeEl.classList.add("hidden");
                 continue;
@@ -263,24 +301,32 @@ export async function setLowBandwidth(on, persist) {
     lastSentQuality = ""; // force re-push with the new effective quality
     pushQuality();
     for (const t of tiles.values()) {
-        if (on) t.video.pause();
+        // (88) a tile with nothing decoded yet keeps playing until its first
+        // frame lands (the element pauses itself then), so it freezes on an
+        // image instead of never leaving the avatar.
+        if (on) { if (t.video.readyState >= 2) t.video.pause(); }
         else t.video.play().catch(() => {});
     }
     applySendCaps();
     if (persist) {
         const s = Object.assign({}, V().state.settings, { low_bandwidth: on });
         const err = await window.go.main.App.SaveSettings(s);
-        if (!err) V().state.settings = s;
+        // (282) re-read rather than caching the copy we sent: the Go side owns
+        // fields the frontend never has (recents, what's-new marker).
+        if (!err) V().state.settings = await window.go.main.App.GetSettings();
     }
 }
 
-// videoSender returns the sender of the video transceiver, or null. Matches
-// by transceiver so it never confuses the share-audio sender.
+// videoSender returns the sender of a video transceiver this client can send
+// on, or null. Matches by transceiver so it never confuses the share-audio
+// sender, and skips recvonly ones: with no camera there is no send transceiver
+// at all and replaceTrack on a server-side recvonly would publish nothing.
 function videoSender() {
     const { state } = V();
     if (!state.pc) return null;
     const t = state.pc.getTransceivers().find((t) =>
-        t.receiver.track.kind === "video" || t.sender.track?.kind === "video");
+        (t.receiver.track?.kind === "video" || t.sender.track?.kind === "video") &&
+        (t.direction === "sendrecv" || t.direction === "sendonly"));
     return t ? t.sender : null;
 }
 
@@ -424,9 +470,32 @@ async function startShare({ surface, preset, withAudio }) {
     }
 
     state.shareStream = display;
-    const vs = videoSender();
-    if (vs) {
+    let vs = videoSender();
+    if (!vs && state.pc) {
+        // Cameraless machine: startVoice never added a send transceiver, so
+        // the share needs its own one plus a renegotiation. addTrack would
+        // recycle one of the server's recvonly m-lines and publish on a
+        // subscriber slot, so take a dedicated sendonly transceiver.
+        let tr = null;
+        try {
+            tr = state.pc.addTransceiver(screenTrack, { direction: "sendonly", streams: [display] });
+            vs = tr.sender;
+            await renegotiate();
+        } catch (e) {
+            V().sysMsg("publishing screen share failed: " + (e.message || e.name));
+            // a rollback only drops transceivers created by applying a remote
+            // description, so this one survives with its direction flip and
+            // would be re-offered — stop it to keep the dead m-line out of
+            // videoSender()'s reach.
+            try { tr?.stop(); } catch { /* nothing left to stop */ }
+            display.getTracks().forEach((t) => t.stop());
+            state.shareStream = null;
+            return;
+        }
+    } else if (vs) {
         await vs.replaceTrack(screenTrack).catch(() => {});
+    }
+    if (vs) {
         // (72) bitrate cap per preset.
         const params = vs.getParameters();
         if (params.encodings?.length) {
@@ -440,11 +509,19 @@ async function startShare({ surface, preset, withAudio }) {
     // fans out every publisher audio track) + renegotiate.
     const displayAudio = withAudio ? display.getAudioTracks()[0] : null;
     if (displayAudio && state.pc) {
+        let tr = null;
         try {
-            state.shareAudioSender = state.pc.addTrack(displayAudio, display);
+            // addTrack would recycle one of the server's recvonly audio
+            // m-lines and publish the share on a subscriber slot, so take a
+            // dedicated sendonly transceiver.
+            tr = state.pc.addTransceiver(displayAudio, { direction: "sendonly", streams: [display] });
+            state.shareAudioSender = tr.sender;
             await renegotiate();
         } catch (e) {
             V().sysMsg("publishing share audio failed: " + (e.message || e.name));
+            // a rollback keeps this transceiver, so without the stop() the
+            // dead track is re-offered on the next renegotiation.
+            try { tr?.stop(); } catch { /* nothing left to stop */ }
             displayAudio.stop();
             state.shareAudioSender = null;
         }
@@ -558,12 +635,19 @@ async function doStopShare() {
     }
 }
 
-// renegotiate runs a client-initiated offer/answer round (used after adding
-// the share-audio track); the server treats re-offers idempotently.
+// renegotiate runs a client-initiated offer/answer round (used after adding a
+// share track); the server treats re-offers idempotently. A failed round is
+// rolled back to "stable": without that the pc stays in have-local-offer and
+// every later renegotiation dies with InvalidStateError.
 async function renegotiate() {
     const { state } = V();
     const offer = await state.pc.createOffer();
     await state.pc.setLocalDescription(offer);
-    const answerSDP = await window.go.main.App.WebRTCOffer(offer.sdp);
-    await state.pc.setRemoteDescription({ type: "answer", sdp: answerSDP });
+    try {
+        const answerSDP = await window.go.main.App.WebRTCOffer(offer.sdp);
+        await state.pc.setRemoteDescription({ type: "answer", sdp: answerSDP });
+    } catch (e) {
+        await state.pc.setLocalDescription({ type: "rollback" }).catch(() => {});
+        throw e;
+    }
 }

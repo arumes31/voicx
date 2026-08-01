@@ -128,6 +128,9 @@ const (
 	MsgPoke               MessageType = 96 // client -> server: poke a client
 	MsgServerInfoQuery    MessageType = 97 // client -> server: request public server info
 	MsgServerInfoResponse MessageType = 98 // server -> client: public server info
+
+	MsgChatKeyRequest MessageType = 99  // client -> server: request specific scope key generations
+	MsgChatKeyBundle  MessageType = 100 // server -> client: sealed generations (+ refusals)
 )
 
 // String returns a human-readable name for the message type.
@@ -329,6 +332,10 @@ func (m MessageType) String() string {
 		return "ServerInfoQuery"
 	case MsgServerInfoResponse:
 		return "ServerInfoResponse"
+	case MsgChatKeyRequest:
+		return "ChatKeyRequest"
+	case MsgChatKeyBundle:
+		return "ChatKeyBundle"
 	default:
 		return fmt.Sprintf("Unknown(%d)", uint16(m))
 	}
@@ -359,6 +366,12 @@ type Authenticate struct {
 	Anonymous      bool   `json:"anonymous,omitempty"`
 	PublicKey      string `json:"public_key,omitempty"`
 	Token          string `json:"token,omitempty"`
+	// X25519PublicKey is the client's ENCRYPTION key (base64, 32 bytes) — the
+	// same value MsgKeyPublish carries. PublicKey above is the Ed25519
+	// identity key and cannot be sealed to, so this is supplied at auth time
+	// so the server can seal the global scope key and the MOTD into
+	// AuthResponse (133).
+	X25519PublicKey string `json:"x25519_public_key,omitempty"`
 }
 
 // AuthResponse is the server's reply to an Authenticate message.
@@ -376,8 +389,17 @@ type AuthResponse struct {
 	// channel certificate (empty when TLS is disabled). Clients use it for
 	// TOFU verification and display.
 	TLSFingerprint string `json:"tls_fingerprint,omitempty"`
-	// MOTD is the server's message of the day (empty when unset).
-	MOTD string `json:"motd,omitempty"`
+	// MOTD is the server's message of the day (empty when unset). When
+	// MOTDEnc is set it is SEALED under the global scope generation
+	// MOTDKeyID, and the client opens it with a key from ChatKeys below.
+	MOTD      string `json:"motd,omitempty"`
+	MOTDEnc   bool   `json:"motd_enc,omitempty"`
+	MOTDKeyID uint32 `json:"motd_key_id,omitempty"`
+	// ChatKeys carries the global scope generation (and nothing else) sealed
+	// to Authenticate.X25519PublicKey, so the client can open MOTD before
+	// Connect() returns — no new frame, no ordering rule, no race. Channel
+	// keys still arrive via MsgChannelKey after key publish.
+	ChatKeys []ChannelKey `json:"chat_keys,omitempty"`
 	// IsAdmin reports whether the authenticated user is a server admin
 	// (users.is_admin). Clients use it to show/hide admin-only UI.
 	IsAdmin bool `json:"is_admin,omitempty"`
@@ -406,6 +428,10 @@ type AuthSignature struct {
 	UniqueID  string `json:"unique_id"`
 	PublicKey string `json:"public_key,omitempty"`
 	Signature []byte `json:"signature"`
+	// X25519PublicKey mirrors Authenticate.X25519PublicKey. The guest/challenge
+	// path leaves Authenticate.PublicKey empty and supplies its identity key
+	// here, so the encryption key has to be carried here too (133).
+	X25519PublicKey string `json:"x25519_public_key,omitempty"`
 }
 
 // CreateChannel requests the creation of a new channel. Type mirrors the
@@ -615,6 +641,13 @@ type FileTransferInitResponse struct {
 	TransferID string `json:"transfer_id"`
 	Token      string `json:"token"`
 	Port       int    `json:"port"`
+	// TLS reports that the file-transfer port requires a TLS handshake, and
+	// TLSFingerprint is the SHA-256 of its certificate — the SAME certificate
+	// as the control channel, so the client re-uses the pin it already holds.
+	// Without these an un-upgraded client hangs in a handshake instead of
+	// failing legibly.
+	TLS            bool   `json:"tls,omitempty"`
+	TLSFingerprint string `json:"tls_fingerprint,omitempty"`
 }
 
 // FileList requests the file listing of a channel. Folder selects a virtual
@@ -819,23 +852,52 @@ type ChatHistory struct {
 	Limit     int   `json:"limit,omitempty"`
 }
 
-// ChatHistoryEntry is one stored message in a history page. Body is empty
-// for tombstoned (deleted) messages. Reactions maps emoji -> count.
+// ChatHistoryEntry is one stored message in a history page. Reactions maps
+// emoji -> count.
 type ChatHistoryEntry struct {
-	ID           int64          `json:"id"`
-	FromUniqueID string         `json:"from_unique_id"`
-	FromNickname string         `json:"from_nickname"`
-	Body         string         `json:"body"`
-	SentAt       int64          `json:"sent_at"` // unix seconds
-	EditedAt     int64          `json:"edited_at,omitempty"`
-	Deleted      bool           `json:"deleted,omitempty"`
-	Reactions    map[string]int `json:"reactions,omitempty"`
+	ID           int64  `json:"id"`
+	FromUniqueID string `json:"from_unique_id"`
+	FromNickname string `json:"from_nickname"`
+
+	// BodyEnc is the stored ciphertext:
+	// base64(nonce[24] || secretbox(plain, scopeKey[KeyID])).
+	// The SERVER populates ONLY BodyEnc/KeyID and NEVER Body — including when
+	// chat_allow_plaintext is set. There is no server-controlled switch that
+	// makes history plaintext on the wire. Both are empty for tombstoned
+	// (deleted) messages.
+	BodyEnc string `json:"body_enc,omitempty"`
+	KeyID   uint32 `json:"key_id,omitempty"`
+
+	// Body is the DECRYPTED text. It is ALWAYS empty on the wire. The Wails
+	// Go layer fills it after unsealing, before the webview sees the entry. A
+	// non-empty Body arriving from a server is a protocol violation and the
+	// client replaces the entry with a refusal string.
+	Body string `json:"body,omitempty"`
+
+	// EncVerified is set by the CLIENT after it successfully opens BodyEnc.
+	// It never appears on the wire from a server. It exists so the renderer
+	// can draw the shield on a message replayed from history — without it a
+	// history message is visually indistinguishable from one the server
+	// handed over in the clear.
+	EncVerified bool `json:"enc_verified,omitempty"`
+
+	SentAt    int64          `json:"sent_at"` // unix seconds
+	EditedAt  int64          `json:"edited_at,omitempty"`
+	Deleted   bool           `json:"deleted,omitempty"`
+	Reactions map[string]int `json:"reactions,omitempty"`
 }
 
 // ChatHistoryResponse carries one history page (newest first).
 type ChatHistoryResponse struct {
 	ChannelID int64              `json:"channel_id"`
 	Messages  []ChatHistoryEntry `json:"messages"`
+	// Keys carries exactly the distinct generations this page references,
+	// sealed for the caller, so a page costs no extra round trips. Refused
+	// and Truncated mean what they mean in ChatKeyBundle and MUST NOT be
+	// conflated.
+	Keys      []ChannelKey `json:"keys,omitempty"`
+	Refused   []uint32     `json:"refused,omitempty"`
+	Truncated bool         `json:"truncated,omitempty"`
 }
 
 // ChatEdit edits the caller's own message. NewText is encrypted like a
@@ -872,10 +934,44 @@ type ChatPinEntry struct {
 	Message   *ChatHistoryEntry `json:"message,omitempty"`
 }
 
-// ChatPinsResponse carries a channel's pins.
+// ChatPinsResponse carries a channel's pins. ChatPinEntry embeds
+// *ChatHistoryEntry, so pinned bodies are ciphertext on the wire for the same
+// reason history bodies are; Keys/Refused/Truncated behave identically.
 type ChatPinsResponse struct {
 	ChannelID int64          `json:"channel_id"`
 	Pins      []ChatPinEntry `json:"pins"`
+	Keys      []ChannelKey   `json:"keys,omitempty"`
+	Refused   []uint32       `json:"refused,omitempty"`
+	Truncated bool           `json:"truncated,omitempty"`
+}
+
+// ChatKeyRequest asks for specific scope chat key generations the client is
+// missing: a live broadcast or chat_edited event referencing a generation it
+// never received. History and pins do NOT use this — they carry their keys
+// inline (ChatHistoryResponse.Keys), because a nested request/response would
+// serialise behind the client's process-global request mutex. KeyIDs is
+// capped at 64 per request; an empty list is rejected.
+type ChatKeyRequest struct {
+	ChannelID int64    `json:"channel_id"`
+	KeyIDs    []uint32 `json:"key_ids"`
+}
+
+// ChatKeyBundle answers a ChatKeyRequest. Keys holds the generations the
+// caller is entitled to, each sealed with box.SealAnonymous to the caller's
+// published X25519 key — the same envelope as ChannelKey.
+//
+// The three outcomes are distinct and MUST NOT be conflated by clients:
+//   - present in Keys      -> usable
+//   - present in Refused   -> permanently withheld (not a member, or unknown
+//     generation). Render "you do not have access".
+//   - absent from both, with Truncated set -> the server capped the response.
+//     Render "key unavailable" and re-request. Treating truncation as refusal
+//     turns a transient cap into a permanent "[missing key]".
+type ChatKeyBundle struct {
+	ChannelID int64        `json:"channel_id"`
+	Keys      []ChannelKey `json:"keys"`
+	Refused   []uint32     `json:"refused,omitempty"`
+	Truncated bool         `json:"truncated,omitempty"`
 }
 
 // Typing is a typing indicator. Exactly one of ChannelID / ToUniqueID is

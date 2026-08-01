@@ -16,35 +16,41 @@ var ErrFileNotFound = errors.New("file not found")
 
 // FileRecord describes one uploaded file.
 type FileRecord struct {
-	ID         int64
-	ChannelID  int64
-	Folder     string // virtual folder ('' = channel root), migration 010
-	Name       string
-	Size       int64
-	SHA256     string
-	Uploader   string
+	ID        int64
+	ChannelID int64
+	Folder    string // virtual folder ('' = channel root), migration 010
+	Name      string
+	Size      int64
+	SHA256    string
+	Uploader  string
+	// Encrypted marks a client-encrypted chat attachment (91-135, migration
+	// 012): the blob is ciphertext whose key exists only inside the encrypted
+	// chat message that references it, so the file browser and download links
+	// must refuse to serve it.
+	Encrypted  bool
 	UploadedAt time.Time
 }
 
 // fileCols is the shared SELECT column list for file rows.
-const fileCols = `id, channel_id, folder, name, size, sha256, COALESCE(uploader, ''), uploaded_at`
+const fileCols = `id, channel_id, folder, name, size, sha256, COALESCE(uploader, ''), encrypted, uploaded_at`
 
 // scanFile scans one file row.
 func scanFile(rows interface{ Scan(...any) error }, rec *FileRecord) error {
 	return rows.Scan(&rec.ID, &rec.ChannelID, &rec.Folder, &rec.Name, &rec.Size,
-		&rec.SHA256, &rec.Uploader, &rec.UploadedAt)
+		&rec.SHA256, &rec.Uploader, &rec.Encrypted, &rec.UploadedAt)
 }
 
 // AddFile inserts or replaces a file record. (channel_id, folder, name) is
 // unique, so uploading the same name again in the same folder replaces the
 // previous record.
 func (s *Store) AddFile(ctx context.Context, rec FileRecord) error {
-	const q = `INSERT INTO files (channel_id, folder, name, size, sha256, uploader)
-	          VALUES ($1, $2, $3, $4, $5, $6)
+	const q = `INSERT INTO files (channel_id, folder, name, size, sha256, uploader, encrypted)
+	          VALUES ($1, $2, $3, $4, $5, $6, $7)
 	          ON CONFLICT (channel_id, folder, name) DO UPDATE
 	          SET size = EXCLUDED.size, sha256 = EXCLUDED.sha256,
-	              uploader = EXCLUDED.uploader, uploaded_at = NOW()`
-	if _, err := s.db.ExecContext(ctx, q, rec.ChannelID, rec.Folder, rec.Name, rec.Size, rec.SHA256, rec.Uploader); err != nil {
+	              uploader = EXCLUDED.uploader, encrypted = EXCLUDED.encrypted,
+	              uploaded_at = NOW()`
+	if _, err := s.db.ExecContext(ctx, q, rec.ChannelID, rec.Folder, rec.Name, rec.Size, rec.SHA256, rec.Uploader, rec.Encrypted); err != nil {
 		return fmt.Errorf("upserting file: %w", err)
 	}
 	return nil
@@ -56,7 +62,8 @@ func (s *Store) GetFile(ctx context.Context, channelID int64, folder, name strin
 	var rec FileRecord
 	q := `SELECT ` + fileCols + ` FROM files WHERE channel_id = $1 AND folder = $2 AND name = $3`
 	err := s.db.QueryRowContext(ctx, q, channelID, folder, name).Scan(
-		&rec.ID, &rec.ChannelID, &rec.Folder, &rec.Name, &rec.Size, &rec.SHA256, &rec.Uploader, &rec.UploadedAt)
+		&rec.ID, &rec.ChannelID, &rec.Folder, &rec.Name, &rec.Size, &rec.SHA256, &rec.Uploader,
+		&rec.Encrypted, &rec.UploadedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrFileNotFound
@@ -174,7 +181,8 @@ func (s *Store) FindFileBySHA(ctx context.Context, channelID int64, sha256, excl
 		WHERE channel_id = $1 AND sha256 = $2 AND NOT (folder = $3 AND name = $4)
 		ORDER BY uploaded_at DESC LIMIT 1`
 	err := s.db.QueryRowContext(ctx, q, channelID, sha256, exclFolder, exclName).Scan(
-		&rec.ID, &rec.ChannelID, &rec.Folder, &rec.Name, &rec.Size, &rec.SHA256, &rec.Uploader, &rec.UploadedAt)
+		&rec.ID, &rec.ChannelID, &rec.Folder, &rec.Name, &rec.Size, &rec.SHA256, &rec.Uploader,
+		&rec.Encrypted, &rec.UploadedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil

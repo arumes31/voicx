@@ -13,6 +13,7 @@ import (
 	"voicx/internal/auth"
 	"voicx/internal/broadcast"
 	"voicx/internal/channels"
+	"voicx/internal/chatcrypto"
 	"voicx/internal/metrics"
 	"voicx/internal/netproto"
 	"voicx/internal/permissions"
@@ -173,21 +174,43 @@ type ComplaintBackend interface {
 }
 
 // ChatStore is the subset of the store needed for server-side chat
-// infrastructure (wave 5a): history, pins, reactions, and server settings.
-// It is satisfied by *store.Store.
+// infrastructure: history, pins, reactions, server settings, and the one-time
+// legacy plaintext backfill. Bodies cross this interface as ciphertext plus
+// the scope generation that sealed them (91). It is satisfied by *store.Store.
 type ChatStore interface {
-	StoreChatMessage(ctx context.Context, channelID int64, fromUniqueID, fromNickname, body string) (int64, error)
+	StoreChatMessage(ctx context.Context, channelID int64, fromUniqueID, fromNickname, bodyEnc string, keyID uint32) (int64, error)
 	ChatHistory(ctx context.Context, channelID, beforeID int64, limit int) ([]store.ChatMessage, error)
 	GetChatMessage(ctx context.Context, id int64) (*store.ChatMessage, error)
-	EditChatMessage(ctx context.Context, id int64, newBody string) error
+	EditChatMessage(ctx context.Context, id int64, bodyEnc string, keyID uint32) error
 	DeleteChatMessage(ctx context.Context, id int64) error
 	PinChatMessage(ctx context.Context, channelID, messageID int64, pinnedBy string) error
 	UnpinChatMessage(ctx context.Context, channelID, messageID int64) error
 	ChatPins(ctx context.Context, channelID int64) ([]store.PinnedMessage, error)
 	ToggleReaction(ctx context.Context, messageID int64, uniqueID, emoji string) (map[string]int, bool, error)
 	ReactionsFor(ctx context.Context, ids []int64) (map[int64]map[string]int, error)
-	SetServerSetting(ctx context.Context, key, value string) error
-	GetServerSetting(ctx context.Context, key string) (string, error)
+	SetServerSetting(ctx context.Context, key, value string, keyID uint32) error
+	GetServerSetting(ctx context.Context, key string) (string, uint32, error)
+
+	// Legacy plaintext backfill (012). It runs once, before the listener
+	// binds, and is fatal on error: a partially encrypted table behind a
+	// NOT VALID constraint is the silent-plaintext state 91 forbids.
+	LegacyPlaintextPage(ctx context.Context, afterID int64, limit int) ([]store.LegacyChatRow, error)
+	SetChatCiphertext(ctx context.Context, id int64, bodyEnc string, keyID uint32) error
+	PurgeLegacyPlaintext(ctx context.Context) (int64, error)
+	CountPlaintextBodies(ctx context.Context) (int64, error)
+	ValidateChatNoPlaintext(ctx context.Context) error
+}
+
+// ScopeKeyStore persists the per-scope chat key generations. Generation ids
+// are allocated by the database and never reused, so a generation can never
+// be re-minted with different key material. It is satisfied by *store.Store.
+type ScopeKeyStore interface {
+	CountScopeKeys(ctx context.Context) (int64, error)
+	AllocScopeKeyID(ctx context.Context, scope int64) (uint32, error)
+	CurrentScopeKey(ctx context.Context, scope int64) (*store.ScopeKey, error)
+	GetScopeKey(ctx context.Context, scope int64, keyID uint32) (*store.ScopeKey, error)
+	InsertScopeKey(ctx context.Context, scope int64, keyID uint32, wrapped []byte, kekID uint16) error
+	RotateScopeKey(ctx context.Context, scope int64, newKeyID uint32, wrapped []byte, kekID uint16) error
 }
 
 // Deps bundles the backend services the TCP control server relies on. Any
@@ -212,6 +235,12 @@ type Deps struct {
 	Groups       GroupStore
 	BanAdmin     BanAdminStore
 	Metrics      metrics.Sink
+
+	// ScopeKeys and ChatKEK back the chat key manager (91). Without both,
+	// chat is unavailable rather than silently RAM-only: a key that does not
+	// survive a restart would make stored ciphertext unreadable forever.
+	ScopeKeys ScopeKeyStore
+	ChatKEK   *chatcrypto.KEKRing
 
 	// ServerPasswordHash, when non-empty, requires clients to supply the
 	// global server password at authenticate time (verified with Argon2id).

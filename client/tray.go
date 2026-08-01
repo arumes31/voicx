@@ -56,7 +56,8 @@ func (t *tray) onReady() {
 	miDisconnect := systray.AddMenuItem("Disconnect", "disconnect the active server tab")
 	miQuit := systray.AddMenuItem("Quit", "quit voicx")
 
-	go func() {
+	// recover is per-goroutine: the menu event loop needs its own guard (331).
+	go guardCrash("tray", func() {
 		for {
 			select {
 			case <-t.miShowHide.ClickedCh:
@@ -74,7 +75,7 @@ func (t *tray) onReady() {
 				}
 			}
 		}
-	}()
+	})
 }
 
 // toggleWindow shows or hides the main window (287).

@@ -696,6 +696,79 @@ func TestPermSetGrantCap(t *testing.T) {
 	}
 }
 
+// TestPermUnsetGrantCap verifies the grant cap guards removals against the
+// entry being deleted: an under-granted caller is refused (it must not be able
+// to strip an admin group of a permission it could never set), and a caller
+// whose own grant covers the entry succeeds.
+func TestPermUnsetGrantCap(t *testing.T) {
+	ctx := context.Background()
+	target := store.PermTarget{GroupID: 3}
+
+	// Caller with a grant of 5 for i_channel_modify_power and none for
+	// i_client_ban_power.
+	tp := tieredWith(
+		boolPerm(permissions.PermissionKeyPermissionManage, true),
+		&permissions.Permission{Key: "i_channel_modify_power", Type: permissions.PermissionTypeInteger, Value: 5, Grant: 5},
+	)
+	env := startTestEnv(t, &tp)
+	defer env.stop()
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+
+	for _, key := range []string{"i_channel_modify_power", "i_client_ban_power"} {
+		if err := env.groups.SetPermission(ctx, store.PermTierServerGroup, target, key, 100, 100, false, false); err != nil {
+			t.Fatalf("seed %s: %v", key, err)
+		}
+	}
+
+	// No grant for the key at all: denied.
+	send(t, conn, netproto.MsgPermUnset, netproto.PermUnset{
+		Tier: "server_group", GroupID: 3, Key: "i_client_ban_power",
+	})
+	if e := readError(t, conn); e.Code != errCodePermissionDenied {
+		t.Fatalf("error = %+v, want grant-cap denial", e)
+	}
+
+	// A grant of 5 against an entry granted 100: denied.
+	send(t, conn, netproto.MsgPermUnset, netproto.PermUnset{
+		Tier: "server_group", GroupID: 3, Key: "i_channel_modify_power",
+	})
+	if e := readError(t, conn); e.Code != errCodePermissionDenied {
+		t.Fatalf("error = %+v, want grant-cap denial", e)
+	}
+	for _, key := range []string{"i_client_ban_power", "i_channel_modify_power"} {
+		env.groups.mu.Lock()
+		_, survived := env.groups.perms[permKey(store.PermTierServerGroup, target, key)]
+		env.groups.mu.Unlock()
+		if !survived {
+			t.Fatalf("%s was unset by an under-granted caller", key)
+		}
+	}
+
+	// Same entry, caller whose own grant covers it: allowed.
+	strong := tieredWith(
+		boolPerm(permissions.PermissionKeyPermissionManage, true),
+		&permissions.Permission{Key: "i_channel_modify_power", Type: permissions.PermissionTypeInteger, Value: 100, Grant: 100},
+	)
+	env2 := startTestEnv(t, &strong)
+	defer env2.stop()
+	conn2, _ := dialAuthed(t, env2.addr, "user-uid")
+	defer conn2.Close()
+
+	if err := env2.groups.SetPermission(ctx, store.PermTierServerGroup, target, "i_channel_modify_power", 100, 100, false, false); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	send(t, conn2, netproto.MsgPermUnset, netproto.PermUnset{
+		Tier: "server_group", GroupID: 3, Key: "i_channel_modify_power",
+	})
+	waitFor(t, "capped perm removed", func() bool {
+		env2.groups.mu.Lock()
+		defer env2.groups.mu.Unlock()
+		_, ok := env2.groups.perms[permKey(store.PermTierServerGroup, target, "i_channel_modify_power")]
+		return !ok
+	})
+}
+
 // TestPermTemplateApply verifies the built-in templates flow through the
 // write path.
 func TestPermTemplateApply(t *testing.T) {
@@ -731,6 +804,82 @@ func TestPermTemplateApply(t *testing.T) {
 	})
 	if e := readError(t, conn); e.Code != errCodeMalformed {
 		t.Fatalf("error = %+v, want malformed", e)
+	}
+}
+
+// TestPermTemplateApplyGrantCap verifies a b_permission_manage holder cannot
+// escalate through the admin template: every key it carries is capped.
+func TestPermTemplateApplyGrantCap(t *testing.T) {
+	tp := tieredWith(boolPerm(permissions.PermissionKeyPermissionManage, true))
+	env := startTestEnv(t, &tp)
+	defer env.stop()
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+
+	send(t, conn, netproto.MsgPermTemplateApply, netproto.PermTemplateApply{
+		Template: "admin", Tier: "server_group", GroupID: 4,
+	})
+	if e := readError(t, conn); e.Code != errCodePermissionDenied {
+		t.Fatalf("error = %+v, want grant-cap denial", e)
+	}
+	env.groups.mu.Lock()
+	n := len(env.groups.perms)
+	env.groups.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("denied template wrote %d entries", n)
+	}
+}
+
+// TestPermTemplateApplyOverwriteGrantCap verifies the template path also caps
+// against the entries it would replace: a caller that may write the template's
+// values still cannot overwrite an entry granted above its own level.
+func TestPermTemplateApplyOverwriteGrantCap(t *testing.T) {
+	perms := []*permissions.Permission{boolPerm(permissions.PermissionKeyPermissionManage, true)}
+	for key := range permTemplates["moderator"] {
+		perms = append(perms, &permissions.Permission{
+			Key: permissions.PermissionKey(key), Type: permissions.PermissionTypeBoolean, Value: 1, Grant: 1,
+		})
+	}
+	tp := tieredWith(perms...)
+	env := startTestEnv(t, &tp)
+	defer env.stop()
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+
+	// Untouched target: every key is within the caller's grant, so it lands.
+	send(t, conn, netproto.MsgPermTemplateApply, netproto.PermTemplateApply{
+		Template: "moderator", Tier: "server_group", GroupID: 4,
+	})
+	waitFor(t, "template applied", func() bool {
+		env.groups.mu.Lock()
+		defer env.groups.mu.Unlock()
+		_, ok := env.groups.perms[permKey(store.PermTierServerGroup, store.PermTarget{GroupID: 4}, "b_channel_modify")]
+		return ok
+	})
+
+	// Target holding one of the template's keys above the caller's grant: the
+	// whole apply is refused and the target is left alone.
+	target := store.PermTarget{GroupID: 5}
+	if err := env.groups.SetPermission(context.Background(), store.PermTierServerGroup, target, "b_channel_modify", 1, 100, false, false); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	send(t, conn, netproto.MsgPermTemplateApply, netproto.PermTemplateApply{
+		Template: "moderator", Tier: "server_group", GroupID: 5,
+	})
+	if e := readError(t, conn); e.Code != errCodePermissionDenied {
+		t.Fatalf("error = %+v, want grant-cap denial", e)
+	}
+	env.groups.mu.Lock()
+	n := 0
+	for k := range env.groups.perms {
+		if strings.HasPrefix(k, "server_group|5|") {
+			n++
+		}
+	}
+	kept := env.groups.perms[permKey(store.PermTierServerGroup, target, "b_channel_modify")]
+	env.groups.mu.Unlock()
+	if n != 1 || kept.grant != 100 {
+		t.Fatalf("denied template touched the target: %d entries, b_channel_modify grant = %d", n, kept.grant)
 	}
 }
 

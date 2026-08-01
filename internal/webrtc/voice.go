@@ -207,12 +207,19 @@ func (v *Voice) RemoveTap(tapID string) {
 
 // HandleOffer (re)creates the peer connection for clientID, attaches it to
 // the router, applies the SDP offer, and returns the SDP answer. An existing
-// session for the client is torn down first, making re-offers idempotent.
+// session for the client is torn down first, making re-offers idempotent;
+// channel membership survives the rebuild.
 //
 // onLocalCandidate, if non-nil, is invoked asynchronously for every locally
 // gathered ICE candidate until the peer connection is closed.
 func (v *Voice) HandleOffer(clientID, offerSDP string, onLocalCandidate func(candidate, sdpMid string, mlineIndex uint16)) (string, error) {
-	_ = v.ClosePeer(clientID)
+	// The rebuild replaces the peer connection only: dropping the client's
+	// channel would leave it routed to nobody after an ICE restart (59), and
+	// dropping plus restoring it would undo a move that lands mid-rebuild (the
+	// control server owns membership and can move the client concurrently).
+	v.stopReneg(clientID)
+	v.router.DetachPeerKeepChannel(clientID)
+	_ = v.engine.ClosePeerConnection(clientID)
 
 	wrapper, err := v.engine.NewPeerConnection(clientID)
 	if err != nil {
@@ -229,7 +236,7 @@ func (v *Voice) HandleOffer(clientID, offerSDP string, onLocalCandidate func(can
 
 	answer, err := wrapper.HandleOffer(offerSDP)
 	if err != nil {
-		v.router.DetachPeer(clientID)
+		v.router.DetachPeerKeepChannel(clientID)
 		_ = v.engine.ClosePeerConnection(clientID)
 		return "", err
 	}
@@ -305,16 +312,22 @@ func (v *Voice) AddICECandidate(clientID, candidate, sdpMid string, mlineIndex u
 // output, channel membership, and whisper configuration. It is a no-op when
 // no session exists.
 func (v *Voice) ClosePeer(clientID string) error {
+	v.stopReneg(clientID)
+	v.router.DetachPeer(clientID)
+	return v.engine.ClosePeerConnection(clientID)
+}
+
+// stopReneg drops the peer's renegotiation scheduling state, cancelling a
+// pending offer timer so it cannot fire against the next peer connection.
+func (v *Voice) stopReneg(clientID string) {
 	v.renegMu.Lock()
+	defer v.renegMu.Unlock()
 	if st, ok := v.reneg[clientID]; ok {
 		if st.timer != nil {
 			st.timer.Stop()
 		}
 		delete(v.reneg, clientID)
 	}
-	v.renegMu.Unlock()
-	v.router.DetachPeer(clientID)
-	return v.engine.ClosePeerConnection(clientID)
 }
 
 // JoinChannel records channel membership for routing.

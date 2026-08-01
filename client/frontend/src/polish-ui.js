@@ -3,6 +3,8 @@
 // zen mode (341), idle video pause (342), screen-reader labels + live
 // announcements (343), notification center (346), DND (347/348), and tree
 // virtualization (349).
+import { setIdleQualityOverride } from "./video.js";
+
 const V = () => window.__voicx;
 const App = () => window.go.main.App;
 
@@ -64,13 +66,21 @@ function initResizablePanes() {
 // ---------------------------------------------------------------------------
 
 let chatPop = null;
+let chatHome = null; // {parent, wrapNext, rowNext}: where the panes dock back
 
 function toggleChatPopout() {
     if (chatPop) {
+        const wrap = document.getElementById("chat-wrap");
+        const inputRow = document.getElementById("chat-input-row");
+        // The panes live inside the popout: dock them before removing it, or
+        // remove() takes the whole chat pane with it.
+        chatHome.parent.insertBefore(wrap, chatHome.wrapNext);
+        chatHome.parent.insertBefore(inputRow, chatHome.rowNext);
         chatPop.remove();
         chatPop = null;
-        document.getElementById("chat-wrap").classList.remove("hidden");
-        document.getElementById("chat-input-row").classList.remove("hidden");
+        chatHome = null;
+        wrap.classList.remove("hidden");
+        inputRow.classList.remove("hidden");
         return;
     }
     chatPop = document.createElement("div");
@@ -78,6 +88,7 @@ function toggleChatPopout() {
     chatPop.innerHTML = `<div class="chat-pop-head">chat — drag me <button class="icon-btn chat-pop-close">✕</button></div>`;
     const wrap = document.getElementById("chat-wrap");
     const inputRow = document.getElementById("chat-input-row");
+    chatHome = { parent: wrap.parentNode, wrapNext: wrap.nextSibling, rowNext: inputRow.nextSibling };
     chatPop.appendChild(wrap);
     chatPop.appendChild(inputRow);
     wrap.classList.remove("hidden");
@@ -134,7 +145,7 @@ function initIdleVideoPause() {
         idleVideoTimer = setTimeout(() => {
             idleVideoPaused = true;
             document.querySelectorAll("#video-grid video, #remote-video").forEach((v) => v.pause());
-            if (V().state.pc) App().SetVideoQuality("low");
+            if (V().state.pc) setIdleQualityOverride(true);
         }, 60000);
     });
     window.addEventListener("focus", () => {
@@ -145,7 +156,7 @@ function initIdleVideoPause() {
         if (idleVideoPaused) {
             idleVideoPaused = false;
             document.querySelectorAll("#video-grid video, #remote-video").forEach((v) => v.play().catch(() => {}));
-            App().SetVideoQuality(V().state.settings?.low_bandwidth ? "low" : "high");
+            setIdleQualityOverride(false); // video.js re-applies the user's pref
         }
     });
 }

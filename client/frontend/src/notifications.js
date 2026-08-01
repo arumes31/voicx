@@ -21,6 +21,13 @@ export const MATRIX_EVENTS = [
     ["channel_watch", "channel watch"],
 ];
 
+// TOAST_CATEGORY maps a matrix event to the toast category the toast filter
+// keys on. Only join/leave is "social" — the notify_join_leave toggle must
+// not swallow mentions, DMs, pokes, kicks or announcements.
+const TOAST_CATEGORY = {
+    join_leave: "social",
+};
+
 // matrixRow returns the effective outputs for an event (defaults: all on
 // except native for chatty events).
 function matrixRow(event) {
@@ -70,7 +77,7 @@ export function notify(event, text, ctx = {}) {
     if (window.__voicxPolish?.dndActive?.()) return;
     if (!overrideAllows(ctx.channelID, ctx.className || "messages", true)) return;
     const row = matrixRow(event);
-    if (row.toast) V().toast(text, ctx.kind || "info", ctx.category || "social");
+    if (row.toast) V().toast(text, ctx.kind || "info", ctx.category || TOAST_CATEGORY[event] || "alert");
     if (row.sound && !ctx.noSound) playEventSound(event);
     if (row.flash) App().FlashWindow();
     if (row.native && !document.hasFocus()) App().Notify("voicx " + event, text.slice(0, 200));
@@ -141,21 +148,26 @@ export function matchKeyword(text) {
 // Channel watch (389)
 // ---------------------------------------------------------------------------
 
-let watchCounts = new Map(); // channelID -> last seen user count
+let watchCounts = new Map(); // override key -> last seen user count
 
 // checkChannelWatch fires when a watched channel crosses 0→threshold.
 export function checkChannelWatch() {
+    const addr = V().state.lastConnect?.addr || "";
     const overrides = V().state.settings?.channel_notify || {};
     for (const [key, ov] of Object.entries(overrides)) {
         if (!ov.watch_threshold) continue;
-        const channelID = Number(key.split("#")[1]);
+        // keys are "addr#channelID": a threshold set on another server must not
+        // fire against a same-numbered channel here.
+        const cut = key.lastIndexOf("#");
+        if (cut < 0 || key.slice(0, cut) !== addr) continue;
+        const channelID = Number(key.slice(cut + 1));
         const count = V().state.clients.filter((c) => c.channel_id === channelID).length;
-        const prev = watchCounts.get(channelID) ?? count;
+        const prev = watchCounts.get(key) ?? count;
         if (prev < ov.watch_threshold && count >= ov.watch_threshold) {
             const ch = V().state.channels.find((c) => c.ChannelID === channelID);
             notify("channel_watch", `#${ch ? ch.Name : channelID} now has ${count} user(s)`, { className: "joins", kind: "info" });
         }
-        watchCounts.set(channelID, count);
+        watchCounts.set(key, count);
     }
 }
 

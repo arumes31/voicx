@@ -25,7 +25,9 @@ async function commit() {
         V().toast("settings not saved: " + err, "warn");
         return false;
     }
-    V().state.settings = draft;
+    // (282) the draft was cloned when the dialog opened: re-read the merged
+    // truth so Go-owned fields (recents) written meanwhile survive.
+    V().state.settings = await window.go.main.App.GetSettings();
     // (126-129) chat display prefs apply live (CSS classes on #chat-log).
     if (V().applyChatPrefs) V().applyChatPrefs();
     // (294-297) appearance applies live (theme/accent/user CSS/font/compact).

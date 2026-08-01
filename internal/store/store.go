@@ -50,11 +50,26 @@ func New(databaseURL string, logger *zap.Logger, maxOpen, maxIdle int, connMaxLi
 	return &Store{db: db, logger: logger}, nil
 }
 
-// Migrate reads all embedded .sql migration files in lexical order and executes
-// them against the database. Migrations are idempotent (use CREATE TABLE IF NOT
-// EXISTS) so re-running is safe. A proper migration tool should replace this in
-// a later phase.
+// Migrate applies every embedded migration exactly once, in lexical order,
+// recording each in schema_migrations. Files applied before this ledger
+// existed are re-applied once and then recorded; every migration up to 011 is
+// idempotent DDL, so that single replay is safe. From 012 onward a migration
+// MAY contain destructive DML, because the ledger guarantees it runs exactly
+// once (91-135: without it, a DELETE in a migration is a permanent booby trap
+// that fires on every boot).
 func (s *Store) Migrate() error {
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+	    filename   TEXT PRIMARY KEY,
+	    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`); err != nil {
+		return fmt.Errorf("creating schema_migrations: %w", err)
+	}
+
+	applied, err := s.appliedMigrations()
+	if err != nil {
+		return err
+	}
+
 	names, err := migrationsFS.ReadDir("migrations")
 	if err != nil {
 		return fmt.Errorf("reading migrations directory: %w", err)
@@ -70,18 +85,53 @@ func (s *Store) Migrate() error {
 	sort.Strings(files)
 
 	for _, name := range files {
+		if applied[name] {
+			continue
+		}
 		content, err := migrationsFS.ReadFile("migrations/" + name)
 		if err != nil {
 			return fmt.Errorf("reading migration %s: %w", name, err)
 		}
-		if _, err := s.db.Exec(string(content)); err != nil {
+		// The ledger INSERT must commit with the file itself; a crash between
+		// the two would re-run a destructive migration.
+		tx, err := s.db.Begin()
+		if err != nil {
+			return fmt.Errorf("beginning migration %s: %w", name, err)
+		}
+		if _, err := tx.Exec(string(content)); err != nil {
+			_ = tx.Rollback()
 			return fmt.Errorf("applying migration %s: %w", name, err)
+		}
+		if _, err := tx.Exec(`INSERT INTO schema_migrations (filename) VALUES ($1)`, name); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("recording migration %s: %w", name, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("committing migration %s: %w", name, err)
 		}
 		if s.logger != nil {
 			s.logger.Info("migration applied", zap.String("file", name))
 		}
 	}
 	return nil
+}
+
+// appliedMigrations reads the ledger.
+func (s *Store) appliedMigrations() (map[string]bool, error) {
+	rows, err := s.db.Query(`SELECT filename FROM schema_migrations`)
+	if err != nil {
+		return nil, fmt.Errorf("reading schema_migrations: %w", err)
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("scanning schema_migrations: %w", err)
+		}
+		out[name] = true
+	}
+	return out, rows.Err()
 }
 
 // Ping verifies the database is reachable.

@@ -63,7 +63,8 @@ const state = {
     avatars: new Map(),  // unique_id -> data url | null
     avatarPending: new Set(),
     settings: null,
-    lastConnect: null,   // {addr, nick, pw, spw} for reconnect-on-loss
+    lastConnect: null,   // {addr, nick, pw, spw, bookmark} for reconnect-on-loss
+    pendingBookmark: null, // (334) {name, addr} of the bookmark loaded into the login dialog
     reconnectAttempts: 0,
     reconnectTimer: null,
     vadMonitor: null,
@@ -82,7 +83,10 @@ const state = {
 // Toasts
 // ---------------------------------------------------------------------------
 
-function toast(text, kind = "info", category = "social") {
+// (385) "social" means join/leave only: the notify_join_leave toggle is
+// labelled "Toasts for join/leave", so untagged callers default to "alert"
+// and are never swallowed by it.
+function toast(text, kind = "info", category = "alert") {
     const s = state.settings;
     if (s) {
         if (category === "social" && !s.notify_join_leave) return;
@@ -171,6 +175,10 @@ function applyAppearance() {
 })();
 
 function showLogin() {
+    // (334) the dialog is retargetable, so a stash from an earlier bookmark
+    // must never identify the next login — a same-address login can be a
+    // different account (callers loading a bookmark stash after this call).
+    state.pendingBookmark = null;
     $("login-overlay").classList.remove("hidden");
     $("app").classList.add("hidden");
     $("conn-lock").classList.add("hidden");
@@ -184,8 +192,12 @@ async function connectFromLogin() {
     const pw = $("login-password").value;
     const spw = $("login-serverpw").value;
     $("login-error").textContent = "";
+    // (334) a nickname override replaces the login nickname, so addr+nickname
+    // no longer identifies the bookmark this login came from: forward the name
+    // the bookmark menu stashed, unless the dialog was retargeted since.
+    const bookmark = state.pendingBookmark?.addr === addr ? state.pendingBookmark.name : "";
     try {
-        const err = await window.go.main.App.Connect(addr, nick, pw, spw);
+        const err = await window.go.main.App.ConnectBookmarkTab(bookmark, addr, nick, pw, spw);
         if (err) {
             // (4a) TOFU fingerprint mismatch: prominent warning + explicit
             // trust action — never silently accepted.
@@ -197,7 +209,11 @@ async function connectFromLogin() {
             return;
         }
         state.myNickname = nick;
-        state.lastConnect = { addr, nick, pw, spw };
+        state.lastConnect = { addr, nick, pw, spw, bookmark };
+        // (334) consumed: lastConnect carries the name for reconnects from
+        // here on. Clearing only on success keeps the retry after a rejected
+        // password identifiable.
+        state.pendingBookmark = null;
         state.reconnectAttempts = 0;
         try {
             state.myClientID = await window.go.main.App.ClientID();
@@ -299,7 +315,7 @@ window.runtime.EventsOn("disconnected", () => {
             clearInterval(tick);
             const c = state.lastConnect;
             if (!c) return;
-            const err = await window.go.main.App.Connect(c.addr, c.nick, c.pw, c.spw);
+            const err = await window.go.main.App.ConnectBookmarkTab(c.bookmark || "", c.addr, c.nick, c.pw, c.spw);
             if (err === "") {
                 try {
                     state.myClientID = await window.go.main.App.ClientID();
@@ -323,6 +339,11 @@ window.runtime.EventsOn("disconnected", () => {
 });
 
 window.runtime.EventsOn("servererror", (msg) => sysMsg("server: " + msg));
+
+// (282) the Go side maintains settings of its own (recents on every connect),
+// so the merged blob it pushes is the authoritative cache — without this the
+// recents list stays frozen at the value read once at startup.
+window.runtime.EventsOn("settings_update", (s) => { state.settings = s; });
 
 // (320) recordRecentChannel tracks the last 5 joined channels per server
 // address in settings (debounced persist).
@@ -409,6 +430,14 @@ function stopQualitySampler() {
 // Snapshot & events
 // ---------------------------------------------------------------------------
 
+// (307) client_id -> channel_id at the time of user_left: going invisible and
+// coming back is announced as leave+join, and user_joined has no channel.
+// Only a returning client consumes its entry and the snapshot arrives once at
+// login, so the map is capped: clients that leave for good would otherwise
+// accumulate for the whole session.
+const lastKnownChannel = new Map();
+const LAST_CHANNEL_MAX = 200;
+
 window.runtime.EventsOn("snapshot", (json) => {
     const snap = JSON.parse(json);
     // broadcast.ClientInfo does not serialize priority_speaker, so carry the
@@ -417,6 +446,7 @@ window.runtime.EventsOn("snapshot", (json) => {
     const prioByID = new Map(state.clients.filter((c) => c.priority_speaker).map((c) => [c.client_id, true]));
     state.channels = [];
     state.clients = [];
+    lastKnownChannel.clear(); // the snapshot is authoritative
     for (const root of snap.root_channels || []) flattenChannel(root);
     for (const c of state.clients) {
         if (prioByID.has(c.client_id)) c.priority_speaker = true;
@@ -424,6 +454,7 @@ window.runtime.EventsOn("snapshot", (json) => {
     // (317) blocked users are locally muted on sight; (318) contact nickname
     // history updates from presence; (383) buddy alerts; (389) channel watch.
     applyBlockAndContacts();
+    resolveTrackUsers();
     window.__voicxNotify?.checkBuddyOnline();
     window.__voicxNotify?.checkChannelWatch();
     renderTree();
@@ -468,7 +499,9 @@ function flattenChannel(node) {
         ParentID: node.ParentID,
         Name: node.Name,
         HasIcon: !!node.HasIcon,
-        HasPassword: !!node.HasPassword, // (304) lock icon
+        // (304) lock icon — the field is read under both spellings so a json
+        // tag on the server's Channel struct cannot silently drop the lock.
+        HasPassword: !!(node.has_password ?? node.HasPassword),
         ClientCount: node.ClientCount || 0, // (303) [n/max]
         Topic: node.Topic || "",
         Description: node.Description || "",
@@ -496,21 +529,35 @@ window.runtime.EventsOn("event", (json) => {
     const env = JSON.parse(json);
     const d = env.data || {};
     switch (env.type) {
-        case "user_joined":
-            state.clients.push({ client_id: d.client_id, unique_id: d.unique_id, nickname: d.nickname, channel_id: 0, is_speaking: false });
+        case "user_joined": {
+            // (307) the server omits channel_id on user_joined, and an
+            // invisible→visible return is announced as leave+join: restore the
+            // channel remembered from the leave so the user is not stranded in
+            // channel 0 ("no channel") until the next user_moved.
+            const joinedChannel = d.channel_id ?? lastKnownChannel.get(d.client_id) ?? 0;
+            lastKnownChannel.delete(d.client_id);
+            state.clients.push({ client_id: d.client_id, unique_id: d.unique_id, nickname: d.nickname, channel_id: joinedChannel, is_speaking: false });
             if (d.client_id !== state.myClientID) {
                 chatUI.sysJoinLeave(d.nickname || d.unique_id || "someone", "joined"); // (130/131)
-                if (d.channel_id === state.myChannelID && state.myChannelID !== 0) {
+                if (joinedChannel === state.myChannelID && state.myChannelID !== 0) {
                     // (385) joins in my channel dispatch through the matrix.
                     window.__voicxNotify?.notify("join_leave", (d.nickname || "someone") + " joined your channel",
                         { channelID: state.myChannelID, className: "joins", kind: "info" });
                 }
             }
             break;
+        }
         case "user_left": {
             const was = state.clients.find((c) => c.client_id === d.client_id);
             state.clients = state.clients.filter((c) => c.client_id !== d.client_id);
             if (was) {
+                if (was.channel_id) {
+                    lastKnownChannel.set(d.client_id, was.channel_id);
+                    // insertion order: drop the oldest unclaimed entry first.
+                    while (lastKnownChannel.size > LAST_CHANNEL_MAX) {
+                        lastKnownChannel.delete(lastKnownChannel.keys().next().value);
+                    }
+                }
                 chatUI.sysJoinLeave(was.nickname || was.unique_id || "someone", "left"); // (130/131)
                 if (was.channel_id === state.myChannelID && state.myChannelID !== 0) {
                     window.__voicxNotify?.notify("join_leave", (was.nickname || "someone") + " left your channel",
@@ -646,21 +693,25 @@ window.runtime.EventsOn("event", (json) => {
         // sections and the details-pane group chips.
         case "group_assigned":
             if (d.group_name) {
-                toast((d.by ? "you were " : "") + "added to group " + d.group_name, "info", "social");
+                toast((d.by ? "you were " : "") + "added to group " + d.group_name, "info", "alert");
             }
             P().refreshGroups().then(() => renderTree());
             break;
         case "group_unassigned":
             if (d.group_name) {
-                toast("removed from group " + d.group_name, "info", "social");
+                toast("removed from group " + d.group_name, "info", "alert");
             }
             P().refreshGroups().then(() => renderTree());
             break;
         case "group_expired":
-            toast("a timed group membership expired", "info", "social");
+            toast("a timed group membership expired", "info", "alert");
             P().refreshGroups().then(() => renderTree());
             break;
     }
+    resolveTrackUsers();
+    // (389) the snapshot arrives once at login, so only the live join/leave/
+    // move events can ever show a channel crossing its watch threshold.
+    window.__voicxNotify?.checkChannelWatch();
     renderTree();
     videoRefreshNames();
 });
@@ -669,7 +720,18 @@ window.runtime.EventsOn("event", (json) => {
 // Channel tree
 // ---------------------------------------------------------------------------
 
+// (303) recomputeClientCounts derives the [n/max] badge counts from the live
+// client list: the snapshot's ClientCount is a point-in-time value that
+// user_joined/left/moved never refresh. The hover card (8b) and windowed mode
+// (349) read the same field.
+function recomputeClientCounts() {
+    const counts = new Map();
+    for (const c of state.clients) counts.set(c.channel_id, (counts.get(c.channel_id) || 0) + 1);
+    for (const ch of state.channels) ch.ClientCount = counts.get(ch.ChannelID) || 0;
+}
+
 function renderTree() {
+    recomputeClientCounts();
     const root = $("channel-tree");
     root.innerHTML = "";
     // (179) Hoisted server groups render as their own sections above the
@@ -1077,29 +1139,43 @@ function videoConstraints() {
 }
 
 async function startVoice() {
-    let audioOK = true;
+    // Capture degrades in steps — mic+camera, then mic only, then camera only.
+    // Either device may be absent, and a machine without a webcam must still
+    // get a full audio session; micErr stays null while the mic works.
+    let micErr = null;
     try {
         state.localStream = await navigator.mediaDevices.getUserMedia({
             audio: audioConstraints(),
             video: videoConstraints(),
         });
-    } catch (e) {
-        if (e.name === "NotFoundError" || e.name === "NotAllowedError") {
-            audioOK = false;
-            setMicState(e.name === "NotFoundError" ? "none" : "denied");
+    } catch {
+        try {
             state.localStream = await navigator.mediaDevices.getUserMedia({
-                video: videoConstraints(),
+                audio: audioConstraints(),
             });
-        } else {
-            throw e;
+        } catch (e) {
+            micErr = e;
+            try {
+                state.localStream = await navigator.mediaDevices.getUserMedia({
+                    video: videoConstraints(),
+                });
+            } catch (ve) {
+                throw new Error("no microphone or camera available (mic: " +
+                    (micErr.name || micErr) + ", camera: " + (ve.name || ve) + ")");
+            }
         }
     }
-    if (audioOK) setMicState("ok");
+    setMicState(micErr === null ? "ok" : micErr.name === "NotAllowedError" ? "denied" : "none");
+    if (state.localStream.getVideoTracks().length === 0) {
+        sysMsg("no camera found; joined voice audio-only");
+    }
     // (78) contentHint tracks the configured frame rate.
     const camTrack = state.localStream.getVideoTracks()[0];
     if (camTrack) camTrack.contentHint = (state.settings?.camera_fps || 30) >= 60 ? "motion" : "detail";
-    $("local-video").srcObject = state.localStream;
-    $("local-video").classList.remove("hidden");
+    // the self-view is a fixed floating panel with a border: without a camera
+    // track it would just be an empty box over the UI (audio-only fallback).
+    $("local-video").srcObject = camTrack ? state.localStream : null;
+    $("local-video").classList.toggle("hidden", !camTrack);
 
     // ICE servers delivered by the server at connect (STUN/TURN); an empty
     // list means "client defaults" (plain RTCPeerConnection).
@@ -1160,7 +1236,7 @@ async function startVoice() {
         }
         // Audio: route through the WebAudio chain (per-user gain hook,
         // limiter, normalizer) instead of the video element.
-        attachRemoteAudio(e.streams[0], e.track, publisher);
+        attachRemoteAudio(e.track, publisher);
     };
 
     const offer = await pc.createOffer();
@@ -1479,7 +1555,7 @@ function warnMutedTalking() {
 function warnEmptyChannel() {
     if (Date.now() - lastEmptyWarn < 30000) return;
     lastEmptyWarn = Date.now();
-    toast("Nobody is in your channel", "info", "social");
+    toast("Nobody is in your channel", "info", "alert");
 }
 
 // Output settings: volume + sink for remote media elements.
@@ -1553,12 +1629,16 @@ function ensureRemoteChain() {
 // attachRemoteAudio adds one publisher's audio track to the shared chain.
 // publisher is the resolved state.clients entry (or null when unknown); its
 // unique ID keys the per-user volume/mute registry from audio.js.
-function attachRemoteAudio(stream, track, publisher) {
+function attachRemoteAudio(track, publisher) {
     detachRemoteTrack(track.id); // re-attach after an ICE restart replaces the track
     if (!ensureRemoteChain()) return;
     try {
         const ctx = remoteChain.ctx;
-        const src = ctx.createMediaStreamSource(stream);
+        // a MediaStreamAudioSourceNode taps only the first audio track of the
+        // stream it is built from, so the per-user volume (1) and local mute
+        // (2) chains would all follow one publisher if several tracks share a
+        // stream: wrap this track alone.
+        const src = ctx.createMediaStreamSource(new MediaStream([track]));
         const gain = ctx.createGain();
         const mute = ctx.createGain();
         src.connect(gain);
@@ -1572,6 +1652,26 @@ function attachRemoteAudio(stream, track, publisher) {
         track.addEventListener("ended", () => detachRemoteTrack(track.id));
     } catch (e) {
         sysMsg("remote audio chain failed: " + e);
+    }
+}
+
+// resolveTrackUsers re-attributes tracks whose renegotiation arrived before
+// the publisher's user_joined event: at ontrack time the client list has no
+// entry yet, and without a second pass the per-user volume (1) and local mute
+// (2) chains are never registered for that publisher for the whole session.
+function resolveTrackUsers() {
+    for (const [trackID, u] of state.trackUsers) {
+        if (u.unique_id) continue;
+        const publisher = state.clients.find((c) => String(c.client_id) === String(trackID));
+        if (!publisher) continue;
+        state.trackUsers.set(trackID, {
+            client_id: publisher.client_id, unique_id: publisher.unique_id, nickname: publisher.nickname,
+        });
+        const t = remoteTracks.get(trackID);
+        if (t && !t.uid && publisher.unique_id) {
+            t.uid = publisher.unique_id;
+            registerUserChain(publisher.unique_id, t.gain, t.mute);
+        }
     }
 }
 
@@ -1667,7 +1767,7 @@ window.runtime.EventsOn("hotkey", (action) => {
             window.go.main.App.WhisperSet([state.lastWhispererUID], [], true);
             sysMsg("whisper reply armed → " + clientName(state.lastWhispererUID) || state.lastWhispererUID);
         } else {
-            toast("no whisper to reply to", "info", "social");
+            toast("no whisper to reply to", "info", "alert");
         }
         return;
     }

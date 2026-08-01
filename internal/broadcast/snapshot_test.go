@@ -73,6 +73,26 @@ func TestBuildSnapshot_Populated(t *testing.T) {
 	}
 }
 
+// TestBuildSnapshot_HasPasswordFieldName pins the (304) lock-icon flag to the
+// Go field name: state.Channel carries no json tags, so a lone tag here would
+// silently break the client's node.HasPassword read.
+func TestBuildSnapshot_HasPasswordFieldName(t *testing.T) {
+	sm := newTestManager()
+	sm.AddChannel(&state.Channel{ChannelID: 1, Name: "Locked", PasswordHash: "argon2id-hash", CreatedAt: time.Now()})
+
+	data, err := json.Marshal(BuildSnapshot(sm, true, ""))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	s := string(data)
+	if !strings.Contains(s, `"HasPassword":true`) {
+		t.Fatalf("expected HasPassword alongside the untagged sibling fields: %s", s)
+	}
+	if strings.Contains(s, "argon2id-hash") {
+		t.Fatalf("password hash leaked into the snapshot: %s", s)
+	}
+}
+
 func TestBuildSnapshot_Empty(t *testing.T) {
 	sm := newTestManager()
 	snap := BuildSnapshot(sm, true, "")

@@ -47,6 +47,40 @@ func TestSettingsRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSaveSettingsKeepsGoOwnedFields verifies a frontend save carrying a
+// stale cached blob cannot wipe fields the Go side maintains on its own
+// (282 recents, 330 what's-new marker).
+func TestSaveSettingsKeepsGoOwnedFields(t *testing.T) {
+	a := &App{
+		settings:     DefaultSettings(),
+		hotkeys:      map[string]*hotkeyReg{},
+		settingsPath: filepath.Join(t.TempDir(), "settings.json"),
+	}
+	// What the frontend cached before the connect happened.
+	stale := a.GetSettings()
+
+	a.RecordRecent("127.0.0.1:10011", "alice")
+	a.settings.LastSeenVersion = "9.9"
+
+	stale.Volume = 120
+	if err := a.SaveSettings(stale); err != "" {
+		t.Fatalf("save: %s", err)
+	}
+	if len(a.settings.Recents) != 1 || a.settings.Recents[0].Addr != "127.0.0.1:10011" {
+		t.Fatalf("recents clobbered by frontend save: %+v", a.settings.Recents)
+	}
+	if a.settings.LastSeenVersion != "9.9" {
+		t.Fatalf("last_seen_version = %q, want 9.9", a.settings.LastSeenVersion)
+	}
+	if a.settings.Volume != 120 {
+		t.Fatalf("frontend-owned volume = %d, want 120", a.settings.Volume)
+	}
+	loaded := loadSettingsAt(a.settingsPath)
+	if len(loaded.Recents) != 1 || loaded.LastSeenVersion != "9.9" {
+		t.Fatalf("persisted settings = %+v / %q", loaded.Recents, loaded.LastSeenVersion)
+	}
+}
+
 // TestSettingsCorruptFile verifies a corrupt file falls back to defaults.
 func TestSettingsCorruptFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "settings.json")

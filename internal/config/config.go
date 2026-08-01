@@ -47,9 +47,33 @@ type Config struct {
 	TLSCertFile string `mapstructure:"tls_cert_file"`
 	TLSKeyFile  string `mapstructure:"tls_key_file"`
 
-	// ChatAllowPlaintext permits unencrypted chat messages (wave 4b dev
-	// escape hatch; default false — chat payloads are encrypted).
+	// ChatAllowPlaintext permits unencrypted chat SENDS (dev escape hatch;
+	// default false). It never affects storage, relay, history or MOTD — the
+	// server seals before storing and before broadcasting regardless (91).
 	ChatAllowPlaintext bool `mapstructure:"chat_allow_plaintext"`
+
+	// Chat encryption at rest (91). ChatMasterKeyFile holds the key-encryption
+	// key that wraps every stored scope generation; it lives OUTSIDE the
+	// database and must be backed up with it — losing it destroys all channel
+	// and global history irreversibly. VOICX_CHAT_MASTER_KEY overrides it.
+	// ChatLegacyHistory selects what the one-time backfill does with pre-012
+	// plaintext rows: "encrypt" (default, sealed in place) or "purge".
+	// ChatKeyRotateMinSecs coalesces channel key rotations so a flapping
+	// client cannot mint one persisted generation per reconnect.
+	// ChatSearchMaxMessages caps the client-side search scan (110).
+	ChatMasterKeyFile     string `mapstructure:"chat_master_key_file"`
+	ChatLegacyHistory     string `mapstructure:"chat_legacy_history"`
+	ChatKeyRotateMinSecs  int    `mapstructure:"chat_key_rotate_min_seconds"`
+	ChatSearchMaxMessages int    `mapstructure:"chat_search_max_messages"`
+
+	// FileTLSEnabled wraps the file-transfer data port in TLS with the SAME
+	// certificate as the control channel. false is a dev-only escape hatch.
+	FileTLSEnabled bool `mapstructure:"file_tls_enabled"`
+
+	// ServerInfoMOTD includes the MOTD in the public server-info reply (313).
+	// That reply answers callers holding no scope key, so it is the one
+	// deliberate plaintext exception; set false to omit it entirely.
+	ServerInfoMOTD bool `mapstructure:"server_info_motd"`
 
 	// DefaultGroupsEnabled auto-creates the Guest/Member server groups and
 	// auto-assigns them (143/144). Guests virtually hold the Guest group's
@@ -169,6 +193,12 @@ func Load() (*Config, error) {
 	v.SetDefault("tls_cert_file", "")
 	v.SetDefault("tls_key_file", "")
 	v.SetDefault("chat_allow_plaintext", false)
+	v.SetDefault("chat_master_key_file", "./data/keys/chat_master.key")
+	v.SetDefault("chat_legacy_history", "encrypt")
+	v.SetDefault("chat_key_rotate_min_seconds", 60)
+	v.SetDefault("chat_search_max_messages", 2000)
+	v.SetDefault("file_tls_enabled", true)
+	v.SetDefault("server_info_motd", true)
 	v.SetDefault("default_groups_enabled", true)
 	v.SetDefault("chat_max_length", 2000)
 	v.SetDefault("chat_rate_msgs", 5)

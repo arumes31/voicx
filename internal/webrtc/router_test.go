@@ -421,6 +421,75 @@ func TestAttachPeer(t *testing.T) {
 	}
 }
 
+// TestPublisherTrackMSID verifies the MSID contract clients rely on: one
+// stream ID per publisher (so the browser builds one MediaStream per
+// publisher) and the publisher's client ID as track ID.
+func TestPublisherTrackMSID(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
+	r := NewRouter(nil)
+
+	for _, id := range []string{"a", "b", "c"} {
+		attachFakePeer(t, e, r, id)
+		r.JoinChannel(1, id)
+	}
+
+	fromA := pubTrackFor(r, "c", "a")
+	fromB := pubTrackFor(r, "c", "b")
+	if fromA == nil || fromB == nil {
+		t.Fatal("missing pub tracks on c")
+	}
+
+	if fromA.audio.ID() != "a" || fromA.video.ID() != "a" {
+		t.Fatalf("track IDs = %q/%q, want both %q", fromA.audio.ID(), fromA.video.ID(), "a")
+	}
+	if fromA.audio.StreamID() != fromA.video.StreamID() {
+		t.Fatalf("audio/video stream IDs = %q/%q, want one stream per publisher",
+			fromA.audio.StreamID(), fromA.video.StreamID())
+	}
+	if fromA.audio.StreamID() == fromB.audio.StreamID() {
+		t.Fatalf("publishers a and b share stream ID %q; the browser then merges them into one MediaStream",
+			fromA.audio.StreamID())
+	}
+}
+
+// TestEnsurePublishersEchoSelfPair verifies a peer rebuild (re-offer / ICE
+// restart) restores the echo channel's self pair, so the client keeps hearing
+// itself (15).
+func TestEnsurePublishersEchoSelfPair(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
+	r := NewRouter(nil)
+	r.SetEchoChannel(15)
+
+	attachFakePeer(t, e, r, "a")
+	r.JoinChannel(15, "a")
+	if pubTrackFor(r, "a", "a") == nil {
+		t.Fatal("no echo self pair after JoinChannel")
+	}
+
+	// Peer rebuild: the connection and its tracks go, membership stays.
+	r.DetachPeerKeepChannel("a")
+	if err := e.ClosePeerConnection("a"); err != nil {
+		t.Fatalf("ClosePeerConnection: %v", err)
+	}
+	attachFakePeer(t, e, r, "a")
+	r.EnsurePublishers("a")
+
+	if pubTrackFor(r, "a", "a") == nil {
+		t.Fatal("peer rebuild lost the echo self pair")
+	}
+	if sent := r.ForwardRTP("a", makeAudioPacket(t, 1, -1)); sent != 1 {
+		t.Fatalf("ForwardRTP sent = %d, want 1 (echoed back to a)", sent)
+	}
+}
+
 // --- voice facade -----------------------------------------------------------
 
 // TestVoiceHandleOffer runs the signaling path against a real SDP offer from
@@ -488,6 +557,124 @@ func TestVoiceHandleOffer(t *testing.T) {
 	}
 	if got := v.PeerCount(); got != 0 {
 		t.Fatalf("PeerCount after ClosePeer = %d, want 0", got)
+	}
+}
+
+// TestVoiceHandleOfferKeepsChannel verifies a re-offer (ICE restart) does not
+// drop the client's channel membership or its publisher tracks (59), while a
+// real ClosePeer still tears membership down.
+func TestVoiceHandleOfferKeepsChannel(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
+	r := NewRouter(nil)
+	v := NewVoice(e, r, testLogger())
+
+	// A second member with a peer connection, so publisher tracks exist in
+	// both directions.
+	attachFakePeer(t, e, r, "c2")
+	r.JoinChannel(7, "c2")
+
+	clientME := &webrtc.MediaEngine{}
+	if err := registerCodecs(clientME, false); err != nil {
+		t.Fatalf("registerCodecs: %v", err)
+	}
+	clientPC, err := webrtc.NewAPI(webrtc.WithMediaEngine(clientME)).NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatalf("client NewPeerConnection: %v", err)
+	}
+	defer clientPC.Close()
+	if _, err := clientPC.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio); err != nil {
+		t.Fatalf("AddTransceiverFromKind: %v", err)
+	}
+	offer, err := clientPC.CreateOffer(nil)
+	if err != nil {
+		t.Fatalf("CreateOffer: %v", err)
+	}
+
+	// The client is in the channel before it ever offers (joining a channel
+	// before pressing Join Voice).
+	v.JoinChannel("c1", 7)
+	if _, err := v.HandleOffer("c1", offer.SDP, nil); err != nil {
+		t.Fatalf("HandleOffer: %v", err)
+	}
+	if ch, ok := r.ChannelOf("c1"); !ok || ch != 7 {
+		t.Fatalf("ChannelOf after HandleOffer = %d/%t, want 7/true", ch, ok)
+	}
+	if pubTrackFor(r, "c1", "c2") == nil || pubTrackFor(r, "c2", "c1") == nil {
+		t.Fatal("no per-publisher track pair after HandleOffer")
+	}
+
+	// A re-offer rebuilds the peer connection; membership and tracks survive.
+	if _, err := v.HandleOffer("c1", offer.SDP, nil); err != nil {
+		t.Fatalf("re-offer HandleOffer: %v", err)
+	}
+	if ch, ok := r.ChannelOf("c1"); !ok || ch != 7 {
+		t.Fatalf("ChannelOf after re-offer = %d/%t, want 7/true", ch, ok)
+	}
+	if pubTrackFor(r, "c1", "c2") == nil || pubTrackFor(r, "c2", "c1") == nil {
+		t.Fatal("re-offer lost the per-publisher track pair")
+	}
+
+	// ClosePeer still tears membership down.
+	if err := v.ClosePeer("c1"); err != nil {
+		t.Fatalf("ClosePeer: %v", err)
+	}
+	if _, ok := r.ChannelOf("c1"); ok {
+		t.Fatal("ClosePeer left channel membership behind")
+	}
+}
+
+// TestVoiceHandleOfferConcurrentMove verifies a move that lands while a
+// re-offer rebuilds the peer connection survives the rebuild: membership is
+// the control server's, so the rebuild must never restore the channel the
+// client occupied when its offer arrived.
+func TestVoiceHandleOfferConcurrentMove(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
+	r := NewRouter(nil)
+	v := NewVoice(e, r, testLogger())
+
+	// A second member, so the rebuild has publisher pairs to tear down (that
+	// teardown is where a concurrent move interleaves).
+	attachFakePeer(t, e, r, "c2")
+	r.JoinChannel(7, "c2")
+
+	clientPC := newClientPC(t)
+	offer, err := clientPC.CreateOffer(nil)
+	if err != nil {
+		t.Fatalf("CreateOffer: %v", err)
+	}
+
+	v.JoinChannel("c1", 7)
+	if _, err := v.HandleOffer("c1", offer.SDP, nil); err != nil {
+		t.Fatalf("HandleOffer: %v", err)
+	}
+
+	// An admin MoveClient lands mid-rebuild: the renegotiation hook fires from
+	// inside the peer teardown, so moving the client there reproduces the race
+	// deterministically.
+	var moved sync.Once
+	r.SetRenegotiateHook(func(string) {
+		moved.Do(func() { r.JoinChannel(9, "c1") })
+	})
+
+	if _, err := v.HandleOffer("c1", offer.SDP, nil); err != nil {
+		t.Fatalf("re-offer HandleOffer: %v", err)
+	}
+	if ch, ok := r.ChannelOf("c1"); !ok || ch != 9 {
+		t.Fatalf("ChannelOf after a move during the re-offer = %d/%t, want 9/true", ch, ok)
+	}
+	r.mu.RLock()
+	stale := r.members[7]["c1"]
+	r.mu.RUnlock()
+	if stale {
+		t.Fatal("re-offer left the client in the channel it was moved out of")
 	}
 }
 

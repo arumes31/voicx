@@ -87,8 +87,13 @@ func (b *Broadcaster) Unregister(clientID string) {
 // it, and sends it to all registered clients. Sends are non-blocking: if a
 // client's channel is full, the message is dropped for that client and a
 // warning is logged.
-func (b *Broadcaster) BroadcastSnapshot() {
-	snap := BuildSnapshot(b.sm, true, "")
+//
+// The snapshot is built for one viewer (forAdmin/viewerUniqueID gate invisible
+// users, 381), so every registered client sees that viewer's view: pass the
+// least-privileged values (false, "") for a true fan-out and use
+// BroadcastToClient with a per-client BuildSnapshot when visibility differs.
+func (b *Broadcaster) BroadcastSnapshot(forAdmin bool, viewerUniqueID string) {
+	snap := BuildSnapshot(b.sm, forAdmin, viewerUniqueID)
 	payload, err := json.Marshal(snap)
 	if err != nil {
 		b.logger.Error("broadcast: failed to marshal snapshot", zap.Error(err))

@@ -10,6 +10,12 @@ import (
 	"time"
 )
 
+// allowDefaultSettingsPath gates the fallback to the real
+// <UserConfigDir>/voicx/settings.json when an App carries no settingsPath.
+// Tests clear it (see main_test.go) so no App built without one can write
+// over the developer's real bookmarks.
+var allowDefaultSettingsPath = true
+
 // Bookmark is a saved server (address + nickname; never passwords).
 type Bookmark struct {
 	Name        string `json:"name"`
@@ -290,20 +296,14 @@ func loadSettings() Settings {
 	return loadSettingsAt(path)
 }
 
-// saveSettings saves to the default path.
-func saveSettings(s Settings) error {
-	path, err := settingsPath()
-	if err != nil {
-		return err
-	}
-	return saveSettingsAt(path, s)
-}
-
 // settingsFile returns the effective settings path: the per-App override
 // (tests) or the default location.
 func (a *App) settingsFile() string {
 	if a.settingsPath != "" {
 		return a.settingsPath
+	}
+	if !allowDefaultSettingsPath {
+		return ""
 	}
 	path, err := settingsPath()
 	if err != nil {
@@ -325,8 +325,27 @@ func (a *App) GetSettings() Settings {
 	return a.settings
 }
 
+// emitSettingsUpdate hands the frontend the merged settings blob. Every field
+// the Go side writes on its own (282 recents, 330 what's-new marker) must be
+// announced through here; the frontend has no other way to learn of it before
+// the next restart.
+func (a *App) emitSettingsUpdate() {
+	a.emitPlain("settings_update", a.settings)
+}
+
+// mergeGoOwned returns incoming with the fields the Go side maintains on its
+// own taken from cur. The frontend caches the whole settings blob and ships
+// it back on every save, so a copy taken before the Go side wrote them would
+// otherwise wipe them (282 recents, 330 what's-new marker).
+func mergeGoOwned(cur, incoming Settings) Settings {
+	incoming.Recents = cur.Recents
+	incoming.LastSeenVersion = cur.LastSeenVersion
+	return incoming
+}
+
 // SaveSettings replaces and persists the settings. The frontend sends the
-// whole object; hotkey specs are validated and re-applied.
+// whole object (Go-owned fields are kept, see mergeGoOwned); hotkey specs
+// are validated and re-applied.
 func (a *App) SaveSettings(s Settings) string {
 	if _, _, err := parseHotkeySpec(s.HotkeyPTT); err != nil {
 		return "ptt hotkey: " + err.Error()
@@ -343,10 +362,11 @@ func (a *App) SaveSettings(s Settings) string {
 	if s.Volume < 0 || s.Volume > 200 {
 		return "volume must be 0..200"
 	}
-	a.settings = s
+	a.settings = mergeGoOwned(a.settings, s)
 	if err := a.save(); err != nil {
 		return err.Error()
 	}
+	a.emitSettingsUpdate()
 	a.applyHotkey("ptt", s.HotkeyPTT)
 	a.applyHotkey("mute_toggle", s.HotkeyMute)
 	a.applyHotkey("deafen_toggle", s.HotkeyDeafen)
@@ -374,5 +394,6 @@ func (a *App) RecordRecent(addr, nickname string) {
 		out = out[:10]
 	}
 	a.settings.Recents = out
-	_ = saveSettings(a.settings)
+	_ = a.save()
+	a.emitSettingsUpdate()
 }

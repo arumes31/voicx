@@ -7,7 +7,8 @@
 //     (headers included) to each subscriber's per-publisher output track.
 //     Each (subscriber, publisher) pair has dedicated audio/video tracks
 //     whose track ID carries the publisher's client ID, so clients can map
-//     incoming tracks to publishers via the MSID track ID.
+//     incoming tracks to publishers via the MSID track ID, and whose MSID
+//     stream ID is per publisher (see publisherStreamID).
 //   - The forwarding core works against small interfaces (TrackReader /
 //     TrackWriter) so it is testable without real peer connections, DTLS, or
 //     ICE. *webrtc.TrackRemote satisfies TrackReader and
@@ -360,6 +361,15 @@ func (r *Router) removePairsLocked(channelID int64, clientID string) map[string]
 	return out
 }
 
+// publisherStreamID returns the MSID stream ID for a publisher's tracks. It
+// must differ per publisher: with one shared stream ID the browser groups every
+// publisher into a single MediaStream, and a MediaStreamAudioSourceNode binds
+// only that stream's first audio track, so every per-user gain/mute chain ends
+// up fed by the same speaker (1, 2, 61).
+func publisherStreamID(publisherID string) string {
+	return "voicx-" + publisherID
+}
+
 // addPublisherLocked creates the per-publisher tracks for (subscriber,
 // publisher) if the subscriber has a peer connection and the pair does not
 // exist yet. Self pairs (subscriber == publisher) are only created by the
@@ -381,7 +391,7 @@ func (r *Router) addPublisherLocked(subscriberID, publisherID string) bool {
 
 	audioTrack, err := webrtc.NewTrackLocalStaticRTP(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
-		publisherID, "voicx",
+		publisherID, publisherStreamID(publisherID),
 	)
 	if err != nil {
 		r.logger.Warn("router: create audio track failed",
@@ -397,7 +407,7 @@ func (r *Router) addPublisherLocked(subscriberID, publisherID string) bool {
 
 	videoTrack, err := webrtc.NewTrackLocalStaticRTP(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000},
-		publisherID, "voicx",
+		publisherID, publisherStreamID(publisherID),
 	)
 	if err != nil {
 		r.logger.Warn("router: create video track failed",
@@ -453,8 +463,11 @@ func (r *Router) removePublisherLocked(subscriberID, publisherID string) bool {
 }
 
 // EnsurePublishers creates all missing publisher tracks between clientID and
-// the other members of its channel. It is called when a peer connection
-// attaches (the initial SDP answer then already contains all tracks).
+// the other members of its channel (plus the echo channel's self pair), and
+// asks the channel's video publishers for a keyframe (a freshly attached peer
+// decodes nothing until it gets one).
+// It is called when a peer connection attaches (the initial SDP answer then
+// already contains all tracks).
 func (r *Router) EnsurePublishers(clientID string) {
 	r.mu.Lock()
 	channelID, ok := r.clientChan[clientID]
@@ -474,9 +487,26 @@ func (r *Router) EnsurePublishers(clientID string) {
 			changed = true
 		}
 	}
+	// Echo channel (15): the self pair dies with the old peer connection, so a
+	// rebuild has to recreate it or the client stops hearing itself.
+	if channelID == r.echoChannel && r.echoChannel != 0 {
+		if r.addPublisherLocked(clientID, clientID) {
+			changed = true
+		}
+	}
+	var keyframeTargets []string
+	for publisherID := range r.videoSources {
+		if publisherID != clientID && r.members[channelID][publisherID] {
+			keyframeTargets = append(keyframeTargets, publisherID)
+		}
+	}
+	pref := r.layerPrefLocked(clientID)
 	hook := r.onRenegotiate
 	r.mu.Unlock()
 
+	for _, publisherID := range keyframeTargets {
+		r.RequestKeyframe(publisherID, pref)
+	}
 	if changed && hook != nil {
 		hook(clientID)
 	}
@@ -633,6 +663,20 @@ func (r *Router) AttachPeer(clientID string, pc *PeerConnectionWrapper) error {
 // tracks in both directions, tap outputs, RTCP writer, video sources, layer
 // preference, whisper configuration, and channel membership.
 func (r *Router) DetachPeer(clientID string) {
+	r.detachPeer(clientID, true)
+}
+
+// DetachPeerKeepChannel is DetachPeer without the channel leave, for peer
+// rebuilds (re-offer / ICE restart). Channel membership belongs to the control
+// server: leaving and re-joining it here would silently undo a move that lands
+// during the rebuild, leaving the router routing the client to the audio of
+// the channel it just left (59).
+func (r *Router) DetachPeerKeepChannel(clientID string) {
+	r.detachPeer(clientID, false)
+}
+
+// detachPeer implements DetachPeer / DetachPeerKeepChannel.
+func (r *Router) detachPeer(clientID string, leaveChannel bool) {
 	r.mu.Lock()
 	delete(r.pubPeers, clientID)
 	delete(r.outputs, clientID)
@@ -671,7 +715,7 @@ func (r *Router) DetachPeer(clientID string) {
 			hook(sub)
 		}
 	}
-	if ok {
+	if ok && leaveChannel {
 		r.LeaveChannel(channelID, clientID)
 	}
 }

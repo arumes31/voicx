@@ -82,8 +82,16 @@ export function Connect(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['Connect'](arg1, arg2, arg3, arg4);
 }
 
+export function ConnectBookmarkTab(arg1, arg2, arg3, arg4, arg5) {
+  return window['go']['main']['App']['ConnectBookmarkTab'](arg1, arg2, arg3, arg4, arg5);
+}
+
 export function ConnectGuest(arg1, arg2) {
   return window['go']['main']['App']['ConnectGuest'](arg1, arg2);
+}
+
+export function ConnectGuestBookmarkTab(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ConnectGuestBookmarkTab'](arg1, arg2, arg3);
 }
 
 export function ConnectGuestTab(arg1, arg2) {

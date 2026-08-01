@@ -173,7 +173,9 @@ export async function setUserMuted(uid, muted) {
 
 async function saveAll(s) {
     const err = await window.go.main.App.SaveSettings(s);
-    if (!err) V().state.settings = s;
+    // (282) re-read rather than caching the copy we sent: the Go side owns
+    // fields the frontend never has (recents, what's-new marker).
+    if (!err) V().state.settings = await window.go.main.App.GetSettings();
 }
 
 // userNodes maps uniqueID -> {gain: GainNode, mute: GainNode}.

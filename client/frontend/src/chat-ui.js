@@ -550,7 +550,7 @@ function scrollToQuote(quoteEl) {
         if (m.from === nick && m.ts <= ts && m.id) target = m;
     }
     if (!target) {
-        V().toast("quoted message not loaded", "info", "social");
+        V().toast("quoted message not loaded", "info", "alert");
         return;
     }
     const el = document.querySelector(`#chat-log .msg[data-msg-id="${target.id}"]`);
@@ -886,7 +886,7 @@ function routeDM(d, m) {
         if (b.timer) clearTimeout(b.timer);
         b.timer = setTimeout(() => {
             offlineBatch.delete(peer);
-            V().toast(`${b.n} offline message${b.n === 1 ? "" : "s"} from ${b.nick}`, "info", "social");
+            V().toast(`${b.n} offline message${b.n === 1 ? "" : "s"} from ${b.nick}`, "info", "alert");
         }, 700);
         offlineBatch.set(peer, b);
     }
@@ -1314,7 +1314,7 @@ async function loadPinsPanel() {
                 el.classList.add("flash");
                 setTimeout(() => el.classList.remove("flash"), 1200);
             } else {
-                V().toast("message not loaded — scroll up to load older history", "info", "social");
+                V().toast("message not loaded — scroll up to load older history", "info", "alert");
             }
         };
         row.appendChild(jump);
@@ -1388,7 +1388,7 @@ async function searchServer() {
     const q = $("chat-search").value.trim().toLowerCase();
     if (!q) return;
     if (view.kind === "dm") {
-        V().toast("server search covers channel/global history only (DMs are E2E)", "info", "social");
+        V().toast("server search covers channel/global history only (DMs are E2E)", "info", "alert");
         return;
     }
     const chID = view.kind === "global" ? 0 : V().state.myChannelID;
@@ -1454,7 +1454,7 @@ function showSearchResults(q, results) {
                 el.classList.add("flash");
                 setTimeout(() => el.classList.remove("flash"), 1200);
             } else {
-                V().toast("message not in the loaded view", "info", "social");
+                V().toast("message not in the loaded view", "info", "alert");
             }
         };
         list.appendChild(row);
@@ -1629,7 +1629,7 @@ export function resetView() {
     $("file-preview-row").classList.add("hidden");
     $("chat-head-title").textContent = "Chat";
     $("chat-topic").classList.add("hidden");
-    updatePMBar();
+    renderTabs();
 }
 
 // ---------------------------------------------------------------------------

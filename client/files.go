@@ -190,7 +190,8 @@ func (a *App) UploadFileProgress(id string, channelID int64, folder, name, dataB
 	if err != nil {
 		return err.Error()
 	}
-	go func() {
+	// recover is per-goroutine: transfer workers need their own guard (331).
+	go guardCrash("ft upload", func() {
 		p := ftProgress{ID: id, Direction: "upload", Name: name, Total: int64(len(data)), Status: "active"}
 		err := a.ftUploadProgress(id, addr, init.Token, init.TransferID, data, &p)
 		if err != nil {
@@ -204,7 +205,7 @@ func (a *App) UploadFileProgress(id string, channelID int64, folder, name, dataB
 			p.Transferred = p.Total
 		}
 		a.ftEmit(p)
-	}()
+	})
 	return ""
 }
 
@@ -286,7 +287,7 @@ func (a *App) DownloadFileProgress(id string, channelID int64, folder, name, des
 	if err != nil {
 		return err.Error()
 	}
-	go func() {
+	go guardCrash("ft download", func() {
 		p := ftProgress{ID: id, Direction: "download", Name: name, Status: "active"}
 		err := a.ftDownloadProgress(id, addr, init.Token, init.TransferID, destPath, &p)
 		if err != nil {
@@ -300,7 +301,7 @@ func (a *App) DownloadFileProgress(id string, channelID int64, folder, name, des
 			p.Transferred = p.Total
 		}
 		a.ftEmit(p)
-	}()
+	})
 	return ""
 }
 

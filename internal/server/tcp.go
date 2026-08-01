@@ -23,6 +23,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"voicx/internal/chatcrypto"
 	"voicx/internal/config"
 	"voicx/internal/metrics"
 	"voicx/internal/netproto"
@@ -66,6 +67,12 @@ type Client struct {
 	challengeNick string
 	challengeExp  time.Time
 
+	// x25519Key is the encryption key presented at authenticate time so the
+	// server can seal the global generation and the MOTD into the auth
+	// response (133). The identity PublicKey is Ed25519 and cannot be sealed
+	// to, hence the separate field.
+	x25519Key string
+
 	wmu sync.Mutex // serializes frame writes to Conn
 }
 
@@ -99,6 +106,21 @@ func (c *Client) uniqueID() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.UniqueID
+}
+
+// setX25519 records the encryption key presented at authenticate time.
+func (c *Client) setX25519(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.x25519Key = key
+}
+
+// x25519 returns the encryption key presented at authenticate time ("" for
+// clients that supplied none).
+func (c *Client) x25519() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.x25519Key
 }
 
 // noteReceived records inbound activity for the Client Info stats.
@@ -213,8 +235,15 @@ type TCPServer struct {
 	// certificate (empty when TLS is disabled). Set in Start.
 	tlsFingerprint string
 
-	// chatKeys manages the per-scope chat encryption keys (wave 4b).
+	// chatKeys manages the per-scope chat encryption keys and their
+	// persisted generations (91).
 	chatKeys *chatKeyManager
+
+	// rotPending coalesces channel key rotations inside
+	// chat_key_rotate_min_seconds so a flapping client cannot mint one
+	// persisted generation per reconnect.
+	rotMu      sync.Mutex
+	rotPending map[int64]bool
 
 	// Chat infrastructure (wave 5a): rate limiter, spam tracker, slow-mode
 	// tracker.
@@ -237,17 +266,23 @@ type TCPServer struct {
 // Shutdown is always safe to call. deps may be nil; handlers that need a
 // missing dependency reply with an "unavailable" error.
 func New(cfg *config.Config, logger *zap.Logger, deps *Deps) *TCPServer {
+	var scopeKeys ScopeKeyStore
+	var kek *chatcrypto.KEKRing
+	if deps != nil {
+		scopeKeys, kek = deps.ScopeKeys, deps.ChatKEK
+	}
 	s := &TCPServer{
-		cfg:       cfg,
-		logger:    logger,
-		deps:      deps,
-		clients:   make(map[string]*Client),
-		stopCh:    make(chan struct{}),
-		startedAt: time.Now(),
-		chatKeys:  newChatKeyManager(),
-		chatRate:  newChatRateLimiter(cfg.ChatRateMsgs, time.Duration(cfg.ChatRateWindowSeconds)*time.Second),
-		chatSpam:  newSpamTracker(),
-		chatSlow:  newSlowTracker(),
+		cfg:        cfg,
+		logger:     logger,
+		deps:       deps,
+		clients:    make(map[string]*Client),
+		stopCh:     make(chan struct{}),
+		startedAt:  time.Now(),
+		chatKeys:   newChatKeyManager(scopeKeys, kek, logger),
+		rotPending: make(map[int64]bool),
+		chatRate:   newChatRateLimiter(cfg.ChatRateMsgs, time.Duration(cfg.ChatRateWindowSeconds)*time.Second),
+		chatSpam:   newSpamTracker(),
+		chatSlow:   newSlowTracker(),
 	}
 	// Install the voice pipeline callbacks (talk/video permission gates,
 	// speaking-state announcements, and renegotiation offer delivery).
@@ -322,6 +357,14 @@ func (s *TCPServer) Start(ctx context.Context) error {
 // certificate, or "" when TLS is disabled.
 func (s *TCPServer) TLSFingerprint() string {
 	return s.tlsFingerprint
+}
+
+// EnsureGlobalScopeKey mints the global chat generation at boot. Global is a
+// fixed, known scope, so minting it eagerly is safe and removes the only
+// legitimate lazy mint from a hot path (91).
+func (s *TCPServer) EnsureGlobalScopeKey(ctx context.Context) error {
+	_, _, err := s.chatKeys.EnsureScope(ctx, globalChatScope)
+	return err
 }
 
 // Shutdown stops accepting new connections and closes the listener. Existing
@@ -503,6 +546,8 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 		return s.handleChatPin(ctx, client, f)
 	case netproto.MsgChatPins:
 		return s.handleChatPins(ctx, client, f)
+	case netproto.MsgChatKeyRequest:
+		return s.handleChatKeyRequest(ctx, client, f)
 	case netproto.MsgChatReact:
 		return s.handleChatReact(ctx, client, f)
 	case netproto.MsgTyping:
@@ -631,7 +676,7 @@ func (s *TCPServer) onDisconnect(client *Client) {
 
 	// Rotate the chat key of the channel the client left (4b).
 	if channelID != 0 {
-		s.rotateScopeKey(channelID)
+		s.rotateScopeKey(context.Background(), channelID)
 	}
 
 	// Tear down the client's voice session (peer connection, router state).

@@ -242,8 +242,17 @@ func (a *App) ListTabs() []TabInfo {
 }
 
 // ConnectTab connects to a server in a NEW tab and activates it. It returns
-// the tab ID on success or the failure reason (mirroring Connect).
+// the tab ID on success or the failure reason (mirroring Connect). The
+// bookmark this login came from is unknown here; see ConnectBookmarkTab.
 func (a *App) ConnectTab(addr, nickname, password, serverPassword string) string {
+	return a.ConnectBookmarkTab("", addr, nickname, password, serverPassword)
+}
+
+// ConnectBookmarkTab is ConnectTab with the originating bookmark's Name.
+// Bookmarks must be identified explicitly: a nickname override (334)
+// replaces the login nickname before connecting, so addr+nickname no longer
+// identifies the bookmark that per-server settings (300/335) belong to.
+func (a *App) ConnectBookmarkTab(bookmark, addr, nickname, password, serverPassword string) string {
 	if addr == "" || nickname == "" {
 		return "server address and nickname are required"
 	}
@@ -259,13 +268,19 @@ func (a *App) ConnectTab(addr, nickname, password, serverPassword string) string
 	}
 	ts.info.Addr = addr
 	ts.info.Nickname = nickname
-	a.onTabConnected(ts.cm, addr, nickname)
+	a.onTabConnected(ts.cm, bookmark, addr, nickname)
 	a.activate(id)
 	return ""
 }
 
 // ConnectGuestTab connects as a guest in a NEW tab (mirroring ConnectGuest).
 func (a *App) ConnectGuestTab(addr, nickname string) string {
+	return a.ConnectGuestBookmarkTab("", addr, nickname)
+}
+
+// ConnectGuestBookmarkTab is ConnectGuestTab with the originating bookmark's
+// Name (see ConnectBookmarkTab).
+func (a *App) ConnectGuestBookmarkTab(bookmark, addr, nickname string) string {
 	if addr == "" || nickname == "" {
 		return "server address and nickname are required"
 	}
@@ -276,33 +291,63 @@ func (a *App) ConnectGuestTab(addr, nickname string) string {
 	}
 	ts.info.Addr = addr
 	ts.info.Nickname = nickname
-	a.onTabConnected(ts.cm, addr, nickname)
+	a.onTabConnected(ts.cm, bookmark, addr, nickname)
 	a.activate(id)
 	return ""
 }
 
+// lookupBookmark resolves the bookmark a connection belongs to, by explicit
+// Name or (for callers that know no name) by the nickname that was sent as
+// the login nickname — the stored one or its override (334). Neither key is
+// unique: names are auto-generated ("nick @ addr"), freely editable, and
+// nothing rejects a duplicate, so both branches require agreement on addr AND
+// resolve only when exactly one bookmark matches. Guessing between candidates
+// applies a foreign hotkey profile (300) and uploads a foreign avatar
+// override (335) to the server.
+func (a *App) lookupBookmark(name, addr, nickname string) *Bookmark {
+	var match *Bookmark
+	for i := range a.settings.Bookmarks {
+		b := &a.settings.Bookmarks[i]
+		if b.Addr != addr {
+			continue
+		}
+		if name != "" {
+			if b.Name != name {
+				continue
+			}
+		} else if b.Nickname != nickname && b.NicknameOverride != nickname {
+			continue
+		}
+		if match != nil {
+			return nil // ambiguous: treat as a plain login
+		}
+		match = b
+	}
+	return match
+}
+
 // onTabConnected records the recents entry (282), applies the bookmark's
 // hotkey profile (300), and uploads the avatar override (335). cm is the
-// newly connected tab's manager (it is not active yet).
-func (a *App) onTabConnected(cm *connManager, addr, nickname string) {
+// newly connected tab's manager (it is not active yet); bookmark is the
+// originating bookmark's Name ("" = direct login).
+func (a *App) onTabConnected(cm *connManager, bookmark, addr, nickname string) {
 	a.RecordRecent(addr, nickname)
-	for _, b := range a.settings.Bookmarks {
-		if b.Addr == addr && b.Nickname == nickname {
-			if b.Profile != "" {
-				a.ApplyHotkeyProfile(b.Profile)
-			} else {
-				a.ApplyHotkeyProfile("default")
-			}
-			// (335) per-server avatar override: upload after connect.
-			if b.AvatarOverrideB64 != "" {
-				if err := cm.write(netproto.MsgAvatarSet, netproto.AvatarSet{DataBase64: b.AvatarOverrideB64}); err != nil {
-					log.Printf("avatar override upload failed: %v", err)
-				}
-			}
-			return
+	b := a.lookupBookmark(bookmark, addr, nickname)
+	if b == nil {
+		a.ApplyHotkeyProfile("default")
+		return
+	}
+	if b.Profile != "" {
+		a.ApplyHotkeyProfile(b.Profile)
+	} else {
+		a.ApplyHotkeyProfile("default")
+	}
+	// (335) per-server avatar override: upload after connect.
+	if b.AvatarOverrideB64 != "" {
+		if err := cm.write(netproto.MsgAvatarSet, netproto.AvatarSet{DataBase64: b.AvatarOverrideB64}); err != nil {
+			log.Printf("avatar override upload failed: %v", err)
 		}
 	}
-	a.ApplyHotkeyProfile("default")
 }
 
 // SetActiveTab switches the active tab (replays its journaled state).

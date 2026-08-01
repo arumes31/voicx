@@ -41,7 +41,9 @@ func runApp() {
 	// Create an instance of the app structure
 	app := NewApp()
 
-	go func() {
+	// recover is per-goroutine, so every goroutine the client starts carries
+	// its own guard (331) — main's covers only main's stack.
+	go guardCrash("wails", func() {
 		// Create application with options
 		err := wails.Run(&options.App{
 			Title:  "voicx-client",
@@ -77,7 +79,7 @@ func runApp() {
 			println("Error:", err.Error())
 		}
 		systray.Quit()
-	}()
+	})
 
 	initTray(app)
 }

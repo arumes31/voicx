@@ -115,7 +115,9 @@ async function saveSettings(patch) {
         V().toast("save failed: " + err, "warn");
         return false;
     }
-    V().state.settings = s;
+    // (282) the blob we sent is a copy taken before the save: re-read the
+    // merged truth so Go-owned fields (recents) written meanwhile survive.
+    V().state.settings = await window.go.main.App.GetSettings();
     return true;
 }
 
@@ -141,6 +143,10 @@ async function connectBookmark(b) {
     $("login-serverpw").value = "";
     state.lastConnect = null;
     V().showLogin();
+    // (334) the override is what gets sent as the login nickname, so the
+    // connect must carry the bookmark name to stay identifiable. Stashed
+    // after showLogin, which drops the previous login's stash.
+    state.pendingBookmark = { name: b.name, addr: b.addr };
     toast("bookmark loaded — enter password to connect");
 }
 
@@ -482,6 +488,7 @@ async function setTheme(theme) {
         V().toast("save failed: " + err, "warn");
         return;
     }
-    V().state.settings = s;
+    // (282) same as saveSettings: the merged blob is the authoritative cache.
+    V().state.settings = await window.go.main.App.GetSettings();
     V().applyAppearance();
 }
