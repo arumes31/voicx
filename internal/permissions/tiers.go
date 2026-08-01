@@ -98,6 +98,11 @@ const (
 	// to a specific client on a specific channel via
 	// channel_client_permissions.
 	TierChannelClient Tier = 4
+	// TierChannel covers permissions granted on the channel object itself
+	// (channel_permissions, migration 009). It evaluates between
+	// TierChannelSpecific and TierChannelGroup in tierOrder; the numeric
+	// value stays out of the existing 0-4 range for compatibility.
+	TierChannel Tier = 5
 )
 
 // String returns a human-readable name for the tier, useful in logs and
@@ -114,6 +119,8 @@ func (t Tier) String() string {
 		return "channel_group"
 	case TierChannelClient:
 		return "channel_client"
+	case TierChannel:
+		return "channel"
 	default:
 		return "unknown"
 	}
@@ -125,6 +132,7 @@ var tierOrder = []Tier{
 	TierServerGroup,
 	TierClientSpecific,
 	TierChannelSpecific,
+	TierChannel,
 	TierChannelGroup,
 	TierChannelClient,
 }

@@ -36,6 +36,46 @@ db_max_open_conns: 25
 db_max_idle_conns: 5
 db_conn_max_lifetime: 30m
 
+# Echo test channel (15): ensured to exist at startup; publishers in it hear
+# their own audio routed back. Empty disables the echo channel.
+echo_channel_name: "Echo Test"
+
+# TLS for the TCP control channel (wave 4a). Enabled by default. With empty
+# cert/key files a self-signed ECDSA P-256 certificate (10y, SANs localhost +
+# server name) is generated into tls_dir on first start and reused after —
+# clients pin its SHA-256 fingerprint (TOFU), which is logged at startup and
+# sent in the auth response. tls_enabled: false is a dev/e2e escape hatch.
+# ServerQuery and file-transfer ports stay plaintext (backlog 225).
+tls_enabled: true
+tls_dir: "./data/tls"
+tls_cert_file: ""
+tls_key_file: ""
+
+# Chat payload encryption (wave 4b). Plaintext chat is rejected by default;
+# allow_plaintext is a dev escape hatch for old clients.
+chat_allow_plaintext: false
+
+# Chat moderation & limits (wave 5a). max_length is in plaintext characters
+# post-decrypt. rate = per-user token bucket. word/link filters apply to
+# channel/global scopes only (DMs are E2EE, exempt). whitelist non-empty =
+# ONLY those domains may be linked.
+chat_max_length: 2000
+chat_rate_msgs: 5
+chat_rate_window_seconds: 3
+chat_word_filter: ""
+chat_link_blacklist: ""
+chat_link_whitelist: ""
+
+# TURN server for NAT traversal (445/446). Only needed for clients behind
+# restrictive NATs. Set secret to the coturn static-auth-secret (see the
+# "turn" profile in docker-compose.yml); clients then receive time-limited
+# REST API credentials in their auth response.
+turn:
+  secret: ""
+  realm: "voicx"
+  uris: []           # e.g. ["turn:turn.example.com:3478?transport=udp"]
+  credentials_ttl: 24h
+
 # WebRTC (Pion) engine configuration.
 # ice_servers: STUN/TURN URLs used when creating peer connections. If empty,
 #   the engine falls back to "stun:stun.l.google.com:19302".

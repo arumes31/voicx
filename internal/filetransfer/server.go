@@ -53,8 +53,13 @@ var ErrInvalidName = errors.New("filetransfer: invalid file name")
 // satisfied by *store.Store.
 type FileStore interface {
 	AddFile(ctx context.Context, rec store.FileRecord) error
-	GetFile(ctx context.Context, channelID int64, name string) (*store.FileRecord, error)
-	ListFiles(ctx context.Context, channelID int64) ([]store.FileRecord, error)
+	GetFile(ctx context.Context, channelID int64, folder, name string) (*store.FileRecord, error)
+	ListFiles(ctx context.Context, channelID int64, folder string) ([]store.FileRecord, error)
+	ListFileFolders(ctx context.Context, channelID int64) ([]string, error)
+	ListFileVersions(ctx context.Context, channelID int64, folder, baseName string) ([]store.FileRecord, error)
+	RenameFile(ctx context.Context, channelID int64, folder, name, newFolder, newName string) error
+	DeleteFile(ctx context.Context, channelID int64, folder, name string) error
+	FindFileBySHA(ctx context.Context, channelID int64, sha256, exclFolder, exclName string) (*store.FileRecord, error)
 	ChannelFileUsage(ctx context.Context, channelID int64) (int64, error)
 }
 
@@ -80,6 +85,7 @@ type transfer struct {
 	Token     string
 	Direction string // "upload" | "download"
 	ChannelID int64
+	Folder    string
 	Name      string
 	Size      int64
 	Uploader  string
@@ -92,6 +98,10 @@ type Server struct {
 	store  FileStore
 	logger *zap.Logger
 	port   int
+
+	// links is the download-link registry (267), served by the health HTTP
+	// server at /dl/<token>.
+	links *LinkRegistry
 
 	// OnTransferComplete, when set, is called with the direction and result
 	// ("ok"/"error") when a transfer finishes (metrics).
@@ -121,6 +131,7 @@ func New(cfg Config, st FileStore, logger *zap.Logger) *Server {
 		store:     st,
 		logger:    logger,
 		port:      port,
+		links:     NewLinkRegistry(),
 		stopCh:    make(chan struct{}),
 		transfers: make(map[string]*transfer),
 	}
@@ -132,11 +143,15 @@ func (s *Server) Port() int {
 	return s.port
 }
 
-// InitUpload issues a single-use upload token after validating the name,
-// the per-transfer size cap, and the channel quota. uploader is the
-// initiating user's unique ID, recorded in the files table.
-func (s *Server) InitUpload(ctx context.Context, channelID int64, name string, size int64, uploader string) (string, string, error) {
+// InitUpload issues a single-use upload token after validating the folder
+// and name, the per-transfer size cap, and the channel quota. uploader is
+// the initiating user's unique ID, recorded in the files table.
+func (s *Server) InitUpload(ctx context.Context, channelID int64, folder, name string, size int64, uploader string) (string, string, error) {
 	name, err := sanitizeName(name)
+	if err != nil {
+		return "", "", err
+	}
+	folder, err = sanitizeFolder(folder)
 	if err != nil {
 		return "", "", err
 	}
@@ -160,6 +175,7 @@ func (s *Server) InitUpload(ctx context.Context, channelID int64, name string, s
 	return s.register(&transfer{
 		Direction: "upload",
 		ChannelID: channelID,
+		Folder:    folder,
 		Name:      name,
 		Size:      size,
 		Uploader:  uploader,
@@ -167,26 +183,143 @@ func (s *Server) InitUpload(ctx context.Context, channelID int64, name string, s
 }
 
 // InitDownload issues a single-use download token for an existing file.
-func (s *Server) InitDownload(ctx context.Context, channelID int64, name string) (string, string, error) {
+func (s *Server) InitDownload(ctx context.Context, channelID int64, folder, name string) (string, string, error) {
 	name, err := sanitizeName(name)
 	if err != nil {
 		return "", "", err
 	}
-	rec, err := s.store.GetFile(ctx, channelID, name)
+	folder, err = sanitizeFolder(folder)
+	if err != nil {
+		return "", "", err
+	}
+	rec, err := s.store.GetFile(ctx, channelID, folder, name)
 	if err != nil {
 		return "", "", err
 	}
 	return s.register(&transfer{
 		Direction: "download",
 		ChannelID: channelID,
+		Folder:    folder,
 		Name:      rec.Name,
 		Size:      rec.Size,
 	})
 }
 
-// ListFiles returns the channel's file listing (passthrough to the store).
-func (s *Server) ListFiles(ctx context.Context, channelID int64) ([]store.FileRecord, error) {
-	return s.store.ListFiles(ctx, channelID)
+// ListFiles returns the channel's file listing for one folder (passthrough
+// to the store).
+func (s *Server) ListFiles(ctx context.Context, channelID int64, folder string) ([]store.FileRecord, error) {
+	folder, err := sanitizeFolder(folder)
+	if err != nil {
+		return nil, err
+	}
+	return s.store.ListFiles(ctx, channelID, folder)
+}
+
+// ListFileFolders returns the channel's virtual folders (derived from file
+// rows, 261).
+func (s *Server) ListFileFolders(ctx context.Context, channelID int64) ([]string, error) {
+	return s.store.ListFileFolders(ctx, channelID)
+}
+
+// ListFileVersions returns the rotated old versions of a file (264).
+func (s *Server) ListFileVersions(ctx context.Context, channelID int64, folder, name string) ([]store.FileRecord, error) {
+	name, err := sanitizeName(name)
+	if err != nil {
+		return nil, err
+	}
+	folder, err = sanitizeFolder(folder)
+	if err != nil {
+		return nil, err
+	}
+	return s.store.ListFileVersions(ctx, channelID, folder, name)
+}
+
+// DeleteFile removes a file record and its blob (263).
+func (s *Server) DeleteFile(ctx context.Context, channelID int64, folder, name string) error {
+	name, err := sanitizeName(name)
+	if err != nil {
+		return err
+	}
+	folder, err = sanitizeFolder(folder)
+	if err != nil {
+		return err
+	}
+	if err := s.store.DeleteFile(ctx, channelID, folder, name); err != nil {
+		return err
+	}
+	if err := os.Remove(s.filePath(channelID, folder, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		s.logger.Warn("removing file blob failed",
+			zap.Int64("channel_id", channelID),
+			zap.String("name", name),
+			zap.Error(err),
+		)
+	}
+	return nil
+}
+
+// RenameFile moves/renames a file record and its blob (262).
+func (s *Server) RenameFile(ctx context.Context, channelID int64, folder, name, newFolder, newName string) error {
+	name, err := sanitizeName(name)
+	if err != nil {
+		return err
+	}
+	newName, err = sanitizeName(newName)
+	if err != nil {
+		return err
+	}
+	folder, err = sanitizeFolder(folder)
+	if err != nil {
+		return err
+	}
+	newFolder, err = sanitizeFolder(newFolder)
+	if err != nil {
+		return err
+	}
+	if folder == newFolder && name == newName {
+		return errors.New("nothing to rename")
+	}
+	if err := s.store.RenameFile(ctx, channelID, folder, name, newFolder, newName); err != nil {
+		return err
+	}
+	oldPath := s.filePath(channelID, folder, name)
+	newPath := s.filePath(channelID, newFolder, newName)
+	if err := os.MkdirAll(filepath.Dir(newPath), 0o750); err != nil {
+		return fmt.Errorf("creating target folder: %w", err)
+	}
+	if err := os.Rename(oldPath, newPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("moving file blob: %w", err)
+	}
+	return nil
+}
+
+// ChannelQuota returns the channel's used bytes and quota (0 = unlimited).
+func (s *Server) ChannelQuota(ctx context.Context, channelID int64) (int64, int64, error) {
+	used, err := s.store.ChannelFileUsage(ctx, channelID)
+	if err != nil {
+		return 0, 0, err
+	}
+	return used, s.cfg.ChannelQuotaMB << 20, nil
+}
+
+// Links returns the download-link registry (mounted on the health server).
+func (s *Server) Links() *LinkRegistry {
+	return s.links
+}
+
+// CreateLink issues an expiring download link for a channel file (267).
+func (s *Server) CreateLink(ctx context.Context, channelID int64, folder, name string) (string, time.Time, error) {
+	name, err := sanitizeName(name)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	folder, err = sanitizeFolder(folder)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	if _, err := s.store.GetFile(ctx, channelID, folder, name); err != nil {
+		return "", time.Time{}, err
+	}
+	return s.links.Create(s.filePath(channelID, folder, name), name)
 }
 
 // register creates a transfer ID and token and records the pending transfer.
@@ -260,9 +393,28 @@ func sanitizeName(name string) (string, error) {
 	return name, nil
 }
 
+// sanitizeFolder validates a virtual folder path (261): "" is the channel
+// root; otherwise '/'-separated segments, each a bare name — no traversal,
+// no backslashes, no leading/trailing/duplicate separators.
+func sanitizeFolder(folder string) (string, error) {
+	if folder == "" {
+		return "", nil
+	}
+	if strings.ContainsAny(folder, "\\") || strings.HasPrefix(folder, "/") ||
+		strings.HasSuffix(folder, "/") || strings.Contains(folder, "//") {
+		return "", fmt.Errorf("%w: %q", ErrInvalidName, folder)
+	}
+	for _, seg := range strings.Split(folder, "/") {
+		if _, err := sanitizeName(seg); err != nil {
+			return "", fmt.Errorf("%w: %q", ErrInvalidName, folder)
+		}
+	}
+	return folder, nil
+}
+
 // filePath returns the on-disk path for a channel file.
-func (s *Server) filePath(channelID int64, name string) string {
-	return filepath.Join(s.cfg.RootDir, strconv.FormatInt(channelID, 10), name)
+func (s *Server) filePath(channelID int64, folder, name string) string {
+	return filepath.Join(s.cfg.RootDir, strconv.FormatInt(channelID, 10), filepath.FromSlash(folder), name)
 }
 
 // CheckRoot verifies the storage root exists and is writable, creating it if

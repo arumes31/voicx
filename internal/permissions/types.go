@@ -66,6 +66,7 @@ const (
 	PermissionKeyClientWhisperPower       PermissionKey = "i_client_whisper_power"
 	PermissionKeyClientNeededWhisperPower PermissionKey = "i_client_needed_whisper_power"
 	PermissionKeyClientVideoPublish       PermissionKey = "b_client_video_publish"
+	PermissionKeyClientPrioritySpeaker    PermissionKey = "b_client_priority_speaker"
 	PermissionKeyClientIgnoreAntiflood    PermissionKey = "b_client_ignore_antiflood"
 	PermissionKeyClientRequestTalker      PermissionKey = "b_client_request_talker"
 
@@ -74,6 +75,9 @@ const (
 	PermissionKeyFTNeededFileUploadPower   PermissionKey = "i_ft_needed_file_upload_power"
 	PermissionKeyFTFileDownloadPower       PermissionKey = "i_ft_file_download_power"
 	PermissionKeyFTNeededFileDownloadPower PermissionKey = "i_ft_needed_file_download_power"
+	// PermissionKeyFTFileDelete allows deleting/renaming other users' files
+	// (263); uploaders may always manage their own files.
+	PermissionKeyFTFileDelete PermissionKey = "b_ft_delete"
 
 	// --- Poke ---
 	PermissionKeyClientPokePower       PermissionKey = "i_client_poke_power"
@@ -81,7 +85,8 @@ const (
 	PermissionKeyClientPoke            PermissionKey = "b_client_poke"
 
 	// --- ServerQuery / visibility ---
-	PermissionKeyClientServerQueryView PermissionKey = "b_client_serverquery_view"
+	PermissionKeyClientServerQueryView   PermissionKey = "b_client_serverquery_view"
+	PermissionKeyClientRemoteAddressView PermissionKey = "b_client_remoteaddress_view"
 
 	// --- Permission management ---
 	PermissionKeyPermissionModifyPower  PermissionKey = "b_permission_modify_power"
@@ -96,6 +101,18 @@ const (
 	PermissionKeyVirtualserverTokenAdd           PermissionKey = "b_virtualserver_token_add"
 	PermissionKeyVirtualserverTokenUse           PermissionKey = "b_virtualserver_token_use"
 	PermissionKeyVirtualserverTokenDelete        PermissionKey = "b_virtualserver_token_delete"
+
+	// --- Chat (wave 5a) ---
+	PermissionKeyChatDeleteAny      PermissionKey = "b_chat_delete_any"
+	PermissionKeyChatMentionAll     PermissionKey = "b_chat_mention_all"
+	PermissionKeyChatSlowmodeBypass PermissionKey = "b_chat_slowmode_bypass"
+	PermissionKeyEmojiManage        PermissionKey = "b_emoji_manage"
+
+	// --- Group & permission management (wave 6a) ---
+	PermissionKeyServerGroupManage  PermissionKey = "b_server_group_manage"
+	PermissionKeyChannelGroupManage PermissionKey = "b_channel_group_manage"
+	PermissionKeyPermissionManage   PermissionKey = "b_permission_manage"
+	PermissionKeyAuditView          PermissionKey = "b_audit_view"
 )
 
 // PermissionType distinguishes boolean permissions from integer (power)

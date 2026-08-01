@@ -88,7 +88,7 @@ func (b *Broadcaster) Unregister(clientID string) {
 // client's channel is full, the message is dropped for that client and a
 // warning is logged.
 func (b *Broadcaster) BroadcastSnapshot() {
-	snap := BuildSnapshot(b.sm)
+	snap := BuildSnapshot(b.sm, true, "")
 	payload, err := json.Marshal(snap)
 	if err != nil {
 		b.logger.Error("broadcast: failed to marshal snapshot", zap.Error(err))

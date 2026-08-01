@@ -34,7 +34,7 @@ func TestBuildSnapshot_Populated(t *testing.T) {
 		t.Fatalf("join c2: %v", err)
 	}
 
-	snap := BuildSnapshot(sm)
+	snap := BuildSnapshot(sm, true, "")
 	if snap == nil {
 		t.Fatal("snapshot is nil")
 	}
@@ -75,7 +75,7 @@ func TestBuildSnapshot_Populated(t *testing.T) {
 
 func TestBuildSnapshot_Empty(t *testing.T) {
 	sm := newTestManager()
-	snap := BuildSnapshot(sm)
+	snap := BuildSnapshot(sm, true, "")
 	if snap == nil {
 		t.Fatal("snapshot is nil")
 	}
@@ -91,7 +91,7 @@ func TestBuildSnapshot_Empty(t *testing.T) {
 }
 
 func TestBuildSnapshot_NilManager(t *testing.T) {
-	snap := BuildSnapshot(nil)
+	snap := BuildSnapshot(nil, true, "")
 	if snap == nil {
 		t.Fatal("snapshot is nil")
 	}

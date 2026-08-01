@@ -24,6 +24,12 @@ type ClientInfo struct {
 	ChannelID   int64     `json:"channel_id"`
 	IsSpeaking  bool      `json:"is_speaking"`
 	ConnectedAt time.Time `json:"connected_at"`
+	// PrioritySpeaker marks TS3-style priority speakers (14); clients duck
+	// other publishers while a priority speaker in their channel talks.
+	PrioritySpeaker bool `json:"priority_speaker,omitempty"`
+	// Status/StatusMessage carry the client's presence (307-309).
+	Status        string `json:"status,omitempty"`
+	StatusMessage string `json:"status_message,omitempty"`
 }
 
 // ChannelNode represents a single channel in the tree snapshot. It embeds the
@@ -51,12 +57,15 @@ func clientToInfo(c *state.Client) ClientInfo {
 		return ClientInfo{}
 	}
 	return ClientInfo{
-		ClientID:    c.ClientID,
-		UniqueID:    c.UniqueID,
-		Nickname:    c.Nickname,
-		ChannelID:   c.ChannelID,
-		IsSpeaking:  c.IsSpeaking,
-		ConnectedAt: c.ConnectedAt,
+		ClientID:        c.ClientID,
+		UniqueID:        c.UniqueID,
+		Nickname:        c.Nickname,
+		ChannelID:       c.ChannelID,
+		IsSpeaking:      c.IsSpeaking,
+		ConnectedAt:     c.ConnectedAt,
+		PrioritySpeaker: c.PrioritySpeaker,
+		Status:          c.Status,
+		StatusMessage:   c.StatusMessage,
 	}
 }
 
@@ -67,7 +76,10 @@ func clientToInfo(c *state.Client) ClientInfo {
 //
 // BuildSnapshot never returns nil; an empty state yields a non-nil snapshot with
 // zero totals.
-func BuildSnapshot(sm *state.Manager) *TreeSnapshot {
+//
+// Invisible users (381) are hidden unless the viewer is an admin or the
+// invisible user themself (they still see everyone).
+func BuildSnapshot(sm *state.Manager, forAdmin bool, viewerUniqueID string) *TreeSnapshot {
 	snap := &TreeSnapshot{
 		GeneratedAt: time.Now(),
 	}
@@ -82,6 +94,7 @@ func BuildSnapshot(sm *state.Manager) *TreeSnapshot {
 	nodeByID := make(map[int64]*ChannelNode, len(channels))
 	for _, ch := range channels {
 		node := &ChannelNode{Channel: *ch}
+		node.HasPassword = ch.PasswordHash != "" // (304) lock icon, without leaking the hash
 		nodeByID[ch.ChannelID] = node
 	}
 
@@ -100,8 +113,13 @@ func BuildSnapshot(sm *state.Manager) *TreeSnapshot {
 		}
 	}
 
-	// Populate clients per channel.
+	// Populate clients per channel (filtering invisible users per viewer).
+	total := 0
 	for _, c := range members {
+		if c.Status == "invisible" && !forAdmin && c.UniqueID != viewerUniqueID {
+			continue
+		}
+		total++
 		info := clientToInfo(c)
 		if c.ChannelID != 0 {
 			if node, ok := nodeByID[c.ChannelID]; ok {
@@ -111,7 +129,7 @@ func BuildSnapshot(sm *state.Manager) *TreeSnapshot {
 	}
 
 	snap.TotalChannels = len(channels)
-	snap.TotalClients = len(members)
+	snap.TotalClients = total
 
 	return snap
 }

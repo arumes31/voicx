@@ -23,38 +23,103 @@ func newFakeFileStore() *fakeFileStore {
 	return &fakeFileStore{files: make(map[string]store.FileRecord)}
 }
 
-func key(channelID int64, name string) string {
-	return string(rune(channelID)) + "/" + name
+func key(channelID int64, folder, name string) string {
+	return string(rune(channelID)) + "/" + folder + "/" + name
 }
 
 func (f *fakeFileStore) AddFile(_ context.Context, rec store.FileRecord) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.files[key(rec.ChannelID, rec.Name)] = rec
+	f.files[key(rec.ChannelID, rec.Folder, rec.Name)] = rec
 	f.added = append(f.added, rec)
 	return nil
 }
 
-func (f *fakeFileStore) GetFile(_ context.Context, channelID int64, name string) (*store.FileRecord, error) {
+func (f *fakeFileStore) GetFile(_ context.Context, channelID int64, folder, name string) (*store.FileRecord, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	rec, ok := f.files[key(channelID, name)]
+	rec, ok := f.files[key(channelID, folder, name)]
 	if !ok {
 		return nil, store.ErrFileNotFound
 	}
 	return &rec, nil
 }
 
-func (f *fakeFileStore) ListFiles(_ context.Context, channelID int64) ([]store.FileRecord, error) {
+func (f *fakeFileStore) ListFiles(_ context.Context, channelID int64, folder string) ([]store.FileRecord, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []store.FileRecord
 	for _, rec := range f.files {
-		if rec.ChannelID == channelID {
+		if rec.ChannelID == channelID && rec.Folder == folder {
 			out = append(out, rec)
 		}
 	}
 	return out, nil
+}
+
+func (f *fakeFileStore) ListFileFolders(_ context.Context, channelID int64) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	seen := map[string]bool{}
+	var out []string
+	for _, rec := range f.files {
+		if rec.ChannelID == channelID && rec.Folder != "" && !seen[rec.Folder] {
+			seen[rec.Folder] = true
+			out = append(out, rec.Folder)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeFileStore) ListFileVersions(_ context.Context, channelID int64, folder, baseName string) ([]store.FileRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []store.FileRecord
+	for _, rec := range f.files {
+		if rec.ChannelID == channelID && rec.Folder == folder &&
+			len(rec.Name) > len(baseName)+2 && rec.Name[:len(baseName)+2] == baseName+".v" {
+			out = append(out, rec)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeFileStore) RenameFile(_ context.Context, channelID int64, folder, name, newFolder, newName string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := key(channelID, folder, name)
+	rec, ok := f.files[k]
+	if !ok {
+		return store.ErrFileNotFound
+	}
+	delete(f.files, k)
+	rec.Folder = newFolder
+	rec.Name = newName
+	f.files[key(channelID, newFolder, newName)] = rec
+	return nil
+}
+
+func (f *fakeFileStore) DeleteFile(_ context.Context, channelID int64, folder, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := key(channelID, folder, name)
+	if _, ok := f.files[k]; !ok {
+		return store.ErrFileNotFound
+	}
+	delete(f.files, k)
+	return nil
+}
+
+func (f *fakeFileStore) FindFileBySHA(_ context.Context, channelID int64, sha256, exclFolder, exclName string) (*store.FileRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, rec := range f.files {
+		if rec.ChannelID == channelID && rec.SHA256 == sha256 && !(rec.Folder == exclFolder && rec.Name == exclName) {
+			cp := rec
+			return &cp, nil
+		}
+	}
+	return nil, nil
 }
 
 func (f *fakeFileStore) ChannelFileUsage(_ context.Context, channelID int64) (int64, error) {
@@ -81,7 +146,7 @@ func TestTokenLifecycle(t *testing.T) {
 	fs := newFakeFileStore()
 	s := New(Config{Addr: ":0", RootDir: t.TempDir()}, fs, nil)
 
-	id, token, err := s.InitUpload(context.Background(), 7, "a.txt", 10, "uid-1")
+	id, token, err := s.InitUpload(context.Background(), 7, "", "a.txt", 10, "uid-1")
 	if err != nil {
 		t.Fatalf("InitUpload: %v", err)
 	}
@@ -104,7 +169,7 @@ func TestTokenLifecycle(t *testing.T) {
 	old := tokenTTL
 	tokenTTL = 10 * time.Millisecond
 	defer func() { tokenTTL = old }()
-	id2, token2, err := s.InitUpload(context.Background(), 7, "b.txt", 10, "uid-1")
+	id2, token2, err := s.InitUpload(context.Background(), 7, "", "b.txt", 10, "uid-1")
 	if err != nil {
 		t.Fatalf("InitUpload 2: %v", err)
 	}
@@ -143,15 +208,15 @@ func TestInitUploadLimits(t *testing.T) {
 	}, fs, nil)
 
 	// Over the per-transfer cap.
-	if _, _, err := s.InitUpload(context.Background(), 7, "x.bin", 6<<20, "u"); !errors.Is(err, ErrTooLarge) {
+	if _, _, err := s.InitUpload(context.Background(), 7, "", "x.bin", 6<<20, "u"); !errors.Is(err, ErrTooLarge) {
 		t.Errorf("oversize init = %v, want ErrTooLarge", err)
 	}
 	// 1 MiB existing + 1.5 MiB new > 2 MiB quota.
-	if _, _, err := s.InitUpload(context.Background(), 7, "y.bin", 1536*1024, "u"); !errors.Is(err, ErrQuotaExceeded) {
+	if _, _, err := s.InitUpload(context.Background(), 7, "", "y.bin", 1536*1024, "u"); !errors.Is(err, ErrQuotaExceeded) {
 		t.Errorf("quota init = %v, want ErrQuotaExceeded", err)
 	}
 	// 1 MiB existing + 1 MiB new == 2 MiB quota: allowed.
-	if _, _, err := s.InitUpload(context.Background(), 7, "z.bin", 1024*1024, "u"); err != nil {
+	if _, _, err := s.InitUpload(context.Background(), 7, "", "z.bin", 1024*1024, "u"); err != nil {
 		t.Errorf("at-quota init = %v, want nil", err)
 	}
 }

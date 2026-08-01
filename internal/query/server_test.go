@@ -5,6 +5,7 @@ package query
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -36,6 +37,24 @@ type fakeBackend struct {
 	complaints []Complaint
 	tokens     []Token
 	nextToken  int
+	settings   map[string]string
+
+	auditEntries []AuditEntry
+
+	// wave 10a state
+	serverEdits    []serverEditCall
+	shutdownCalled bool
+	channelPerms   []ChannelPerm
+	groups         []GroupInfo
+	nextGroupID    int64
+	groupMembers   []GroupMemberInfo
+	custom         map[string]string
+	logLines       []string
+}
+
+type serverEditCall struct {
+	name, welcome string
+	maxClients    int
 }
 
 type kickCall struct {
@@ -109,6 +128,57 @@ func (f *fakeBackend) DeleteChannel(_ context.Context, channelID int64) error {
 	return nil
 }
 
+// ChannelInfo returns the canned channel with the matching ID.
+func (f *fakeBackend) ChannelInfo(_ context.Context, channelID int64) (ChannelInfo, bool) {
+	for _, ch := range f.channels {
+		if ch.ChannelID == channelID {
+			return ch, true
+		}
+	}
+	return ChannelInfo{}, false
+}
+
+// ServerSet records the setting.
+func (f *fakeBackend) ServerSet(_ context.Context, key, value string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.settings == nil {
+		f.settings = map[string]string{}
+	}
+	f.settings[key] = value
+	return nil
+}
+
+// EditChannel records the edit and applies it to the canned channel.
+func (f *fakeBackend) EditChannel(_ context.Context, channelID int64, params ChannelEditParams) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, ch := range f.channels {
+		if ch.ChannelID == channelID {
+			if params.Topic != nil {
+				f.channels[i].Topic = *params.Topic
+			}
+			if params.MaxClients != nil {
+				f.channels[i].MaxClients = *params.MaxClients
+			}
+			if params.OpusBitrate != nil {
+				f.channels[i].OpusBitrate = *params.OpusBitrate
+			}
+			if params.OpusFEC != nil {
+				f.channels[i].OpusFEC = *params.OpusFEC
+			}
+			if params.OpusDTX != nil {
+				f.channels[i].OpusDTX = *params.OpusDTX
+			}
+			if params.OpusStereo != nil {
+				f.channels[i].OpusStereo = *params.OpusStereo
+			}
+			return nil
+		}
+	}
+	return nil
+}
+
 func (f *fakeBackend) BanClient(_ context.Context, clientID string, seconds int64, reason string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -164,6 +234,174 @@ func (f *fakeBackend) TokenDelete(_ context.Context, key string) error {
 	return ErrTokenNotFound
 }
 
+func (f *fakeBackend) AuditLog(_ context.Context, limit int) ([]AuditEntry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if limit > 0 && limit < len(f.auditEntries) {
+		return f.auditEntries[:limit], nil
+	}
+	return f.auditEntries, nil
+}
+
+// --- wave 10a fakes -----------------------------------------------------------
+
+func (f *fakeBackend) ServerEdit(_ context.Context, name, welcome string, maxClients int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.serverEdits = append(f.serverEdits, serverEditCall{name, welcome, maxClients})
+	return nil
+}
+
+func (f *fakeBackend) Shutdown(_ context.Context, restart bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.shutdownCalled = restart || f.shutdownCalled
+	return nil
+}
+
+func (f *fakeBackend) PermOverview(_ context.Context, uniqueID string, channelID int64) ([]PermLine, error) {
+	if uniqueID != "user-uid" {
+		return nil, errors.New("user not found")
+	}
+	return []PermLine{
+		{Key: "i_client_talk_power", Value: 42, Grant: 50, Tier: "server_group"},
+		{Key: "b_channel_modify", Value: 1, Tier: "client_specific"},
+	}, nil
+}
+
+func (f *fakeBackend) ChannelPermList(context.Context, int64) ([]ChannelPerm, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.channelPerms, nil
+}
+
+func (f *fakeBackend) ChannelAddPerm(_ context.Context, actor string, channelID int64, key string, value, grant int, skip, negate bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, p := range f.channelPerms {
+		if p.Key == key {
+			f.channelPerms[i] = ChannelPerm{Key: key, Value: value, Grant: grant, Skip: skip, Negate: negate}
+			return nil
+		}
+	}
+	f.channelPerms = append(f.channelPerms, ChannelPerm{Key: key, Value: value, Grant: grant, Skip: skip, Negate: negate})
+	return nil
+}
+
+func (f *fakeBackend) ChannelDelPerm(_ context.Context, actor string, channelID int64, key string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	keep := f.channelPerms[:0]
+	for _, p := range f.channelPerms {
+		if p.Key != key {
+			keep = append(keep, p)
+		}
+	}
+	f.channelPerms = keep
+	return nil
+}
+
+func (f *fakeBackend) ServerGroupAdd(_ context.Context, actor, name string, sortID int) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextGroupID++
+	f.groups = append(f.groups, GroupInfo{ID: f.nextGroupID, Name: name, SortID: sortID})
+	return f.nextGroupID, nil
+}
+
+func (f *fakeBackend) ServerGroupDel(_ context.Context, actor string, groupID int64, force bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, g := range f.groups {
+		if g.ID == groupID {
+			if g.MemberCount > 0 && !force {
+				return errors.New("group has members (use force)")
+			}
+			f.groups = append(f.groups[:i], f.groups[i+1:]...)
+			return nil
+		}
+	}
+	return errors.New("group not found")
+}
+
+func (f *fakeBackend) ServerGroupAddClient(_ context.Context, actor string, groupID int64, uniqueID string, durationSeconds int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, g := range f.groups {
+		if g.ID == groupID {
+			f.groups[i].MemberCount++
+			f.groupMembers = append(f.groupMembers, GroupMemberInfo{UniqueID: uniqueID, Nickname: "nick"})
+			return nil
+		}
+	}
+	return errors.New("group not found")
+}
+
+func (f *fakeBackend) ServerGroupDelClient(_ context.Context, actor string, groupID int64, uniqueID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	keep := f.groupMembers[:0]
+	removed := false
+	for _, m := range f.groupMembers {
+		if m.UniqueID != uniqueID {
+			keep = append(keep, m)
+		} else {
+			removed = true
+		}
+	}
+	f.groupMembers = keep
+	if removed {
+		for i, g := range f.groups {
+			if g.ID == groupID && g.MemberCount > 0 {
+				f.groups[i].MemberCount--
+			}
+		}
+	}
+	return nil
+}
+
+func (f *fakeBackend) ServerGroupList(context.Context) ([]GroupInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.groups, nil
+}
+
+func (f *fakeBackend) ServerGroupClientList(_ context.Context, groupID int64) ([]GroupMemberInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.groupMembers, nil
+}
+
+func (f *fakeBackend) CustomSet(_ context.Context, uniqueID, key, value string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.custom[uniqueID+"/"+key] = value
+	return nil
+}
+
+func (f *fakeBackend) CustomDel(_ context.Context, uniqueID, key string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.custom, uniqueID+"/"+key)
+	return nil
+}
+
+func (f *fakeBackend) CustomInfo(_ context.Context, uniqueID string) ([]CustomProp, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []CustomProp
+	for k, v := range f.custom {
+		if strings.HasPrefix(k, uniqueID+"/") {
+			out = append(out, CustomProp{Key: strings.TrimPrefix(k, uniqueID+"/"), Value: v})
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeBackend) LogView(_ context.Context, lines int, filter string) ([]string, error) {
+	return f.logLines, nil
+}
+
 func newFakeBackend() *fakeBackend {
 	return &fakeBackend{
 		users: map[string]struct {
@@ -179,7 +417,8 @@ func newFakeBackend() *fakeBackend {
 		channels: []ChannelInfo{
 			{ChannelID: 1, ParentID: 0, Name: "Lobby", Type: 2, ClientCount: 1},
 		},
-		info: Info{Name: "voicx test", Uptime: 90 * time.Second, ClientsOnline: 1, MaxClients: 1024, ChannelsOnline: 1},
+		info:   Info{Name: "voicx test", Uptime: 90 * time.Second, ClientsOnline: 1, MaxClients: 1024, ChannelsOnline: 1},
+		custom: map[string]string{},
 	}
 }
 
@@ -692,5 +931,228 @@ func TestTokenCommands(t *testing.T) {
 	lines = sendCmd(t, conn, r, "tokendelete token=nope")
 	if got := lastErr(t, lines); !strings.HasPrefix(got, "error id=512") {
 		t.Fatalf("tokendelete unknown = %q", got)
+	}
+}
+
+// TestAuditlogCommand verifies the auditlog query command (149).
+func TestAuditlogCommand(t *testing.T) {
+	backend := newFakeBackend()
+	backend.auditEntries = []AuditEntry{
+		{ID: 2, Actor: "admin-uid", Action: "group_create", Target: "server:Mods", Detail: "id=3", CreatedAt: time.Unix(200, 0)},
+		{ID: 1, Actor: "serverquery", Action: "channel_create", Target: "5", Detail: "General", CreatedAt: time.Unix(100, 0)},
+	}
+	addr, _ := startQueryServer(t, backend)
+	conn, r := dialQuery(t, addr)
+	defer conn.Close()
+	loginOK(t, conn, r)
+
+	lines := sendCmd(t, conn, r, "auditlog")
+	if len(lines) != 3 { // two rows + error line
+		t.Fatalf("auditlog lines = %v", lines)
+	}
+	if !strings.Contains(lines[0], "action=group_create") || !strings.Contains(lines[0], "actor=admin-uid") {
+		t.Fatalf("row = %q", lines[0])
+	}
+
+	// limit=1 returns only the newest entry.
+	lines = sendCmd(t, conn, r, "auditlog limit=1")
+	if len(lines) != 2 {
+		t.Fatalf("auditlog limit=1 lines = %v", lines)
+	}
+
+	// A negative limit is rejected.
+	lines = sendCmd(t, conn, r, "auditlog limit=-1")
+	if got := lastErr(t, lines); !strings.HasPrefix(got, "error id=512") {
+		t.Fatalf("auditlog bad limit = %q", got)
+	}
+}
+
+// --- wave 10a command tests ---------------------------------------------------
+
+// TestServeredit verifies the full and partial update paths (217).
+func TestServeredit(t *testing.T) {
+	backend := newFakeBackend()
+	addr, _ := startQueryServer(t, backend)
+	conn, r := dialQuery(t, addr)
+	defer conn.Close()
+	loginOK(t, conn, r)
+
+	lines := sendCmd(t, conn, r, `serveredit virtualserver_name=My\sServer virtualserver_maxclients=50`)
+	if got := lastErr(t, lines); got != "error id=0 msg=ok" {
+		t.Fatalf("serveredit = %q", got)
+	}
+	backend.mu.Lock()
+	call := backend.serverEdits[0]
+	backend.mu.Unlock()
+	if call.name != "My Server" || call.maxClients != 50 || call.welcome != "" {
+		t.Fatalf("serveredit call = %+v", call)
+	}
+
+	// No fields: usage error.
+	lines = sendCmd(t, conn, r, "serveredit")
+	if got := lastErr(t, lines); !strings.HasPrefix(got, "error id=512") {
+		t.Fatalf("serveredit empty = %q", got)
+	}
+}
+
+// TestServerstopConfirm verifies the confirm=1 gate (218).
+func TestServerstopConfirm(t *testing.T) {
+	backend := newFakeBackend()
+	addr, _ := startQueryServer(t, backend)
+	conn, r := dialQuery(t, addr)
+	defer conn.Close()
+	loginOK(t, conn, r)
+
+	lines := sendCmd(t, conn, r, "serverstop")
+	if got := lastErr(t, lines); !strings.HasPrefix(got, "error id=512") {
+		t.Fatalf("serverstop without confirm = %q", got)
+	}
+	backend.mu.Lock()
+	called := backend.shutdownCalled
+	backend.mu.Unlock()
+	if called {
+		t.Fatal("shutdown called without confirm")
+	}
+
+	lines = sendCmd(t, conn, r, "serverrestart confirm=1")
+	if got := lastErr(t, lines); got != "error id=0 msg=ok" {
+		t.Fatalf("serverrestart = %q", got)
+	}
+	backend.mu.Lock()
+	called = backend.shutdownCalled
+	backend.mu.Unlock()
+	if !called {
+		t.Fatal("shutdown not called with confirm=1")
+	}
+}
+
+// TestPermoverview verifies the resolved permission listing (219).
+func TestPermoverview(t *testing.T) {
+	backend := newFakeBackend()
+	addr, _ := startQueryServer(t, backend)
+	conn, r := dialQuery(t, addr)
+	defer conn.Close()
+	loginOK(t, conn, r)
+
+	lines := sendCmd(t, conn, r, "permoverview user-uid")
+	if len(lines) != 3 { // two entries + error line
+		t.Fatalf("permoverview lines = %v", lines)
+	}
+	if !strings.Contains(lines[0], "permid=i_client_talk_power") || !strings.Contains(lines[0], "permvalue=42") || !strings.Contains(lines[0], "tier=server_group") {
+		t.Fatalf("row = %q", lines[0])
+	}
+
+	lines = sendCmd(t, conn, r, "permoverview nope-uid")
+	if got := lastErr(t, lines); !strings.HasPrefix(got, "error id=512") {
+		t.Fatalf("permoverview unknown user = %q", got)
+	}
+}
+
+// TestChannelPerms verifies the channel-tier add/list/delete cycle (220).
+func TestChannelPerms(t *testing.T) {
+	backend := newFakeBackend()
+	addr, _ := startQueryServer(t, backend)
+	conn, r := dialQuery(t, addr)
+	defer conn.Close()
+	loginOK(t, conn, r)
+
+	sendCmd(t, conn, r, "channeladdperm cid=1 permid=i_client_needed_talk_power permvalue=50 permgrant=75 permskip=1")
+	lines := sendCmd(t, conn, r, "channelpermlist cid=1")
+	if len(lines) != 2 {
+		t.Fatalf("channelpermlist = %v", lines)
+	}
+	if !strings.Contains(lines[0], "permvalue=50") || !strings.Contains(lines[0], "permgrant=75") || !strings.Contains(lines[0], "permskip=1") {
+		t.Fatalf("row = %q", lines[0])
+	}
+
+	sendCmd(t, conn, r, "channeldelperm cid=1 permid=i_client_needed_talk_power")
+	lines = sendCmd(t, conn, r, "channelpermlist cid=1")
+	if len(lines) != 1 { // just the error line
+		t.Fatalf("after del = %v", lines)
+	}
+
+	lines = sendCmd(t, conn, r, "channeladdperm cid=1")
+	if got := lastErr(t, lines); !strings.HasPrefix(got, "error id=512") {
+		t.Fatalf("channeladdperm usage = %q", got)
+	}
+}
+
+// TestServerGroups verifies the group management cycle (221).
+func TestServerGroups(t *testing.T) {
+	backend := newFakeBackend()
+	addr, _ := startQueryServer(t, backend)
+	conn, r := dialQuery(t, addr)
+	defer conn.Close()
+	loginOK(t, conn, r)
+
+	lines := sendCmd(t, conn, r, `servergroupadd name=Mods\sAlpha sortid=10`)
+	if !strings.HasPrefix(lines[0], "sgid=") {
+		t.Fatalf("servergroupadd = %v", lines)
+	}
+
+	lines = sendCmd(t, conn, r, "servergrouplist")
+	if !strings.Contains(lines[0], `name=Mods\sAlpha`) || !strings.Contains(lines[0], "sortid=10") {
+		t.Fatalf("servergrouplist = %q", lines[0])
+	}
+
+	sendCmd(t, conn, r, "servergroupaddclient sgid=1 cldbid=user-uid duration=3600")
+	lines = sendCmd(t, conn, r, "servergroupclientlist sgid=1")
+	if !strings.Contains(lines[0], "cldbid=user-uid") {
+		t.Fatalf("clientlist = %q", lines[0])
+	}
+
+	// Delete with members without force: refused; with force: ok.
+	lines = sendCmd(t, conn, r, "servergroupdel sgid=1")
+	if got := lastErr(t, lines); !strings.HasPrefix(got, "error id=512") {
+		t.Fatalf("del without force = %q", got)
+	}
+	sendCmd(t, conn, r, "servergroupdelclient sgid=1 cldbid=user-uid")
+	lines = sendCmd(t, conn, r, "servergroupdel sgid=1")
+	if got := lastErr(t, lines); got != "error id=0 msg=ok" {
+		t.Fatalf("del after unassign = %q", got)
+	}
+}
+
+// TestCustomProps verifies customset/custominfo/customdel (222) and escaping.
+func TestCustomProps(t *testing.T) {
+	backend := newFakeBackend()
+	addr, _ := startQueryServer(t, backend)
+	conn, r := dialQuery(t, addr)
+	defer conn.Close()
+	loginOK(t, conn, r)
+
+	sendCmd(t, conn, r, `customset cldbid=user-uid ident=role value=senior\sdev`)
+	sendCmd(t, conn, r, `customset cldbid=user-uid ident=team value=core`)
+	lines := sendCmd(t, conn, r, "custominfo cldbid=user-uid")
+	if len(lines) != 3 {
+		t.Fatalf("custominfo = %v", lines)
+	}
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, `ident=role value=senior\sdev`) || !strings.Contains(joined, "ident=team value=core") {
+		t.Fatalf("custominfo rows = %v", lines)
+	}
+
+	sendCmd(t, conn, r, "customdel cldbid=user-uid ident=role")
+	lines = sendCmd(t, conn, r, "custominfo cldbid=user-uid")
+	if len(lines) != 2 {
+		t.Fatalf("after del = %v", lines)
+	}
+}
+
+// TestLogview verifies the log tail command (223).
+func TestLogview(t *testing.T) {
+	backend := newFakeBackend()
+	backend.logLines = []string{"first line", "second line with marker"}
+	addr, _ := startQueryServer(t, backend)
+	conn, r := dialQuery(t, addr)
+	defer conn.Close()
+	loginOK(t, conn, r)
+
+	lines := sendCmd(t, conn, r, "logview lines=5")
+	if len(lines) != 3 {
+		t.Fatalf("logview = %v", lines)
+	}
+	if lines[0] != `line=first\sline` {
+		t.Fatalf("logview row = %q", lines[0])
 	}
 }

@@ -103,18 +103,21 @@ func (s *Store) DB() *sql.DB {
 
 // SpooledMessage is an offline chat message awaiting delivery to a user.
 type SpooledMessage struct {
-	ID         int64
-	FromUserID int64
-	FromName   string // sender nickname at send time, empty if unknown
-	Message    string
-	SentAt     time.Time
+	ID           int64
+	FromUserID   int64
+	FromUniqueID string // sender unique ID (needed to open E2EE DMs)
+	FromName     string // sender nickname at send time, empty if unknown
+	Message      string
+	SentAt       time.Time
 }
 
-// SpoolMessage stores an offline message for later delivery.
-func (s *Store) SpoolMessage(ctx context.Context, fromUserID, toUserID int64, message string) error {
-	const q = `INSERT INTO offline_messages (from_user_id, to_user_id, message)
-	          VALUES ($1, $2, $3)`
-	if _, err := s.db.ExecContext(ctx, q, fromUserID, toUserID, message); err != nil {
+// SpoolMessage stores an offline message for later delivery. For E2EE direct
+// messages, message is base64 ciphertext the server cannot read and
+// fromUniqueID lets the recipient fetch the sender's public key.
+func (s *Store) SpoolMessage(ctx context.Context, fromUserID, toUserID int64, fromUniqueID, message string) error {
+	const q = `INSERT INTO offline_messages (from_user_id, to_user_id, from_unique_id, message)
+	          VALUES ($1, $2, $3, $4)`
+	if _, err := s.db.ExecContext(ctx, q, fromUserID, toUserID, fromUniqueID, message); err != nil {
 		return fmt.Errorf("spooling offline message: %w", err)
 	}
 	return nil
@@ -123,7 +126,7 @@ func (s *Store) SpoolMessage(ctx context.Context, fromUserID, toUserID int64, me
 // PendingMessages returns all undelivered offline messages for a user, oldest
 // first.
 func (s *Store) PendingMessages(ctx context.Context, toUserID int64) ([]SpooledMessage, error) {
-	const q = `SELECT om.id, om.from_user_id, COALESCE(u.nickname, ''), om.message, om.sent_at
+	const q = `SELECT om.id, om.from_user_id, om.from_unique_id, COALESCE(u.nickname, ''), om.message, om.sent_at
 	          FROM offline_messages om
 	          LEFT JOIN users u ON u.id = om.from_user_id
 	          WHERE om.to_user_id = $1 AND om.delivered_at IS NULL
@@ -137,12 +140,33 @@ func (s *Store) PendingMessages(ctx context.Context, toUserID int64) ([]SpooledM
 	var out []SpooledMessage
 	for rows.Next() {
 		var m SpooledMessage
-		if err := rows.Scan(&m.ID, &m.FromUserID, &m.FromName, &m.Message, &m.SentAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.FromUserID, &m.FromUniqueID, &m.FromName, &m.Message, &m.SentAt); err != nil {
 			return nil, fmt.Errorf("scanning offline message: %w", err)
 		}
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// SetE2EPublicKey stores a user's X25519 public key (base64) for E2EE.
+func (s *Store) SetE2EPublicKey(ctx context.Context, userID int64, publicKey string) error {
+	const q = `UPDATE users SET e2e_public_key = $1 WHERE id = $2`
+	if _, err := s.db.ExecContext(ctx, q, publicKey, userID); err != nil {
+		return fmt.Errorf("storing e2e public key: %w", err)
+	}
+	return nil
+}
+
+// GetE2EPublicKey returns a user's X25519 public key ("" when never
+// published).
+func (s *Store) GetE2EPublicKey(ctx context.Context, uniqueID string) (string, error) {
+	const q = `SELECT COALESCE(e2e_public_key, '') FROM users WHERE unique_id = $1`
+	var key string
+	err := s.db.QueryRowContext(ctx, q, uniqueID).Scan(&key)
+	if err != nil {
+		return "", fmt.Errorf("loading e2e public key: %w", err)
+	}
+	return key, nil
 }
 
 // MarkMessagesDelivered marks the given offline messages as delivered. It is

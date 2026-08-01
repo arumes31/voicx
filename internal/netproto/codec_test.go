@@ -45,6 +45,8 @@ func TestMessageTypeString(t *testing.T) {
 		{MsgTokenUse, "TokenUse"},
 		{MsgComplaint, "Complaint"},
 		{MsgScreenShare, "ScreenShare"},
+		{MsgClientInfoQuery, "ClientInfoQuery"},
+		{MsgClientInfoResponse, "ClientInfoResponse"},
 		{MessageType(999), "Unknown(999)"},
 	}
 	for _, tc := range cases {
@@ -70,7 +72,22 @@ func TestCodecRoundTrip(t *testing.T) {
 		in := AuthResponse{OK: true, ClientID: "c-1", UniqueID: "uid-abc", Nickname: "dan", Reason: "x"}
 		var out AuthResponse
 		roundTrip(t, MsgAuthResponse, in, &out)
-		if out != in {
+		if out.OK != in.OK || out.ClientID != in.ClientID || out.UniqueID != in.UniqueID ||
+			out.Nickname != in.Nickname || out.Reason != in.Reason || len(out.ICEServers) != 0 {
+			t.Errorf("got %+v, want %+v", out, in)
+		}
+	})
+
+	t.Run("AuthResponseWithICEServers", func(t *testing.T) {
+		in := AuthResponse{OK: true, ClientID: "c-1", ICEServers: []ICEServer{
+			{URLs: []string{"stun:stun.example.com:3478"}},
+			{URLs: []string{"turn:turn.example.com:3478"}, Username: "123:uid", Credential: "cred"},
+		}}
+		var out AuthResponse
+		roundTrip(t, MsgAuthResponse, in, &out)
+		if len(out.ICEServers) != 2 ||
+			out.ICEServers[0].URLs[0] != "stun:stun.example.com:3478" ||
+			out.ICEServers[1].Username != "123:uid" || out.ICEServers[1].Credential != "cred" {
 			t.Errorf("got %+v, want %+v", out, in)
 		}
 	})
@@ -112,10 +129,12 @@ func TestCodecRoundTrip(t *testing.T) {
 	})
 
 	t.Run("ChatBroadcast", func(t *testing.T) {
-		in := ChatBroadcast{ChannelID: "7", FromClientID: "c-1", From: "dan", Text: "hello", Offline: true}
+		in := ChatBroadcast{ChannelID: "7", FromClientID: "c-1", FromUniqueID: "uid-1", From: "dan", Text: "hello", Offline: true, ID: 42, Mentions: []string{"uid-2"}, ClientMsgID: "ref-1"}
 		var out ChatBroadcast
 		roundTrip(t, MsgChatBroadcast, in, &out)
-		if out != in {
+		if out.ChannelID != in.ChannelID || out.FromClientID != in.FromClientID || out.FromUniqueID != in.FromUniqueID ||
+			out.From != in.From || out.Text != in.Text || out.Offline != in.Offline || out.ID != in.ID ||
+			len(out.Mentions) != 1 || out.Mentions[0] != "uid-2" || out.ClientMsgID != in.ClientMsgID {
 			t.Errorf("got %+v, want %+v", out, in)
 		}
 	})
@@ -295,6 +314,28 @@ func TestCodecRoundTrip(t *testing.T) {
 		in := ScreenShare{Active: true}
 		var out ScreenShare
 		roundTrip(t, MsgScreenShare, in, &out)
+		if out != in {
+			t.Errorf("got %+v, want %+v", out, in)
+		}
+	})
+
+	t.Run("ClientInfoQuery", func(t *testing.T) {
+		in := ClientInfoQuery{ClientID: "c-1"}
+		var out ClientInfoQuery
+		roundTrip(t, MsgClientInfoQuery, in, &out)
+		if out != in {
+			t.Errorf("got %+v, want %+v", out, in)
+		}
+	})
+
+	t.Run("ClientInfoResponse", func(t *testing.T) {
+		in := ClientInfoResponse{
+			ClientID: "c-1", UniqueID: "uid", Nickname: "nick", ChannelID: 7,
+			ConnectedAt: 1700000000, IdleSeconds: 42, PingMs: 62, IP: "1.2.3.4",
+			Port: 5000, BytesIn: 1000, BytesOut: 2000,
+		}
+		var out ClientInfoResponse
+		roundTrip(t, MsgClientInfoResponse, in, &out)
 		if out != in {
 			t.Errorf("got %+v, want %+v", out, in)
 		}

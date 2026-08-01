@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -16,6 +17,7 @@ import (
 
 	"voicx/internal/auth"
 	"voicx/internal/netproto"
+	"voicx/internal/tlscert"
 )
 
 // eventSink receives backend events: the Wails runtime in production, a
@@ -40,16 +42,54 @@ func (s wailsSink) Emit(name string, payload any) {
 type connManager struct {
 	sink eventSink
 
+	// tabID identifies the owning server tab (281). Empty means the legacy
+	// single-connection manager (tests, headless tools): events go out under
+	// their plain names. Tabbed managers route through tabSink, which
+	// forwards active-tab events under their plain names and journals
+	// background-tab events for replay on tab switch.
+	tabID string
+
 	mu       sync.Mutex
 	conn     net.Conn
+	addr     string // control address (tab info)
 	clientID string
 	uniqueID string
 	nickname string
+	isAdmin  bool
 	closed   bool
+	// lastSnapshot/lastChannelList cache the latest state frames so a tab
+	// switch can replay them (281).
+	lastSnapshot    string
+	lastChannelList string
+	// iceServers are the ICE servers delivered by the server in the
+	// AuthResponse (nil = use client defaults).
+	iceServers []netproto.ICEServer
+	// motd is the server's message of the day from the AuthResponse
+	// ("" when unset); surfaced in chat once per connect (133).
+	motd string
 
 	// id is the client's Ed25519 identity (nil = load lazily on connect;
 	// tests inject a temp one).
 	id *identity
+
+	// E2EE chat (wave 4b): peer key cache + per-scope channel keys.
+	pubKeys   *pubKeyCache
+	scopeKeys *scopeKeyStore
+
+	// debugFrames tees frame summaries to the "debug_frame" event (327 debug
+	// console) when enabled.
+	debugFrames bool
+
+	// Transport security (wave 4a): TLS with TOFU fingerprint pinning.
+	// allowPlaintext permits falling back to plaintext for dev servers.
+	// knownServers nil disables verification (tests, tools).
+	allowPlaintext bool
+	knownServers   *knownServers
+	// tlsUsed/fingerprint/newServer describe the current connection for the
+	// UI ("connected via TLS, fingerprint …, first seen").
+	tlsUsed     bool
+	fingerprint string
+	newServer   bool
 
 	// pending maps message types to one-shot response waiters
 	// (PermissionsQuery, WebRTCOffer).
@@ -62,8 +102,10 @@ type connManager struct {
 
 func newConnManager(wailsCtx context.Context) *connManager {
 	return &connManager{
-		sink:    wailsSink{ctx: wailsCtx},
-		pending: make(map[netproto.MessageType]chan *netproto.Frame),
+		sink:      wailsSink{ctx: wailsCtx},
+		pending:   make(map[netproto.MessageType]chan *netproto.Frame),
+		pubKeys:   newPubKeyCache(),
+		scopeKeys: newScopeKeyStore(),
 	}
 }
 
@@ -80,6 +122,71 @@ func (m *connManager) identity() (*identity, error) {
 	}
 	m.id = id
 	return id, nil
+}
+
+// dialTransport dials the control channel with TLS and verifies the
+// certificate fingerprint against the TOFU store: first-seen servers are
+// accepted and pinned; a changed fingerprint fails hard
+// (errFingerprintMismatch). When the server does not speak TLS, it falls
+// back to plaintext only if allowPlaintext is set.
+func (m *connManager) dialTransport(addr string) (net.Conn, error) {
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true, // TOFU: verified via fingerprint pinning below
+		MinVersion:         tls.VersionTLS12,
+	}
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", addr, tlsConf)
+	if err == nil {
+		var fp string
+		if pc := conn.ConnectionState().PeerCertificates; len(pc) > 0 {
+			fp = tlscert.FingerprintDER(pc[0].Raw)
+		}
+		m.mu.Lock()
+		m.tlsUsed = true
+		m.fingerprint = fp
+		m.newServer = false
+		ks := m.knownServers
+		m.mu.Unlock()
+
+		if ks != nil && fp != "" {
+			switch ks.verify(addr, fp) {
+			case trustUnknown:
+				if err := ks.trust(addr, fp); err != nil {
+					_ = conn.Close()
+					return nil, fmt.Errorf("pinning server fingerprint: %w", err)
+				}
+				m.mu.Lock()
+				m.newServer = true
+				m.mu.Unlock()
+			case trustMismatch:
+				_ = conn.Close()
+				return nil, errFingerprintMismatch
+			}
+		}
+		return conn, nil
+	}
+	tlsErr := err
+
+	m.mu.Lock()
+	allowPlain := m.allowPlaintext
+	m.mu.Unlock()
+	if !allowPlain {
+		return nil, fmt.Errorf("server does not accept TLS: %v (plaintext dev server? enable allow_plaintext in settings)", tlsErr)
+	}
+
+	m.mu.Lock()
+	m.tlsUsed = false
+	m.fingerprint = ""
+	m.newServer = false
+	m.mu.Unlock()
+	return net.DialTimeout("tcp", addr, 5*time.Second)
+}
+
+// securitySnapshot reports how the current connection is secured, for
+// display in the UI (About / login flow).
+func (m *connManager) securitySnapshot() (tlsUsed bool, fingerprint string, newServer bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.tlsUsed, m.fingerprint, m.newServer
 }
 
 // connect dials and authenticates. With a password it is an account login
@@ -126,7 +233,7 @@ type challengeSigner func(challenge []byte) (signature []byte, publicKey string,
 // challenge handshake is completed. It returns "" on success or the failure
 // reason.
 func (m *connManager) connectWith(addr string, authMsg netproto.Authenticate, signer challengeSigner) string {
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	conn, err := m.dialTransport(addr)
 	if err != nil {
 		return err.Error()
 	}
@@ -187,11 +294,21 @@ func (m *connManager) connectWith(addr string, authMsg netproto.Authenticate, si
 
 	m.mu.Lock()
 	m.conn = conn
+	m.addr = addr
 	m.clientID = resp.ClientID
 	m.uniqueID = resp.UniqueID
 	m.nickname = resp.Nickname
+	m.isAdmin = resp.IsAdmin
+	m.iceServers = resp.ICEServers
+	m.motd = resp.MOTD
 	m.closed = false
 	m.mu.Unlock()
+
+	// Publish the E2EE public key; the server answers with sealed chat keys.
+	// Failure is non-fatal (old server) but chat encryption will not work.
+	if err := m.publishE2EKey(); err != nil {
+		m.emit("servererror", "e2e key publish failed: "+err.Error())
+	}
 
 	go m.readLoop(conn)
 	return ""
@@ -201,11 +318,44 @@ func (m *connManager) connectWith(addr string, authMsg netproto.Authenticate, si
 func (m *connManager) disconnect() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.iceServers = nil
+	m.motd = ""
 	if m.conn != nil {
 		m.closed = true
 		_ = m.conn.Close()
 		m.conn = nil
 	}
+}
+
+// iceServersSnapshot returns the ICE servers the server provided at connect
+// (nil = use client defaults).
+func (m *connManager) iceServersSnapshot() []netproto.ICEServer {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.iceServers
+}
+
+// motdSnapshot returns the server's message of the day delivered in the
+// AuthResponse ("" when unset or offline).
+func (m *connManager) motdSnapshot() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.motd
+}
+
+// clientIDSnapshot returns the server-assigned client ID ("" when not
+// connected).
+func (m *connManager) clientIDSnapshot() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.clientID
+}
+
+// isAdminSnapshot reports whether the authenticated user is a server admin.
+func (m *connManager) isAdminSnapshot() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.isAdmin
 }
 
 // connected reports whether a live connection exists.
@@ -231,7 +381,36 @@ func (m *connManager) writeConn(conn net.Conn, mt netproto.MessageType, msg any)
 	if err != nil {
 		return err
 	}
+	m.teeFrame("out", f)
 	return netproto.WriteFrame(conn, f)
+}
+
+// frameSummary is the debug console's per-frame record (327).
+type frameSummary struct {
+	Dir     string `json:"dir"` // "in" | "out"
+	Type    string `json:"type"`
+	Payload string `json:"payload"`
+	At      int64  `json:"at"` // unix millis
+}
+
+// teeFrame emits a frame summary when the debug console is listening.
+func (m *connManager) teeFrame(dir string, f *netproto.Frame) {
+	m.mu.Lock()
+	on := m.debugFrames
+	m.mu.Unlock()
+	if !on {
+		return
+	}
+	payload := string(f.Payload)
+	if len(payload) > 4000 {
+		payload = payload[:4000] + "…"
+	}
+	m.emit("debug_frame", frameSummary{
+		Dir:     dir,
+		Type:    netproto.MessageType(f.Type).String(),
+		Payload: payload,
+		At:      time.Now().UnixMilli(),
+	})
 }
 
 // request sends a message and waits for a typed response.
@@ -265,7 +444,14 @@ func (m *connManager) readLoop(conn net.Conn) {
 	for {
 		f, err := netproto.ReadFrame(conn)
 		if err != nil {
-			m.emit("disconnected", "")
+			// Intentional closes (Disconnect/CloseTab) end the loop quietly;
+			// only unexpected drops are reported.
+			m.mu.Lock()
+			intentional := m.closed
+			m.mu.Unlock()
+			if !intentional {
+				m.emit("disconnected", "")
+			}
 			m.disconnect()
 			return
 		}
@@ -276,6 +462,7 @@ func (m *connManager) readLoop(conn net.Conn) {
 // dispatch routes one frame to pending waiters or frontend events.
 func (m *connManager) dispatch(f *netproto.Frame) {
 	mt := netproto.MessageType(f.Type)
+	m.teeFrame("in", f)
 
 	m.mu.Lock()
 	waiter, ok := m.pending[mt]
@@ -290,10 +477,22 @@ func (m *connManager) dispatch(f *netproto.Frame) {
 
 	switch mt {
 	case netproto.MsgSnapshot:
+		m.mu.Lock()
+		m.lastSnapshot = string(f.Payload)
+		m.mu.Unlock()
 		m.emit("snapshot", string(f.Payload))
 	case netproto.MsgEvent:
-		m.emit("event", string(f.Payload))
+		// Encrypted chat is decrypted in the backend (4b); DMs decrypt
+		// asynchronously and re-emit (maybeDecryptChat returns "" then).
+		if out := m.maybeDecryptChat(string(f.Payload)); out != "" {
+			m.emit("event", out)
+		}
+	case netproto.MsgChannelKey:
+		m.handleChannelKey(f)
 	case netproto.MsgChannelList:
+		m.mu.Lock()
+		m.lastChannelList = string(f.Payload)
+		m.mu.Unlock()
 		m.emit("channellist", string(f.Payload))
 	case netproto.MsgICECandidate:
 		m.emit("ice", string(f.Payload))
@@ -308,6 +507,10 @@ func (m *connManager) dispatch(f *netproto.Frame) {
 		}
 	case netproto.MsgPong, netproto.MsgChatBroadcast, netproto.MsgAuthResponse:
 		// Nothing to do.
+	case netproto.MsgPing:
+		// Answer server-initiated keepalive pings (feeds server-side RTT for
+		// the Client Info dialog).
+		_ = m.write(netproto.MsgPong, netproto.Pong{})
 	default:
 		// Unknown frame: ignore.
 	}

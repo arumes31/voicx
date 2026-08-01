@@ -17,14 +17,26 @@ import (
 // Conn is nullable: headless clients (e.g. bots or server-side entities) may
 // have a nil Conn. Metadata is an arbitrary string map for per-client extras.
 type Client struct {
-	ClientID    string
-	UniqueID    string
-	Nickname    string
-	ChannelID   int64 // 0 means no channel
-	IsSpeaking  bool
-	ConnectedAt time.Time
-	Conn        net.Conn // nullable for headless clients
-	Metadata    map[string]string
+	ClientID   string
+	UniqueID   string
+	Nickname   string
+	ChannelID  int64 // 0 means no channel
+	IsSpeaking bool
+	// PrioritySpeaker marks TS3-style priority speakers (channel commanders):
+	// clients duck other publishers while a priority speaker talks.
+	PrioritySpeaker bool
+	// Status/StatusMessage carry the client's presence (wave 8b, 307-309):
+	// "online" ("" counts as online), "away", or "busy", plus a free-form
+	// status message.
+	Status        string
+	StatusMessage string
+	// E2EPublicKey is the client's X25519 public key (base64) for E2EE
+	// direct messages and sealed chat-key distribution (wave 4b). Registered
+	// users also persist it in the database; guests live here only.
+	E2EPublicKey string `json:"-"`
+	ConnectedAt  time.Time
+	Conn         net.Conn // nullable for headless clients
+	Metadata     map[string]string
 }
 
 // Channel represents an active channel tracked in memory.
@@ -51,6 +63,24 @@ type Channel struct {
 	PasswordHash    string `json:"-"`
 	NeededJoinPower int
 	HasIcon         bool
+	// HasPassword reports (without exposing the hash) that a join password is
+	// set (304 lock icon); it is populated by the snapshot builder.
+	HasPassword bool `json:"has_password,omitempty"`
+	// Per-channel Opus audio quality (migration 005). OpusBitrate is the
+	// target bitrate in bits/s; 0 means the server default (32000). A channel
+	// with OpusStereo and OpusBitrate >= 96000 counts as a music channel: the
+	// talk-power gate is bypassed for its publishers.
+	OpusBitrate int
+	OpusFEC     bool
+	OpusDTX     bool
+	OpusStereo  bool
+	// SlowModeSeconds is the minimum delay between one user's chat messages
+	// in this channel (114; 0 = off). Privileged users (b_chat_slowmode_bypass
+	// or admins) skip it.
+	SlowModeSeconds int
+	// Description is the channel's long description (112/113), rendered
+	// client-side with markdown.
+	Description string
 }
 
 // SpeakingState records that a client is currently speaking in a channel.

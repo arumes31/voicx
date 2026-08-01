@@ -111,6 +111,12 @@ func (s *Server) execute(ctx context.Context, sess *session, line string) bool {
 		return s.cmdChannelcreate(ctx, sess, cmd)
 	case "channeldelete":
 		return s.cmdChanneldelete(ctx, sess, cmd)
+	case "channelinfo":
+		return s.cmdChannelinfo(ctx, sess, cmd)
+	case "channeledit":
+		return s.cmdChanneledit(ctx, sess, cmd)
+	case "serverset":
+		return s.cmdServerset(ctx, sess, cmd)
 	case "banclient":
 		return s.cmdBanclient(ctx, sess, cmd)
 	case "complaintlist":
@@ -125,6 +131,42 @@ func (s *Server) execute(ctx context.Context, sess *session, line string) bool {
 		return s.cmdTokenlist(ctx, sess)
 	case "tokendelete":
 		return s.cmdTokendelete(ctx, sess, cmd)
+	case "auditlog":
+		return s.cmdAuditlog(ctx, sess, cmd)
+	case "serveredit":
+		return s.cmdServeredit(ctx, sess, cmd)
+	case "serverstop":
+		return s.cmdServerstop(ctx, sess, cmd, false)
+	case "serverrestart":
+		return s.cmdServerstop(ctx, sess, cmd, true)
+	case "permoverview":
+		return s.cmdPermoverview(ctx, sess, cmd)
+	case "channelpermlist":
+		return s.cmdChannelpermlist(ctx, sess, cmd)
+	case "channeladdperm":
+		return s.cmdChanneladdperm(ctx, sess, cmd)
+	case "channeldelperm":
+		return s.cmdChanneldelperm(ctx, sess, cmd)
+	case "servergroupadd":
+		return s.cmdServergroupadd(ctx, sess, cmd)
+	case "servergroupdel":
+		return s.cmdServergroupdel(ctx, sess, cmd)
+	case "servergroupaddclient":
+		return s.cmdServergroupaddclient(ctx, sess, cmd)
+	case "servergroupdelclient":
+		return s.cmdServergroupdelclient(ctx, sess, cmd)
+	case "servergrouplist":
+		return s.cmdServergrouplist(ctx, sess)
+	case "servergroupclientlist":
+		return s.cmdServergroupclientlist(ctx, sess, cmd)
+	case "customset":
+		return s.cmdCustomset(ctx, sess, cmd)
+	case "customdel":
+		return s.cmdCustomdel(ctx, sess, cmd)
+	case "custominfo":
+		return s.cmdCustominfo(ctx, sess, cmd)
+	case "logview":
+		return s.cmdLogview(ctx, sess, cmd)
 	default:
 		return s.write(sess, errorLine(errUnknownCommand, "unknown command: "+cmd.name))
 	}
@@ -229,9 +271,12 @@ func (s *Server) cmdChannellist(ctx context.Context, sess *session) bool {
 // cmdServerinfo reports server-level information.
 func (s *Server) cmdServerinfo(ctx context.Context, sess *session) bool {
 	info := s.backend.ServerInfo(ctx)
-	line := fmt.Sprintf("virtualserver_name=%s virtualserver_uptime=%d virtualserver_clientsonline=%d virtualserver_maxclients=%d virtualserver_channels_online=%d\n",
+	line := fmt.Sprintf("virtualserver_name=%s virtualserver_uptime=%d virtualserver_clientsonline=%d virtualserver_maxclients=%d virtualserver_channels_online=%d",
 		escape(info.Name), int64(info.Uptime.Seconds()), info.ClientsOnline, info.MaxClients, info.ChannelsOnline)
-	return s.write(sess, line+errorLine(errOK, "ok"))
+	if info.TLSFingerprint != "" {
+		line += fmt.Sprintf(" virtualserver_tls_fingerprint=%s", info.TLSFingerprint)
+	}
+	return s.write(sess, line+"\n"+errorLine(errOK, "ok"))
 }
 
 // cmdClientmove moves a client: clientmove clid=<id> cid=<channel_id>
@@ -307,6 +352,112 @@ func (s *Server) cmdChanneldelete(ctx context.Context, sess *session, cmd comman
 	}
 	if err := s.backend.DeleteChannel(ctx, cid); err != nil {
 		return s.write(sess, errorLine(errInvalidParameter, err.Error()))
+	}
+	return s.write(sess, errorLine(errOK, "ok"))
+}
+
+// cmdChannelinfo shows one channel's details: channelinfo cid=<id>
+func (s *Server) cmdChannelinfo(ctx context.Context, sess *session, cmd command) bool {
+	cid, err := strconv.ParseInt(cmd.args["cid"], 10, 64)
+	if err != nil {
+		return s.write(sess, errorLine(errInvalidParameter, "usage: channelinfo cid=<id>"))
+	}
+	ch, ok := s.backend.ChannelInfo(ctx, cid)
+	if !ok {
+		return s.write(sess, errorLine(errInvalidParameter, "channel not found"))
+	}
+	line := fmt.Sprintf("cid=%d pid=%d channel_name=%s channel_topic=%s channel_type=%d channel_maxclients=%d total_clients=%d opus_bitrate=%d opus_fec=%d opus_dtx=%d opus_stereo=%d slow_mode_seconds=%d\n",
+		ch.ChannelID, ch.ParentID, escape(ch.Name), escape(ch.Topic), ch.Type, ch.MaxClients, ch.ClientCount,
+		ch.OpusBitrate, boolInt(ch.OpusFEC), boolInt(ch.OpusDTX), boolInt(ch.OpusStereo), ch.SlowModeSeconds)
+	return s.write(sess, line+errorLine(errOK, "ok"))
+}
+
+// cmdChanneledit edits a channel:
+// channeledit cid=<id> [channel_topic=<t>] [channel_maxclients=<n>]
+// [opus_bitrate=<bps>] [opus_fec=0|1] [opus_dtx=0|1] [opus_stereo=0|1]
+func (s *Server) cmdChanneledit(ctx context.Context, sess *session, cmd command) bool {
+	cid, err := strconv.ParseInt(cmd.args["cid"], 10, 64)
+	if err != nil {
+		return s.write(sess, errorLine(errInvalidParameter, "usage: channeledit cid=<id> [channel_topic=<t>] [channel_maxclients=<n>] [opus_bitrate=<bps>] [opus_fec=0|1] [opus_dtx=0|1] [opus_stereo=0|1] [slow_mode_seconds=<n>]"))
+	}
+	var params ChannelEditParams
+	if v, ok := cmd.args["channel_topic"]; ok {
+		params.Topic = &v
+	}
+	if v, ok := cmd.args["channel_maxclients"]; ok {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return s.write(sess, errorLine(errInvalidParameter, "invalid channel_maxclients"))
+		}
+		params.MaxClients = &n
+	}
+	if v, ok := cmd.args["opus_bitrate"]; ok {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return s.write(sess, errorLine(errInvalidParameter, "invalid opus_bitrate"))
+		}
+		params.OpusBitrate = &n
+	}
+	if v, ok := cmd.args["slow_mode_seconds"]; ok {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return s.write(sess, errorLine(errInvalidParameter, "invalid slow_mode_seconds"))
+		}
+		params.SlowModeSeconds = &n
+	}
+	for _, b := range []struct {
+		key string
+		dst **bool
+	}{
+		{"opus_fec", &params.OpusFEC},
+		{"opus_dtx", &params.OpusDTX},
+		{"opus_stereo", &params.OpusStereo},
+	} {
+		if v, ok := cmd.args[b.key]; ok {
+			val, err := parseBoolArg(v)
+			if err != nil {
+				return s.write(sess, errorLine(errInvalidParameter, "invalid "+b.key+" (want 0 or 1)"))
+			}
+			*b.dst = &val
+		}
+	}
+	if err := s.backend.EditChannel(ctx, cid, params); err != nil {
+		return s.write(sess, errorLine(errInvalidParameter, err.Error()))
+	}
+	return s.write(sess, errorLine(errOK, "ok"))
+}
+
+// boolInt renders a bool as 0/1 for TS3-style output.
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// parseBoolArg parses a TS3-style boolean argument ("0"/"1").
+func parseBoolArg(v string) (bool, error) {
+	switch v {
+	case "0":
+		return false, nil
+	case "1":
+		return true, nil
+	default:
+		return false, strconv.ErrSyntax
+	}
+}
+
+// cmdServerset stores a server setting (wave 5a: motd, announcement):
+// serverset key=<motd|announcement> value=<text>
+// Setting "announcement" also broadcasts it to all online clients.
+func (s *Server) cmdServerset(ctx context.Context, sess *session, cmd command) bool {
+	key := cmd.args["key"]
+	value := cmd.args["value"]
+	if key != "motd" && key != "announcement" {
+		return s.write(sess, errorLine(errInvalidParameter, "usage: serverset key=<motd|announcement> value=<text>"))
+	}
+	if err := s.backend.ServerSet(ctx, key, value); err != nil {
+		return s.write(sess, errorLine(errServerError, err.Error()))
 	}
 	return s.write(sess, errorLine(errOK, "ok"))
 }
@@ -422,6 +573,29 @@ func (s *Server) cmdTokendelete(ctx context.Context, sess *session, cmd command)
 	return s.write(sess, errorLine(errOK, "ok"))
 }
 
+// cmdAuditlog lists the newest audit entries: auditlog [limit=<n>]
+func (s *Server) cmdAuditlog(ctx context.Context, sess *session, cmd command) bool {
+	limit := 0
+	if v := cmd.args["limit"]; v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return s.write(sess, errorLine(errInvalidParameter, "invalid limit"))
+		}
+		limit = n
+	}
+	entries, err := s.backend.AuditLog(ctx, limit)
+	if err != nil {
+		return s.write(sess, errorLine(errServerError, "listing audit log failed"))
+	}
+	var b strings.Builder
+	for _, e := range entries {
+		fmt.Fprintf(&b, "id=%d actor=%s action=%s target=%s detail=%s created_at=%d\n",
+			e.ID, escape(e.Actor), escape(e.Action), escape(e.Target), escape(e.Detail), e.CreatedAt.Unix())
+	}
+	b.WriteString(errorLine(errOK, "ok"))
+	return s.write(sess, b.String())
+}
+
 // helpText documents the command set.
 const helpText = `available commands:
 login <unique_id> <password>
@@ -437,6 +611,9 @@ clientkick clid=<id> reasonid=<4|5> [reasonmsg=<text>]
 sendtextmessage targetmode=<1|2|3> target=<id> msg=<text>
 channelcreate channel_name=<name> [channel_topic=<t>] [channel_flag_permanent=1|channel_flag_semi_permanent=1]
 channeldelete cid=<id> [force=1]
+channelinfo cid=<id>
+channeledit cid=<id> [channel_topic=<t>] [channel_maxclients=<n>] [opus_bitrate=<bps>] [opus_fec=0|1] [opus_dtx=0|1] [opus_stereo=0|1] [slow_mode_seconds=<n>]
+serverset key=<motd|announcement> value=<text>
 banclient clid=<id> [time=<seconds>] [banreason=<text>]
 complaintlist
 complaintdel id=<id>
@@ -444,4 +621,317 @@ complaintdelall
 tokenadd [tokentype=0] tokenid1=<group_id>
 tokenlist
 tokendelete token=<key>
+auditlog [limit=<n>]
+serveredit [virtualserver_name=<n>] [virtualserver_welcomemessage=<m>] [virtualserver_maxclients=<n>]
+serverstop confirm=1
+serverrestart confirm=1
+permoverview unique_id=<id> [cid=<channel_id>]
+channelpermlist cid=<id>
+channeladdperm cid=<id> permid=<key> permvalue=<v> [permgrant=<g>] [permskip=0|1] [permnegate=0|1]
+channeldelperm cid=<id> permid=<key>
+servergroupadd name=<n> [sortid=<i>]
+servergroupdel sgid=<id> [force=1]
+servergroupaddclient sgid=<id> cldbid=<unique_id> [duration=<seconds>]
+servergroupdelclient sgid=<id> cldbid=<unique_id>
+servergrouplist
+servergroupclientlist sgid=<id>
+customset cldbid=<unique_id> ident=<key> value=<v>
+customdel cldbid=<unique_id> ident=<key>
+custominfo cldbid=<unique_id>
+logview [lines=<n>] [filter=<substr>]
 `
+
+// ---------------------------------------------------------------------------
+// Wave 10a: server management commands (217-223)
+// ---------------------------------------------------------------------------
+
+// cmdServeredit updates server name / welcome message / max-clients override
+// (217): serveredit [virtualserver_name=<n>] [virtualserver_welcomemessage=<m>]
+// [virtualserver_maxclients=<n>]. All fields optional; omitted = keep.
+func (s *Server) cmdServeredit(ctx context.Context, sess *session, cmd command) bool {
+	name := cmd.args["virtualserver_name"]
+	welcome := cmd.args["virtualserver_welcomemessage"]
+	maxClients := 0
+	if v := cmd.args["virtualserver_maxclients"]; v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return s.write(sess, errorLine(errInvalidParameter, "invalid virtualserver_maxclients"))
+		}
+		maxClients = n
+	}
+	if name == "" && welcome == "" && maxClients == 0 {
+		return s.write(sess, errorLine(errInvalidParameter,
+			"usage: serveredit [virtualserver_name=<n>] [virtualserver_welcomemessage=<m>] [virtualserver_maxclients=<n>]"))
+	}
+	if err := s.backend.ServerEdit(ctx, name, welcome, maxClients); err != nil {
+		return s.write(sess, errorLine(errServerError, err.Error()))
+	}
+	return s.write(sess, errorLine(errOK, "ok"))
+}
+
+// cmdServerstop handles serverstop and serverrestart (218); both require
+// confirm=1. serverrestart is a graceful stop that a supervisor restarts.
+func (s *Server) cmdServerstop(ctx context.Context, sess *session, cmd command, restart bool) bool {
+	if cmd.args["confirm"] != "1" {
+		verb := "serverstop"
+		if restart {
+			verb = "serverrestart"
+		}
+		return s.write(sess, errorLine(errInvalidParameter, verb+" requires confirm=1"))
+	}
+	ok := s.write(sess, errorLine(errOK, "ok"))
+	if err := s.backend.Shutdown(ctx, restart); err != nil {
+		s.logger.Warn("shutdown via query failed", zap.Error(err))
+	}
+	return ok
+}
+
+// cmdPermoverview lists a user's resolved permissions (219):
+// permoverview <unique_id> [cid=<channel_id>]
+func (s *Server) cmdPermoverview(ctx context.Context, sess *session, cmd command) bool {
+	uid := cmd.args["unique_id"]
+	if uid == "" && len(cmd.positional) > 0 {
+		uid = cmd.positional[0]
+	}
+	if uid == "" {
+		return s.write(sess, errorLine(errInvalidParameter, "usage: permoverview unique_id=<id> [cid=<channel_id>]"))
+	}
+	var channelID int64
+	if v := cmd.args["cid"]; v != "" {
+		var err error
+		channelID, err = strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return s.write(sess, errorLine(errInvalidParameter, "invalid cid"))
+		}
+	}
+	lines, err := s.backend.PermOverview(ctx, uid, channelID)
+	if err != nil {
+		return s.write(sess, errorLine(errInvalidParameter, err.Error()))
+	}
+	var b strings.Builder
+	for _, p := range lines {
+		fmt.Fprintf(&b, "permid=%s permvalue=%d permgrant=%d tier=%s\n",
+			escape(p.Key), p.Value, p.Grant, escape(p.Tier))
+	}
+	b.WriteString(errorLine(errOK, "ok"))
+	return s.write(sess, b.String())
+}
+
+// cmdChannelpermlist lists a channel's tier permissions (220).
+func (s *Server) cmdChannelpermlist(ctx context.Context, sess *session, cmd command) bool {
+	cid, err := strconv.ParseInt(cmd.args["cid"], 10, 64)
+	if err != nil {
+		return s.write(sess, errorLine(errInvalidParameter, "usage: channelpermlist cid=<id>"))
+	}
+	perms, err := s.backend.ChannelPermList(ctx, cid)
+	if err != nil {
+		return s.write(sess, errorLine(errServerError, err.Error()))
+	}
+	var b strings.Builder
+	for _, p := range perms {
+		fmt.Fprintf(&b, "cid=%d permid=%s permvalue=%d permgrant=%d permskip=%d permnegate=%d\n",
+			cid, escape(p.Key), p.Value, p.Grant, boolInt(p.Skip), boolInt(p.Negate))
+	}
+	b.WriteString(errorLine(errOK, "ok"))
+	return s.write(sess, b.String())
+}
+
+// cmdChanneladdperm writes a channel-tier permission (220):
+// channeladdperm cid=<id> permid=<key> permvalue=<v> [permgrant=<g>]
+// [permskip=0|1] [permnegate=0|1]
+func (s *Server) cmdChanneladdperm(ctx context.Context, sess *session, cmd command) bool {
+	cid, err := strconv.ParseInt(cmd.args["cid"], 10, 64)
+	if err != nil || cmd.args["permid"] == "" || cmd.args["permvalue"] == "" {
+		return s.write(sess, errorLine(errInvalidParameter,
+			"usage: channeladdperm cid=<id> permid=<key> permvalue=<v> [permgrant=<g>] [permskip=0|1] [permnegate=0|1]"))
+	}
+	value, err := strconv.Atoi(cmd.args["permvalue"])
+	if err != nil {
+		return s.write(sess, errorLine(errInvalidParameter, "invalid permvalue"))
+	}
+	grant := 0
+	if v := cmd.args["permgrant"]; v != "" {
+		if grant, err = strconv.Atoi(v); err != nil {
+			return s.write(sess, errorLine(errInvalidParameter, "invalid permgrant"))
+		}
+	}
+	skip := cmd.args["permskip"] == "1"
+	negate := cmd.args["permnegate"] == "1"
+	if err := s.backend.ChannelAddPerm(ctx, sess.username, cid, cmd.args["permid"], value, grant, skip, negate); err != nil {
+		return s.write(sess, errorLine(errServerError, err.Error()))
+	}
+	return s.write(sess, errorLine(errOK, "ok"))
+}
+
+// cmdChanneldelperm removes a channel-tier permission (220).
+func (s *Server) cmdChanneldelperm(ctx context.Context, sess *session, cmd command) bool {
+	cid, err := strconv.ParseInt(cmd.args["cid"], 10, 64)
+	if err != nil || cmd.args["permid"] == "" {
+		return s.write(sess, errorLine(errInvalidParameter, "usage: channeldelperm cid=<id> permid=<key>"))
+	}
+	if err := s.backend.ChannelDelPerm(ctx, sess.username, cid, cmd.args["permid"]); err != nil {
+		return s.write(sess, errorLine(errServerError, err.Error()))
+	}
+	return s.write(sess, errorLine(errOK, "ok"))
+}
+
+// cmdServergroupadd creates a server group (221).
+func (s *Server) cmdServergroupadd(ctx context.Context, sess *session, cmd command) bool {
+	name := cmd.args["name"]
+	if name == "" {
+		return s.write(sess, errorLine(errInvalidParameter, "usage: servergroupadd name=<n> [sortid=<i>]"))
+	}
+	sortID := 0
+	if v := cmd.args["sortid"]; v != "" {
+		var err error
+		if sortID, err = strconv.Atoi(v); err != nil {
+			return s.write(sess, errorLine(errInvalidParameter, "invalid sortid"))
+		}
+	}
+	id, err := s.backend.ServerGroupAdd(ctx, sess.username, name, sortID)
+	if err != nil {
+		return s.write(sess, errorLine(errServerError, err.Error()))
+	}
+	return s.write(sess, fmt.Sprintf("sgid=%d\n", id)+errorLine(errOK, "ok"))
+}
+
+// cmdServergroupdel deletes a server group (221; force=1 with members).
+func (s *Server) cmdServergroupdel(ctx context.Context, sess *session, cmd command) bool {
+	sgid, err := strconv.ParseInt(cmd.args["sgid"], 10, 64)
+	if err != nil {
+		return s.write(sess, errorLine(errInvalidParameter, "usage: servergroupdel sgid=<id> [force=1]"))
+	}
+	if err := s.backend.ServerGroupDel(ctx, sess.username, sgid, cmd.args["force"] == "1"); err != nil {
+		return s.write(sess, errorLine(errInvalidParameter, err.Error()))
+	}
+	return s.write(sess, errorLine(errOK, "ok"))
+}
+
+// cmdServergroupaddclient assigns a user to a server group (221).
+func (s *Server) cmdServergroupaddclient(ctx context.Context, sess *session, cmd command) bool {
+	sgid, err := strconv.ParseInt(cmd.args["sgid"], 10, 64)
+	uid := cmd.args["cldbid"]
+	if err != nil || uid == "" {
+		return s.write(sess, errorLine(errInvalidParameter, "usage: servergroupaddclient sgid=<id> cldbid=<unique_id> [duration=<seconds>]"))
+	}
+	var duration int64
+	if v := cmd.args["duration"]; v != "" {
+		if duration, err = strconv.ParseInt(v, 10, 64); err != nil || duration < 0 {
+			return s.write(sess, errorLine(errInvalidParameter, "invalid duration"))
+		}
+	}
+	if err := s.backend.ServerGroupAddClient(ctx, sess.username, sgid, uid, duration); err != nil {
+		return s.write(sess, errorLine(errInvalidParameter, err.Error()))
+	}
+	return s.write(sess, errorLine(errOK, "ok"))
+}
+
+// cmdServergroupdelclient removes a user from a server group (221).
+func (s *Server) cmdServergroupdelclient(ctx context.Context, sess *session, cmd command) bool {
+	sgid, err := strconv.ParseInt(cmd.args["sgid"], 10, 64)
+	uid := cmd.args["cldbid"]
+	if err != nil || uid == "" {
+		return s.write(sess, errorLine(errInvalidParameter, "usage: servergroupdelclient sgid=<id> cldbid=<unique_id>"))
+	}
+	if err := s.backend.ServerGroupDelClient(ctx, sess.username, sgid, uid); err != nil {
+		return s.write(sess, errorLine(errInvalidParameter, err.Error()))
+	}
+	return s.write(sess, errorLine(errOK, "ok"))
+}
+
+// cmdServergrouplist lists server groups (221).
+func (s *Server) cmdServergrouplist(ctx context.Context, sess *session) bool {
+	groups, err := s.backend.ServerGroupList(ctx)
+	if err != nil {
+		return s.write(sess, errorLine(errServerError, err.Error()))
+	}
+	var b strings.Builder
+	for _, g := range groups {
+		fmt.Fprintf(&b, "sgid=%d name=%s sortid=%d membercount=%d\n", g.ID, escape(g.Name), g.SortID, g.MemberCount)
+	}
+	b.WriteString(errorLine(errOK, "ok"))
+	return s.write(sess, b.String())
+}
+
+// cmdServergroupclientlist lists a server group's members (221).
+func (s *Server) cmdServergroupclientlist(ctx context.Context, sess *session, cmd command) bool {
+	sgid, err := strconv.ParseInt(cmd.args["sgid"], 10, 64)
+	if err != nil {
+		return s.write(sess, errorLine(errInvalidParameter, "usage: servergroupclientlist sgid=<id>"))
+	}
+	members, err := s.backend.ServerGroupClientList(ctx, sgid)
+	if err != nil {
+		return s.write(sess, errorLine(errServerError, err.Error()))
+	}
+	var b strings.Builder
+	for _, m := range members {
+		fmt.Fprintf(&b, "cldbid=%s nickname=%s expires_at=%d\n", escape(m.UniqueID), escape(m.Nickname), m.ExpiresAt)
+	}
+	b.WriteString(errorLine(errOK, "ok"))
+	return s.write(sess, b.String())
+}
+
+// cmdCustomset sets a custom client property (222).
+func (s *Server) cmdCustomset(ctx context.Context, sess *session, cmd command) bool {
+	uid, key, value := cmd.args["cldbid"], cmd.args["ident"], cmd.args["value"]
+	if uid == "" || key == "" {
+		return s.write(sess, errorLine(errInvalidParameter, "usage: customset cldbid=<unique_id> ident=<key> value=<v>"))
+	}
+	if err := s.backend.CustomSet(ctx, uid, key, value); err != nil {
+		return s.write(sess, errorLine(errServerError, err.Error()))
+	}
+	return s.write(sess, errorLine(errOK, "ok"))
+}
+
+// cmdCustomdel removes a custom client property (222).
+func (s *Server) cmdCustomdel(ctx context.Context, sess *session, cmd command) bool {
+	uid, key := cmd.args["cldbid"], cmd.args["ident"]
+	if uid == "" || key == "" {
+		return s.write(sess, errorLine(errInvalidParameter, "usage: customdel cldbid=<unique_id> ident=<key>"))
+	}
+	if err := s.backend.CustomDel(ctx, uid, key); err != nil {
+		return s.write(sess, errorLine(errServerError, err.Error()))
+	}
+	return s.write(sess, errorLine(errOK, "ok"))
+}
+
+// cmdCustominfo lists a client's custom properties (222).
+func (s *Server) cmdCustominfo(ctx context.Context, sess *session, cmd command) bool {
+	uid := cmd.args["cldbid"]
+	if uid == "" {
+		return s.write(sess, errorLine(errInvalidParameter, "usage: custominfo cldbid=<unique_id>"))
+	}
+	props, err := s.backend.CustomInfo(ctx, uid)
+	if err != nil {
+		return s.write(sess, errorLine(errServerError, err.Error()))
+	}
+	var b strings.Builder
+	for _, p := range props {
+		fmt.Fprintf(&b, "ident=%s value=%s\n", escape(p.Key), escape(p.Value))
+	}
+	b.WriteString(errorLine(errOK, "ok"))
+	return s.write(sess, b.String())
+}
+
+// cmdLogview returns recent server log lines (223):
+// logview [lines=<n>] [filter=<substr>]
+func (s *Server) cmdLogview(ctx context.Context, sess *session, cmd command) bool {
+	lines := 50
+	if v := cmd.args["lines"]; v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return s.write(sess, errorLine(errInvalidParameter, "invalid lines"))
+		}
+		lines = n
+	}
+	entries, err := s.backend.LogView(ctx, lines, cmd.args["filter"])
+	if err != nil {
+		return s.write(sess, errorLine(errServerError, err.Error()))
+	}
+	var b strings.Builder
+	for _, l := range entries {
+		b.WriteString("line=" + escape(l) + "\n")
+	}
+	b.WriteString(errorLine(errOK, "ok"))
+	return s.write(sess, b.String())
+}

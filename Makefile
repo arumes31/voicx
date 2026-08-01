@@ -6,19 +6,39 @@ DOCKER      ?= docker
 IMAGE       ?= voicx:dev
 BINARY       = bin/voicx
 PKG          = ./cmd/server
-LDFLAGS      = -ldflags="-s -w"
 
-.PHONY: all build run migrate tidy test cover fmt vet docker-build docker-run docker-stop compose-up compose-down compose-logs clean help
+# Embedded version metadata (see internal/version). Build = commit count, so
+# every commit bumps the version; dirty flag for uncommitted changes.
+VOICX_VERSION    ?= $(shell cat VERSION 2>/dev/null || echo 0.0.0-dev)
+VOICX_BUILD      ?= $(shell git rev-list --count HEAD 2>/dev/null || echo 0)
+VOICX_COMMIT     ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
+VOICX_DIRTY      ?= $(shell git diff --quiet 2>/dev/null && echo false || echo true)
+VOICX_BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+VOICX_UPDATE_REPO ?= voicx/voicx
+
+VERSION_FLAGS = -ldflags="-s -w \
+	-X voicx/internal/version.Version=$(VOICX_VERSION) \
+	-X voicx/internal/version.Build=$(VOICX_BUILD) \
+	-X voicx/internal/version.Commit=$(VOICX_COMMIT) \
+	-X voicx/internal/version.BuildDate=$(VOICX_BUILD_DATE) \
+	-X voicx/internal/version.Dirty=$(VOICX_DIRTY) \
+	-X voicx/internal/version.UpdateRepo=$(VOICX_UPDATE_REPO)"
+
+.PHONY: all build run migrate tidy test cover fmt vet docker-build docker-run docker-stop compose-up compose-down compose-logs clean help client-build
 
 all: build
 
 ## build: compile the server binary into ./bin
 build:
-	$(GO) build $(LDFLAGS) -o $(BINARY) $(PKG)
+	$(GO) build $(VERSION_FLAGS) -o $(BINARY) $(PKG)
+
+## client-build: build the Wails client with embedded version metadata
+client-build:
+	cd client && wails build $(VERSION_FLAGS)
 
 ## run: run the server locally (go run)
 run:
-	$(GO) run $(PKG)
+	$(GO) run $(VERSION_FLAGS) $(PKG)
 
 ## migrate: run database migrations (go run ./cmd/migrate)
 migrate:
@@ -46,7 +66,14 @@ vet:
 
 ## docker-build: build the voicx:dev image from the Dockerfile
 docker-build:
-	$(DOCKER) build -t $(IMAGE) .
+	$(DOCKER) build \
+		--build-arg VOICX_VERSION=$(VOICX_VERSION) \
+		--build-arg VOICX_BUILD=$(VOICX_BUILD) \
+		--build-arg VOICX_COMMIT=$(VOICX_COMMIT) \
+		--build-arg VOICX_DIRTY=$(VOICX_DIRTY) \
+		--build-arg VOICX_BUILD_DATE=$(VOICX_BUILD_DATE) \
+		--build-arg VOICX_UPDATE_REPO=$(VOICX_UPDATE_REPO) \
+		-t $(IMAGE) .
 
 ## docker-run: run the voicx:dev image with default ports published
 docker-run:

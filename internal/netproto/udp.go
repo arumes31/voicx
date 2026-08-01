@@ -1,11 +1,12 @@
 // Package netproto defines the wire formats used by the voicx server.
-// This file declares the UDP media/signaling message types and a small
-// header parser used by the UDP listener (internal/server/udp.go).
+// This file declares the UDP message types and a small header parser used by
+// the UDP listener (internal/server/udp.go).
 //
 // UDP packets use a minimal 1-byte header: the first byte is the message
 // type (one of the UDPMsg* constants below) and the remaining bytes are
-// the type-specific payload. This keeps per-packet overhead tiny, which
-// matters for high-frequency media/speaking traffic.
+// the type-specific payload. The UDP surface is deliberately tiny — a
+// ping/pong connectivity probe only; all media and signaling run over
+// WebRTC (DTLS-SRTP) and the TCP control channel.
 package netproto
 
 import "errors"
@@ -18,24 +19,12 @@ const (
 	UDPMsgPing byte = 0x01
 	// UDPMsgPong is the reply to UDPMsgPing.
 	UDPMsgPong byte = 0x02
-	// UDPMsgMedia carries a raw media payload (e.g. Opus/RTP). Not yet wired
-	// to a real codec; the server logs and drops these packets for now.
-	UDPMsgMedia byte = 0x03
-	// UDPMsgSignal carries WebRTC signaling fragments. Real Pion wiring lands
-	// in a later phase; currently logged and dropped.
-	UDPMsgSignal byte = 0x04
-	// UDPMsgSpeaking indicates a client's speaking state changes. Logged and
-	// dropped until the media pipeline is implemented.
-	UDPMsgSpeaking byte = 0x05
 )
 
 // udpMsgName maps a UDP message type to a human-readable name used in logs.
 var udpMsgName = map[byte]string{
-	UDPMsgPing:     "ping",
-	UDPMsgPong:     "pong",
-	UDPMsgMedia:    "media",
-	UDPMsgSignal:   "signal",
-	UDPMsgSpeaking: "speaking",
+	UDPMsgPing: "ping",
+	UDPMsgPong: "pong",
 }
 
 // UDPMsgName returns a human-readable name for a UDP message type, or

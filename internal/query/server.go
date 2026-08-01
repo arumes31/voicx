@@ -15,12 +15,14 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"voicx/internal/version"
 )
 
 // Version reported by the version command and the greeting banner.
-const Version = "0.1.0"
+var Version = version.String()
 
-const (
+var (
 	// banner is sent on connect, one line.
 	banner = "VOICX ServerQuery " + Version
 	// bannerHint is the second greeting line.

@@ -242,6 +242,30 @@ func (a *AuthService) BindPublicKey(ctx context.Context, userID int64, publicKey
 	return nil
 }
 
+// SetE2EPublicKey stores a user's X25519 public key for E2EE (wave 4b).
+func (a *AuthService) SetE2EPublicKey(ctx context.Context, userID int64, publicKey string) error {
+	const q = `UPDATE users SET e2e_public_key = $2 WHERE id = $1`
+	if _, err := a.store.DB().ExecContext(ctx, q, userID, publicKey); err != nil {
+		return fmt.Errorf("storing e2e public key: %w", err)
+	}
+	return nil
+}
+
+// GetE2EPublicKey returns a user's X25519 public key ("" when never
+// published, auth.ErrUserNotFound for unknown users).
+func (a *AuthService) GetE2EPublicKey(ctx context.Context, uniqueID string) (string, error) {
+	const q = `SELECT COALESCE(e2e_public_key, '') FROM users WHERE unique_id = $1`
+	var key string
+	err := a.store.DB().QueryRowContext(ctx, q, uniqueID).Scan(&key)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", ErrUserNotFound
+		}
+		return "", fmt.Errorf("loading e2e public key: %w", err)
+	}
+	return key, nil
+}
+
 // GenerateChallenge returns 32 cryptographically random bytes for use in
 // challenge-response authentication.
 func GenerateChallenge() ([]byte, error) {

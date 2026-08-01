@@ -25,6 +25,7 @@ type fakeVoice struct {
 	onSpeakingFn func(string, bool)
 	canVideoFn   func(string) bool
 	qualityErr   error
+	offerSender  func(clientID, offerSDP string) error
 
 	onCandidate func(candidate, sdpMid string, mlineIndex uint16)
 	offers      []string // offer SDPs by client
@@ -106,6 +107,13 @@ func (f *fakeVoice) SetVideoHandlers(canVideo func(string) bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.canVideoFn = canVideo
+}
+
+// SetOfferSender records the renegotiation offer delivery callback.
+func (f *fakeVoice) SetOfferSender(fn func(clientID, offerSDP string) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.offerSender = fn
 }
 
 // SetVideoQuality records the requested quality.

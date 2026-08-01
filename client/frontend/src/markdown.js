@@ -1,0 +1,83 @@
+// markdown.js — (91/92/93) XSS-safe mini-markdown renderer for chat.
+// Discipline: user text is HTML-escaped FIRST; every transform below only
+// injects markup built from already-escaped content. Code spans/blocks are
+// stashed away before escaping so their contents are never interpreted as
+// markdown or HTML.
+
+// ~50 common shortcode -> unicode emoji mappings (95).
+export const EMOJI = {
+    smile: "😄", smiley: "😃", grin: "😁", laughing: "😆", sweat_smile: "😅",
+    joy: "😂", rofl: "🤣", wink: "😉", blush: "😊", yum: "😋",
+    sunglasses: "😎", heart_eyes: "😍", kissing_heart: "😘", thinking: "🤔", neutral_face: "😐",
+    expressionless: "😑", rolling_eyes: "🙄", smirk: "😏", worried: "😟", cry: "😢",
+    sob: "😭", angry: "😠", rage: "🤬", scream: "😱", sleeping: "😴",
+    mask: "😷", nerd: "🤓", innocent: "😇", upside_down: "🙃", salute: "🫡",
+    thumbsup: "👍", "+1": "👍", thumbsdown: "👎", "-1": "👎", ok_hand: "👌",
+    clap: "👏", wave: "👋", muscle: "💪", pray: "🙏", eyes: "👀",
+    eye: "👁️", fire: "🔥", sparkles: "✨", star: "⭐", tada: "🎉",
+    heart: "❤️", broken_heart: "💔", hundred: "💯", "100": "💯", boom: "💥",
+    zap: "⚡", rocket: "🚀", check: "✅", x: "❌", warning: "⚠️",
+    question: "❓", exclamation: "❗", bulb: "💡", lock: "🔒", unlock: "🔓",
+    microphone: "🎙️", speaker: "🔊", mute: "🔇", computer: "💻", bug: "🐛",
+    poop: "💩", skull: "💀", ghost: "👻", robot: "🤖", pizza: "🍕",
+};
+
+const KEYWORDS = /\b(func|package|import|return|if|else|for|range|go|defer|var|const|let|function|class|new|typeof|instanceof|await|async|yield|type|struct|interface|map|chan|nil|true|false|null|undefined|switch|case|default|break|continue|fallthrough|select|this|export|from|extends|try|catch|finally|throw|in|of|do|while)\b/g;
+
+// escapeHTML escapes the five HTML-significant characters.
+export function escapeHTML(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    }[c]));
+}
+
+// highlight applies light syntax colouring to ALREADY-escaped code text:
+// strings, // and /* */ comments, and a shared js/go keyword set (92).
+// Keywords run FIRST so they can't match inside the span markup injected by
+// the string/comment passes; nested spans (keyword inside a string) are fine.
+function highlight(escaped) {
+    return escaped
+        .replace(KEYWORDS, `<span class="tk-kw">$1</span>`)
+        .replace(/(&quot;[^\n]*?&quot;|&#39;[^\n]*?&#39;)/g, `<span class="tk-str">$1</span>`)
+        .replace(/(\/\/[^\n]*|\/\*[\s\S]*?\*\/)/g, `<span class="tk-com">$1</span>`);
+}
+
+// renderMarkdown converts user text to a safe HTML string. Links are
+// rendered as <a class="md-link" data-url="...">; opening happens via click
+// delegation (runtime.BrowserOpenURL) wired up in chat-ui.js — never via a
+// raw href navigation inside the webview.
+export function renderMarkdown(text) {
+    if (!text) return "";
+    const stash = [];
+    const push = (html) => {
+        stash.push(html);
+        return "\u0001" + (stash.length - 1) + "\u0002";
+    };
+
+    let t = String(text);
+    // Fenced code blocks (```lang\n...```) first — their content is opaque.
+    t = t.replace(/```(\w*)\r?\n?([\s\S]*?)(?:```|$)/g, (_m, _lang, code) =>
+        push(`<pre class="md-pre"><code>${highlight(escapeHTML(code.replace(/\n$/, "")))}</code></pre>`));
+    // Inline code spans.
+    t = t.replace(/`([^`\n]+)`/g, (_m, code) =>
+        push(`<code class="md-code">${escapeHTML(code)}</code>`));
+
+    // Everything else gets escaped, then inline markup is applied.
+    t = escapeHTML(t);
+    t = t.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+    t = t.replace(/__([^_\n]+)__/g, "<u>$1</u>");
+    t = t.replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
+    t = t.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,;!?]|$)/g, "$1<em>$2</em>");
+    // Images (channel descriptions; 113). http(s) only — no javascript:.
+    t = t.replace(/!\[([^\]\n]*)\]\((https?:\/\/[^\s)]+)\)/g,
+        `<img class="md-img" alt="$1" src="$2">`);
+    // Autolink URLs (93): tooltip carries the full URL.
+    t = t.replace(/(?<![="'\w])(https?:\/\/[^\s<>"'\])}]+)/g,
+        (u) => `<a href="#" class="md-link" data-url="${u}" title="${u}">${u}</a>`);
+    // :shortcode: emoji (95).
+    t = t.replace(/:([a-z0-9_+-]+):/gi, (m, name) => EMOJI[name.toLowerCase()] || m);
+    t = t.replace(/\n/g, "<br>");
+    // Restore stashed code.
+    t = t.replace(/\u0001(\d+)\u0002/g, (_m, i) => stash[Number(i)]);
+    return t;
+}

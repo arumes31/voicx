@@ -17,6 +17,15 @@
 # -----------------------------------------------------------------------------
 FROM golang:1.25-alpine AS builder
 
+# Version metadata: .git is excluded from the build context (see
+# .dockerignore), so it is injected via --build-arg (from Makefile/compose).
+ARG VOICX_VERSION=0.0.0-dev
+ARG VOICX_BUILD=0
+ARG VOICX_COMMIT=none
+ARG VOICX_DIRTY=false
+ARG VOICX_BUILD_DATE=unknown
+ARG VOICX_UPDATE_REPO=voicx/voicx
+
 # git is required by `go mod download` for modules that reference VCS sources.
 RUN apk add --no-cache git
 
@@ -30,12 +39,18 @@ RUN go mod download
 # Copy the rest of the source tree.
 COPY . .
 
-# Build a stripped, static binary.
+# Build a stripped, static binary with embedded version metadata.
 #   -s : strip symbol table
 #   -w : strip DWARF debug info
 # CGO_ENABLED=0 ensures a static binary with no libc dependency.
 RUN CGO_ENABLED=0 GOOS=linux go build \
-    -ldflags="-s -w" \
+    -ldflags="-s -w \
+      -X voicx/internal/version.Version=${VOICX_VERSION} \
+      -X voicx/internal/version.Build=${VOICX_BUILD} \
+      -X voicx/internal/version.Commit=${VOICX_COMMIT} \
+      -X voicx/internal/version.BuildDate=${VOICX_BUILD_DATE} \
+      -X voicx/internal/version.Dirty=${VOICX_DIRTY} \
+      -X voicx/internal/version.UpdateRepo=${VOICX_UPDATE_REPO}" \
     -o /out/voicx ./cmd/server
 
 # -----------------------------------------------------------------------------

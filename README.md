@@ -1,11 +1,11 @@
 # voicx
 
-A TeamSpeak-like voice/video server written in Go. TCP/JSON control protocol, UDP media transport, Pion WebRTC engine, PostgreSQL persistence, TS3-style permissions.
+A TeamSpeak-like voice/video server written in Go. TCP/JSON control protocol, Pion WebRTC media engine (SFU), PostgreSQL persistence, TS3-style permissions.
 
 ## Architecture
 
-- **TCP control channel** (`:10011`) — length-prefixed binary frames carrying JSON messages (`internal/netproto`). Handles authentication, channel management, chat, kick/ban/move, and keepalive. Handlers are wired to the backends via `server.Deps` with a permission middleware (`internal/server`).
-- **UDP media channel** (`:9987`) — datagram listener with a bounded worker pool for voice/signaling packets (`internal/server/udp.go`). Media routing lands with the Pion integration.
+- **TCP control channel** (`:10011`) — length-prefixed binary frames carrying JSON messages (`internal/netproto`) over **TLS by default** (self-signed cert in `tls_dir`, TOFU fingerprint pinning on clients). Handles authentication, channel management, chat, kick/ban/move, and keepalive. Handlers are wired to the backends via `server.Deps` with a permission middleware (`internal/server`).
+- **UDP keepalive channel** (`:9987`) — datagram listener with a bounded worker pool answering ping/pong connectivity probes (`internal/server/udp.go`). All media runs over WebRTC (DTLS-SRTP); the raw-UDP surface is deliberately limited to keepalive.
 - **WebRTC engine** (`internal/webrtc`) — Pion-based SFU engine (constructed at startup; wiring into the media path is a later phase).
 - **PostgreSQL** — users, channels, groups, permissions, bans, tokens, offline messages (`internal/store`, migrations in `internal/store/migrations/`).
 - **Permissions** (`internal/permissions`) — TeamSpeak 3 model: five evaluation tiers (server group → client → channel client → channel → channel group), power-vs-needed-power comparisons, skip/negate flags, DB-backed loader with a 5s cache.
@@ -21,16 +21,24 @@ A TeamSpeak-like voice/video server written in Go. TCP/JSON control protocol, UD
 - Channels: create/delete, temporary/semi-permanent/permanent types, automatic cleanup of empty temporary channels, channel passwords, per-channel needed-join-power, persisted channels loaded into state at startup.
 - Permission-gated operations: channel create/delete, join (power and password/ignore-password), kick (channel/server), ban, moving other clients.
 - Chat: channel, global, and direct messages; direct messages to offline users are spooled (`offline_messages`) and delivered on next login.
-- Voice SFU: WebRTC signaling over the control channel (SDP offer/answer, trickle ICE), audio fan-out with per-subscriber tracks, whisper lists, talk-power gate, VAD speaking events (ssrc-audio-level header extension, 300ms hangover), 3D position relays.
-- Video SFU: channel fan-out with per-subscriber tracks, simulcast layer selection per subscriber (`high`/`mid`/`low` → RID `f`/`h`/`q` with fallback), PLI/FIR keyframe relay to publishers and on subscriber join, video-publish permission gate.
+- Server-side chat infrastructure (wave 5a): channel/global history (`chat_messages`, decrypted — the server holds scope keys; DMs are E2EE and never stored, their history is client-local), edit (`chat_edited`) and delete (own or `b_chat_delete_any`, tombstones), pinned messages (`b_channel_modify`-gated), reactions (toggle + full-map broadcasts), slow mode per channel (`slow_mode_seconds`, `b_chat_slowmode_bypass` skips), per-user rate limit (5/3s), anti-spam (identical ×3 in 30s), max length (2000 chars), word/link filters (`chat_word_filter`, `chat_link_blacklist`, `chat_link_whitelist`; DMs exempt), @mention parsing (`@nickname`, `@channel`, `@here`/`@everyone` via `b_chat_mention_all`), typing indicators (relayed), DM delivery/read receipts (client refs), MOTD (auth response) + announcement (login + broadcast; set via ServerQuery `serverset`), custom emoji uploads (`b_emoji_manage`, `file_root/emojis/`).
+- Voice SFU: WebRTC signaling over the control channel (SDP offer/answer, trickle ICE, server-initiated renegotiation on membership change), audio fan-out with per-publisher tracks (track ID = publisher client ID, mapped via MSID), whisper lists, talk-power gate, VAD speaking events (ssrc-audio-level header extension, 300ms hangover), 3D position relays.
+- Priority speaker (TS3-style channel commander): `b_client_priority_speaker`-gated toggle (`MsgPrioritySpeaker`), `priority_speaker_changed` broadcast; clients duck other publishers −12 dB while a priority speaker talks (restore after 500 ms of silence).
+- Echo test channel: `echo_channel_name` (default "Echo Test") is ensured to exist at startup; publishers in it hear their own audio routed back (the only channel with self-fan-out).
+- Per-channel Opus quality: `opus_bitrate`/`opus_fec`/`opus_dtx`/`opus_stereo` columns (migration 005), set at create or via `MsgChannelEdit`/ServerQuery `channeledit` (`b_channel_modify`); enforced by rewriting the Opus fmtp line in SDP answers/offers per subscriber channel. Music channels (stereo + bitrate ≥ 96k) bypass the talk-power gate; the client ships Voice 32k / HQ Voice 64k / Music 128k-stereo presets.
+- TURN for NAT traversal: optional `coturn` compose profile (`docker compose --profile turn up -d`); when `turn.secret` is set the server mints time-limited coturn REST credentials (`internal/turn`, 24h TTL) and delivers STUN+TURN ICE servers in the auth response.
+- Video SFU: channel fan-out with per-publisher tracks, simulcast layer selection per subscriber (`high`/`mid`/`low` → RID `f`/`h`/`q` with fallback), PLI/FIR keyframe relay to publishers and on subscriber join, video-publish permission gate.
 - Server-side recording: optional ffmpeg-subprocess recorder for channel audio/video (`internal/recorder`), start/stop via control message, hardware-encoder-ready argument configuration.
-- ServerQuery: TS3-style line-based admin protocol on `:10012` (`internal/query`) for headless administration and bots — admin-only login, client/channel listing, move/kick/ban, text injection, channel create/delete; connection cap, idle timeout, and login brute-force lockout built in.
-- File transfer: token-authorized uploads/downloads on `:30033` (`internal/filetransfer`) — single-use short-lived tokens issued over the control channel, SHA-256 integrity, per-channel quotas, per-connection bandwidth caps, per-transfer size caps, on-disk storage per channel with a `files` metadata table.
+- Presence status: online/away/busy/invisible + status message (`MsgSetStatus`, `status_changed` broadcasts); invisible is admin-only to set and hides the user from non-admin snapshots and join/leave events (visible to admins and the user themself).
+- ServerQuery: TS3-style line-based admin protocol on `:10012` (`internal/query`) for headless administration and bots — admin-only login, client/channel listing, move/kick/ban, text injection, channel create/delete/info/edit (incl. Opus quality); connection cap, idle timeout, and login brute-force lockout built in.
+- File transfer: token-authorized uploads/downloads on `:30033` (`internal/filetransfer`) — single-use short-lived tokens issued over the control channel, SHA-256 integrity, per-channel quotas, per-connection bandwidth caps, per-transfer size caps, on-disk storage per channel with a `files` metadata table. Wave 7 adds: virtual folders (migration 010), rename/move and delete (`MsgFileRename`/`MsgFileDelete`, uploader or `b_ft_delete`), file versioning (N=3 rotation to `<name>.vN` on overwrite, `MsgFileVersions`), SHA-256 dedup (hard-link to the identical blob), quota state in the list response, expiring download links (`MsgFileLink` → `/dl/<token>` on the health port, 15 min), and a server icon (`MsgServerIconSet`/`MsgServerIconGet`, admin-only).
 - Server password: optional global password (`server_password`, hashed at startup), enforced at authenticate time.
 - Avatars & channel icons: base64 upload with type/size validation (png/jpeg/gif/webp, 256 KiB), stored under the file root; `avatar_changed`/`channel_icon_changed` events; `has_icon` in channel snapshots.
 - Complaints: file complaints against users (max 5 open per reporter); manage via ServerQuery (`complaintlist`/`complaintdel`/`complaintdelall`).
+- Permission/group management (wave 6a, server side): group CRUD + membership over the control channel (`GroupList`/`GroupCreate`/`GroupRename`/`GroupDelete`/`GroupAssign`/`GroupUnassign`, gated by admin or `b_server_group_manage`/`b_channel_group_manage`, deny-on-unset); permission writes on all five tiers (`PermSet`/`PermUnset` with value/grant/skip/negate, gated by `b_permission_manage`; non-admin grant cap: values ≤ own grant — TS3-lite); built-in Guest/Member/Moderator/Admin templates (`PermTemplateApply`); permission trace (`PermTrace` → winning tier + all tier entries); timed server-group memberships (`expires_in_seconds`, 60s reaper + `group_expired` event); default groups (`default_groups_enabled`: "Guest"/"Member" seeded at startup, registered users auto-join Member on first login, guests virtually hold Guest); group icons/color/hoist data; audit log (`audit_log` table; perm/group/kick/ban/token/channel actions; `AuditLog` paged, gated by admin or `b_audit_view`; ServerQuery `auditlog`). Client UI is a later wave.
 - Privilege tokens: TS3-style privilege keys (`tokenadd`/`tokenlist`/`tokendelete` via ServerQuery, `TokenUse` from clients) granting server-group membership or admin; first-run bootstrap logs a one-time admin token when no admin exists.
 - Screen share: declared via `ScreenShare`, relayed to channel members as `screenshare_changed`.
+- Client Info (TS3-style): per-client activity tracking (connect/idle times, bytes in/out, smoothed RTT from server-initiated 15s pings), `ClientInfoQuery`/`ClientInfoResponse` — self queries always full, others' IP/port gated by admin or `b_client_remoteaddress_view` (deny-on-unset).
 - Prometheus metrics on `/metrics` (health port): `voicx_clients_connected`, `voicx_channels_active`, `voicx_udp_packets_total{kind}`, `voicx_udp_packets_dropped_total`, `voicx_tcp_connections_total`, `voicx_chat_messages_total{scope}`, `voicx_webrtc_peers`, `voicx_rtp_packets_forwarded_total{media}`, `voicx_file_transfers_total{direction,result}`, plus the Go collector.
 - UDP DDoS mitigation: per-source-IP token-bucket rate limiting with idle-bucket eviction (`udp_rate_limit_pps`, `udp_rate_burst`; 0 disables).
 - Ping/pong keepalive; graceful shutdown of all listeners.
@@ -40,8 +48,8 @@ A TeamSpeak-like voice/video server written in Go. TCP/JSON control protocol, UD
 
 | Port  | Protocol | Purpose                                    |
 |-------|----------|--------------------------------------------|
-| 9987  | UDP      | Voice/media transport                      |
-| 10011 | TCP      | Control channel (query, JSON frames)       |
+| 9987  | UDP      | Keepalive (ping/pong probes)               |
+| 10011 | TCP+TLS  | Control channel (query, JSON frames)       |
 | 10012 | TCP      | ServerQuery (admin/bot text protocol)      |
 | 30033 | TCP      | File transfer (token-authorized)           |
 | 9090  | TCP/HTTP | Health (`/healthz`), readiness (`/readyz`), metrics (`/metrics`) |
@@ -62,7 +70,7 @@ Loaded with viper. Precedence (highest first):
 | `log_level` | `VOICX_LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error` |
 | `dev_mode` | `VOICX_DEV_MODE` | `true` | Development (console) vs production (JSON) logger |
 | `tcp_addr` | `VOICX_TCP_ADDR` | `:10011` | Control listener address |
-| `udp_addr` | `VOICX_UDP_ADDR` | `:9987` | Media listener address |
+| `udp_addr` | `VOICX_UDP_ADDR` | `:9987` | UDP keepalive listener address |
 | `grpc_addr` | `VOICX_GRPC_ADDR` | `:50051` | gRPC address (reserved) |
 | `health_addr` | `VOICX_HEALTH_ADDR` | `:9090` | Health HTTP listener address |
 | `query_addr` | `VOICX_QUERY_ADDR` | `:10012` | ServerQuery listener address |
@@ -76,6 +84,23 @@ Loaded with viper. Precedence (highest first):
 | `redis_password` | `VOICX_REDIS_PASSWORD` | `""` | Redis password |
 | `redis_enabled` | `VOICX_REDIS_ENABLED` | `true` | Set `false` to run without Redis |
 | `max_clients` | `VOICX_MAX_CLIENTS` | `1024` | Maximum simultaneous clients |
+| `echo_channel_name` | `VOICX_ECHO_CHANNEL_NAME` | `Echo Test` | Loopback test channel name (empty = disabled) |
+| `tls_enabled` | `VOICX_TLS_ENABLED` | `true` | TLS on the control channel |
+| `tls_dir` | `VOICX_TLS_DIR` | `./data/tls` | Auto-generated cert/key location |
+| `tls_cert_file` | `VOICX_TLS_CERT_FILE` | `""` | Custom cert (empty = self-signed) |
+| `tls_key_file` | `VOICX_TLS_KEY_FILE` | `""` | Custom key (empty = self-signed) |
+| `chat_allow_plaintext` | `VOICX_CHAT_ALLOW_PLAINTEXT` | `false` | Allow unencrypted chat (dev escape hatch) |
+| `chat_max_length` | `VOICX_CHAT_MAX_LENGTH` | `2000` | Max message length (chars, post-decrypt) |
+| `chat_rate_msgs` | `VOICX_CHAT_RATE_MSGS` | `5` | Per-user chat token bucket size |
+| `chat_rate_window_seconds` | `VOICX_CHAT_RATE_WINDOW_SECONDS` | `3` | Per-user chat bucket window (s) |
+| `chat_word_filter` | `VOICX_CHAT_WORD_FILTER` | `""` | Comma-separated banned substrings |
+| `chat_link_blacklist` | `VOICX_CHAT_LINK_BLACKLIST` | `""` | Comma-separated blocked link substrings |
+| `chat_link_whitelist` | `VOICX_CHAT_LINK_WHITELIST` | `""` | If set, only these domains may be linked |
+| `default_groups_enabled` | `VOICX_DEFAULT_GROUPS_ENABLED` | `true` | Seed Guest/Member server groups and auto-assign them at login |
+| `turn.secret` | `VOICX_TURN_SECRET` | `""` | coturn static-auth-secret (empty = TURN disabled) |
+| `turn.realm` | `VOICX_TURN_REALM` | `voicx` | TURN realm |
+| `turn.uris` | `VOICX_TURN_URIS` | `[]` | Client TURN URIs (comma-separated via env) |
+| `turn.credentials_ttl` | `VOICX_TURN_CREDENTIALS_TTL` | `24h` | TURN credential lifetime |
 | `db_max_open_conns` | `VOICX_DB_MAX_OPEN_CONNS` | `25` | Postgres pool size |
 | `db_max_idle_conns` | `VOICX_DB_MAX_IDLE_CONNS` | `5` | Postgres idle pool size |
 | `db_conn_max_lifetime` | `VOICX_DB_CONN_MAX_LIFETIME` | `30m` | Postgres connection lifetime |
@@ -136,14 +161,14 @@ go run ./cmd/adduser -nickname admin -password adminpw -admin
 `cmd/e2e` runs a live checklist (health, UDP, auth, channels, chat, permissions, file transfer, ServerQuery) and prints `PASS`/`FAIL` per check plus a summary:
 
 ```bash
-go run ./cmd/e2e \
+go run ./cmd/e2e -tls-insecure \
   -alice-uid <alice uid> -alice-pass alicepw \
   -bob-uid <bob uid> -bob-pass bobpw \
   -admin-uid <admin uid> -admin-pass adminpw
 # exit code 0 only when all checks pass
 ```
 
-Note: authentication uses the **unique ID** printed by adduser, not the nickname. Ports default to localhost standard values; override with `-addr`, `-query-addr`, `-health-url`, `-udp-addr`, `-file-addr`, and `-server-password` if the server has a global password.
+Note: authentication uses the **unique ID** printed by adduser, not the nickname. Ports default to localhost standard values; override with `-addr`, `-query-addr`, `-health-url`, `-udp-addr`, `-file-addr`, and `-server-password` if the server has a global password. Since the control channel is TLS by default (self-signed cert), e2e and loadtest need `-tls-insecure` (skips certificate verification, logs the presented fingerprint once); omit it only against a `tls_enabled: false` server.
 
 ## Load testing
 
@@ -162,7 +187,13 @@ All simulated clients share one account (voicx allows multiple connections per u
 
 ## Security notes
 
-- The container image runs as a non-root user (uid 10001); the compose service additionally sets `no-new-privileges`, drops all capabilities, mounts the root filesystem read-only, and keeps writable data (uploads, avatars, icons, recordings) on a named volume at `/data`.
+- **Encryption at a glance**: the TCP control channel is TLS by default (`tls_enabled`; self-signed ECDSA P-256 cert auto-generated into `tls_dir` on first start, 10y validity, SANs localhost + server name; SHA-256 fingerprint logged at startup, sent in the auth response, and shown in ServerQuery `serverinfo`). The Wails client pins the fingerprint TOFU-style in `known_servers.json` — a later mismatch hard-fails with a warning dialog until the user explicitly trusts the new fingerprint. Voice/video media is encrypted by WebRTC's DTLS-SRTP (mandated by the spec, not optional). **Still plaintext this wave**: ServerQuery (`:10012`, backlog 225) and file transfer (`:30033`, token-authorized) — keep them on trusted networks.
+- **Chat payload encryption (wave 4b) — exact trust model**:
+  - **Direct messages: true E2EE.** Clients generate an X25519 pair (stored in `identity.json` next to the Ed25519 signing key) and publish the public key to a server directory (`users.e2e_public_key`, migration 006; guests: state only). DM bodies are sealed with nacl/box (Curve25519 + XSalsa20-Poly1305) for the recipient's key. **The server relays and spools ciphertext it cannot read** — offline DMs are stored encrypted, a real privacy win. Caveat: static keys, so **no forward secrecy**; a stolen `identity.json` decrypts all past DMs to that user.
+  - **Channel + global messages: encrypted with server-held symmetric keys** (nacl/secretbox, XSalsa20-Poly1305). The server generates the keys in memory (lost on restart) and distributes them **sealed** (box.SealAnonymous) to each member's X25519 key — the distribution channel is E2E even though the server is a key holder. The server CAN read these scopes; that's deliberate: wave 5 needs server-side history, search, and moderation.
+  - **Rotation**: a channel's key rotates (bumped `key_id`) when a member leaves, and is redistributed to remaining members — ex-members can't read *new* messages. They keep access to history from their membership period (documented limitation). The global key does not rotate (it would re-key every client on every disconnect).
+  - **Plaintext chat is rejected** by default (`chat_allow_plaintext: false`, dev escape hatch). The server validates scope `key_id` and ciphertext size but never inspects DM bodies.
+- The container image runs as a non-root user (uid 10001); the compose service additionally sets `no-new-privileges`, drops all capabilities, mounts the root filesystem read-only, and keeps writable data (uploads, avatars, icons, recordings, TLS keys) on a named volume at `/data`.
 - Passwords are Argon2id-hashed; challenge-response auth uses Ed25519; the server password is hashed at startup.
 - The UDP listener applies per-source-IP token-bucket rate limiting with idle-bucket eviction (`udp_rate_limit_pps`/`udp_rate_burst`).
 - ServerQuery is admin-only with connection caps, idle timeouts, and login lockout; file transfers use single-use short-lived tokens.
@@ -188,6 +219,15 @@ To transcode with a hardware encoder, set `recording.video_args` accordingly (an
 
 Note: recording currently expects the publisher codecs the generated SDP advertises (Opus audio, VP8 video); validate against a live client before relying on it.
 
+## TURN (NAT traversal)
+
+TURN is only needed for clients behind restrictive NATs (symmetric NAT, UDP-blocking firewalls); LAN and direct-WAN deployments can skip it entirely. To enable:
+
+1. Start coturn via the compose profile: `TURN_SECRET=<random> docker compose --profile turn up -d` (publishes 3478 tcp/udp, 5349, relay range 49152-49252/udp).
+2. Point the server at it with the same secret: `VOICX_TURN_SECRET=<random>`, `VOICX_TURN_URIS=turn:<host>:3478?transport=udp,turn:<host>:3478?transport=tcp`.
+
+The server then mints time-limited credentials per client (`internal/turn`, coturn REST API: `username = <expiry>:<uid>`, `credential = base64(HMAC-SHA1(secret, username))`, TTL `turn.credentials_ttl`, default 24h) and delivers them together with the STUN defaults in the auth response; clients merge them into their `RTCPeerConnection` automatically.
+
 Client-side hardware encode/decode is negotiated by the WebRTC client, not the server: the Phase 8 client should prefer hardware-backed codecs in `RTCPeerConnection` (platform default on most browsers; on native clients pick HW-accelerated encoder implementations and match the codec list the server advertises — VP8/VP9/H.264, optional AV1 via `webrtc.enable_av1`).
 
 ## Client
@@ -206,6 +246,35 @@ Guests are never admin, resolve to an empty permission set (all defaults: join/c
 **Nickname login & key binding**: password auth accepts a nickname in place of a unique ID — the server falls back to a nickname lookup when the unique ID isn't found, returns the account's canonical unique ID, and binds the client's presented identity public key to the account (`public_key` column). Future challenge logins with that key resolve the account via the bound key even though the key-derived UID differs from the account's canonical one.
 
 ## Guest / anonymous login is also used by the tooling: `cmd/loadtest -anonymous` connects N guests with `loadtest-N` nicknames (no provisioning needed), and `cmd/e2e` covers the guest paths in its checklist.
+
+## Versioning & releases
+
+Every binary embeds build metadata (`internal/version`, injected via
+`-ldflags -X`): **base semver + commit count + short SHA**, e.g.
+`0.4.0+87.abc1234` (or `-dirty` for uncommitted changes). The base semver
+lives in the root `VERSION` file; the build number is
+`git rev-list --count HEAD`, so **every commit bumps the version**
+automatically.
+
+- `make build` / `make run` / `make client-build` inject it locally
+  (`VERSION_FLAGS` in the Makefile).
+- Docker builds take it via `--build-arg` (`.git` is excluded from the
+  context; `make docker-build` and compose `build.args` pass it).
+- The server logs it at startup, ServerQuery `version` returns it,
+  `/healthz` reports `{"status":"ok","version":"..."}`, and Prometheus
+  exports `voicx_build_info{version,commit} 1`.
+
+**Releasing**: tag `vX.Y.Z` and push — the CI `release` job
+(`.github/workflows/ci.yml`) builds the Windows client (`wails build`) and a
+Linux server binary with the tag as the embedded version, generates
+`checksums.txt` (SHA-256), and uploads all three to a GitHub Release. The
+client's auto-updater compares against that release feed, so tag names
+decide availability: a higher base semver or a higher `+build` number wins.
+
+**Update source**: the client reads the repo slug from
+`version.UpdateRepo` (ldflags `-X voicx/internal/version.UpdateRepo=<owner/repo>`;
+CI sets it to `github.repository` automatically). With the placeholder
+default, update checks report "no update source" and stay quiet.
 
 ## Status / roadmap
 
@@ -230,7 +299,7 @@ internal/permissions/ TS3-style permission model, resolver, DB loader
 internal/query/    TS3-style ServerQuery admin/bot text protocol
 internal/recorder/ ffmpeg-subprocess channel recording
 internal/redisx/   Redis client wrapper (optional)
-internal/server/   TCP control + UDP media listeners
+internal/server/   TCP control + UDP keepalive listeners
 internal/state/    in-memory client/channel/membership state
 internal/store/    Postgres store + embedded migrations
 internal/webrtc/   Pion WebRTC engine

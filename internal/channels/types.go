@@ -77,6 +77,27 @@ type ChannelSpec struct {
 	NeededJoinPower int
 	// CreatedBy is the user ID of the channel creator. 0 means unknown.
 	CreatedBy int64
+
+	// Per-channel Opus audio quality (migration 005). OpusBitrate is the
+	// target bitrate in bits/s; 0 means the server default (32000).
+	OpusBitrate int
+	OpusFEC     bool
+	OpusDTX     bool
+	OpusStereo  bool
+}
+
+// ChannelUpdate describes the editable fields of a channel. Nil pointers
+// leave the corresponding column untouched. It is the input to
+// ChannelManager.UpdateChannel.
+type ChannelUpdate struct {
+	Topic           *string
+	MaxClients      *int
+	OpusBitrate     *int
+	OpusFEC         *bool
+	OpusDTX         *bool
+	OpusStereo      *bool
+	SlowModeSeconds *int
+	Description     *string
 }
 
 // Validate checks the spec for obvious errors and returns a descriptive error

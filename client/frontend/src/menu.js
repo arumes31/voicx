@@ -83,7 +83,7 @@ function dlgAbout() {
             <h3>About voicx</h3>
             <div class="about-body">
                 <div class="wordmark" style="font-size:26px">voicx</div>
-                <div>voice ops console — client v0.1.0</div>
+                <div class="mono about-version"></div>
                 <div class="mono about-uid"></div>
                 <div class="about-links">
                     <a href="https://github.com/voicx" target="_blank">project</a> ·
@@ -92,6 +92,9 @@ function dlgAbout() {
             </div>
             <div class="dlg-buttons"><button class="dlg-ok">Close</button></div>
         </div>`;
+    window.go.main.App.ClientVersion().then((v) => {
+        overlay.querySelector(".about-version").textContent = "version " + v;
+    });
     const uidEl = overlay.querySelector(".about-uid");
     uidEl.textContent = state.myUniqueID || "(not connected)";
     overlay.querySelector(".dlg-ok").onclick = () => overlay.remove();
@@ -132,7 +135,8 @@ async function bookmarkCurrent() {
 async function connectBookmark(b) {
     const { state, toast, $ } = V();
     $("login-addr").value = b.addr;
-    $("login-nick").value = b.nickname;
+    // (334) per-server nickname override applies at connect.
+    $("login-nick").value = b.nickname_override || b.nickname;
     $("login-password").value = "";
     $("login-serverpw").value = "";
     state.lastConnect = null;
@@ -140,33 +144,85 @@ async function connectBookmark(b) {
     toast("bookmark loaded — enter password to connect");
 }
 
+// sortedBookmarks returns bookmarks grouped by folder, ordered within (284).
+function sortedBookmarks() {
+    const bms = [...(currentSettings().bookmarks || [])];
+    bms.sort((a, b) =>
+        (a.folder || "").localeCompare(b.folder || "") ||
+        (a.order || 0) - (b.order || 0) ||
+        a.name.localeCompare(b.name));
+    return bms;
+}
+
 function manageBookmarks() {
     const overlay = document.createElement("div");
     overlay.className = "dlg-overlay";
+    const persist = async () => {
+        const s = currentSettings();
+        // Renumber the order within each folder (284).
+        const groups = {};
+        for (const b of s.bookmarks) {
+            const f = b.folder || "";
+            groups[f] = groups[f] || [];
+            groups[f].push(b);
+        }
+        for (const f of Object.keys(groups)) groups[f].forEach((b, i) => { b.order = i; });
+        return saveSettings({ bookmarks: s.bookmarks });
+    };
     const render = () => {
-        const bms = currentSettings().bookmarks || [];
-        overlay.querySelector(".bm-list").innerHTML = bms.length === 0
-            ? `<div class="empty-state">No bookmarks yet</div>`
-            : "";
-        bms.forEach((b, i) => {
+        const bms = sortedBookmarks();
+        const list = overlay.querySelector(".bm-list");
+        list.innerHTML = bms.length === 0 ? `<div class="empty-state">No bookmarks yet</div>` : "";
+        let lastFolder = null;
+        bms.forEach((b) => {
+            const folder = b.folder || "";
+            if (folder !== lastFolder) {
+                lastFolder = folder;
+                const head = document.createElement("div");
+                head.className = "bm-folder";
+                head.textContent = folder || "(ungrouped)";
+                list.appendChild(head);
+            }
+            const idx = currentSettings().bookmarks.indexOf(b);
             const row = document.createElement("div");
             row.className = "bm-row";
-            row.innerHTML = `<span class="bm-name"></span><span class="bm-addr mono"></span>
-                <button class="bm-rename">Rename</button><button class="bm-del">Delete</button>`;
+            row.innerHTML = `
+                <span class="bm-dot" title="color (284)"></span>
+                <span class="bm-name"></span>
+                <span class="bm-addr mono"></span>
+                <button class="bm-up" title="move up">↑</button>
+                <button class="bm-down" title="move down">↓</button>
+                <button class="bm-edit">Edit</button>
+                <button class="bm-del">Delete</button>`;
             row.querySelector(".bm-name").textContent = b.name;
-            row.querySelector(".bm-addr").textContent = b.addr;
-            row.querySelector(".bm-rename").onclick = () => {
-                const nn = prompt("Bookmark name:", b.name);
-                if (nn) {
-                    bms[i].name = nn;
-                    saveSettings({ bookmarks: bms }).then(render);
+            row.querySelector(".bm-addr").textContent = b.addr + (b.auto_connect ? " ⚡" : "");
+            const dot = row.querySelector(".bm-dot");
+            dot.style.background = b.color || "var(--text-faint)";
+            dot.onclick = () => {
+                const c = prompt("Bookmark color (hex, e.g. #2ee6a8; empty = none):", b.color || "");
+                if (c === null) return;
+                b.color = c.trim();
+                persist().then(render);
+            };
+            const s = currentSettings();
+            row.querySelector(".bm-up").onclick = () => {
+                if (idx > 0) {
+                    [s.bookmarks[idx - 1], s.bookmarks[idx]] = [s.bookmarks[idx], s.bookmarks[idx - 1]];
+                    persist().then(render);
                 }
             };
-            row.querySelector(".bm-del").onclick = () => {
-                bms.splice(i, 1);
-                saveSettings({ bookmarks: bms }).then(render);
+            row.querySelector(".bm-down").onclick = () => {
+                if (idx < s.bookmarks.length - 1) {
+                    [s.bookmarks[idx + 1], s.bookmarks[idx]] = [s.bookmarks[idx], s.bookmarks[idx + 1]];
+                    persist().then(render);
+                }
             };
-            overlay.querySelector(".bm-list").appendChild(row);
+            row.querySelector(".bm-edit").onclick = () => editBookmark(b, persist, render);
+            row.querySelector(".bm-del").onclick = () => {
+                s.bookmarks.splice(idx, 1);
+                persist().then(render);
+            };
+            list.appendChild(row);
         });
     };
     overlay.innerHTML = `
@@ -181,38 +237,102 @@ function manageBookmarks() {
     render();
 }
 
+// editBookmark edits one bookmark's extended fields (283/284/286/300).
+function editBookmark(b, persist, render) {
+    const overlay = document.createElement("div");
+    overlay.className = "dlg-overlay";
+    overlay.innerHTML = `
+        <div class="dlg">
+            <h3>Edit bookmark</h3>
+            <label class="dlg-label">Name</label>
+            <input class="dlg-input bm-f-name" />
+            <label class="dlg-label">Folder (283)</label>
+            <input class="dlg-input bm-f-folder" placeholder="e.g. work / friends" />
+            <label class="dlg-label">Hotkey profile (300)</label>
+            <input class="dlg-input bm-f-profile" placeholder="default" />
+            <label class="dlg-label">Nickname override (334)</label>
+            <input class="dlg-input bm-f-nick" placeholder="use bookmark nickname" />
+            <label class="dlg-label">Avatar override (335)</label>
+            <div class="bm-f-avatar-row">
+                <button class="icon-btn bm-f-avatar-btn">choose image…</button>
+                <span class="bm-f-avatar-state mono"></span>
+            </div>
+            <label class="dlg-label"><input type="checkbox" class="bm-f-auto" /> auto-connect on startup (286; guest/prefill only — passwords are never stored)</label>
+            <div class="dlg-buttons">
+                <button class="dlg-ok">Save</button>
+                <button class="dlg-cancel">Cancel</button>
+            </div>
+        </div>`;
+    const q = (sel) => overlay.querySelector(sel);
+    q(".bm-f-name").value = b.name;
+    q(".bm-f-folder").value = b.folder || "";
+    q(".bm-f-profile").value = b.profile || "";
+    q(".bm-f-nick").value = b.nickname_override || "";
+    q(".bm-f-auto").checked = !!b.auto_connect;
+    q(".bm-f-avatar-state").textContent = b.avatar_override_b64 ? "set (" + Math.round(b.avatar_override_b64.length / 1366) + " KB)" : "none";
+    q(".bm-f-avatar-btn").onclick = async () => {
+        const img = await pickIcon(256, 0.85);
+        if (!img) return;
+        b.avatar_override_b64 = img.dataBase64;
+        q(".bm-f-avatar-state").textContent = "set";
+    };
+    q(".dlg-ok").onclick = async () => {
+        b.name = q(".bm-f-name").value.trim() || b.name;
+        b.folder = q(".bm-f-folder").value.trim();
+        b.profile = q(".bm-f-profile").value.trim();
+        b.nickname_override = q(".bm-f-nick").value.trim();
+        b.auto_connect = q(".bm-f-auto").checked;
+        overlay.remove();
+        await persist();
+        render();
+    };
+    q(".dlg-cancel").onclick = () => overlay.remove();
+    overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+    document.body.appendChild(overlay);
+}
+
 // --- Self actions --------------------------------------------------------------
 
-function setAvatarFile() {
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = "image/png,image/jpeg,image/gif,image/webp";
-    input.onchange = async () => {
-        const file = input.files[0];
-        if (!file) return;
-        if (file.size > 256 * 1024) {
-            V().toast("avatar too large (max 256 KiB)", "warn");
-            return;
-        }
-        const buf = await file.arrayBuffer();
-        const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
-        const err = await window.go.main.App.SetAvatar(b64);
-        if (err) V().toast("avatar failed: " + err, "warn");
-        else V().toast("avatar updated");
-    };
-    input.click();
+// menu.js — TS3-style menu bar with dropdown menus.
+import { t } from "./i18n.js";
+import { pickAvatar, pickIcon } from "./image-tools.js";
+
+// --- Self actions --------------------------------------------------------------
+
+// setAvatarFile opens the avatar crop dialog (268): preview, zoom/reposition,
+// 256x256 canvas resize; animated GIF/WebP pass through untouched (269).
+async function setAvatarFile() {
+    const img = await pickAvatar();
+    if (!img) return;
+    const err = await window.go.main.App.SetAvatar(img.dataBase64);
+    if (err) V().toast("avatar failed: " + err, "warn");
+    else V().toast("avatar updated");
+}
+
+// setServerIcon uploads a compressed server icon (admin, 270/274).
+async function setServerIcon() {
+    const img = await pickIcon();
+    if (!img) return;
+    const err = await window.go.main.App.ServerIconSet(img.dataBase64);
+    if (err) {
+        V().toast("server icon failed: " + err, "warn");
+        return;
+    }
+    V().toast("server icon updated");
+    window.__voicxFiles.loadServerIcon();
 }
 
 // --- menu bar -------------------------------------------------------------------
 
 export function initMenu() {
     const { $ } = V();
+    $("menubar").innerHTML = ""; // rebuilds on language change (336)
 
-    const connections = buildMenu("Connections", [
-        menuAction("Connect…", () => V().showLogin()),
-        menuAction("Disconnect", () => V().disconnect()),
+    const connections = buildMenu(t("menu.connections"), [
+        menuAction(t("menu.connect"), () => V().showLogin()),
+        menuAction(t("menu.disconnect"), () => V().disconnect()),
         divider(),
-        menuAction("Quit", () => window.runtime.Quit()),
+        menuAction(t("menu.quit"), () => window.runtime.Quit()),
     ]);
 
     const bookmarkItems = [menuAction("Bookmark current server", bookmarkCurrent), divider()];
@@ -220,11 +340,20 @@ export function initMenu() {
     bookmarkList.className = "bm-menu-list";
     const renderBookmarkMenu = () => {
         bookmarkList.innerHTML = "";
-        for (const b of currentSettings().bookmarks || []) {
+        let lastFolder = null;
+        for (const b of sortedBookmarks()) {
+            const folder = b.folder || "";
+            if (folder !== lastFolder) {
+                lastFolder = folder;
+                const head = document.createElement("div");
+                head.className = "bm-menu-folder";
+                head.textContent = folder;
+                bookmarkList.appendChild(head);
+            }
             bookmarkList.appendChild(menuAction(b.name, () => connectBookmark(b)));
         }
     };
-    const bookmarks = buildMenu("Bookmarks", [
+    const bookmarks = buildMenu(t("menu.bookmarks"), [
         ...bookmarkItems,
         bookmarkList,
         menuAction("Manage bookmarks…", manageBookmarks),
@@ -233,7 +362,7 @@ export function initMenu() {
     const origClick = bmItem.onclick;
     bmItem.onclick = (e) => { renderBookmarkMenu(); origClick(e); };
 
-    const self = buildMenu("Self", [
+    const self = buildMenu(t("menu.self"), [
         menuAction("Change nickname…", () => {
             dlgPrompt("Change nickname", "Nickname for your next connect:", V().state.myNickname, (v) => {
                 if (v) {
@@ -243,7 +372,17 @@ export function initMenu() {
                 }
             });
         }),
-        menuAction("Set avatar…", setAvatarFile),
+        menuAction(t("menu.setStatus"), () => {
+            if (!V().state.myClientID) return V().toast("not connected", "warn");
+            window.__voicxSocial.openStatusPicker();
+        }),
+        menuAction(t("menu.contacts"), () => window.__voicxSocial.openContacts()),
+        menuAction(t("menu.setAvatar"), setAvatarFile),
+        menuAction(t("menu.setServerIcon"), () => {
+            if (!V().state.myClientID) return V().toast("not connected", "warn");
+            if (!V().state.isAdmin) return V().toast("server icon is admin-only", "warn");
+            setServerIcon();
+        }),
         divider(),
         menuAction("Toggle mute", () => $("voice-mute").click()),
         menuAction("Toggle deafen", () => {
@@ -253,20 +392,77 @@ export function initMenu() {
         }),
     ]);
 
-    const permissions = buildMenu("Permissions", [
-        menuAction("View my permissions", () => {
+    const permissions = buildMenu(t("menu.permissions"), [
+        menuAction(t("menu.viewMyPerms"), () => {
             V().refreshPermissions();
             $("details").scrollIntoView({ behavior: "smooth" });
         }),
+        menuAction(t("menu.permManager"), () => {
+            if (!V().state.myClientID) return V().toast("not connected", "warn");
+            window.__voicxPerms.openPermissionManager();
+        }),
     ]);
 
-    const tools = buildMenu("Tools", [
-        menuAction("Settings…", () => window.__voicx.openSettings("application")),
-        menuAction("Whisper lists…", () => window.__voicx.openSettings("whisper")),
+    const tools = buildMenu(t("menu.tools"), [
+        menuAction(t("menu.settings"), () => window.__voicx.openSettings("application")),
+        menuAction(t("menu.whisperLists"), () => window.__voicx.openSettings("whisper")),
+        divider(),
+        menuAction(t("menu.auditLog"), () => {
+            if (!V().state.myClientID) return V().toast("not connected", "warn");
+            window.__voicxPerms.openAuditViewer();
+        }),
+        menuAction(t("menu.bans"), () => {
+            if (!V().state.myClientID) return V().toast("not connected", "warn");
+            window.__voicxPerms.openBanList();
+        }),
+        divider(),
+        menuAction(t("menu.debugConsole"), () => {
+            if (!V().state.myClientID) return V().toast("not connected", "warn");
+            window.__voicxMeta.openDebugConsole();
+        }),
+        menuAction(t("menu.connStats"), () => {
+            if (!V().state.myClientID) return V().toast("not connected", "warn");
+            window.__voicxMeta.openStatsPage();
+        }),
     ]);
 
-    const help = buildMenu("Help", [
-        menuAction("About voicx", dlgAbout),
+    // View menu: window/integration toggles (wave 8a/8c).
+    const view = buildMenu(t("menu.view"), [
+        menuAction(t("menu.compact"), () => V().toggleCompact()),
+        menuAction(t("menu.zen"), () => window.__voicxPolish.toggleZen()),
+        menuAction("Pop out chat", () => window.__voicxPolish.toggleChatPopout()),
+        menuAction("Do not disturb", async () => {
+            const s = V().state.settings;
+            s.dnd_enabled = !s.dnd_enabled;
+            await window.go.main.App.SaveSettings(s);
+            V().toast("do not disturb " + (s.dnd_enabled ? "on" : "off"));
+            V().renderTree();
+        }),
+        menuAction("Always on top", async () => {
+            const on = !(V().state.settings?.always_on_top);
+            await window.go.main.App.SetAlwaysOnTop(on);
+            if (V().state.settings) V().state.settings.always_on_top = on;
+            V().toast("always on top " + (on ? "on" : "off"));
+        }),
+        menuAction("Window opacity…", () => {}, {
+            disabled: true,
+            tooltip: "not supported by the Wails v2 WebView2 backend (292)",
+        }),
+        divider(),
+        menuAction("Theme: dark", () => setTheme("dark")),
+        menuAction("Theme: light", () => setTheme("light")),
+        menuAction("Theme: high contrast", () => setTheme("hc")),
+    ]);
+
+    const help = buildMenu(t("menu.help"), [
+        menuAction(t("menu.checkUpdates"), () => window.__voicx.checkForUpdatesInteractive()),
+        menuAction(t("menu.exportLogs"), async () => {
+            const err = await window.go.main.App.ExportLogs();
+            if (err) V().toast("export failed: " + err, "warn");
+            else V().toast("logs exported");
+        }),
+        divider(),
+        menuAction(t("menu.about"), dlgAbout),
         menuAction("Open log folder", async () => {
             const err = await window.go.main.App.OpenLogFolder();
             if (err) V().toast("cannot open log folder: " + err, "warn");
@@ -274,6 +470,18 @@ export function initMenu() {
     ]);
 
     const bar = $("menubar");
-    for (const m of [connections, bookmarks, self, permissions, tools, help]) bar.appendChild(m);
+    for (const m of [connections, bookmarks, self, view, permissions, tools, help]) bar.appendChild(m);
     document.addEventListener("click", closeMenus);
+}
+
+// setTheme switches the UI theme (294/295) and persists it.
+async function setTheme(theme) {
+    const s = Object.assign({}, V().state.settings || {}, { theme });
+    const err = await window.go.main.App.SaveSettings(s);
+    if (err) {
+        V().toast("save failed: " + err, "warn");
+        return;
+    }
+    V().state.settings = s;
+    V().applyAppearance();
 }

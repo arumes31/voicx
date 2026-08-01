@@ -1,0 +1,200 @@
+// notifications.js — wave-9 notification dispatch (383-391, 215): a central
+// notify() honoring the matrix (385), per-channel overrides (386/391),
+// muted channels (387), and DND (347/348, still badging silently). Also the
+// buddy-online watcher (383), keyword highlights (388), channel watch
+// (389), and the alpha notice (215).
+import { playEvent, play } from "./sounds.js";
+
+const V = () => window.__voicx;
+const App = () => window.go.main.App;
+
+// MATRIX_EVENTS are the rows of the notification matrix (385).
+export const MATRIX_EVENTS = [
+    ["mention", "mention"],
+    ["keyword", "keyword highlight"],
+    ["dm", "direct message"],
+    ["poke", "poke"],
+    ["join_leave", "join/leave (your channel)"],
+    ["buddy_online", "watched contact online"],
+    ["kick", "kick/ban"],
+    ["announcement", "announcement"],
+    ["channel_watch", "channel watch"],
+];
+
+// matrixRow returns the effective outputs for an event (defaults: all on
+// except native for chatty events).
+function matrixRow(event) {
+    const m = V().state.settings?.notify_matrix?.[event];
+    if (m) return m;
+    return { toast: true, sound: true, flash: event !== "join_leave" && event !== "buddy_online", native: event === "mention" || event === "poke" || event === "dm" };
+}
+
+// channelKey builds the per-channel override key ("addr#channelID").
+function channelKey(channelID) {
+    const addr = V().state.lastConnect?.addr || "";
+    return addr + "#" + channelID;
+}
+
+// channelOverride returns the override for a channel (or null).
+export function channelOverride(channelID) {
+    return V().state.settings?.channel_notify?.[channelKey(channelID)] || null;
+}
+
+export async function saveChannelOverride(channelID, ov) {
+    const s = V().state.settings;
+    s.channel_notify = s.channel_notify || {};
+    s.channel_notify[channelKey(channelID)] = ov;
+    await App().SaveSettings(s);
+    V().renderTree();
+}
+
+// overrideAllows applies an inherit|on|off override for an event class.
+// className is "messages" | "mentions" | "joins".
+function overrideAllows(channelID, className, defaultOn) {
+    if (!channelID) return defaultOn;
+    const ov = channelOverride(channelID);
+    if (!ov) return defaultOn;
+    if (ov.muted) return false;
+    const v = ov[className];
+    if (v === "on") return true;
+    if (v === "off") return false;
+    return defaultOn;
+}
+
+// notify is the single dispatch point for user-facing notifications:
+// DND → record-only; muted/overridden channels → filtered; matrix → which
+// outputs fire. ctx: {channelID, uid, className ("messages"|"mentions"|"joins"), noSound}.
+export function notify(event, text, ctx = {}) {
+    // (346) always record in the notification center (even under DND).
+    window.__voicxPolish?.recordNotification(event, text, ctx);
+    if (window.__voicxPolish?.dndActive?.()) return;
+    if (!overrideAllows(ctx.channelID, ctx.className || "messages", true)) return;
+    const row = matrixRow(event);
+    if (row.toast) V().toast(text, ctx.kind || "info", ctx.category || "social");
+    if (row.sound && !ctx.noSound) playEventSound(event);
+    if (row.flash) App().FlashWindow();
+    if (row.native && !document.hasFocus()) App().Notify("voicx " + event, text.slice(0, 200));
+}
+
+// playEventSound plays an event's sound: custom beep (384) when configured,
+// else the sound pack preset.
+function playEventSound(event) {
+    if (window.__voicxPolish?.dndActive?.()) return;
+    const spec = V().state.settings?.custom_sounds?.[event];
+    if (spec && spec.freq > 0) {
+        play("sine", spec.freq, (spec.duration_ms || 200) / 1000, (V().state.settings?.sound_volume ?? 100) / 100);
+        return;
+    }
+    playEvent(event);
+}
+
+// ---------------------------------------------------------------------------
+// Buddy online (383)
+// ---------------------------------------------------------------------------
+
+let buddyNotified = new Set(); // uniqueIDs already toasted this connect
+
+export function resetBuddyWatch() {
+    buddyNotified = new Set();
+}
+
+// checkBuddyOnline fires once per connect when a watched contact is online.
+export function checkBuddyOnline() {
+    const s = V().state.settings;
+    if (!s) return;
+    for (const c of s.contacts || []) {
+        if (!c.notify_online || buddyNotified.has(c.unique_id)) continue;
+        const online = V().state.clients.find((x) => x.unique_id === c.unique_id);
+        if (online) {
+            buddyNotified.add(c.unique_id);
+            notify("buddy_online", (c.label || online.nickname || "contact") + " is online", { className: "joins", kind: "info" });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Keyword highlights (388)
+// ---------------------------------------------------------------------------
+
+// matchKeyword returns the matched keyword when the text contains one
+// (case-insensitive whole-word match), else "".
+export function matchKeyword(text) {
+    const addr = V().state.lastConnect?.addr || "";
+    const words = V().state.settings?.keywords?.[addr] || [];
+    const lower = text.toLowerCase();
+    for (const w of words) {
+        if (!w) continue;
+        const needle = w.toLowerCase();
+        let i = lower.indexOf(needle);
+        while (i >= 0) {
+            const before = i === 0 || /[\s\p{P}]/u.test(lower[i - 1]);
+            const afterIdx = i + needle.length;
+            const after = afterIdx >= lower.length || /[\s\p{P}]/u.test(lower[afterIdx]);
+            if (before && after) return w;
+            i = lower.indexOf(needle, i + 1);
+        }
+    }
+    return "";
+}
+
+// ---------------------------------------------------------------------------
+// Channel watch (389)
+// ---------------------------------------------------------------------------
+
+let watchCounts = new Map(); // channelID -> last seen user count
+
+// checkChannelWatch fires when a watched channel crosses 0→threshold.
+export function checkChannelWatch() {
+    const overrides = V().state.settings?.channel_notify || {};
+    for (const [key, ov] of Object.entries(overrides)) {
+        if (!ov.watch_threshold) continue;
+        const channelID = Number(key.split("#")[1]);
+        const count = V().state.clients.filter((c) => c.channel_id === channelID).length;
+        const prev = watchCounts.get(channelID) ?? count;
+        if (prev < ov.watch_threshold && count >= ov.watch_threshold) {
+            const ch = V().state.channels.find((c) => c.ChannelID === channelID);
+            notify("channel_watch", `#${ch ? ch.Name : channelID} now has ${count} user(s)`, { className: "joins", kind: "info" });
+        }
+        watchCounts.set(channelID, count);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Alpha notice (215)
+// ---------------------------------------------------------------------------
+
+export function maybeAlphaNotice(force = false) {
+    const s = V().state.settings;
+    const ver = V().state.clientVersion || "";
+    if (!s || !ver || (!force && s.alpha_dismissed === ver)) return;
+    const overlay = document.createElement("div");
+    overlay.className = "dlg-overlay";
+    overlay.innerHTML = `
+        <div class="dlg">
+            <h3>voicx is alpha software</h3>
+            <div class="dlg-text">
+                <p>voicx ${ver} is under construction — expect bugs and rough edges.
+                Please report issues on the project tracker (Help → About has the link).</p>
+                <label class="dlg-label"><input type="checkbox" class="alpha-skip" /> don't show again for this version</label>
+            </div>
+            <div class="dlg-buttons"><button class="dlg-ok">Got it</button></div>
+        </div>`;
+    overlay.querySelector(".dlg-ok").onclick = async () => {
+        if (overlay.querySelector(".alpha-skip").checked) {
+            s.alpha_dismissed = ver;
+            await App().SaveSettings(s);
+        }
+        overlay.remove();
+    };
+    document.body.appendChild(overlay);
+}
+
+export function initNotifications() {
+    window.__voicxNotify = {
+        notify, checkBuddyOnline, resetBuddyWatch, matchKeyword,
+        checkChannelWatch, channelOverride, saveChannelOverride, maybeAlphaNotice,
+    };
+    const badge = document.getElementById("alpha-badge");
+    if (badge) badge.onclick = () => maybeAlphaNotice(true);
+    setTimeout(() => maybeAlphaNotice(false), 1200);
+}

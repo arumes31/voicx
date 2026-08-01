@@ -93,7 +93,7 @@ func TestUploadRoundTrip(t *testing.T) {
 	addr, s := startServer(t, fs)
 
 	content := []byte("hello world")
-	id, token, err := s.InitUpload(context.Background(), 7, "hello.txt", int64(len(content)), "uid-1")
+	id, token, err := s.InitUpload(context.Background(), 7, "", "hello.txt", int64(len(content)), "uid-1")
 	if err != nil {
 		t.Fatalf("InitUpload: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestUploadRoundTrip(t *testing.T) {
 		t.Fatalf("file content = %q, want %q", onDisk, content)
 	}
 
-	rec, err := fs.GetFile(context.Background(), 7, "hello.txt")
+	rec, err := fs.GetFile(context.Background(), 7, "", "hello.txt")
 	if err != nil {
 		t.Fatalf("GetFile: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestUploadSizeMismatch(t *testing.T) {
 	fs := newFakeFileStore()
 	addr, s := startServer(t, fs)
 
-	id, token, err := s.InitUpload(context.Background(), 7, "m.txt", 4, "uid-1")
+	id, token, err := s.InitUpload(context.Background(), 7, "", "m.txt", 4, "uid-1")
 	if err != nil {
 		t.Fatalf("InitUpload: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestUploadChecksumMismatch(t *testing.T) {
 	addr, s := startServer(t, fs)
 
 	content := []byte("abcd")
-	id, token, err := s.InitUpload(context.Background(), 7, "c.txt", 4, "uid-1")
+	id, token, err := s.InitUpload(context.Background(), 7, "", "c.txt", 4, "uid-1")
 	if err != nil {
 		t.Fatalf("InitUpload: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestDownloadRoundTrip(t *testing.T) {
 		t.Fatalf("AddFile: %v", err)
 	}
 
-	id, token, err := s.InitDownload(context.Background(), 7, "doc.txt")
+	id, token, err := s.InitDownload(context.Background(), 7, "", "doc.txt")
 	if err != nil {
 		t.Fatalf("InitDownload: %v", err)
 	}
@@ -256,7 +256,7 @@ done:
 func TestDownloadMissing(t *testing.T) {
 	fs := newFakeFileStore()
 	_, s := startServer(t, fs)
-	if _, _, err := s.InitDownload(context.Background(), 7, "nope.txt"); err == nil {
+	if _, _, err := s.InitDownload(context.Background(), 7, "", "nope.txt"); err == nil {
 		t.Fatal("InitDownload for missing file succeeded")
 	}
 }

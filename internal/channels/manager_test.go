@@ -603,3 +603,108 @@ func TestLoadIntoState(t *testing.T) {
 		return !ok && !channelExistsInDB(t, s, tempID)
 	}, "temporary channel was not cleaned up after LoadIntoState")
 }
+
+// TestUpdateChannel_Persistence verifies UpdateChannel writes non-nil fields
+// to the DB and mirrors them into state, leaving nil fields untouched, and
+// rejects invalid values.
+func TestUpdateChannel_Persistence(t *testing.T) {
+	mgr, s, sm := testEnv(t)
+	userID := createTestUser(t, s)
+	channelID := createParentChannel(t, mgr, sm, userID)
+
+	topic := "music room"
+	bitrate := 128000
+	stereo := true
+	if err := mgr.UpdateChannel(context.Background(), channelID, ChannelUpdate{
+		Topic:       &topic,
+		OpusBitrate: &bitrate,
+		OpusStereo:  &stereo,
+	}); err != nil {
+		t.Fatalf("UpdateChannel: %v", err)
+	}
+
+	// State reflects the edit.
+	ch, ok := sm.GetChannel(channelID)
+	if !ok {
+		t.Fatalf("channel %d not in state", channelID)
+	}
+	if ch.Topic != "music room" || ch.OpusBitrate != 128000 || !ch.OpusStereo || ch.OpusFEC || ch.OpusDTX {
+		t.Fatalf("state channel = %+v, want edited values", ch)
+	}
+
+	// The DB row reflects the edit.
+	var (
+		dbTopic   string
+		dbBitrate int
+		dbFEC     bool
+		dbStereo  bool
+	)
+	err := s.DB().QueryRowContext(context.Background(),
+		`SELECT COALESCE(topic, ''), opus_bitrate, opus_fec, opus_stereo FROM channels WHERE id = $1`,
+		channelID,
+	).Scan(&dbTopic, &dbBitrate, &dbFEC, &dbStereo)
+	if err != nil {
+		t.Fatalf("query channel row: %v", err)
+	}
+	if dbTopic != "music room" || dbBitrate != 128000 || dbStereo != true || dbFEC != false {
+		t.Fatalf("db row = (%q, %d, %v, %v), want (music room, 128000, false, true)",
+			dbTopic, dbBitrate, dbFEC, dbStereo)
+	}
+
+	// max_clients round-trips through NULL for unlimited.
+	zero := 0
+	if err := mgr.UpdateChannel(context.Background(), channelID, ChannelUpdate{MaxClients: &zero}); err != nil {
+		t.Fatalf("UpdateChannel max_clients=0: %v", err)
+	}
+	var maxClients *int
+	if err := s.DB().QueryRowContext(context.Background(),
+		`SELECT max_clients FROM channels WHERE id = $1`, channelID,
+	).Scan(&maxClients); err != nil {
+		t.Fatalf("query max_clients: %v", err)
+	}
+	if maxClients != nil {
+		t.Fatalf("max_clients = %v, want NULL (unlimited)", *maxClients)
+	}
+
+	// Invalid values are rejected; unknown channels report not-found.
+	bad := -1
+	if err := mgr.UpdateChannel(context.Background(), channelID, ChannelUpdate{OpusBitrate: &bad}); err == nil {
+		t.Fatal("negative bitrate accepted")
+	}
+	if err := mgr.UpdateChannel(context.Background(), 999999, ChannelUpdate{Topic: &topic}); !errors.Is(err, ErrChannelNotFound) {
+		t.Fatalf("unknown channel: %v, want ErrChannelNotFound", err)
+	}
+}
+
+// TestUpdateChannel_Description verifies the description column (migration
+// 008) persists and loads back into state (112/113).
+func TestUpdateChannel_Description(t *testing.T) {
+	mgr, s, sm := testEnv(t)
+	userID := createTestUser(t, s)
+	channelID := createParentChannel(t, mgr, sm, userID)
+
+	desc := "the **quiet** room — rules inside"
+	if err := mgr.UpdateChannel(context.Background(), channelID, ChannelUpdate{Description: &desc}); err != nil {
+		t.Fatalf("UpdateChannel: %v", err)
+	}
+	if ch, _ := sm.GetChannel(channelID); ch.Description != desc {
+		t.Fatalf("state description = %q, want %q", ch.Description, desc)
+	}
+	var dbDesc string
+	if err := s.DB().QueryRowContext(context.Background(),
+		`SELECT description FROM channels WHERE id = $1`, channelID,
+	).Scan(&dbDesc); err != nil {
+		t.Fatalf("query description: %v", err)
+	}
+	if dbDesc != desc {
+		t.Fatalf("db description = %q, want %q", dbDesc, desc)
+	}
+
+	// And it survives a fresh LoadIntoState.
+	if _, err := mgr.LoadIntoState(context.Background()); err != nil {
+		t.Fatalf("LoadIntoState: %v", err)
+	}
+	if ch, _ := sm.GetChannel(channelID); ch.Description != desc {
+		t.Fatalf("description after reload = %q, want %q", ch.Description, desc)
+	}
+}

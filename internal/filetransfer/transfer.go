@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"go.uber.org/zap"
@@ -78,7 +79,7 @@ func (s *Server) serve(ctx context.Context, conn net.Conn) {
 // into place with a files-table record. On any failure the .part file is
 // removed.
 func (s *Server) receiveUpload(ctx context.Context, conn net.Conn, tr *transfer) error {
-	finalPath := s.filePath(tr.ChannelID, tr.Name)
+	finalPath := s.filePath(tr.ChannelID, tr.Folder, tr.Name)
 	if err := os.MkdirAll(filepath.Dir(finalPath), 0o750); err != nil {
 		return fmt.Errorf("creating channel dir: %w", err)
 	}
@@ -135,22 +136,13 @@ func (s *Server) receiveUpload(ctx context.Context, conn net.Conn, tr *transfer)
 				_ = os.Remove(tmpPath)
 				return fmt.Errorf("closing file: %w", err)
 			}
-			if err := os.Rename(tmpPath, finalPath); err != nil {
-				_ = os.Remove(tmpPath)
-				return fmt.Errorf("finalizing file: %w", err)
-			}
-			if err := s.store.AddFile(ctx, store.FileRecord{
-				ChannelID: tr.ChannelID,
-				Name:      tr.Name,
-				Size:      received,
-				SHA256:    sum,
-				Uploader:  tr.Uploader,
-			}); err != nil {
-				return fmt.Errorf("recording file: %w", err)
+			if err := s.finalizeUpload(ctx, tr, tmpPath, finalPath, received, sum); err != nil {
+				return err
 			}
 			s.logger.Info("upload complete",
 				zap.String("transfer_id", tr.ID),
 				zap.Int64("channel_id", tr.ChannelID),
+				zap.String("folder", tr.Folder),
 				zap.String("name", tr.Name),
 				zap.Int64("size", received),
 			)
@@ -162,10 +154,79 @@ func (s *Server) receiveUpload(ctx context.Context, conn net.Conn, tr *transfer)
 	}
 }
 
+// maxFileVersions is how many old versions are kept on overwrite (264).
+const maxFileVersions = 3
+
+// finalizeUpload places a verified upload: it rotates the replaced file into
+// <name>.v1..v3 (264), hard-links to an identical existing blob when one
+// exists (275 dedup), and records the row.
+func (s *Server) finalizeUpload(ctx context.Context, tr *transfer, tmpPath, finalPath string, size int64, sum string) error {
+	// Identical re-upload of the current file: keep the blob, refresh the row.
+	if cur, err := s.store.GetFile(ctx, tr.ChannelID, tr.Folder, tr.Name); err == nil && cur.SHA256 == sum {
+		_ = os.Remove(tmpPath)
+		return s.store.AddFile(ctx, store.FileRecord{
+			ChannelID: tr.ChannelID, Folder: tr.Folder, Name: tr.Name,
+			Size: size, SHA256: sum, Uploader: tr.Uploader,
+		})
+	}
+
+	s.rotateVersions(ctx, tr)
+
+	// Dedup (275): point at an identical existing blob instead of storing a
+	// second copy.
+	linked := false
+	if ex, err := s.store.FindFileBySHA(ctx, tr.ChannelID, sum, tr.Folder, tr.Name); err == nil && ex != nil {
+		if err := os.Link(s.filePath(tr.ChannelID, ex.Folder, ex.Name), finalPath); err == nil {
+			linked = true
+			_ = os.Remove(tmpPath)
+		}
+	}
+	if !linked {
+		if err := os.Rename(tmpPath, finalPath); err != nil {
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("finalizing file: %w", err)
+		}
+	}
+	return s.store.AddFile(ctx, store.FileRecord{
+		ChannelID: tr.ChannelID, Folder: tr.Folder, Name: tr.Name,
+		Size: size, SHA256: sum, Uploader: tr.Uploader,
+	})
+}
+
+// rotateVersions shifts <name>.v1..v2 up one slot (dropping the oldest) and
+// renames the current file to <name>.v1 (264). Failures are logged, not
+// fatal: losing a version must not break the upload.
+func (s *Server) rotateVersions(ctx context.Context, tr *transfer) {
+	rename := func(folder, from, to string) {
+		if _, err := s.store.GetFile(ctx, tr.ChannelID, folder, from); err != nil {
+			return // nothing to rotate
+		}
+		if err := s.store.RenameFile(ctx, tr.ChannelID, folder, from, folder, to); err != nil {
+			s.logger.Warn("version rotate (db) failed", zap.String("from", from), zap.Error(err))
+			return
+		}
+		oldPath := s.filePath(tr.ChannelID, folder, from)
+		newPath := s.filePath(tr.ChannelID, folder, to)
+		if err := os.Rename(oldPath, newPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			s.logger.Warn("version rotate (disk) failed", zap.String("from", from), zap.Error(err))
+		}
+	}
+	// Oldest version falls off the end.
+	oldest := tr.Name + ".v" + strconv.Itoa(maxFileVersions)
+	if _, err := s.store.GetFile(ctx, tr.ChannelID, tr.Folder, oldest); err == nil {
+		_ = s.store.DeleteFile(ctx, tr.ChannelID, tr.Folder, oldest)
+		_ = os.Remove(s.filePath(tr.ChannelID, tr.Folder, oldest))
+	}
+	for v := maxFileVersions - 1; v >= 1; v-- {
+		rename(tr.Folder, tr.Name+".v"+strconv.Itoa(v), tr.Name+".v"+strconv.Itoa(v+1))
+	}
+	rename(tr.Folder, tr.Name, tr.Name+".v1")
+}
+
 // sendDownload streams the file in chunk frames followed by the digest
 // frame carrying its SHA-256.
 func (s *Server) sendDownload(conn net.Conn, tr *transfer) error {
-	f, err := os.Open(s.filePath(tr.ChannelID, tr.Name))
+	f, err := os.Open(s.filePath(tr.ChannelID, tr.Folder, tr.Name))
 	if err != nil {
 		return fmt.Errorf("opening file: %w", err)
 	}
