@@ -128,12 +128,41 @@ func (s *TCPServer) BanClient(ctx context.Context, byClientID, targetID string, 
 // SendServerText injects a chat message as the server (e.g. from
 // ServerQuery). targetMode: 1 = direct to client (target is a client ID),
 // 2 = channel (target is a channel ID), 3 = global.
+//
+// The text is SEALED like any other chat body (91): the channel generation
+// for mode 2, the global generation for modes 1 and 3. Mode 1 is therefore a
+// server notice delivered to one client, NOT an E2EE direct message — the
+// server has no DM key and never did, so any holder of the global generation
+// who intercepts the frame can read it. The UI labels it as a notice.
 func (s *TCPServer) SendServerText(targetMode int, target, msg string) error {
 	if s.deps == nil || s.deps.Broadcast == nil {
 		return errors.New("broadcast backend unavailable")
 	}
+	if s.chatKeys == nil || !s.chatKeys.configured() {
+		return errChatKeysUnconfigured
+	}
 
-	chat := netproto.ChatBroadcast{From: "ServerQuery", Text: msg}
+	if targetMode < 1 || targetMode > 3 {
+		return fmt.Errorf("invalid targetmode %d", targetMode)
+	}
+	// ServerQuery has no request context; the seal is a local key lookup plus
+	// at most one row read.
+	ctx := context.Background()
+	scope := globalChatScope
+	var channelID int64
+	if targetMode == 2 {
+		id, err := strconv.ParseInt(target, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid channel id %q", target)
+		}
+		channelID, scope = id, id
+	}
+	keyID, sealed, err := s.chatKeys.seal(ctx, scope, msg)
+	if err != nil {
+		return fmt.Errorf("sealing server text for scope %d: %w", scope, err)
+	}
+
+	chat := netproto.ChatBroadcast{From: "ServerQuery", Text: sealed, Enc: true, KeyID: keyID}
 	switch targetMode {
 	case 1:
 		payload, err := eventEnvelope(eventChat, chat)
@@ -142,10 +171,6 @@ func (s *TCPServer) SendServerText(targetMode int, target, msg string) error {
 		}
 		return s.deps.Broadcast.BroadcastToClient(target, payload)
 	case 2:
-		channelID, err := strconv.ParseInt(target, 10, 64)
-		if err != nil {
-			return fmt.Errorf("invalid channel id %q", target)
-		}
 		chat.ChannelID = target
 		payload, err := eventEnvelope(eventChat, chat)
 		if err != nil {

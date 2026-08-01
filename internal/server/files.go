@@ -61,11 +61,18 @@ func (s *TCPServer) handleFileTransferInit(ctx context.Context, client *Client, 
 		zap.Int64("channel_id", msg.ChannelID),
 		zap.String("name", msg.Name),
 	)
-	return s.writeMessage(client, netproto.MsgFileTransferInitResponse, netproto.FileTransferInitResponse{
+	resp := netproto.FileTransferInitResponse{
 		TransferID: transferID,
 		Token:      token,
 		Port:       s.deps.FileTransfer.Port(),
-	})
+	}
+	// The data port presents the SAME certificate as the control channel, so
+	// the client re-uses the pin it already holds. Without these an
+	// un-upgraded client hangs in a handshake instead of failing legibly.
+	if fp := s.deps.FileTransfer.Fingerprint(); fp != "" {
+		resp.TLS, resp.TLSFingerprint = true, fp
+	}
+	return s.writeMessage(client, netproto.MsgFileTransferInitResponse, resp)
 }
 
 // fileEntries maps store records to wire entries.

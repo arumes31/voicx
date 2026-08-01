@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -411,8 +412,53 @@ func (s *TCPServer) parseMentions(ctx context.Context, client *Client, channelID
 // History (103)
 // ---------------------------------------------------------------------------
 
-// handleChatHistory returns a paged, decrypted history for a scope the
-// caller belongs to (guests included; membership is checked at query time).
+// maxKeysPerResponse caps the sealed generations piggybacked on one history
+// or pins page. Overflow sets Truncated so the client re-requests the rest;
+// it is NEVER reported as Refused, which is a permanent state (91).
+const maxKeysPerResponse = 64
+
+// publishedKey returns the caller's X25519 public key, or "" when it never
+// published one. A client with no key cannot open anything, so history and
+// pins refuse it outright rather than shipping rows it provably cannot read.
+func (s *TCPServer) publishedKey(client *Client) string {
+	if s.deps == nil || s.deps.State == nil {
+		return ""
+	}
+	sc, ok := s.deps.State.GetClient(client.ID)
+	if !ok {
+		return ""
+	}
+	return sc.E2EPublicKey
+}
+
+// scopeKeyBundle seals every generation a page references for the caller.
+// Generations are sorted so the bundle is deterministic, and the cap is
+// reported as truncation rather than refusal.
+func (s *TCPServer) scopeKeyBundle(ctx context.Context, scope int64, memberPub string, gens map[uint32]bool) (keys []netproto.ChannelKey, refused []uint32, truncated bool) {
+	ordered := make([]uint32, 0, len(gens))
+	for gen := range gens {
+		ordered = append(ordered, gen)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	for _, gen := range ordered {
+		if len(keys) >= maxKeysPerResponse {
+			truncated = true
+			break
+		}
+		ck, err := s.chatKeys.sealFor(ctx, scope, gen, memberPub)
+		if err != nil {
+			refused = append(refused, gen)
+			continue
+		}
+		keys = append(keys, *ck)
+	}
+	return keys, refused, truncated
+}
+
+// handleChatHistory returns a paged history for a scope the caller belongs
+// to (guests included; membership is checked at query time). Bodies are
+// ciphertext; the generations that page references ride along in Keys, so a
+// scroll-back costs no extra round trips (91).
 func (s *TCPServer) handleChatHistory(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.ChatHistory
 	if err := netproto.Decode(f, &msg); err != nil {
@@ -421,11 +467,12 @@ func (s *TCPServer) handleChatHistory(ctx context.Context, client *Client, f *ne
 	if s.deps == nil || s.deps.Chat == nil || s.deps.State == nil {
 		return s.sendError(client, errCodeUnavailable, "chat store unavailable")
 	}
-	if msg.ChannelID != 0 {
-		sc, ok := s.deps.State.GetClient(client.ID)
-		if !ok || sc.ChannelID != msg.ChannelID {
-			return s.sendError(client, errCodePermissionDenied, "not a member of this channel")
-		}
+	if !s.scopeReadable(client, msg.ChannelID) {
+		return s.sendError(client, errCodePermissionDenied, "not a member of this channel")
+	}
+	memberPub := s.publishedKey(client)
+	if memberPub == "" {
+		return s.sendError(client, errCodePermissionDenied, "publish an encryption key before reading history")
 	}
 
 	msgs, err := s.deps.Chat.ChatHistory(ctx, msg.ChannelID, msg.BeforeID, msg.Limit)
@@ -442,9 +489,15 @@ func (s *TCPServer) handleChatHistory(ctx context.Context, client *Client, f *ne
 	}
 
 	resp := netproto.ChatHistoryResponse{ChannelID: msg.ChannelID, Messages: []netproto.ChatHistoryEntry{}}
+	gens := map[uint32]bool{}
 	for _, m := range msgs {
-		resp.Messages = append(resp.Messages, chatHistoryEntry(m, reactions[m.ID]))
+		e := chatHistoryEntry(m, reactions[m.ID])
+		if e.KeyID != 0 {
+			gens[e.KeyID] = true
+		}
+		resp.Messages = append(resp.Messages, e)
 	}
+	resp.Keys, resp.Refused, resp.Truncated = s.scopeKeyBundle(ctx, msg.ChannelID, memberPub, gens)
 	return s.writeMessage(client, netproto.MsgChatHistoryResponse, resp)
 }
 
@@ -474,9 +527,10 @@ func chatHistoryEntry(m store.ChatMessage, reactions map[string]int) netproto.Ch
 // Edit (101) + delete (102)
 // ---------------------------------------------------------------------------
 
-// handleChatEdit edits the caller's own message: decrypt (when enc), filter,
-// update, and broadcast chat_edited with the re-sealed body so the wire
-// format stays uniform with normal chat.
+// handleChatEdit edits the caller's own message: validate the generation,
+// decrypt for moderation, store the caller's ciphertext VERBATIM, and
+// broadcast those same bytes. Storing the sender's own bytes means the bytes
+// that were moderated are exactly the bytes that end up at rest (91).
 func (s *TCPServer) handleChatEdit(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.ChatEdit
 	if err := netproto.Decode(f, &msg); err != nil {
@@ -484,6 +538,9 @@ func (s *TCPServer) handleChatEdit(ctx context.Context, client *Client, f *netpr
 	}
 	if s.deps == nil || s.deps.Chat == nil {
 		return s.sendError(client, errCodeUnavailable, "chat store unavailable")
+	}
+	if !msg.Enc && (s.cfg == nil || !s.cfg.ChatAllowPlaintext) {
+		return s.sendError(client, errCodePermissionDenied, "plaintext chat is disabled on this server — update your client (chat encryption is mandatory)")
 	}
 	stored, err := s.deps.Chat.GetChatMessage(ctx, msg.MessageID)
 	if err != nil {
@@ -495,11 +552,20 @@ func (s *TCPServer) handleChatEdit(ctx context.Context, client *Client, f *netpr
 	if stored.FromUniqueID != client.UniqueID {
 		return s.sendError(client, errCodePermissionDenied, "you can only edit your own messages")
 	}
+	if s.chatKeys == nil {
+		return s.sendError(client, errCodeUnavailable, "chat key manager unavailable")
+	}
 
 	plain := msg.NewText
 	if msg.Enc {
-		if s.chatKeys == nil {
-			return s.sendError(client, errCodeUnavailable, "chat key manager unavailable")
+		// Mirror handleChatSend: an edit under a rotated generation would
+		// otherwise fail deep in the pipeline with a confusing error.
+		currentID, _, err := s.chatKeys.current(ctx, stored.ChannelID)
+		if err != nil {
+			return s.sendError(client, errCodeUnavailable, "no chat key for this channel yet — rejoin the channel")
+		}
+		if msg.KeyID != currentID {
+			return s.sendError(client, errCodeMalformed, "stale chat key for channel (key rotated; wait for re-key)")
 		}
 		p, err := s.chatKeys.open(ctx, stored.ChannelID, msg.KeyID, msg.NewText)
 		if err != nil {
@@ -510,12 +576,14 @@ func (s *TCPServer) handleChatEdit(ctx context.Context, client *Client, f *netpr
 	if utf8.RuneCountInString(plain) > s.cfg.ChatMaxLength && s.cfg.ChatMaxLength > 0 {
 		return s.sendError(client, errCodeMalformed, fmt.Sprintf("message too long (max %d characters)", s.cfg.ChatMaxLength))
 	}
-	if err := s.moderateBody(plain); err != nil {
+	if err := s.moderateBody(stripAttachmentRefs(plain)); err != nil {
 		return s.sendError(client, errCodeMalformed, err.Error())
 	}
 
-	bodyEnc, keyID := plain, uint32(0)
-	if msg.Enc && s.chatKeys != nil {
+	// The plaintext escape hatch never reaches storage or the relay: the
+	// server seals before both, exactly as it does on the send path.
+	bodyEnc, keyID := msg.NewText, msg.KeyID
+	if !msg.Enc {
 		id, ct, err := s.chatKeys.seal(ctx, stored.ChannelID, plain)
 		if err != nil {
 			return s.sendError(client, errCodeUnavailable, "chat key unavailable")
@@ -527,13 +595,13 @@ func (s *TCPServer) handleChatEdit(ctx context.Context, client *Client, f *netpr
 		return s.sendError(client, errCodeNotFound, "edit failed: "+err.Error())
 	}
 
-	// Broadcast the edit re-sealed with the current scope key (uniform wire
-	// format: clients decrypt like normal chat).
+	// Uniform wire format: the edit event carries ciphertext like any other
+	// chat frame, whatever the sender did.
 	s.broadcastScope(stored.ChannelID, eventChatEdited, map[string]any{
 		"message_id": msg.MessageID,
 		"channel_id": stored.ChannelID,
 		"body":       bodyEnc,
-		"enc":        msg.Enc,
+		"enc":        true,
 		"key_id":     keyID,
 		"edited_by":  client.UniqueID,
 	})
@@ -647,7 +715,11 @@ func (s *TCPServer) handleChatPin(ctx context.Context, client *Client, f *netpro
 	return nil
 }
 
-// handleChatPins lists a channel's pins.
+// handleChatPins lists a channel's pins. It is gated exactly like history:
+// without the membership check any authenticated client could enumerate the
+// message ids, authors, timestamps and bodies of a channel it never joined,
+// and key-gating alone would close the body leak while leaving the metadata
+// enumeration open (91).
 func (s *TCPServer) handleChatPins(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.ChatPins
 	if err := netproto.Decode(f, &msg); err != nil {
@@ -656,19 +728,31 @@ func (s *TCPServer) handleChatPins(ctx context.Context, client *Client, f *netpr
 	if s.deps == nil || s.deps.Chat == nil {
 		return s.sendError(client, errCodeUnavailable, "chat store unavailable")
 	}
+	if !s.scopeReadable(client, msg.ChannelID) {
+		return s.sendError(client, errCodePermissionDenied, "not a member of this channel")
+	}
+	memberPub := s.publishedKey(client)
+	if memberPub == "" {
+		return s.sendError(client, errCodePermissionDenied, "publish an encryption key before reading history")
+	}
 	pins, err := s.deps.Chat.ChatPins(ctx, msg.ChannelID)
 	if err != nil {
 		return s.sendError(client, errCodeUnavailable, "pins query failed")
 	}
 	resp := netproto.ChatPinsResponse{ChannelID: msg.ChannelID, Pins: []netproto.ChatPinEntry{}}
+	gens := map[uint32]bool{}
 	for _, p := range pins {
 		entry := netproto.ChatPinEntry{MessageID: p.MessageID, PinnedBy: p.PinnedBy, PinnedAt: p.PinnedAt.Unix()}
 		if p.Message != nil {
 			m := chatHistoryEntry(*p.Message, nil)
+			if m.KeyID != 0 {
+				gens[m.KeyID] = true
+			}
 			entry.Message = &m
 		}
 		resp.Pins = append(resp.Pins, entry)
 	}
+	resp.Keys, resp.Refused, resp.Truncated = s.scopeKeyBundle(ctx, msg.ChannelID, memberPub, gens)
 	return s.writeMessage(client, netproto.MsgChatPinsResponse, resp)
 }
 
@@ -894,7 +978,14 @@ func (s *TCPServer) handleEmojiGet(_ context.Context, client *Client, f *netprot
 // Server settings: MOTD + announcement (132/133)
 // ---------------------------------------------------------------------------
 
-// serverSetting returns a server setting ("" when unset or no store).
+// sealedSetting reports whether a server setting is operator-authored
+// broadcast text and therefore stored under the global generation (132/133).
+// Everything else (server_name, max_clients_override) is machine
+// configuration, not message content, and stays plain.
+func sealedSetting(key string) bool { return key == "motd" || key == "announcement" }
+
+// serverSetting returns an UNSEALED server setting ("" when unset or no
+// store). Callers must not use it for sealed keys — see serverSettingPlain.
 func (s *TCPServer) serverSetting(ctx context.Context, key string) string {
 	if s.deps == nil || s.deps.Chat == nil {
 		return ""
@@ -906,18 +997,96 @@ func (s *TCPServer) serverSetting(ctx context.Context, key string) string {
 	return v
 }
 
-// SetServerSettingAndAnnounce stores a server setting; the "announcement"
-// key is additionally broadcast to all online clients.
+// serverSettingSealed returns a sealed setting as (ciphertext, generation),
+// re-sealing it under the current global generation first when the stored
+// generation is retired or the value predates 012. Without the re-seal a
+// global rotation would lock everyone out of the MOTD forever.
+func (s *TCPServer) serverSettingSealed(ctx context.Context, key string) (string, uint32, error) {
+	if s.deps == nil || s.deps.Chat == nil {
+		return "", 0, nil
+	}
+	v, gen, err := s.deps.Chat.GetServerSetting(ctx, key)
+	if err != nil || v == "" {
+		return "", 0, err
+	}
+	if s.chatKeys == nil || !s.chatKeys.configured() {
+		return "", 0, errChatKeysUnconfigured
+	}
+	currentID, _, err := s.chatKeys.current(ctx, globalChatScope)
+	if err != nil {
+		return "", 0, err
+	}
+	if gen == currentID {
+		return v, gen, nil
+	}
+	plain := v
+	if gen != 0 {
+		p, err := s.chatKeys.open(ctx, globalChatScope, gen, v)
+		if err != nil {
+			return "", 0, fmt.Errorf("opening %s under generation %d: %w", key, gen, err)
+		}
+		plain = p
+	}
+	id, ct, err := s.chatKeys.seal(ctx, globalChatScope, plain)
+	if err != nil {
+		return "", 0, err
+	}
+	if err := s.deps.Chat.SetServerSetting(ctx, key, ct, id); err != nil {
+		// The re-seal still stands for this caller; the write-back is an
+		// optimisation, not a correctness requirement.
+		s.logger.Warn("persisting re-sealed server setting failed", zap.String("key", key), zap.Error(err))
+	}
+	return ct, id, nil
+}
+
+// serverSettingPlain returns a sealed setting's plaintext, for the one
+// surface that must serve it in the clear (the public server-info reply).
+func (s *TCPServer) serverSettingPlain(ctx context.Context, key string) string {
+	if s.deps == nil || s.deps.Chat == nil {
+		return ""
+	}
+	v, gen, err := s.deps.Chat.GetServerSetting(ctx, key)
+	if err != nil || v == "" || gen == 0 {
+		if err != nil {
+			return ""
+		}
+		return v
+	}
+	if s.chatKeys == nil {
+		return ""
+	}
+	plain, err := s.chatKeys.open(ctx, globalChatScope, gen, v)
+	if err != nil {
+		return ""
+	}
+	return plain
+}
+
+// SetServerSettingAndAnnounce stores a server setting. The operator-authored
+// broadcast texts (motd, announcement) are SEALED under the current global
+// generation before they touch the database, so a dump never yields them;
+// "announcement" is additionally broadcast to all online clients.
 func (s *TCPServer) SetServerSettingAndAnnounce(ctx context.Context, key, value string) error {
 	if s.deps == nil || s.deps.Chat == nil {
 		return errors.New("chat store unavailable")
 	}
 	keyID := uint32(0)
-	if key == "announcement" && value != "" && s.chatKeys != nil {
-		id, ct, err := s.chatKeys.seal(ctx, 0, value)
-		if err == nil {
-			value, keyID = ct, id
+	if sealedSetting(key) && value != "" {
+		if s.chatKeys == nil || !s.chatKeys.configured() {
+			return errChatKeysUnconfigured
 		}
+		// Global is a fixed, known scope; the boot-time mint normally beat us
+		// here, and ensuring it is the documented authorised third site.
+		if _, _, err := s.chatKeys.EnsureScope(ctx, globalChatScope); err != nil {
+			s.logger.Warn("ensuring global chat key failed", zap.String("key", key), zap.Error(err))
+			return fmt.Errorf("ensuring global chat key for %s: %w", key, err)
+		}
+		id, ct, err := s.chatKeys.seal(ctx, globalChatScope, value)
+		if err != nil {
+			s.logger.Warn("sealing server setting failed", zap.String("key", key), zap.Error(err))
+			return fmt.Errorf("sealing %s: %w", key, err)
+		}
+		value, keyID = ct, id
 	}
 	if err := s.deps.Chat.SetServerSetting(ctx, key, value, keyID); err != nil {
 		return err
@@ -926,10 +1095,4 @@ func (s *TCPServer) SetServerSettingAndAnnounce(ctx context.Context, key, value 
 		s.broadcastEvent(eventAnnouncement, map[string]any{"text": value, "enc": keyID > 0, "key_id": keyID})
 	}
 	return nil
-}
-
-// parseChannelID parses a string channel id ("" = 0).
-func parseChannelID(s string) int64 {
-	id, _ := strconv.ParseInt(s, 10, 64)
-	return id
 }

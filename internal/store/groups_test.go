@@ -6,7 +6,6 @@ package store
 import (
 	"context"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 )
@@ -15,11 +14,7 @@ import (
 // wave-6a tables/columns exist.
 func testDBStore(t *testing.T) *Store {
 	t.Helper()
-	url := os.Getenv("VOICX_TEST_DATABASE_URL")
-	if url == "" {
-		url = "postgres://voicx:voicx@127.0.0.1:55432/voicx?sslmode=disable"
-	}
-	s, err := New(url, testLogger(), 2, 1, time.Minute)
+	s, err := New(testDBURL(), testLogger(), 2, 1, time.Minute)
 	if err != nil {
 		t.Skipf("no database available (%v); skipping DB-backed test", err)
 	}

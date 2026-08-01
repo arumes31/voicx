@@ -70,9 +70,11 @@ type Config struct {
 	// certificate as the control channel. false is a dev-only escape hatch.
 	FileTLSEnabled bool `mapstructure:"file_tls_enabled"`
 
-	// ServerInfoMOTD includes the MOTD in the public server-info reply (313).
-	// That reply answers callers holding no scope key, so it is the one
-	// deliberate plaintext exception; set false to omit it entirely.
+	// ServerInfoMOTD includes the MOTD in the server-info reply (313) as
+	// PLAINTEXT. Off by default: the reply is authenticated-only and the
+	// sealed MOTD already rides the AuthResponse, so serving it again in the
+	// clear would be the one path that escapes ciphertext-at-rest (91-135).
+	// Enable only for a deliberately public, non-sensitive MOTD.
 	ServerInfoMOTD bool `mapstructure:"server_info_motd"`
 
 	// DefaultGroupsEnabled auto-creates the Guest/Member server groups and
@@ -198,7 +200,7 @@ func Load() (*Config, error) {
 	v.SetDefault("chat_key_rotate_min_seconds", 60)
 	v.SetDefault("chat_search_max_messages", 2000)
 	v.SetDefault("file_tls_enabled", true)
-	v.SetDefault("server_info_motd", true)
+	v.SetDefault("server_info_motd", false)
 	v.SetDefault("default_groups_enabled", true)
 	v.SetDefault("chat_max_length", 2000)
 	v.SetDefault("chat_rate_msgs", 5)

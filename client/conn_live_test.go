@@ -584,11 +584,11 @@ func TestLiveFileManagement(t *testing.T) {
 	if err := json.Unmarshal(f.Payload, &init); err != nil {
 		t.Fatalf("decode init: %v", err)
 	}
-	ftAddr, err := app.ftAddr(init.Port)
+	ep, err := app.ftTarget(init)
 	if err != nil {
-		t.Fatalf("ftAddr: %v", err)
+		t.Fatalf("ftTarget: %v", err)
 	}
-	if err := ftUpload(ftAddr, init.Token, init.TransferID, []byte("docs")); err != nil {
+	if err := ftUpload(ep, init.Token, init.TransferID, []byte("docs")); err != nil {
 		t.Fatalf("folder upload: %v", err)
 	}
 	defer app.FileDelete(channelID, "docs", folderFile)

@@ -1,6 +1,7 @@
 // tls_test.go covers the encrypted data port (91-135): the listener refuses
 // plaintext peers, transfers survive a fingerprint-pinned TLS dial, a wrong
-// pin aborts, and expiring links refuse client-encrypted chat attachments.
+// pin aborts, expiring links refuse client-encrypted chat attachments, and a
+// ".vcx" name is flagged and must match the digest of the bytes it carries.
 package filetransfer
 
 import (
@@ -62,6 +63,13 @@ func startTLSServer(t *testing.T, fs FileStore) (string, string, *Server) {
 		<-errCh
 	})
 	return addr, fp, s
+}
+
+// storageName mirrors the client's attachment naming rule: the first 32 hex
+// characters of the ciphertext digest plus ".vcx" (91-135). The truncation is
+// the part the server must not second-guess.
+func storageName(content []byte) string {
+	return sha256Hex(content)[:32] + encryptedSuffix
 }
 
 // pinnedTLSConfig dials with TOFU semantics: no CA chain, the presented
@@ -238,7 +246,7 @@ func TestCreateLinkRefusesEncryptedAttachment(t *testing.T) {
 	addr, s := startServer(t, fs)
 
 	content := []byte("sealed bytes")
-	name := sha256Hex(content) + encryptedSuffix
+	name := storageName(content)
 	uploadOne(t, addr, s, "", name, content)
 
 	if _, _, err := s.CreateLink(context.Background(), 7, "", name); !errors.Is(err, ErrEncryptedAttachment) {
@@ -259,7 +267,7 @@ func TestEncryptedAttachmentFlagged(t *testing.T) {
 	addr, s := startServer(t, fs)
 
 	content := []byte("ciphertext")
-	sealed := sha256Hex(content) + encryptedSuffix
+	sealed := storageName(content)
 	uploadOne(t, addr, s, "", sealed, content)
 	uploadOne(t, addr, s, "", "readme.md", []byte("plain"))
 
@@ -279,38 +287,68 @@ func TestEncryptedAttachmentFlagged(t *testing.T) {
 	}
 }
 
-// TestEncryptedAttachmentNameMismatch asserts that uploading a .vcx file whose name
-// does not match its ciphertext digest is rejected.
-func TestEncryptedAttachmentNameMismatch(t *testing.T) {
+// TestEncryptedAttachmentNameMustMatchDigest guards the contract in both
+// directions: the truncated content-derived name a conformant client sends is
+// stored, and a .vcx name unrelated to the bytes is refused. Accepting the
+// latter would let an upload displace the blob an older message points at,
+// since .vcx names deliberately skip version rotation.
+func TestEncryptedAttachmentNameMustMatchDigest(t *testing.T) {
 	fs := newFakeFileStore()
 	addr, s := startServer(t, fs)
 
 	content := []byte("ciphertext")
-	mismatchedName := "mismatched_hash.vcx"
-
-	id, token, err := s.InitUpload(context.Background(), 7, "", mismatchedName, int64(len(content)), "uid-1")
+	good := storageName(content)
+	uploadOne(t, addr, s, "", good, content)
+	rec, err := fs.GetFile(context.Background(), 7, "", good)
 	if err != nil {
-		t.Fatalf("InitUpload: %v", err)
+		t.Fatalf("GetFile(%s): %v", good, err)
+	}
+	if !rec.Encrypted {
+		t.Fatalf("%s not flagged encrypted", good)
 	}
 
-	conn, err := net.Dial("tcp", addr)
+	const forged = "holiday-photos.vcx"
+	id, token, err := s.InitUpload(context.Background(), 7, "", forged, int64(len(content)), "uid-1")
 	if err != nil {
-		t.Fatalf("dial: %v", err)
+		t.Fatalf("InitUpload %s: %v", forged, err)
 	}
+	conn := dialTransfer(t, addr, id, token)
 	defer conn.Close()
-
-	if err := writeJSON(conn, frameInit, initMsg{Token: token, TransferID: id}); err != nil {
-		t.Fatalf("writeInit: %v", err)
+	if err := netproto.WriteFrame(conn, &netproto.Frame{Type: frameChunk, Payload: content}); err != nil {
+		t.Fatalf("write chunk: %v", err)
 	}
 	if err := writeJSON(conn, frameDigest, digestMsg{SHA256: sha256Hex(content)}); err != nil {
-		t.Fatalf("writeDigest: %v", err)
+		t.Fatalf("write digest: %v", err)
 	}
-	if _, err := conn.Write(content); err != nil {
-		t.Fatalf("writeBytes: %v", err)
+	if st := readStatus(t, conn); st.OK {
+		t.Fatal("forged .vcx name accepted")
 	}
+	if _, err := fs.GetFile(context.Background(), 7, "", forged); err == nil {
+		t.Fatal("forged .vcx name was stored")
+	}
+}
 
-	status := readStatus(t, conn)
-	if status.OK {
-		t.Fatalf("uploading mismatched .vcx name succeeded, want rejection")
+// TestEncryptedAttachmentSkipsVersionRotation verifies .vcx uploads never
+// enter the .v1..v3 path (264): content-derived names cannot collide, so
+// rotation would only be a guaranteed store miss.
+func TestEncryptedAttachmentSkipsVersionRotation(t *testing.T) {
+	fs := newFakeFileStore()
+	addr, s := startServer(t, fs)
+
+	first := []byte("sealed one")
+	name := storageName(first)
+	uploadOne(t, addr, s, "", name, first)
+	// The name is the digest, so a same-name upload is by definition the same
+	// bytes: re-sending the identical blob must refresh the row, not version it.
+	uploadOne(t, addr, s, "", name, first)
+
+	if _, err := fs.GetFile(context.Background(), 7, "", name+".v1"); err == nil {
+		t.Fatal("chat attachment rotated into .v1")
+	}
+	// The plain path still rotates (264 is unchanged).
+	uploadOne(t, addr, s, "", "notes.txt", []byte("one"))
+	uploadOne(t, addr, s, "", "notes.txt", []byte("two"))
+	if _, err := fs.GetFile(context.Background(), 7, "", "notes.txt.v1"); err != nil {
+		t.Fatalf("plain upload did not rotate: %v", err)
 	}
 }

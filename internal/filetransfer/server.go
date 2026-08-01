@@ -12,16 +12,20 @@
 // and atomically renamed on success; a same-name upload replaces the
 // previous file (both on disk and in the files table).
 //
-// The port speaks TLS (91-135). The single-use token is minted on the TLS
-// control channel and then presented here, so a plaintext data port leaks the
-// token as well as the bytes: an on-path observer could lift it and pull the
-// file itself. The certificate is the one the control channel already
+// The port speaks TLS whenever Config.TLSEnabled is set (91-135); when it is
+// not, Start logs a PLAINTEXT warning, because that is a dev-only escape
+// hatch and not a supported deployment. The single-use token is minted on the
+// TLS control channel and then presented here, so a plaintext data port leaks
+// the token as well as the bytes: an on-path observer could lift it and pull
+// the file itself. The certificate is the one the control channel already
 // presents, so clients re-use the fingerprint they have already pinned.
 //
 // The package has no awareness of chat-attachment encryption: it moves opaque
 // bytes. Chat attachments are sealed by the client before upload and arrive
 // here under a content-derived ".vcx" name; the only two places that care are
-// the files.encrypted flag and the download-link refusal in links.go.
+// the files.encrypted flag and the download-link refusal in links.go. In
+// particular nothing here validates that name — the bytes are opaque, so the
+// server has no opinion on how the client derived it.
 //
 // Per-channel file passwords (TS3 b_ft_ignore_password) are out of scope.
 package filetransfer
@@ -70,10 +74,16 @@ var ErrEncryptedAttachment = errors.New("encrypted chat attachment — open it i
 // so nothing server-side can ever read it back.
 const encryptedSuffix = ".vcx"
 
+// encryptedNameLen is how much of the hex digest the client keeps in the
+// storage name (hex(sha256(ciphertext))[:32] + ".vcx"). finalizeUpload
+// re-derives it from the received bytes, so the name cannot be forged.
+const encryptedNameLen = 32
+
 // isEncryptedAttachment reports whether a stored name is a client-encrypted
-// chat attachment. The name is content-derived by the client
-// (sha256(ciphertext) + ".vcx"), which is why these never collide with an
-// existing name and so never reach the .v1..v3 rotation path.
+// chat attachment. Content-derived names never collide with an existing name
+// and so never reach the .v1..v3 rotation path. The suffix is the only
+// signal: an ordinary browser upload that happens to end in ".vcx" is treated
+// the same way, which costs nothing but a lock icon.
 func isEncryptedAttachment(name string) bool {
 	return strings.HasSuffix(name, encryptedSuffix)
 }
@@ -185,7 +195,9 @@ func (s *Server) Port() int {
 // Fingerprint returns the SHA-256 fingerprint of the certificate this port
 // presents, empty when TLS is disabled. Clients cross-check it against the
 // control-channel pin so a hostile server cannot redirect transfers to a
-// third-party host.
+// third-party host. Empty therefore also answers "is the port plaintext?",
+// which is all the control channel needs to fill both
+// FileTransferInitResponse.TLS and .TLSFingerprint from this one call.
 func (s *Server) Fingerprint() string {
 	if !s.cfg.TLSEnabled {
 		return ""

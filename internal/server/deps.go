@@ -122,6 +122,10 @@ type FileTransferBackend interface {
 	ChannelQuota(ctx context.Context, channelID int64) (used, quota int64, err error)
 	CreateLink(ctx context.Context, channelID int64, folder, name string) (token string, expires time.Time, err error)
 	Port() int
+	// Fingerprint is the SHA-256 of the certificate the data port presents,
+	// "" when its TLS is off. It travels in FileTransferInitResponse so the
+	// client can pin the same certificate the control channel uses (91).
+	Fingerprint() string
 }
 
 // TokenBackend is the subset of the store needed to redeem privilege tokens.

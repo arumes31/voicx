@@ -89,7 +89,10 @@ function normalize(d, chID) {
         reactions: d.reactions || null,
         mentions: d.mentions || [],
         e2e: !!d.e2e,
-        enc: !!d.enc,
+        // enc_verified is set by the Go layer after it opened the body itself:
+        // without it a history message would draw no badge at all and look
+        // exactly like one the server handed over in the clear (91-135).
+        enc: !!d.enc || !!d.enc_verified,
         offline: !!d.offline,
         clientMsgID: d.client_msg_id || "",
         channelID,
@@ -194,6 +197,26 @@ function applyCustomEmoji(html) {
 // Message rendering (91-93, 97, 99, 101/102, 106, 107)
 // ---------------------------------------------------------------------------
 
+// UNOPENED_BODIES are the exact strings the Go layer substitutes for a body it
+// could not show. They must match client/e2e.go character for character — a
+// drift silently downgrades the ⚠ badge back to a normal shield (91-135).
+const UNOPENED_BODIES = new Set([
+    "[encrypted message — key unavailable]",
+    "[encrypted message — you do not have access]",
+    "[refused: server sent plaintext history]",
+    "[encrypted message — decryption failed]",
+]);
+
+// CHAT_ENCRYPTION_HELP is the single source for what the shield actually
+// promises, so the channel info panel and the README cannot drift apart.
+export const CHAT_ENCRYPTION_HELP =
+    "Channel and global messages are encrypted with a key the server holds, so it can " +
+    "apply moderation at send time but keeps no readable copy: history, pins and " +
+    "attachments are stored sealed. Direct messages are end-to-end encrypted and the " +
+    "server never holds their key. Search runs in this client over decrypted messages — " +
+    "the server cannot match on content. Attachments carry their own key inside the " +
+    "encrypted message body, so a file is exactly as private as the message that links it.";
+
 function renderMsg(m) {
     const el = document.createElement("div");
     el.className = "msg rich";
@@ -219,14 +242,24 @@ function renderMsg(m) {
     tag.textContent = m.e2e ? (m.offline ? "dm · offline" : "dm") : (m.channelID ? "channel" : "global");
     el.appendChild(tag);
 
-    // (4b) lock icon semantics carried over from the pre-5b renderer.
-    if (m.e2e || m.enc) {
+    // (4b/91-135) lock semantics. A placeholder body means the message stayed
+    // sealed, which must not look like an ordinary encrypted message.
+    const unopened = !m.deleted && UNOPENED_BODIES.has(m.text);
+    if (unopened) el.classList.add("missing-key");
+    if (m.e2e || m.enc || unopened) {
         const lock = document.createElement("span");
         lock.className = "msg-lock";
-        lock.textContent = m.e2e ? "🔒" : "🛡";
-        lock.title = m.e2e
-            ? "end-to-end encrypted — only you and the other user can read this"
-            : "encrypted — server-held channel key";
+        if (unopened) {
+            lock.textContent = "⚠";
+            lock.title = "this message is still encrypted — its key is not available to this client";
+        } else if (m.e2e) {
+            lock.textContent = "🔒";
+            lock.title = "end-to-end encrypted — only you and the other user can read this";
+        } else {
+            lock.textContent = "🛡";
+            lock.title = "encrypted with this channel's key — stored encrypted. The server holds " +
+                "the channel key so it can moderate at send time; it does not keep the text.";
+        }
         el.appendChild(lock);
     }
 
@@ -293,14 +326,31 @@ function renderBody(container, m) {
 
 const IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp"];
 
-function attachFileRef(container, m, name) {
+// parseFileRef splits a [file:<capture>] token into its three parts. It is
+// total and never throws: zero or one separators is a legacy plain reference,
+// which is what keeps pre-encryption messages rendering. Mirrors
+// parseFileRef in client/chat.go.
+export function parseFileRef(cap) {
+    const i = cap.indexOf("#");
+    if (i < 0) return { storage: cap, key: "", name: cap };       // legacy [file:photo.png]
+    const j = cap.indexOf("#", i + 1);
+    if (j < 0) return { storage: cap, key: "", name: cap };       // malformed -> treat as plain
+    return { storage: cap.slice(0, i), key: cap.slice(i + 1, j), name: cap.slice(j + 1) };
+}
+
+// attachFileRef takes the RAW capture and parses it here rather than in
+// renderBody, so the file key never crosses the split boundary. The key goes
+// straight into the Go call: never into textContent, an attribute or a src.
+function attachFileRef(container, m, cap) {
     const chID = m.channelID ?? V().state.myChannelID ?? 0;
+    const ref = parseFileRef(cap);
+    const name = ref.name;
     const ext = (name.split(".").pop() || "").toLowerCase();
     const wrap = document.createElement("span");
     wrap.className = "msg-file";
     if (IMAGE_EXTS.includes(ext)) {
         wrap.textContent = "loading image " + name + " …";
-        app().DownloadFile(chID, name).then((b64) => {
+        app().DownloadChatAttachment(chID, ref.storage, ref.key).then((b64) => {
             wrap.textContent = "";
             if (!b64) {
                 wrap.textContent = "📎 " + name + " (unavailable)";
@@ -323,7 +373,7 @@ function attachFileRef(container, m, name) {
         b.title = "download " + name;
         b.onclick = async () => {
             try {
-                const b64 = await app().DownloadFile(chID, name);
+                const b64 = await app().DownloadChatAttachment(chID, ref.storage, ref.key);
                 const a = document.createElement("a");
                 a.href = "data:application/octet-stream;base64," + b64;
                 a.download = name;
@@ -945,21 +995,15 @@ function updateReceiptTick(cmid) {
 // Live edit/delete/pin/reaction events
 // ---------------------------------------------------------------------------
 
-export async function onChatEdited(d) {
-    // WORKAROUND: chat_edited bodies arrive re-sealed with the scope key and
-    // the Go backend only decrypts live `chat` events, so the new text can't
-    // be read off the event. Re-fetch the latest history page and pick the
-    // edited message out of it instead.
+export function onChatEdited(d) {
+    // The Go layer unseals chat_edited before emitting it, so the new body is
+    // on the event itself: no history refetch, and an edit further back than
+    // one page is covered like any other (91-135).
     const m = findMsg(d.message_id);
     if (!m) return;
-    try {
-        const resp = await app().ChatHistory(Number(d.channel_id) || 0, 0, PAGE);
-        const hit = (resp.messages || []).find((x) => Number(x.id) === Number(d.message_id));
-        if (!hit) return;
-        m.text = hit.body;
-        m.edited = true;
-        refreshMsgEl(m);
-    } catch { /* best-effort; the next history refresh will catch up */ }
+    m.text = d.body ?? "";
+    m.edited = true;
+    refreshMsgEl(m);
 }
 
 export function onChatDeleted(d) {
@@ -1009,15 +1053,19 @@ export async function sendMessage() {
         if (target && !pmTabs.has(target)) openPMKeepView(target);
     }
 
-    // Files upload first, each followed by a [file:<name>] chat ref (98).
+    // Files are sealed with their own key and uploaded under a content-derived
+    // name; the returned token carries that key inside the encrypted message
+    // body, so the attachment is as private as the message (91-135).
     const chID = scope === "channel" ? st.myChannelID : 0;
     for (const f of files) {
-        const err = await app().UploadFile(chID, f.name, f.dataBase64);
-        if (err) {
-            V().sysMsg("upload failed: " + err);
+        let token;
+        try {
+            token = await app().UploadChatAttachment(chID, f.name, f.dataBase64);
+        } catch (e) {
+            V().sysMsg("upload failed: " + e);
             continue;
         }
-        await app().SendChat(scope, target, `[file:${f.name}]`);
+        await app().SendChat(scope, target, token);
     }
 
     if (text) {
@@ -1384,8 +1432,12 @@ function markIn(el, q) {
     }
 }
 
+// SEARCH_MAX mirrors the server's chat_search_max_messages default; the Go
+// layer applies its own cap, this is only what we ask for.
+const SEARCH_MAX = 2000;
+
 async function searchServer() {
-    const q = $("chat-search").value.trim().toLowerCase();
+    const q = $("chat-search").value.trim();
     if (!q) return;
     if (view.kind === "dm") {
         V().toast("server search covers channel/global history only (DMs are E2E)", "info", "alert");
@@ -1395,34 +1447,33 @@ async function searchServer() {
     const btn = $("chat-search-server");
     btn.disabled = true;
     btn.textContent = "searching…";
-    const results = [];
+    // The paging loop lives in Go now: the keys never cross into the webview
+    // and a page can use the store's cap of 200 instead of the UI's 50 (110).
+    const unsub = window.runtime.EventsOn("chatsearch:progress",
+        (n) => { btn.textContent = `searching… ${n}`; });
+    let res = { messages: [], undecryptable: 0 };
     try {
-        let before = 0;
-        for (let page = 0; page < 10; page++) { // cap: 10 pages backwards (110)
-            const resp = await app().ChatHistory(chID, before, PAGE);
-            const msgs = resp.messages || [];
-            if (msgs.length === 0) break;
-            for (const x of msgs) {
-                if (!x.deleted && (x.body || "").toLowerCase().includes(q)) results.push(x);
-            }
-            before = Math.min(...msgs.map((x) => Number(x.id)));
-            if (msgs.length < PAGE) break;
-        }
+        res = await app().ChatSearch(chID, q, SEARCH_MAX);
     } catch (e) {
         V().toast("search failed: " + e, "warn");
     }
+    if (unsub) unsub();
     btn.disabled = false;
     btn.textContent = "search server history";
-    showSearchResults(q, results);
+    showSearchResults(q.toLowerCase(), res.messages || [], res.undecryptable || 0);
 }
 
-function showSearchResults(q, results) {
+function showSearchResults(q, results, undecryptable) {
     const overlay = document.createElement("div");
     overlay.className = "dlg-overlay";
     const dlg = document.createElement("div");
     dlg.className = "dlg dlg-wide search-results";
     const h = document.createElement("h3");
-    h.textContent = `Search results (${results.length})`;
+    // A partial search must never look complete: messages under a generation
+    // this client cannot obtain are counted, not silently dropped.
+    h.textContent = undecryptable > 0
+        ? `${results.length} matches (${undecryptable} messages could not be decrypted)`
+        : `${results.length} matches`;
     dlg.appendChild(h);
     const list = document.createElement("div");
     list.className = "search-list";
@@ -1527,6 +1578,15 @@ function openDescription() {
         body.textContent = "This channel has no description.";
     }
     dlg.appendChild(body);
+    // (91-135) one source for the encryption story, so the client and the
+    // README cannot drift apart on what the shield actually promises.
+    const encH = document.createElement("h4");
+    encH.textContent = "How chat encryption works here";
+    dlg.appendChild(encH);
+    const enc = document.createElement("div");
+    enc.className = "set-hint";
+    enc.textContent = CHAT_ENCRYPTION_HELP;
+    dlg.appendChild(enc);
     const btns = document.createElement("div");
     btns.className = "dlg-buttons";
     const ok = document.createElement("button");
@@ -1542,16 +1602,76 @@ function openDescription() {
     document.body.appendChild(overlay);
 }
 
+// exportChat writes the loaded transcript out. Everything on screen is
+// decrypted, so a plain export is the one place this client can undo the
+// storage guarantee — it takes an explicit confirm, and the encrypted
+// container is offered first (125).
 async function exportChat() {
     const key = activeKey();
     const st = getStore(key);
     const lines = st.msgs.map((m) =>
         `[${fmtFull(m.ts)}] ${m.from}: ${m.deleted ? "(deleted)" : m.text}`);
+    const contents = lines.join("\n") + "\n";
     const name = view.kind === "dm" ? "dm-" + view.uid.slice(0, 8)
         : view.kind === "global" ? "global"
         : (V().state.channels.find((c) => c.ChannelID === V().state.myChannelID)?.Name || "channel");
-    const err = await app().ExportChat(`voicx-${name}.txt`, lines.join("\n") + "\n");
+
+    const pass = await askExportPassphrase();
+    if (pass === null) return; // cancelled
+    if (pass !== "") {
+        try {
+            await app().ExportChatEncrypted(`voicx-${name}.voicxchat`, contents, pass);
+        } catch (e) {
+            V().toast("export failed: " + e, "warn");
+        }
+        return;
+    }
+    const err = await app().ExportChat(`voicx-${name}.txt`, contents);
     if (err) V().toast("export failed: " + err, "warn");
+}
+
+// askExportPassphrase resolves to a passphrase (encrypted export), "" (plain
+// export, explicitly confirmed) or null (cancelled).
+function askExportPassphrase() {
+    return new Promise((resolve) => {
+        const overlay = document.createElement("div");
+        overlay.className = "dlg-overlay";
+        const dlg = document.createElement("div");
+        dlg.className = "dlg";
+        const h = document.createElement("h3");
+        h.textContent = "Export chat";
+        dlg.appendChild(h);
+        const warn = document.createElement("div");
+        warn.className = "set-hint warn";
+        warn.textContent = "A plain export writes DECRYPTED messages to a file on your disk. " +
+            "Enter a passphrase to write an encrypted .voicxchat instead.";
+        dlg.appendChild(warn);
+        const inp = document.createElement("input");
+        inp.type = "password";
+        inp.placeholder = "passphrase (leave empty for a plain export)";
+        dlg.appendChild(inp);
+        const btns = document.createElement("div");
+        btns.className = "dlg-buttons";
+        const done = (v) => { overlay.remove(); resolve(v); };
+        const cancel = document.createElement("button");
+        cancel.textContent = "Cancel";
+        cancel.onclick = () => done(null);
+        const ok = document.createElement("button");
+        ok.className = "dlg-ok";
+        ok.textContent = "Export";
+        ok.onclick = () => {
+            const p = inp.value;
+            if (p === "" && !confirm("Write an UNENCRYPTED copy of this chat to disk?")) return;
+            done(p);
+        };
+        btns.appendChild(cancel);
+        btns.appendChild(ok);
+        dlg.appendChild(btns);
+        overlay.appendChild(dlg);
+        overlay.onclick = (e) => { if (e.target === overlay) done(null); };
+        document.body.appendChild(overlay);
+        inp.focus();
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1593,10 +1713,12 @@ export async function onConnect() {
     try {
         st.myUniqueID = await app().IdentityUID();
     } catch { /* best-effort */ }
-    // (133) surface the server MOTD once per connect as a system block.
+    // (133) surface the server MOTD once per connect. It is a server notice,
+    // not a message: styling it as one would put it next to a shield or a lock
+    // it has not earned.
     try {
         const motd = await app().MOTD();
-        if (motd) V().sysMsg("MOTD — " + motd);
+        if (motd) V().sysMsg("server notice — " + motd);
     } catch { /* MOTD is best-effort */ }
 }
 

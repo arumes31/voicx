@@ -159,18 +159,16 @@ const maxFileVersions = 3
 
 // finalizeUpload places a verified upload: it rotates the replaced file into
 // <name>.v1..v3 (264), hard-links to an identical existing blob when one
-// exists (275 dedup), and records the row. Client-encrypted chat attachments
-// are flagged so the file browser can refuse to hand out a blob it has no key
-// for (91-135); their content-derived names never collide, so neither
-// rotation nor dedup is reachable for them.
+// exists (275 dedup), and records the row. A ".vcx" upload is flagged
+// (91-135) so the file browser can refuse to hand out a blob it has no key
+// for, and its name must be the truncated digest of the ciphertext: that is
+// what makes the name unforgeable, so an upload cannot displace the blob an
+// older message still points at.
 func (s *Server) finalizeUpload(ctx context.Context, tr *transfer, tmpPath, finalPath string, size int64, sum string) error {
 	encrypted := isEncryptedAttachment(tr.Name)
-	if encrypted {
-		wantName := sum + encryptedSuffix
-		if tr.Name != wantName {
-			_ = os.Remove(tmpPath)
-			return fmt.Errorf("encrypted attachment name mismatch: got %q, want %q", tr.Name, wantName)
-		}
+	if encrypted && tr.Name != sum[:encryptedNameLen]+encryptedSuffix {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("encrypted attachment name is not its content digest")
 	}
 
 	// Identical re-upload of the current file: keep the blob, refresh the row.
@@ -182,7 +180,11 @@ func (s *Server) finalizeUpload(ctx context.Context, tr *transfer, tmpPath, fina
 		})
 	}
 
-	s.rotateVersions(ctx, tr)
+	// Content-derived .vcx names never collide, so rotation can only burn four
+	// store lookups on a guaranteed miss for them (91-135).
+	if !encrypted {
+		s.rotateVersions(ctx, tr)
+	}
 
 	// Dedup (275): point at an identical existing blob instead of storing a
 	// second copy.

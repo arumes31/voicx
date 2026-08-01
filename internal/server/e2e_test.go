@@ -8,6 +8,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"golang.org/x/crypto/nacl/box"
 	"golang.org/x/crypto/nacl/secretbox"
 
+	"voicx/internal/chatcrypto"
 	"voicx/internal/config"
 	"voicx/internal/netproto"
 	"voicx/internal/state"
@@ -201,6 +204,30 @@ func sealScopeTest(t *testing.T, key [32]byte, plain string) string {
 	return base64.StdEncoding.EncodeToString(append(nonce[:], secretbox.Seal(nil, []byte(plain), &nonce, &key)...))
 }
 
+// openScopeTest opens a scope-sealed body the way a client would.
+func openScopeTest(t *testing.T, key [32]byte, blobB64 string) string {
+	t.Helper()
+	raw, err := base64.StdEncoding.DecodeString(blobB64)
+	if err != nil || len(raw) < 24 {
+		t.Fatalf("scope ciphertext is not base64 nonce||box: %q", blobB64)
+	}
+	var nonce [24]byte
+	copy(nonce[:], raw[:24])
+	plain, ok := secretbox.Open(nil, raw[24:], &nonce, &key)
+	if !ok {
+		t.Fatal("scope decryption failed")
+	}
+	return string(plain)
+}
+
+// unsealScopeKey opens one sealed generation from a piggybacked key bundle.
+func unsealScopeKey(t *testing.T, ck netproto.ChannelKey, pub, priv [32]byte) [32]byte {
+	t.Helper()
+	var key [32]byte
+	copy(key[:], unseal(t, ck, pub, priv))
+	return key
+}
+
 // TestEncryptedChannelChatRoundTrip verifies an encrypted channel message is
 // fanned out as ciphertext: the server decrypts it for moderation/storage
 // but relays the ORIGINAL ciphertext to members.
@@ -301,6 +328,252 @@ func TestE2EDMSpoolCiphertext(t *testing.T) {
 	}
 	if !chat.Offline || !chat.Enc || !chat.E2E || chat.FromUniqueID != "admin-uid" || chat.Text != ciphertext {
 		t.Fatalf("delivered spooled chat = %+v", chat)
+	}
+}
+
+// testKeyManager builds a standalone key manager over a fresh fake store and
+// KEK ring, for the tests that need to reason about generations directly.
+func testKeyManager(t *testing.T, st ScopeKeyStore) (*chatKeyManager, ScopeKeyStore, *chatcrypto.KEKRing) {
+	t.Helper()
+	if st == nil {
+		st = newFakeScopeKeys()
+	}
+	kek, err := chatcrypto.LoadKEKRing(filepath.Join(t.TempDir(), "kek.ring"), "", true)
+	if err != nil {
+		t.Fatalf("load kek ring: %v", err)
+	}
+	return newChatKeyManager(st, kek, testLogger()), st, kek
+}
+
+// TestScopeKeyNotMintedByChatSend is the disk-exhaustion guard: a send naming
+// a channel the client is not in must be refused BEFORE anything can mint,
+// because minting from an attacker-supplied scope id fills the disk (91).
+func TestScopeKeyNotMintedByChatSend(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+	pub, _ := testX25519(t)
+	publishKey(t, conn, pub)
+
+	fsk, ok := env.deps.ScopeKeys.(*fakeScopeKeys)
+	if !ok {
+		t.Fatalf("scope key store is %T, want the fake", env.deps.ScopeKeys)
+	}
+	before := fsk.insertCount()
+
+	send(t, conn, netproto.MsgChatSend, netproto.ChatSend{
+		ChannelID: "999999", Text: b64e([]byte("ciphertext")), Enc: true, KeyID: 1,
+	})
+	f := readOfType(t, conn, netproto.MsgError)
+	var e netproto.Error
+	if err := netproto.Decode(f, &e); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if e.Code != errCodePermissionDenied {
+		t.Fatalf("error = %d %q, want permission denied", e.Code, e.Message)
+	}
+	if got := fsk.insertCount(); got != before {
+		t.Fatalf("a rejected send minted %d generations", got-before)
+	}
+
+	// The same holds through the plaintext escape hatch, which skips every
+	// key check and would otherwise reach EnsureScope.
+	send(t, conn, netproto.MsgChatSend, netproto.ChatSend{ChannelID: "999998", Text: "plain"})
+	f = readOfType(t, conn, netproto.MsgError)
+	if err := netproto.Decode(f, &e); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if e.Code != errCodePermissionDenied {
+		t.Fatalf("plaintext hatch: error = %d %q, want permission denied", e.Code, e.Message)
+	}
+	if got := fsk.insertCount(); got != before {
+		t.Fatalf("the plaintext hatch minted %d generations", got-before)
+	}
+}
+
+// TestRotateOnUnloadedScopeDoesNotCollide verifies generation ids come from
+// the database sequence, never from RAM: a manager that never loaded a scope
+// must not re-mint a colliding id with different key material.
+func TestRotateOnUnloadedScopeDoesNotCollide(t *testing.T) {
+	ctx := t.Context()
+	first, st, kek := testKeyManager(t, nil)
+
+	gen1, key1, err := first.EnsureScope(ctx, 7)
+	if err != nil {
+		t.Fatalf("EnsureScope: %v", err)
+	}
+	if gen1 != 1 {
+		t.Fatalf("first generation = %d, want 1", gen1)
+	}
+
+	// A fresh manager over the same store has no memory of scope 7 at all.
+	cold := newChatKeyManager(st, kek, testLogger())
+	gen2, key2, err := cold.rotate(ctx, 7)
+	if err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	if gen2 != 2 {
+		t.Fatalf("rotated generation = %d, want 2 from the sequence", gen2)
+	}
+	if key1 == key2 {
+		t.Fatal("rotation reused the previous key material")
+	}
+	recovered, err := cold.at(ctx, 7, gen1)
+	if err != nil {
+		t.Fatalf("at(gen 1): %v", err)
+	}
+	if recovered != key1 {
+		t.Fatal("rotation overwrote generation 1's key material")
+	}
+}
+
+// TestHistorySurvivesRestart verifies a restart recovers identical key bytes,
+// so ciphertext written before it still opens.
+func TestHistorySurvivesRestart(t *testing.T) {
+	ctx := t.Context()
+	before, st, kek := testKeyManager(t, nil)
+
+	gen, key, err := before.EnsureScope(ctx, 3)
+	if err != nil {
+		t.Fatalf("EnsureScope: %v", err)
+	}
+	sealedGen, blob, err := before.seal(ctx, 3, "survives the restart")
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if sealedGen != gen {
+		t.Fatalf("sealed under %d, want %d", sealedGen, gen)
+	}
+
+	after := newChatKeyManager(st, kek, testLogger())
+	recovered, err := after.at(ctx, 3, gen)
+	if err != nil {
+		t.Fatalf("at after restart: %v", err)
+	}
+	if recovered != key {
+		t.Fatal("the restarted manager recovered different key material")
+	}
+	plain, err := after.open(ctx, 3, gen, blob)
+	if err != nil {
+		t.Fatalf("open after restart: %v", err)
+	}
+	if plain != "survives the restart" {
+		t.Fatalf("opened %q", plain)
+	}
+}
+
+// TestRotationCoalescing verifies leaves inside chat_key_rotate_min_seconds
+// produce exactly ONE new generation: a client flapping on a bad link would
+// otherwise mint one persisted generation per reconnect.
+func TestRotationCoalescing(t *testing.T) {
+	env := startTestEnvFull(t, nil, func(c *config.Config) { c.ChatKeyRotateMinSecs = 1 })
+	defer env.stop()
+	ctx := t.Context()
+
+	if _, _, err := env.srv.chatKeys.EnsureScope(ctx, 4); err != nil {
+		t.Fatalf("EnsureScope: %v", err)
+	}
+	fsk := env.deps.ScopeKeys.(*fakeScopeKeys)
+	before := fsk.countFor(4)
+
+	for i := 0; i < 10; i++ {
+		env.srv.rotateScopeKey(ctx, 4)
+	}
+	waitFor(t, "the coalesced rotation to fire", func() bool { return fsk.countFor(4) > before })
+	time.Sleep(300 * time.Millisecond)
+	if got := fsk.countFor(4) - before; got != 1 {
+		t.Fatalf("ten leaves in one window produced %d generations, want 1", got)
+	}
+}
+
+// TestChatKeyRequestRequiresMembership verifies a non-member's request is
+// answered with Refused rather than sealed keys.
+func TestChatKeyRequestRequiresMembership(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	alice, bob, _, keyID, _ := chatPair(t, env)
+	defer alice.Close()
+	defer bob.Close()
+
+	env.state.AddChannel(testChannel(2))
+	outsider, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer outsider.Close()
+	opub, _ := testX25519(t)
+	publishKey(t, outsider, opub)
+	send(t, outsider, netproto.MsgJoinChannel, netproto.JoinChannel{ChannelID: 2})
+	readChannelKeyFor(t, outsider, 2)
+
+	send(t, outsider, netproto.MsgChatKeyRequest, netproto.ChatKeyRequest{ChannelID: 1, KeyIDs: []uint32{keyID}})
+	f := readOfType(t, outsider, netproto.MsgChatKeyBundle)
+	var bundle netproto.ChatKeyBundle
+	if err := netproto.Decode(f, &bundle); err != nil {
+		t.Fatalf("decode bundle: %v", err)
+	}
+	if len(bundle.Keys) != 0 || len(bundle.Refused) != 1 || bundle.Refused[0] != keyID {
+		t.Fatalf("bundle = %+v, want generation %d refused", bundle, keyID)
+	}
+}
+
+// TestChatKeyRequestRejectsEmptyIDs verifies the cheap-to-send request is
+// shape-checked before it costs a seal.
+func TestChatKeyRequestRejectsEmptyIDs(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+	pub, _ := testX25519(t)
+	publishKey(t, conn, pub)
+
+	send(t, conn, netproto.MsgChatKeyRequest, netproto.ChatKeyRequest{ChannelID: 0})
+	f := readOfType(t, conn, netproto.MsgError)
+	var e netproto.Error
+	if err := netproto.Decode(f, &e); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if e.Code != errCodeMalformed {
+		t.Fatalf("empty key_ids: error = %d, want malformed", e.Code)
+	}
+
+	over := make([]uint32, maxKeysPerResponse+1)
+	send(t, conn, netproto.MsgChatKeyRequest, netproto.ChatKeyRequest{ChannelID: 0, KeyIDs: over})
+	f = readOfType(t, conn, netproto.MsgError)
+	if err := netproto.Decode(f, &e); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if e.Code != errCodeMalformed {
+		t.Fatalf("oversized key_ids: error = %d, want malformed", e.Code)
+	}
+}
+
+// TestChatKeyRequestRateLimited verifies the handler runs through the same
+// per-user bucket as a send: it is cheap to call and expensive to serve.
+func TestChatKeyRequestRateLimited(t *testing.T) {
+	env := startTestEnvFull(t, nil, func(c *config.Config) {
+		c.ChatRateMsgs = 2
+		c.ChatRateWindowSeconds = 30
+	})
+	defer env.stop()
+
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+	pub, _ := testX25519(t)
+	publishKey(t, conn, pub)
+
+	for i := 0; i < 2; i++ {
+		send(t, conn, netproto.MsgChatKeyRequest, netproto.ChatKeyRequest{ChannelID: 0, KeyIDs: []uint32{1}})
+		readOfType(t, conn, netproto.MsgChatKeyBundle)
+	}
+	send(t, conn, netproto.MsgChatKeyRequest, netproto.ChatKeyRequest{ChannelID: 0, KeyIDs: []uint32{1}})
+	f := readOfType(t, conn, netproto.MsgError)
+	var e netproto.Error
+	if err := netproto.Decode(f, &e); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if !strings.Contains(e.Message, "rate limit") {
+		t.Fatalf("error = %q, want a rate-limit rejection", e.Message)
 	}
 }
 

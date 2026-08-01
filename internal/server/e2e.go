@@ -195,14 +195,20 @@ func (s *TCPServer) doRotateScopeKey(ctx context.Context, channelID int64) {
 	s.logger.Debug("chat key rotated", zap.Int64("channel_id", channelID))
 }
 
-// handleChatKeyRequest responds to a client's request for missing scope chat key generations.
+// handleChatKeyRequest serves the generations a client missed on a live
+// broadcast or chat_edited event. It is cheap to send and expensive to answer
+// — one box.SealAnonymous plus a possible store read per requested id — so it
+// runs through the same per-user chat rate limiter as a send.
 func (s *TCPServer) handleChatKeyRequest(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.ChatKeyRequest
 	if err := netproto.Decode(f, &msg); err != nil {
 		return s.sendError(client, errCodeMalformed, "malformed chat_key_request: "+err.Error())
 	}
-	if len(msg.KeyIDs) == 0 || len(msg.KeyIDs) > 64 {
+	if len(msg.KeyIDs) == 0 || len(msg.KeyIDs) > maxKeysPerResponse {
 		return s.sendError(client, errCodeMalformed, "key_ids count must be 1..64")
+	}
+	if s.chatRate != nil && !s.chatRate.allow(client.UniqueID, time.Now()) {
+		return s.sendError(client, errCodeMalformed, "chat rate limit exceeded — slow down")
 	}
 	if s.deps == nil || s.deps.State == nil || s.chatKeys == nil {
 		return s.sendError(client, errCodeUnavailable, "chat key manager unavailable")

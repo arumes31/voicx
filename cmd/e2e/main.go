@@ -118,9 +118,10 @@ type eventEnvelope struct {
 // MsgChannelKey frames opportunistically.
 var clientsByConn sync.Map
 
-// registerClient stores the connection association and publishes the
-// client's X25519 public key (the server answers with sealed chat keys).
-func registerClient(c *client) error {
+// initClientKeys generates the client's X25519 pair BEFORE authenticating, so
+// the public half can ride along on Authenticate and the server can seal the
+// global generation and the MOTD straight into the AuthResponse (133).
+func initClientKeys(c *client) error {
 	c.scopeKeys = map[int64]map[uint32][32]byte{}
 	c.scopeLatest = map[int64]uint32{}
 	pub, priv, err := box.GenerateKey(rand.Reader)
@@ -128,10 +129,66 @@ func registerClient(c *client) error {
 		return err
 	}
 	c.e2ePub, c.e2ePriv = *pub, *priv
+	return nil
+}
+
+// registerClient stores the connection association and publishes the client's
+// X25519 public key into the server directory (DM peers resolve it there).
+func registerClient(c *client) error {
 	clientsByConn.Store(c.conn, c)
 	return writeMsg(c.conn, netproto.MsgKeyPublish, netproto.KeyPublish{
-		PublicKey: base64.StdEncoding.EncodeToString(pub[:]),
+		PublicKey: base64.StdEncoding.EncodeToString(c.e2ePub[:]),
 	})
+}
+
+// unsealScopeKey opens one sealed generation with the client's private key.
+func unsealScopeKey(c *client, ck netproto.ChannelKey) ([32]byte, bool) {
+	var out [32]byte
+	raw, err := base64.StdEncoding.DecodeString(ck.SealedKey)
+	if err != nil {
+		return out, false
+	}
+	key, ok := box.OpenAnonymous(nil, raw, &c.e2ePub, &c.e2ePriv)
+	if !ok || len(key) != 32 {
+		return out, false
+	}
+	copy(out[:], key)
+	return out, true
+}
+
+// installScopeKeys unseals a bundle of generations for a scope. current says
+// whether they are the scope's live generation (the AuthResponse) or archival
+// ones piggybacked on a history/pins page, which must not move scopeLatest.
+func installScopeKeys(c *client, scope int64, keys []netproto.ChannelKey, current bool) {
+	for _, ck := range keys {
+		k, ok := unsealScopeKey(c, ck)
+		if !ok {
+			continue
+		}
+		if c.scopeKeys[scope] == nil {
+			c.scopeKeys[scope] = map[uint32][32]byte{}
+		}
+		c.scopeKeys[scope][ck.KeyID] = k
+		if current && ck.KeyID > c.scopeLatest[scope] {
+			c.scopeLatest[scope] = ck.KeyID
+		}
+	}
+}
+
+// historyBody opens one history entry. It mirrors the real client: the server
+// never fills Body, so a non-empty Body on the wire is a protocol violation.
+func historyBody(c *client, scope int64, m netproto.ChatHistoryEntry) (string, error) {
+	if m.Body != "" {
+		return "", fmt.Errorf("server sent PLAINTEXT history body for message %d", m.ID)
+	}
+	if m.BodyEnc == "" {
+		return "", nil
+	}
+	key, ok := c.scopeKeys[scope][m.KeyID]
+	if !ok {
+		return "", fmt.Errorf("no key for generation %d", m.KeyID)
+	}
+	return e2eOpenScope(m.BodyEnc, key)
 }
 
 // captureChannelKey unseals and stores a scope key frame for the connection's
@@ -451,10 +508,16 @@ func dialAuth(addr, uid, password, serverPassword string) (*client, error) {
 	if err != nil {
 		return nil, err
 	}
+	c := &client{conn: conn, uid: uid}
+	if err := initClientKeys(c); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	if err := writeMsg(conn, netproto.MsgAuthenticate, netproto.Authenticate{
-		Username:       uid,
-		Password:       password,
-		ServerPassword: serverPassword,
+		Username:        uid,
+		Password:        password,
+		ServerPassword:  serverPassword,
+		X25519PublicKey: base64.StdEncoding.EncodeToString(c.e2ePub[:]),
 	}); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -473,11 +536,14 @@ func dialAuth(addr, uid, password, serverPassword string) (*client, error) {
 		_ = conn.Close()
 		return nil, errors.New("auth rejected: " + resp.Reason)
 	}
+	// The global generation rides along with the response; it is the CURRENT
+	// one, so it may advance scopeLatest.
+	installScopeKeys(c, 0, resp.ChatKeys, true)
 	if _, err := readOfType(conn, netproto.MsgSnapshot, readTimeout); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("reading snapshot: %w", err)
 	}
-	c := &client{conn: conn, uid: uid, clientID: resp.ClientID, nickname: resp.Nickname}
+	c.clientID, c.nickname = resp.ClientID, resp.Nickname
 	if err := registerClient(c); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("e2e key publish: %w", err)
@@ -987,8 +1053,18 @@ func checkChatHistory(c *checkCtx) error {
 	if err := netproto.Decode(f, &resp); err != nil {
 		return err
 	}
+	// The page carries the generations it references, sealed to bob's key.
+	// They are ARCHIVAL: installing them must not move the send generation.
+	installScopeKeys(c.bob, c.channelID, resp.Keys, false)
 	for _, m := range resp.Messages {
-		if m.Body == text && m.FromUniqueID == c.alice.uid && !m.Deleted {
+		if m.FromUniqueID != c.alice.uid || m.Deleted {
+			continue
+		}
+		body, err := historyBody(c.bob, c.channelID, m)
+		if err != nil {
+			return fmt.Errorf("history entry %d: %w", m.ID, err)
+		}
+		if body == text {
 			return nil
 		}
 	}
@@ -1074,7 +1150,9 @@ func checkChatEditDelete(c *checkCtx) error {
 	}
 	for _, m := range resp.Messages {
 		if m.ID == chat.ID {
-			if !m.Deleted || m.Body != "" {
+			// A tombstone must carry neither plaintext nor ciphertext: with
+			// bodies always sealed, checking Body alone would pass vacuously.
+			if !m.Deleted || m.Body != "" || m.BodyEnc != "" || m.KeyID != 0 {
 				return fmt.Errorf("history entry after delete = %+v, want tombstone", m)
 			}
 			return nil
@@ -1265,8 +1343,31 @@ func readStatusFrame(conn net.Conn) (bool, string, error) {
 	return st.OK, st.Error, nil
 }
 
+// dialFileTransfer dials the data port. It is TLS whenever the server offers
+// it (file_tls_enabled defaults on), with a plaintext fallback so the harness
+// still runs against a dev server that disabled it.
+func dialFileTransfer(addr string, init netproto.FileTransferInitResponse) (net.Conn, error) {
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: readTimeout}, "tcp", addr,
+		&tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}) //nolint:gosec // e2e harness
+	if err == nil {
+		if init.TLSFingerprint != "" {
+			if pc := conn.ConnectionState().PeerCertificates; len(pc) > 0 {
+				if got := tlscert.FingerprintDER(pc[0].Raw); !strings.EqualFold(got, init.TLSFingerprint) {
+					_ = conn.Close()
+					return nil, fmt.Errorf("file transfer fingerprint = %s, want %s", got, init.TLSFingerprint)
+				}
+			}
+		}
+		return conn, nil
+	}
+	if init.TLS {
+		return nil, fmt.Errorf("file transfer port requires TLS: %w", err)
+	}
+	return net.DialTimeout("tcp", addr, readTimeout)
+}
+
 func uploadFile(addr string, init netproto.FileTransferInitResponse, payload []byte) error {
-	conn, err := net.DialTimeout("tcp", addr, readTimeout)
+	conn, err := dialFileTransfer(addr, init)
 	if err != nil {
 		return err
 	}
@@ -1301,7 +1402,7 @@ func uploadFile(addr string, init netproto.FileTransferInitResponse, payload []b
 }
 
 func downloadFile(addr string, init netproto.FileTransferInitResponse) ([]byte, error) {
-	conn, err := net.DialTimeout("tcp", addr, readTimeout)
+	conn, err := dialFileTransfer(addr, init)
 	if err != nil {
 		return nil, err
 	}

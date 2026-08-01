@@ -186,14 +186,14 @@ func (a *App) UploadFileProgress(id string, channelID int64, folder, name, dataB
 	if err := decodeJSON(f, &init); err != nil {
 		return err.Error()
 	}
-	addr, err := a.ftAddr(init.Port)
+	ep, err := a.ftTarget(init)
 	if err != nil {
 		return err.Error()
 	}
 	// recover is per-goroutine: transfer workers need their own guard (331).
 	go guardCrash("ft upload", func() {
 		p := ftProgress{ID: id, Direction: "upload", Name: name, Total: int64(len(data)), Status: "active"}
-		err := a.ftUploadProgress(id, addr, init.Token, init.TransferID, data, &p)
+		err := a.ftUploadProgress(id, ep, init.Token, init.TransferID, data, &p)
 		if err != nil {
 			p.Status = "error"
 			if errors.Is(err, errTransferCanceled) {
@@ -213,8 +213,8 @@ func (a *App) UploadFileProgress(id string, channelID int64, folder, name, dataB
 var errTransferCanceled = errors.New("transfer canceled")
 
 // ftUploadProgress streams data with per-chunk progress callbacks.
-func (a *App) ftUploadProgress(id, addr, token, transferID string, data []byte, p *ftProgress) error {
-	conn, err := ftDial(addr)
+func (a *App) ftUploadProgress(id string, ep ftEndpoint, token, transferID string, data []byte, p *ftProgress) error {
+	conn, err := ftDial(ep)
 	if err != nil {
 		return err
 	}
@@ -283,13 +283,13 @@ func (a *App) DownloadFileProgress(id string, channelID int64, folder, name, des
 	if err := decodeJSON(f, &init); err != nil {
 		return err.Error()
 	}
-	addr, err := a.ftAddr(init.Port)
+	ep, err := a.ftTarget(init)
 	if err != nil {
 		return err.Error()
 	}
 	go guardCrash("ft download", func() {
 		p := ftProgress{ID: id, Direction: "download", Name: name, Status: "active"}
-		err := a.ftDownloadProgress(id, addr, init.Token, init.TransferID, destPath, &p)
+		err := a.ftDownloadProgress(id, ep, init.Token, init.TransferID, destPath, &p)
 		if err != nil {
 			p.Status = "error"
 			if errors.Is(err, errTransferCanceled) {
@@ -306,8 +306,8 @@ func (a *App) DownloadFileProgress(id string, channelID int64, folder, name, des
 }
 
 // ftDownloadProgress streams a download into destPath with progress.
-func (a *App) ftDownloadProgress(id, addr, token, transferID, destPath string, p *ftProgress) error {
-	conn, err := ftDial(addr)
+func (a *App) ftDownloadProgress(id string, ep ftEndpoint, token, transferID, destPath string, p *ftProgress) error {
+	conn, err := ftDial(ep)
 	if err != nil {
 		return err
 	}
@@ -386,11 +386,11 @@ func (a *App) VerifyFile(channelID int64, folder, name, expectedSHA string) (boo
 	if err := decodeJSON(f, &init); err != nil {
 		return false, err
 	}
-	addr, err := a.ftAddr(init.Port)
+	ep, err := a.ftTarget(init)
 	if err != nil {
 		return false, err
 	}
-	data, err := ftDownload(addr, init.Token, init.TransferID)
+	data, err := ftDownload(ep, init.Token, init.TransferID)
 	if err != nil {
 		return false, err
 	}

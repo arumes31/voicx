@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+
 	"voicx/internal/auth"
 	"voicx/internal/broadcast"
 	"voicx/internal/channels"
@@ -248,6 +250,13 @@ type fakeChat struct {
 	pins      map[int64]map[int64]store.PinnedMessage // channel -> message -> pin
 	reactions map[int64]map[string]map[string]bool    // message -> emoji -> uid -> present
 	settings  map[string]string
+	settingID map[string]uint32
+	legacy    []store.LegacyChatRow
+	validated bool
+
+	// storeErr, when set, fails every StoreChatMessage — the constraint
+	// violation a CHECK produces in production (91).
+	storeErr error
 }
 
 func newFakeChat() *fakeChat {
@@ -256,12 +265,30 @@ func newFakeChat() *fakeChat {
 		pins:      map[int64]map[int64]store.PinnedMessage{},
 		reactions: map[int64]map[string]map[string]bool{},
 		settings:  map[string]string{},
+		settingID: map[string]uint32{},
 	}
+}
+
+// failStores makes every subsequent StoreChatMessage fail.
+func (f *fakeChat) failStores(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.storeErr = err
+}
+
+// messageCount reports how many messages were stored.
+func (f *fakeChat) messageCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.order)
 }
 
 func (f *fakeChat) StoreChatMessage(_ context.Context, channelID int64, fromUniqueID, fromNickname, bodyEnc string, keyID uint32) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.storeErr != nil {
+		return 0, f.storeErr
+	}
 	f.nextID++
 	m := &store.ChatMessage{
 		ID:           f.nextID,
@@ -402,32 +429,70 @@ func (f *fakeChat) SetServerSetting(_ context.Context, key, value string, keyID 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.settings[key] = value
+	f.settingID[key] = keyID
 	return nil
 }
 
 func (f *fakeChat) GetServerSetting(_ context.Context, key string) (string, uint32, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.settings[key], 0, nil
+	return f.settings[key], f.settingID[key], nil
+}
+
+// seedLegacy adds a pre-012 plaintext row for the backfill tests.
+func (f *fakeChat) seedLegacy(id, channelID int64, body string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.legacy = append(f.legacy, store.LegacyChatRow{ID: id, ChannelID: channelID, Body: body})
 }
 
 func (f *fakeChat) LegacyPlaintextPage(_ context.Context, afterID int64, limit int) ([]store.LegacyChatRow, error) {
-	return nil, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []store.LegacyChatRow
+	for _, r := range f.legacy {
+		if r.ID > afterID && len(out) < limit {
+			out = append(out, r)
+		}
+	}
+	return out, nil
 }
 
 func (f *fakeChat) SetChatCiphertext(_ context.Context, id int64, bodyEnc string, keyID uint32) error {
-	return nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, r := range f.legacy {
+		if r.ID != id {
+			continue
+		}
+		f.messages[id] = &store.ChatMessage{
+			ID: id, ChannelID: r.ChannelID, BodyEnc: bodyEnc, KeyID: keyID, SentAt: time.Now(),
+		}
+		f.order = append(f.order, id)
+		f.legacy = append(f.legacy[:i], f.legacy[i+1:]...)
+		return nil
+	}
+	return fmt.Errorf("legacy chat row %d not found", id)
 }
 
 func (f *fakeChat) PurgeLegacyPlaintext(_ context.Context) (int64, error) {
-	return 0, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := int64(len(f.legacy))
+	f.legacy = nil
+	return n, nil
 }
 
 func (f *fakeChat) CountPlaintextBodies(_ context.Context) (int64, error) {
-	return 0, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return int64(len(f.legacy)), nil
 }
 
 func (f *fakeChat) ValidateChatNoPlaintext(_ context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.validated = true
 	return nil
 }
 
@@ -437,13 +502,35 @@ type fakeScopeKeyEntry struct {
 }
 
 type fakeScopeKeys struct {
-	mu     sync.Mutex
-	nextID uint32
-	keys   map[string]*fakeScopeKeyEntry
+	mu      sync.Mutex
+	nextID  uint32
+	keys    map[string]*fakeScopeKeyEntry
+	inserts int
 }
 
 func newFakeScopeKeys() *fakeScopeKeys {
 	return &fakeScopeKeys{keys: map[string]*fakeScopeKeyEntry{}}
+}
+
+// insertCount reports how many generations were ever persisted — the
+// disk-exhaustion counter the mint DoS guard asserts on (91).
+func (f *fakeScopeKeys) insertCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.inserts
+}
+
+// countFor reports how many generations exist for one scope.
+func (f *fakeScopeKeys) countFor(scope int64) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, e := range f.keys {
+		if e.scopeID == scope {
+			n++
+		}
+	}
+	return n
 }
 
 func (f *fakeScopeKeys) keyStr(scope int64, id uint32) string {
@@ -496,7 +583,11 @@ func (f *fakeScopeKeys) InsertScopeKey(_ context.Context, scope int64, keyID uin
 		KEKID:     kekID,
 		CreatedAt: time.Now(),
 	}
+	if _, dup := f.keys[f.keyStr(scope, keyID)]; dup {
+		return fmt.Errorf("scope key %d/%d already exists", scope, keyID)
+	}
 	f.keys[f.keyStr(scope, keyID)] = &fakeScopeKeyEntry{scopeID: scope, key: k}
+	f.inserts++
 	return nil
 }
 
@@ -676,6 +767,16 @@ func startTestEnvFull(t *testing.T, perms *permissions.TieredPermissions, mutate
 // server deps (e.g. default group IDs for wave-6a tests).
 func startTestEnvDeps(t *testing.T, perms *permissions.TieredPermissions, mutateCfg func(*config.Config), mutateDeps func(*Deps)) *testEnv {
 	t.Helper()
+	return startTestEnvLogger(t, perms, mutateCfg, mutateDeps, nil)
+}
+
+// startTestEnvLogger is startTestEnvDeps with the server's logger supplied by
+// the caller, so a test can assert on what the pipeline logs (91).
+func startTestEnvLogger(t *testing.T, perms *permissions.TieredPermissions, mutateCfg func(*config.Config), mutateDeps func(*Deps), logger *zap.Logger) *testEnv {
+	t.Helper()
+	if logger == nil {
+		logger = testLogger()
+	}
 
 	sm := state.New(testLogger())
 	bc := broadcast.New(testLogger(), sm)
@@ -751,7 +852,12 @@ func startTestEnvDeps(t *testing.T, perms *permissions.TieredPermissions, mutate
 	if mutateCfg != nil {
 		mutateCfg(cfg)
 	}
-	srv := New(cfg, testLogger(), deps)
+	srv := New(cfg, logger, deps)
+	// Mirror the binary's boot order: the global generation is minted once,
+	// eagerly, so nothing on a hot path ever mints (91).
+	if err := srv.EnsureGlobalScopeKey(context.Background()); err != nil && deps.ScopeKeys != nil {
+		t.Fatalf("ensure global scope key: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	startErr := make(chan error, 1)
@@ -847,6 +953,27 @@ func dialAuthed(t *testing.T, addr, uniqueID string) (net.Conn, string) {
 	// The snapshot frame must follow the auth response.
 	readOfType(t, conn, netproto.MsgSnapshot)
 	return conn, resp.ClientID
+}
+
+// dialAuthedX25519 authenticates while presenting an encryption key. That is
+// the path that receives the global generation and the sealed MOTD in the
+// auth response itself, before Connect() would return (133).
+func dialAuthedX25519(t *testing.T, addr, uniqueID string, pub [32]byte) (net.Conn, netproto.AuthResponse) {
+	t.Helper()
+	conn := dialRetry(t, addr)
+	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{
+		Username: uniqueID, Password: "pw", X25519PublicKey: b64e(pub[:]),
+	})
+	f := readOfType(t, conn, netproto.MsgAuthResponse)
+	var resp netproto.AuthResponse
+	if err := netproto.Decode(f, &resp); err != nil {
+		t.Fatalf("decode auth response: %v", err)
+	}
+	if !resp.OK {
+		t.Fatalf("authenticate %q failed: %s", uniqueID, resp.Reason)
+	}
+	readOfType(t, conn, netproto.MsgSnapshot)
+	return conn, resp
 }
 
 // decodeEvent unwraps a MsgEvent frame's {"type","data"} envelope.
@@ -1554,8 +1681,10 @@ func TestCreateChannelNeededPowerCap(t *testing.T) {
 
 // --- offline message spool --------------------------------------------------
 
-// TestDirectMessageSpooledOffline verifies that a direct message to an
-// offline user is spooled instead of failing.
+// TestDirectMessageSpooledOffline verifies that an encrypted direct message
+// to an offline user is spooled instead of failing, and that a plaintext one
+// is refused: the server has no DM key, so it could not seal it, and an
+// unsealable body must never reach the spool (91).
 func TestDirectMessageSpooledOffline(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
@@ -1563,10 +1692,25 @@ func TestDirectMessageSpooledOffline(t *testing.T) {
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
 	defer adminConn.Close()
 
-	send(t, adminConn, netproto.MsgChatSend, netproto.ChatSend{ToUniqueID: "user-uid", Text: "see you later"})
+	send(t, adminConn, netproto.MsgChatSend, netproto.ChatSend{
+		ToUniqueID: "user-uid", Text: "see you later", Enc: true,
+	})
 	waitFor(t, "message spooled", func() bool {
 		return env.spool.pendingCount() == 1
 	})
+
+	send(t, adminConn, netproto.MsgChatSend, netproto.ChatSend{ToUniqueID: "user-uid", Text: "in the clear"})
+	f := readOfType(t, adminConn, netproto.MsgError)
+	var e netproto.Error
+	if err := netproto.Decode(f, &e); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if e.Code != errCodePermissionDenied {
+		t.Fatalf("plaintext spool: error = %d, want permission denied", e.Code)
+	}
+	if env.spool.pendingCount() != 1 {
+		t.Fatalf("plaintext DM reached the spool: %d pending", env.spool.pendingCount())
+	}
 }
 
 // TestSpooledMessagesDeliveredOnLogin verifies spooled messages are delivered

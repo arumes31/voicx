@@ -199,25 +199,32 @@ func (m *connManager) connect(addr, nickname, password, serverPassword string) s
 		return err.Error()
 	}
 
+	// The X25519 key rides along with auth so the server can seal the global
+	// chat generation and the MOTD into the AuthResponse itself (133).
+	encPub := m.x25519PublicB64()
+
 	if password != "" {
 		return m.connectWith(addr, netproto.Authenticate{
-			Username:       nickname, // unique ID or nickname; the server resolves both
-			Password:       password,
-			ServerPassword: serverPassword,
-			PublicKey:      id.PublicKey,
+			Username:        nickname, // unique ID or nickname; the server resolves both
+			Password:        password,
+			ServerPassword:  serverPassword,
+			PublicKey:       id.PublicKey,
+			X25519PublicKey: encPub,
 		}, nil)
 	}
 
-	// Guest login with the client's own identity (key-derived unique ID).
+	// Guest login with the client's own identity (key-derived unique ID). The
+	// Ed25519 key is supplied by the signer callback, not here.
 	uid, err := id.uniqueID()
 	if err != nil {
 		return err.Error()
 	}
 	return m.connectWith(addr, netproto.Authenticate{
-		Username:       uid,
-		Anonymous:      true,
-		Nickname:       nickname,
-		ServerPassword: serverPassword,
+		Username:        uid,
+		Anonymous:       true,
+		Nickname:        nickname,
+		ServerPassword:  serverPassword,
+		X25519PublicKey: encPub,
 	}, func(challenge []byte) ([]byte, string, error) {
 		sig, err := auth.SignChallenge(id.PrivateKey, challenge)
 		return sig, id.PublicKey, err
@@ -268,9 +275,10 @@ func (m *connManager) connectWith(addr string, authMsg netproto.Authenticate, si
 				return err.Error()
 			}
 			if err := m.writeConn(conn, netproto.MsgAuthSignature, netproto.AuthSignature{
-				UniqueID:  authMsg.Username,
-				PublicKey: pub,
-				Signature: sig,
+				UniqueID:        authMsg.Username,
+				PublicKey:       pub,
+				Signature:       sig,
+				X25519PublicKey: authMsg.X25519PublicKey,
 			}); err != nil {
 				_ = conn.Close()
 				return err.Error()
@@ -292,6 +300,13 @@ func (m *connManager) connectWith(addr string, authMsg netproto.Authenticate, si
 		return "authentication failed"
 	}
 
+	// The global generation and the MOTD sealed under it are resolved BEFORE
+	// this returns, so App.MOTD() stays a correct one-shot read with no event
+	// and no re-render path (133). installCurrentKeys takes m.mu via
+	// identity(), so it must run outside the state lock below.
+	m.installCurrentKeys(0, resp.ChatKeys)
+	motd := m.openMOTD(resp)
+
 	m.mu.Lock()
 	m.conn = conn
 	m.addr = addr
@@ -300,7 +315,7 @@ func (m *connManager) connectWith(addr string, authMsg netproto.Authenticate, si
 	m.nickname = resp.Nickname
 	m.isAdmin = resp.IsAdmin
 	m.iceServers = resp.ICEServers
-	m.motd = resp.MOTD
+	m.motd = motd
 	m.closed = false
 	m.mu.Unlock()
 
@@ -317,12 +332,14 @@ func (m *connManager) connectWith(addr string, authMsg netproto.Authenticate, si
 				m.mu.Lock()
 				owned := (m.conn == conn)
 				intentional := m.closed
+				if owned {
+					m.disconnectLocked()
+				}
 				m.mu.Unlock()
 				if owned {
 					if !intentional {
 						m.emit("disconnected", "")
 					}
-					m.disconnect()
 				} else {
 					_ = conn.Close()
 				}
@@ -334,10 +351,26 @@ func (m *connManager) connectWith(addr string, authMsg netproto.Authenticate, si
 	return ""
 }
 
-// disconnect closes the connection, if any.
-func (m *connManager) disconnect() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// openMOTD unseals the AuthResponse MOTD with the global generation that came
+// with it. A sealed MOTD the client cannot open resolves to "" — the raw
+// ciphertext must never reach the banner.
+func (m *connManager) openMOTD(resp netproto.AuthResponse) string {
+	if !resp.MOTDEnc {
+		return resp.MOTD
+	}
+	key, ok := m.scopeKeys.get(0, resp.MOTDKeyID)
+	if !ok {
+		return ""
+	}
+	plain, err := openScope(resp.MOTD, key)
+	if err != nil {
+		return ""
+	}
+	return plain
+}
+
+// disconnectLocked closes the connection while m.mu is held.
+func (m *connManager) disconnectLocked() {
 	m.iceServers = nil
 	m.motd = ""
 	if m.conn != nil {
@@ -345,6 +378,13 @@ func (m *connManager) disconnect() {
 		_ = m.conn.Close()
 		m.conn = nil
 	}
+}
+
+// disconnect closes the connection, if any.
+func (m *connManager) disconnect() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.disconnectLocked()
 }
 
 // iceServersSnapshot returns the ICE servers the server provided at connect
@@ -502,13 +542,19 @@ func (m *connManager) dispatch(f *netproto.Frame) {
 		m.mu.Unlock()
 		m.emit("snapshot", string(f.Payload))
 	case netproto.MsgEvent:
-		// Encrypted chat is decrypted in the backend (4b); DMs decrypt
-		// asynchronously and re-emit (maybeDecryptChat returns "" then).
-		if out := m.maybeDecryptChat(string(f.Payload)); out != "" {
+		// Sealed payloads (chat bodies, edits, announcements) are opened in
+		// the backend; DMs decrypt asynchronously and re-emit, which is what
+		// the empty return means.
+		if out := m.maybeDecryptEvent(string(f.Payload)); out != "" {
 			m.emit("event", out)
 		}
 	case netproto.MsgChannelKey:
 		m.handleChannelKey(f)
+	case netproto.MsgChatKeyBundle:
+		// Answer to a pull (99/100). Archival generations only: they never
+		// advance the send key, and a waiter in awaitScopeText wakes on the
+		// install.
+		m.handleChatKeyBundle(f)
 	case netproto.MsgChannelList:
 		m.mu.Lock()
 		m.lastChannelList = string(f.Payload)

@@ -112,9 +112,12 @@ func (s *Store) GetChatMessage(ctx context.Context, id int64) (*ChatMessage, err
 	return &m, nil
 }
 
-// EditChatMessage replaces the ciphertext and stamps edited_at.
+// EditChatMessage replaces the ciphertext and stamps edited_at. It also blanks
+// the legacy column: chat_messages_no_plaintext is checked on every UPDATE, so
+// editing a not-yet-backfilled row that still holds plaintext would otherwise
+// fail at the database (91-135).
 func (s *Store) EditChatMessage(ctx context.Context, id int64, bodyEnc string, keyID uint32) error {
-	const q = `UPDATE chat_messages SET body_enc = $1, key_id = $2, edited_at = NOW()
+	const q = `UPDATE chat_messages SET body_enc = $1, key_id = $2, body = '', edited_at = NOW()
 	          WHERE id = $3 AND deleted_at IS NULL`
 	res, err := s.db.ExecContext(ctx, q, bodyEnc, keyID, id)
 	if err != nil {
@@ -288,11 +291,11 @@ func (s *Store) GetServerSetting(ctx context.Context, key string) (string, uint3
 // --- One-shot legacy backfill (migration 012) --------------------------------
 
 // LegacyPlaintextPage returns up to limit pre-012 rows that still need
-// sealing, ordered by id so the backfill is resumable. The predicate is
-// body_enc = '' rather than body <> '': an encrypted message whose plaintext
-// was the empty string stores exactly such a row, and it still has to be
-// sealed to satisfy chat_messages_sealed. Tombstones are excluded — they
-// carry no body (012 normalises them once).
+// sealing, ordered by id so the backfill is resumable. The predicate matches
+// an EMPTY body_enc rather than a non-empty body: an encrypted message whose
+// plaintext was the empty string stores exactly such a row, and it still has
+// to be sealed to satisfy chat_messages_sealed. Tombstones are excluded: every
+// delete path has always blanked body, and chat_messages_sealed exempts them.
 func (s *Store) LegacyPlaintextPage(ctx context.Context, afterID int64, limit int) ([]LegacyChatRow, error) {
 	if limit <= 0 || limit > 5000 {
 		limit = 500

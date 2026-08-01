@@ -97,6 +97,12 @@ func (s *TCPServer) handleAuthenticate(ctx context.Context, client *Client, f *n
 	if client.isAuthed() {
 		return s.sendError(client, errCodeMalformed, "already authenticated")
 	}
+	// (133) the encryption key is captured before any auth path branches, so
+	// finishAuth can seal the global generation and the MOTD into the reply
+	// whichever path completes.
+	if msg.X25519PublicKey != "" {
+		client.setX25519(msg.X25519PublicKey)
+	}
 	if s.deps == nil || s.deps.Auth == nil {
 		return s.sendError(client, errCodeUnavailable, "authentication backend unavailable")
 	}
@@ -193,6 +199,11 @@ func (s *TCPServer) handleAuthSignature(ctx context.Context, client *Client, f *
 	}
 	if client.isAuthed() {
 		return s.sendError(client, errCodeMalformed, "already authenticated")
+	}
+	// The guest/challenge path leaves Authenticate.PublicKey empty and carries
+	// its keys here instead, so the encryption key is captured here too (133).
+	if msg.X25519PublicKey != "" {
+		client.setX25519(msg.X25519PublicKey)
 	}
 	if s.deps == nil || s.deps.Auth == nil {
 		return s.sendError(client, errCodeUnavailable, "authentication backend unavailable")
@@ -390,6 +401,11 @@ func (s *TCPServer) finishAuth(ctx context.Context, client *Client, id authIdent
 			ConnectedAt: time.Now(),
 			Conn:        client.Conn,
 		})
+		// (133) the key must be live before the snapshot, so anything that
+		// reads it during this handshake sees it.
+		if x := client.x25519(); x != "" {
+			s.deps.State.SetE2EPublicKey(client.ID, x)
+		}
 	}
 
 	if s.deps.Broadcast != nil {
@@ -411,9 +427,9 @@ func (s *TCPServer) finishAuth(ctx context.Context, client *Client, id authIdent
 		UniqueID:       id.uniqueID,
 		Nickname:       id.nickname,
 		TLSFingerprint: s.tlsFingerprint,
-		MOTD:           s.serverSetting(ctx, "motd"),
 		IsAdmin:        id.admin,
 	}
+	s.attachChatKeysAndMOTD(ctx, client, &resp)
 	if s.deps.ICEServers != nil {
 		resp.ICEServers = s.deps.ICEServers(id.uniqueID)
 	}
@@ -426,9 +442,12 @@ func (s *TCPServer) finishAuth(ctx context.Context, client *Client, id authIdent
 	}
 
 	// (133) active announcement, if any — after the snapshot so clients
-	// process it as the first live event.
-	if ann := s.serverSetting(ctx, "announcement"); ann != "" {
-		if payload, err := eventEnvelope(eventAnnouncement, map[string]any{"text": ann}); err == nil {
+	// process it as the first live event. It stays here rather than moving
+	// behind key publish: deliverScopeKey skips clients that never published
+	// one, which would silently drop the announcement for all of them.
+	if ann, gen, err := s.serverSettingSealed(ctx, "announcement"); err == nil && ann != "" {
+		data := map[string]any{"text": ann, "enc": gen > 0, "key_id": gen}
+		if payload, err := eventEnvelope(eventAnnouncement, data); err == nil {
 			_ = s.writeFrame(client, &netproto.Frame{Type: uint16(netproto.MsgEvent), Payload: payload})
 		}
 	}
@@ -449,6 +468,51 @@ func (s *TCPServer) finishAuth(ctx context.Context, client *Client, id authIdent
 		Nickname: id.nickname,
 	})
 	return nil
+}
+
+// attachChatKeysAndMOTD seals the global generation for the client's X25519
+// key and hands over the MOTD sealed under that same generation, so the
+// client can render it before Connect() returns — no extra frame, no
+// ordering rule, no race (133).
+//
+// A client that published no encryption key gets neither: it could not open
+// them. Under the plaintext escape hatch such a client still sees the MOTD,
+// which is the only reason that branch exists.
+func (s *TCPServer) attachChatKeysAndMOTD(ctx context.Context, client *Client, resp *netproto.AuthResponse) {
+	pub := client.x25519()
+	if pub == "" {
+		if s.cfg != nil && s.cfg.ChatAllowPlaintext {
+			resp.MOTD = s.serverSettingPlain(ctx, "motd")
+		}
+		return
+	}
+	if s.chatKeys == nil || !s.chatKeys.configured() {
+		return
+	}
+	// Never mints: the global generation is created once at boot.
+	gen, _, err := s.chatKeys.current(ctx, globalChatScope)
+	if err != nil {
+		s.logger.Warn("global chat key unavailable at auth",
+			zap.String("client_id", client.ID),
+			zap.Error(err),
+		)
+		return
+	}
+	ck, err := s.chatKeys.sealFor(ctx, globalChatScope, gen, pub)
+	if err != nil {
+		s.logger.Warn("sealing global chat key for auth response failed",
+			zap.String("client_id", client.ID),
+			zap.Error(err),
+		)
+		return
+	}
+	resp.ChatKeys = []netproto.ChannelKey{*ck}
+
+	motd, motdGen, err := s.serverSettingSealed(ctx, "motd")
+	if err != nil || motd == "" {
+		return
+	}
+	resp.MOTD, resp.MOTDEnc, resp.MOTDKeyID = motd, true, motdGen
 }
 
 // dedupeNickname appends #2, #3, ... when the nickname is already taken by
@@ -837,32 +901,50 @@ func (s *TCPServer) handleChatSend(ctx context.Context, client *Client, f *netpr
 	if msg.Enc && msg.KeyID == 0 && msg.ChannelID != "" {
 		return s.sendError(client, errCodeMalformed, "channel chat requires a scope key id")
 	}
-	if msg.Enc && msg.ChannelID != "" {
-		channelID, err := strconv.ParseInt(msg.ChannelID, 10, 64)
-		if err != nil {
-			return s.sendError(client, errCodeMalformed, "invalid channel_id: "+msg.ChannelID)
-		}
-		if s.chatKeys != nil {
-			currentID, _, _ := s.chatKeys.current(ctx, channelID)
-			if msg.KeyID != currentID {
-				return s.sendError(client, errCodeMalformed, "stale chat key for channel (key rotated; wait for re-key)")
-			}
-		}
-	}
-	if msg.Enc && msg.ChannelID == "" && msg.ToUniqueID == "" && msg.ToClientID == "" && s.chatKeys != nil {
-		// Global scope: validate against the global key generation.
-		currentID, _, _ := s.chatKeys.current(ctx, globalChatScope)
-		if msg.KeyID != currentID {
-			return s.sendError(client, errCodeMalformed, "stale chat key for global scope (key rotated; wait for re-key)")
-		}
-	}
 
 	isDM := msg.ToUniqueID != "" || msg.ToClientID != ""
 
 	// Channel/global scopes run the moderation pipeline (wave 5a): rate
 	// limit, slow mode, decrypt, filters, spam, mentions, store, relay.
 	if !isDM {
-		return s.routeScopedChat(ctx, client, msg, parseChannelID(msg.ChannelID))
+		var channelID int64
+		if msg.ChannelID != "" {
+			id, err := strconv.ParseInt(msg.ChannelID, 10, 64)
+			if err != nil {
+				return s.sendError(client, errCodeMalformed, "invalid channel_id: "+msg.ChannelID)
+			}
+			channelID = id
+		}
+		// Membership FIRST, before anything touches chatKeys: routeScopedChat
+		// may ensure a scope's first generation, and reaching that with an
+		// attacker-supplied channel id is a disk-exhaustion DoS (91).
+		if channelID != 0 {
+			if s.deps.State == nil {
+				return s.sendError(client, errCodeUnavailable, "state backend unavailable")
+			}
+			sc, ok := s.deps.State.GetClient(client.ID)
+			if !ok || sc.ChannelID != channelID {
+				return s.sendError(client, errCodePermissionDenied, "not a member of this channel")
+			}
+		}
+		if msg.Enc && s.chatKeys != nil {
+			// Non-minting lookup: an unknown scope is "rejoin", never a mint.
+			currentID, _, err := s.chatKeys.current(ctx, channelID)
+			if errors.Is(err, ErrNoScopeKey) {
+				return s.sendError(client, errCodeUnavailable, "no chat key for this channel yet — rejoin the channel")
+			}
+			if err != nil {
+				return s.sendError(client, errCodeUnavailable, "chat key unavailable")
+			}
+			if msg.KeyID != currentID {
+				scope := "channel"
+				if channelID == 0 {
+					scope = "global scope"
+				}
+				return s.sendError(client, errCodeMalformed, "stale chat key for "+scope+" (key rotated; wait for re-key)")
+			}
+		}
+		return s.routeScopedChat(ctx, client, msg, channelID)
 	}
 
 	// Direct messages are true E2EE: relay/spool only, no moderation.
@@ -884,7 +966,7 @@ func (s *TCPServer) handleChatSend(ctx context.Context, client *Client, f *netpr
 
 	switch {
 	case msg.ToUniqueID != "":
-		return s.sendDirectByUniqueID(ctx, client, msg.ToUniqueID, payload, msg.Text)
+		return s.sendDirectByUniqueID(ctx, client, msg.ToUniqueID, payload, msg.Text, msg.Enc)
 	default: // msg.ToClientID != ""
 		if err := s.deps.Broadcast.BroadcastToClient(msg.ToClientID, payload); err != nil {
 			return s.sendError(client, errCodeNotFound, "target client not reachable")
@@ -900,7 +982,7 @@ func (s *TCPServer) handleChatSend(ctx context.Context, client *Client, f *netpr
 // unique ID. If the user is online the message is delivered immediately (and
 // echoed to the sender); otherwise it is spooled into offline_messages for
 // delivery at their next login.
-func (s *TCPServer) sendDirectByUniqueID(ctx context.Context, client *Client, toUniqueID string, payload []byte, text string) error {
+func (s *TCPServer) sendDirectByUniqueID(ctx context.Context, client *Client, toUniqueID string, payload []byte, text string, enc bool) error {
 	if s.deps.Auth == nil {
 		return s.sendError(client, errCodeUnavailable, "authentication backend unavailable")
 	}
@@ -927,6 +1009,13 @@ func (s *TCPServer) sendDirectByUniqueID(ctx context.Context, client *Client, to
 
 	if s.deps.Spool == nil {
 		return s.sendError(client, errCodeNotFound, "target user is offline")
+	}
+	// A DM has no scope key, so the server cannot seal one on the sender's
+	// behalf: a plaintext DM to an offline user would land in the spool in
+	// the clear. Relaying it live is the sender's choice; persisting it is
+	// not, so the escape hatch stops at the spool (91).
+	if !enc {
+		return s.sendError(client, errCodePermissionDenied, "target user is offline and plaintext direct messages are never spooled — encrypt the message")
 	}
 	// E2EE DMs are spooled as ciphertext the server cannot read; the sender's
 	// unique ID travels along so the recipient can fetch the public key.
@@ -964,17 +1053,17 @@ func (s *TCPServer) deliverSpooled(ctx context.Context, client *Client, userID i
 
 	ids := make([]int64, 0, len(msgs))
 	for _, m := range msgs {
-		// Messages spooled with a from_unique_id are E2EE DMs (ciphertext);
-		// older rows are plaintext and delivered as-is.
-		e2e := m.FromUniqueID != ""
+		// Every spooled row is E2EE ciphertext: 012 deleted the undelivered
+		// pre-4b plaintext rows and offline_messages_sealed stops new ones,
+		// so there is no plaintext replay branch left to take (91).
 		payload, err := eventEnvelope(eventChat, netproto.ChatBroadcast{
 			FromClientID: strconv.FormatInt(m.FromUserID, 10),
 			FromUniqueID: m.FromUniqueID,
 			From:         m.FromName,
 			Text:         m.Message,
 			Offline:      true,
-			Enc:          e2e,
-			E2E:          e2e,
+			Enc:          true,
+			E2E:          true,
 		})
 		if err != nil {
 			continue

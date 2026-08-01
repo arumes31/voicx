@@ -232,8 +232,16 @@ type TCPServer struct {
 	listener net.Listener
 
 	// tlsFingerprint is the SHA-256 fingerprint of the control-channel
-	// certificate (empty when TLS is disabled). Set in Start.
+	// certificate (empty when TLS is disabled). Set in Start, or earlier by
+	// UseTLSMaterial.
 	tlsFingerprint string
+
+	// tlsCert is the control-channel certificate when the caller supplied it
+	// up front. The file-transfer port must present the SAME certificate, so
+	// the binary generates it once and hands it to both rather than letting
+	// two racing tlscert.Ensure calls mint two self-signed certs.
+	tlsCert    *tls.Certificate
+	tlsCertSet bool
 
 	// chatKeys manages the per-scope chat encryption keys and their
 	// persisted generations (91).
@@ -312,11 +320,17 @@ func (s *TCPServer) Start(ctx context.Context) error {
 		return fmt.Errorf("tcp listen on %s: %w", s.cfg.TCPAddr, err)
 	}
 	if s.cfg.TLSEnabled {
-		cert, fp, err := tlscert.Ensure(s.cfg.TLSDir, s.cfg.TLSCertFile, s.cfg.TLSKeyFile,
-			[]string{"localhost", s.cfg.ServerName})
-		if err != nil {
-			_ = ln.Close()
-			return fmt.Errorf("preparing control-channel TLS: %w", err)
+		cert, fp := tls.Certificate{}, ""
+		if s.tlsCertSet {
+			cert, fp = *s.tlsCert, s.tlsFingerprint
+		} else {
+			c, f, err := tlscert.Ensure(s.cfg.TLSDir, s.cfg.TLSCertFile, s.cfg.TLSKeyFile,
+				[]string{"localhost", s.cfg.ServerName})
+			if err != nil {
+				_ = ln.Close()
+				return fmt.Errorf("preparing control-channel TLS: %w", err)
+			}
+			cert, fp = c, f
 		}
 		s.tlsFingerprint = fp
 		ln = tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
@@ -359,6 +373,14 @@ func (s *TCPServer) Start(ctx context.Context) error {
 // certificate, or "" when TLS is disabled.
 func (s *TCPServer) TLSFingerprint() string {
 	return s.tlsFingerprint
+}
+
+// UseTLSMaterial installs the control-channel certificate instead of letting
+// Start mint its own. The file-transfer port presents the same certificate,
+// and two independent tlscert.Ensure calls on a fresh install would race to
+// create two different self-signed certs. Call before Start.
+func (s *TCPServer) UseTLSMaterial(cert tls.Certificate, fingerprint string) {
+	s.tlsCert, s.tlsFingerprint, s.tlsCertSet = &cert, fingerprint, true
 }
 
 // EnsureGlobalScopeKey mints the global chat generation at boot. Global is a

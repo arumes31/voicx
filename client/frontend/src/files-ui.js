@@ -169,6 +169,15 @@ function renderFbList() {
     list.appendChild(table);
 }
 
+// isChatAttachment reports a row the browser cannot make sense of: a chat
+// attachment is sealed with a per-file key that exists only inside the
+// encrypted chat message linking it, so downloading it here yields ciphertext
+// that looks like corruption (91-135). The .vcx suffix is content-derived and
+// always present; the server's encrypted flag is honoured when it sends one.
+function isChatAttachment(e) {
+    return !!e.encrypted || (e.name || "").toLowerCase().endsWith(".vcx");
+}
+
 function fileRow(e) {
     const tr = document.createElement("tr");
     tr.innerHTML = `
@@ -178,7 +187,10 @@ function fileRow(e) {
         <td class="mono fb-date">${fmtDate(e.uploaded_at)}</td>
         <td class="mono fb-sha" title="click to copy"></td>
         <td class="fb-actions"></td>`;
-    tr.querySelector(".fb-name").textContent = e.name;
+    const sealed = isChatAttachment(e);
+    const nameCell = tr.querySelector(".fb-name");
+    nameCell.textContent = sealed ? "🔒 chat attachment" : e.name;
+    if (sealed) nameCell.title = e.name;
     const up = tr.querySelector(".fb-up");
     up.textContent = (e.uploader || "").slice(0, 8) + (e.uploader ? "…" : "");
     up.title = e.uploader || "";
@@ -197,7 +209,11 @@ function fileRow(e) {
         act.appendChild(b);
         return b;
     };
-    btn("⬇", "download", () => downloadFile(e));
+    const dl = btn("⬇", "download", () => downloadFile(e));
+    if (sealed) {
+        dl.disabled = true;
+        dl.title = "open it from the chat message that carries its key";
+    }
     btn("🔗", "copy download link (15 min)", () => linkFile(e));
     btn("✓", "verify checksum (re-downloads and compares)", () => verifyFile(e, tr));
     btn("▾", "versions (264)", () => toggleVersions(e, tr));

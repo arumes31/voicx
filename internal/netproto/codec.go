@@ -651,7 +651,7 @@ type FileTransferInitResponse struct {
 }
 
 // FileList requests the file listing of a channel. Folder selects a virtual
-// folder (” = root, wave 7); Path is the legacy alias ("" or "/" only).
+// folder ("" = root, wave 7); Path is the legacy alias ("" or "/" only).
 type FileList struct {
 	ChannelID int64  `json:"channel_id"`
 	Path      string `json:"path,omitempty"`

@@ -425,13 +425,21 @@ func (m *connManager) installCurrentKeys(scope int64, keys []netproto.ChannelKey
 // requestKeys pulls specific generations the client missed (99/100). It is
 // fire-and-forget: the bundle lands on the read loop.
 func (m *connManager) requestKeys(scope int64, ids []uint32) error {
-	if len(ids) == 0 {
+	// Generations that landed while this pull was being assembled are dropped,
+	// so a retry never spends the 64-id budget on keys already held.
+	want := make([]uint32, 0, len(ids))
+	for _, id := range ids {
+		if !m.scopeKeys.has(scope, id) {
+			want = append(want, id)
+		}
+	}
+	if len(want) == 0 {
 		return nil
 	}
-	if len(ids) > maxKeyRequest {
-		ids = ids[:maxKeyRequest]
+	if len(want) > maxKeyRequest {
+		want = want[:maxKeyRequest]
 	}
-	return m.write(netproto.MsgChatKeyRequest, netproto.ChatKeyRequest{ChannelID: scope, KeyIDs: ids})
+	return m.write(netproto.MsgChatKeyRequest, netproto.ChatKeyRequest{ChannelID: scope, KeyIDs: want})
 }
 
 // peerPubKey resolves a user's X25519 public key: cache first, then the

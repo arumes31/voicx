@@ -174,7 +174,13 @@ func (s *TCPServer) handleServerInfoQuery(ctx context.Context, client *Client, f
 		Name:       s.cfg.ServerName,
 		Version:    version.String(),
 		MaxClients: s.cfg.MaxClients,
-		MOTD:       s.serverSetting(ctx, "motd"),
+	}
+	// Off by default (91): this reply is authenticated-only and every caller
+	// that published an X25519 key already got the MOTD sealed in its
+	// AuthResponse, so repeating it here in the clear would be the sole
+	// plaintext body left on the wire. Operators opt in for a public MOTD.
+	if s.cfg.ServerInfoMOTD {
+		resp.MOTD = s.serverSettingPlain(ctx, "motd")
 	}
 	if s.deps != nil && s.deps.State != nil {
 		stats := s.deps.State.Stats()

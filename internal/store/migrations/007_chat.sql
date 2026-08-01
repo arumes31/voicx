@@ -1,8 +1,9 @@
 -- 007_chat.sql — server-side chat infrastructure (wave 5a, backlog 96-133).
 --
--- chat_messages stores channel/global chat history. The server holds the
--- scope keys (wave 4b), so bodies are stored DECRYPTED for history, search,
--- and moderation. Direct messages are NOT stored here: they are true E2EE
+-- chat_messages stores channel/global chat history. The body column below is
+-- superseded by body_enc in 012_chat_encryption.sql (91-135): bodies are
+-- CIPHERTEXT at rest and body is pinned empty by a CHECK, so nothing may be
+-- read from it. Direct messages are NOT stored here: they are true E2EE
 -- and their history is client-local by design.
 -- Idempotent: safe to re-run via Store.Migrate().
 

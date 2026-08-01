@@ -16,12 +16,13 @@ import (
 
 // fakeFileTransfer implements FileTransferBackend, recording calls.
 type fakeFileTransfer struct {
-	mu        sync.Mutex
-	uploads   []ftCall
-	downloads []ftCall
-	files     []store.FileRecord
-	deleted   []string
-	renamed   [][2]string
+	mu          sync.Mutex
+	uploads     []ftCall
+	downloads   []ftCall
+	files       []store.FileRecord
+	deleted     []string
+	renamed     [][2]string
+	fingerprint string
 }
 
 type ftCall struct {
@@ -126,6 +127,13 @@ func (f *fakeFileTransfer) CreateLink(_ context.Context, channelID int64, folder
 }
 
 func (f *fakeFileTransfer) Port() int { return 30033 }
+
+// fingerprint is the data port's certificate fingerprint ("" = TLS off).
+func (f *fakeFileTransfer) Fingerprint() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fingerprint
+}
 
 func (f *fakeFileTransfer) uploadCount() int {
 	f.mu.Lock()
