@@ -51,6 +51,10 @@ type Client struct {
 	mu     sync.RWMutex
 	authed bool
 	admin  bool
+	// rulesPending gates a session that still owes the operator's rules an
+	// answer (215). It is per connection, not per account, because a guest
+	// has no users row to record an acceptance against.
+	rulesPending bool
 
 	// Activity and connection stats (Client Info dialog).
 	lastActive time.Time // last received frame
@@ -653,6 +657,8 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 		return s.handleTokenAdd(ctx, client, f)
 	case netproto.MsgTokenDelete:
 		return s.handleTokenDelete(ctx, client, f)
+	case netproto.MsgServerRulesAccept:
+		return s.handleServerRulesAccept(ctx, client, f)
 	case netproto.MsgPing:
 		return s.handlePing(ctx, client, f)
 	case netproto.MsgPong:

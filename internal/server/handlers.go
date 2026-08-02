@@ -467,6 +467,11 @@ func (s *TCPServer) finishAuth(ctx context.Context, client *Client, id authIdent
 		s.deliverSpooled(ctx, client, id.userID)
 	}
 
+	// (215) the rules gate arms last in the handshake: the client already has
+	// the tree and its own identity, so the modal goes up over a rendered UI
+	// and a failing rules read costs it none of that.
+	s.sendPendingRules(ctx, client, id.guest)
+
 	if s.deps.State != nil {
 		s.metricsSink().SetClientsConnected(s.deps.State.ClientCount())
 	}
@@ -522,6 +527,110 @@ func (s *TCPServer) attachChatKeysAndMOTD(ctx context.Context, client *Client, r
 		return
 	}
 	resp.MOTD, resp.MOTDEnc, resp.MOTDKeyID = motd, true, motdGen
+}
+
+// setRulesPending arms or clears the server-rules gate on the connection
+// (215).
+func (c *Client) setRulesPending(pending bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rulesPending = pending
+}
+
+// rulesBlocked reports whether the session still owes the server rules an
+// answer (215).
+func (c *Client) rulesBlocked() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.rulesPending
+}
+
+// sendPendingRules delivers the operator's rules when this session still owes
+// them an answer, and arms the gate that keeps the client out of channels and
+// chat until it gives one (215).
+//
+// Guests are asked on EVERY connect and their answer lives only in this
+// session: server_rules_acceptance.user_id references users.id, and a guest
+// has no such row, so no acceptance can be recorded for them. Asking every
+// time is the honest reading of an item that publishes the rules to everyone
+// who joins — the alternative, not asking at all, would exempt exactly the
+// users the operator knows least about.
+func (s *TCPServer) sendPendingRules(ctx context.Context, client *Client, guest bool) {
+	if s.deps == nil || s.deps.Rules == nil {
+		return
+	}
+	var (
+		text, hash string
+		pending    bool
+		err        error
+	)
+	if guest {
+		text, hash, err = s.deps.Rules.Text(ctx)
+		pending = hash != ""
+	} else {
+		text, hash, pending, err = s.deps.Rules.Pending(ctx, client.UserID)
+	}
+	if err != nil {
+		s.logger.Warn("reading the server rules failed",
+			zap.String("client_id", client.ID),
+			zap.Error(err),
+		)
+		return
+	}
+	if !pending {
+		return
+	}
+	client.setRulesPending(true)
+	if err := s.writeMessage(client, netproto.MsgServerRules, netproto.ServerRules{Text: text, Hash: hash}); err != nil {
+		s.logger.Warn("sending the server rules failed",
+			zap.String("client_id", client.ID),
+			zap.Error(err),
+		)
+	}
+}
+
+// handleServerRulesAccept records the caller's acceptance of the wording it
+// was shown (215). A stale hash is refused with an error frame AND a fresh
+// ServerRules frame carrying the text actually in force, so the client
+// re-displays instead of silently consenting to words nobody read. An empty
+// ServerRules frame is the acknowledgement of a successful accept: the gate
+// state stays server-authoritative, so the dialog never has to guess.
+func (s *TCPServer) handleServerRulesAccept(ctx context.Context, client *Client, f *netproto.Frame) error {
+	var msg netproto.ServerRulesAccept
+	if err := netproto.Decode(f, &msg); err != nil {
+		return s.sendError(client, errCodeMalformed, "malformed server_rules_accept: "+err.Error())
+	}
+	if s.deps == nil || s.deps.Rules == nil {
+		return s.sendError(client, errCodeUnavailable, "server rules unavailable")
+	}
+	text, hash, err := s.deps.Rules.Text(ctx)
+	if err != nil {
+		s.logger.Warn("reading the server rules failed",
+			zap.String("client_id", client.ID),
+			zap.Error(err),
+		)
+		return s.sendError(client, errCodeUnavailable, "server rules unavailable")
+	}
+	if hash == "" || msg.Hash != hash {
+		if err := s.sendError(client, errCodeMalformed, "the server rules changed since they were shown"); err != nil {
+			return err
+		}
+		client.setRulesPending(hash != "")
+		return s.writeMessage(client, netproto.MsgServerRules, netproto.ServerRules{Text: text, Hash: hash})
+	}
+	// A guest has no users row to write the acceptance to, so it stays on the
+	// connection (see sendPendingRules).
+	if client.UserID != 0 {
+		if err := s.deps.Rules.Accept(ctx, client.UserID, msg.Hash); err != nil {
+			s.logger.Warn("recording the rules acceptance failed",
+				zap.String("client_id", client.ID),
+				zap.Error(err),
+			)
+			return s.sendError(client, errCodeUnavailable, "recording the acceptance failed")
+		}
+	}
+	client.setRulesPending(false)
+	return s.writeMessage(client, netproto.MsgServerRules, netproto.ServerRules{})
 }
 
 // dedupeNickname appends #2, #3, ... when the nickname is already taken by
@@ -794,6 +903,12 @@ func (s *TCPServer) handleJoinChannel(ctx context.Context, client *Client, f *ne
 	if s.deps == nil || s.deps.State == nil {
 		return s.sendError(client, errCodeUnavailable, "state backend unavailable")
 	}
+	// (215) acceptance is a condition of entry, not a notice: an unanswered
+	// rules prompt keeps the client in the lobby, where the only thing it can
+	// still do is answer.
+	if client.rulesBlocked() {
+		return s.sendError(client, errCodePermissionDenied, "accept the server rules before joining a channel")
+	}
 	ch, ok := s.deps.State.GetChannel(msg.ChannelID)
 	if !ok {
 		return s.sendError(client, errCodeNotFound, "channel not found")
@@ -923,6 +1038,11 @@ func (s *TCPServer) handleChatSend(ctx context.Context, client *Client, f *netpr
 	}
 	if s.deps == nil || s.deps.Broadcast == nil {
 		return s.sendError(client, errCodeUnavailable, "broadcast backend unavailable")
+	}
+	// (215) same gate as the join: rules the user has not answered would
+	// otherwise be advisory, and DMs would route around a channel-only check.
+	if client.rulesBlocked() {
+		return s.sendError(client, errCodePermissionDenied, "accept the server rules before sending messages")
 	}
 
 	if len(msg.Text) > maxChatBytes {

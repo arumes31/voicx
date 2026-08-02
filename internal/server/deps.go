@@ -185,6 +185,15 @@ type BanAdminStore interface {
 	DeleteBan(ctx context.Context, id int64) error
 }
 
+// RulesBackend is the subset of rules.Service the TCP server needs (215):
+// what a user still has to accept, the wording in force, and recording an
+// acceptance. It is satisfied by *rules.Service.
+type RulesBackend interface {
+	Pending(ctx context.Context, userID int64) (text, hash string, pending bool, err error)
+	Text(ctx context.Context) (text, hash string, err error)
+	Accept(ctx context.Context, userID int64, hash string) error
+}
+
 // ComplaintBackend is the subset of the store needed to file and review
 // complaints (173).
 type ComplaintBackend interface {
@@ -255,6 +264,11 @@ type Deps struct {
 	Groups       GroupStore
 	BanAdmin     BanAdminStore
 	Metrics      metrics.Sink
+
+	// Rules delivers the operator's rules and gates unaccepted clients
+	// (215). Nil means no server configured rules at all, so nothing is
+	// asked and nothing is gated.
+	Rules RulesBackend
 
 	// ScopeKeys and ChatKEK back the chat key manager (91). Without both,
 	// chat is unavailable rather than silently RAM-only: a key that does not

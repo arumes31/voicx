@@ -154,6 +154,11 @@ const (
 	MsgServerBannerDat MessageType = 118 // server -> client: server banner payload
 	MsgEmojiDelete     MessageType = 119 // client -> server: delete a custom emoji
 	MsgEmojiRename     MessageType = 120 // client -> server: rename a custom emoji
+
+	MsgServerRules       MessageType = 121 // server -> client: rules text awaiting acceptance
+	MsgServerRulesAccept MessageType = 122 // client -> server: accept the rules by hash
+	MsgChannelSubscribe  MessageType = 123 // client -> server: (un)subscribe to channels
+	MsgSubscriptionState MessageType = 124 // server -> client: the authoritative subscription set
 )
 
 // String returns a human-readable name for the message type.
@@ -399,6 +404,14 @@ func (m MessageType) String() string {
 		return "EmojiDelete"
 	case MsgEmojiRename:
 		return "EmojiRename"
+	case MsgServerRules:
+		return "ServerRules"
+	case MsgServerRulesAccept:
+		return "ServerRulesAccept"
+	case MsgChannelSubscribe:
+		return "ChannelSubscribe"
+	case MsgSubscriptionState:
+		return "SubscriptionState"
 	default:
 		return fmt.Sprintf("Unknown(%d)", uint16(m))
 	}
@@ -794,6 +807,38 @@ type FileRename struct {
 	// NewChannelID moves the file to another channel (262). 0 keeps it where
 	// it is; a move is permission-checked against BOTH channels.
 	NewChannelID int64 `json:"new_channel_id,omitempty"`
+}
+
+// ServerRules carries the operator's rules text awaiting acceptance (215).
+// Hash identifies the exact text: editing the rules changes it, which re-asks
+// everyone and makes a stale acceptance refusable.
+type ServerRules struct {
+	Text string `json:"text"`
+	Hash string `json:"hash"`
+}
+
+// ServerRulesAccept records that the caller accepted the rules they were
+// shown (215). A hash that is no longer current is refused, so the client
+// re-displays rather than silently accepting text the user never read.
+type ServerRulesAccept struct {
+	Hash string `json:"hash"`
+}
+
+// ChannelSubscribe (un)subscribes the caller from channels it is not in
+// (312), so their chat and presence still arrive. Gated by the subscriber's
+// i_channel_subscribe_power against each target's
+// i_channel_needed_subscribe_power.
+type ChannelSubscribe struct {
+	ChannelIDs []int64 `json:"channel_ids"`
+	Subscribe  bool    `json:"subscribe"`
+}
+
+// SubscriptionState is the AUTHORITATIVE set after any change (312). The
+// server always sends the whole set rather than a delta, so a client cannot
+// accumulate drift against it. The caller's own channel is always included
+// and cannot be unsubscribed.
+type SubscriptionState struct {
+	ChannelIDs []int64 `json:"channel_ids"`
 }
 
 // ChannelIconGet fetches a channel's icon (271). Without it the uploaded

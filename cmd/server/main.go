@@ -526,6 +526,11 @@ func run() error {
 		}
 	}
 
+	// (215) one rules service for both readers: ServerQuery edits the wording
+	// and the control server hands it out, and a second instance would only
+	// be a second place for the two to disagree.
+	rulesSvc := rules.New(dbStore, dbStore.DB())
+
 	// Start the TCP control listener, wired to the auth, state, channels,
 	// broadcast, permissions, and voice backends.
 	tcpServer := server.New(cfg, logger, &server.Deps{
@@ -546,6 +551,7 @@ func run() error {
 		Groups:             dbStore,
 		BanAdmin:           dbStore,
 		Metrics:            m,
+		Rules:              rulesSvc,
 		ScopeKeys:          dbStore,
 		ChatKEK:            chatKEK,
 		ServerPasswordHash: serverPasswordHash,
@@ -615,7 +621,7 @@ func run() error {
 		startedAt:  time.Now(),
 		serverName: cfg.ServerName,
 		maxClients: cfg.MaxClients,
-		rules:      rules.New(dbStore, dbStore.DB()),
+		rules:      rulesSvc,
 	}
 	queryServer := query.New(cfg.QueryAddr, logger, qBackend)
 	queryErr := make(chan error, 1)
