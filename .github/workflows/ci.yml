@@ -20,6 +20,7 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: npm run build
+      - run: npm run test:unit
       - run: npm run test:e2e
 
   test:
@@ -83,13 +84,44 @@ jobs:
           go build ./...
           (cd client && go build ./...)
 
-      - name: test
+      - name: test and enforce coverage
         run: |
-          go test ./... -race -count=1
-          (cd client && xvfb-run -a go test ./...)
+          root_coverage="$RUNNER_TEMP/root-unit.out"
+          go test -race -count=1 -covermode=atomic -coverprofile="$root_coverage" ./internal/...
+          go test -race -count=1 . ./cmd/... ./v1
+          root_pct="$(go tool cover -func="$root_coverage" | awk '/^total:/ {gsub("%", "", $3); print $3}')"
+          awk -v got="$root_pct" 'BEGIN {
+            minimum = 70
+            if (got + 0 < minimum) {
+              printf "root internal coverage %.1f%% is below %.1f%%\n", got, minimum
+              exit 1
+            }
+          }'
+
+          client_coverage="$RUNNER_TEMP/client-unit.out"
+          (cd client && xvfb-run -a go test -race -count=1 -covermode=atomic -coverprofile="$client_coverage" ./...)
+          client_pct="$(go tool cover -func="$client_coverage" | awk '/^total:/ {gsub("%", "", $3); print $3}')"
+          awk -v got="$client_pct" 'BEGIN {
+            minimum = 50
+            if (got + 0 < minimum) {
+              printf "client coverage %.1f%% is below %.1f%%\n", got, minimum
+              exit 1
+            }
+          }'
+
+          printf "root internal coverage: %s%%\nclient coverage: %s%%\n" "$root_pct" "$client_pct"
         env:
           VOICX_TEST_DATABASE_URL: postgres://voicx:voicx@localhost:5432/voicx?sslmode=disable
           VOICX_REDIS_ADDR: localhost:6379
+
+      - name: upload coverage profiles
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage
+          path: |
+            ${{ runner.temp }}/root-unit.out
+            ${{ runner.temp }}/client-unit.out
 
   docker:
     needs: test

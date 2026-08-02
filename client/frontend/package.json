@@ -2,10 +2,13 @@
   "name": "frontend",
   "private": true,
   "version": "0.0.0",
+  "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "test": "npm run test:unit && npm run test:e2e",
+    "test:unit": "node --test --experimental-test-coverage --test-coverage-include=src/markdown.js --test-coverage-include=src/i18n.js --test-coverage-lines=90 --test-coverage-functions=90 --test-coverage-branches=80 unit/markdown.test.mjs unit/i18n.test.mjs",
     "test:e2e": "playwright test"
   },
   "dependencies": {
