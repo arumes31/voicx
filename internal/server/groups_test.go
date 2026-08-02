@@ -281,6 +281,20 @@ func (f *fakeGroups) UnsetPermission(_ context.Context, tier store.PermTier, tar
 	return nil
 }
 
+func (f *fakeGroups) CopyPermissions(_ context.Context, tier store.PermTier, target store.PermTarget, remove []string, entries []store.PermEntry) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, key := range remove {
+		delete(f.perms, permKey(tier, target, key))
+	}
+	for _, entry := range entries {
+		f.perms[permKey(tier, target, entry.Key)] = fakeGroupPerm{
+			value: entry.Value, grant: entry.Grant, skip: entry.Skip, negate: entry.Negate,
+		}
+	}
+	return nil
+}
+
 // ListPermissions returns the fake entries for a target on a tier.
 func (f *fakeGroups) ListPermissions(_ context.Context, tier store.PermTier, target store.PermTarget) ([]store.PermEntry, error) {
 	f.mu.Lock()

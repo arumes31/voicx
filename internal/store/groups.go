@@ -365,13 +365,18 @@ type PermTarget struct {
 	ChannelID int64
 }
 
+type permissionExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
 // upsertPermissionRow finds or creates the permissions row for the exact
 // (key, value, grant, skip, negate) tuple and returns its id.
-func (s *Store) upsertPermissionRow(ctx context.Context, key string, value, grant int, skip, negate bool) (int64, error) {
+func upsertPermissionRow(ctx context.Context, db permissionExecutor, key string, value, grant int, skip, negate bool) (int64, error) {
 	const sel = `SELECT id FROM permissions
 	             WHERE permission_key = $1 AND value = $2 AND grant_value = $3 AND skip_flag = $4 AND negate_flag = $5`
 	var id int64
-	err := s.db.QueryRowContext(ctx, sel, key, value, grant, skip, negate).Scan(&id)
+	err := db.QueryRowContext(ctx, sel, key, value, grant, skip, negate).Scan(&id)
 	if err == nil {
 		return id, nil
 	}
@@ -380,7 +385,7 @@ func (s *Store) upsertPermissionRow(ctx context.Context, key string, value, gran
 	}
 	const ins = `INSERT INTO permissions (permission_key, value, grant_value, skip_flag, negate_flag)
 	             VALUES ($1, $2, $3, $4, $5) RETURNING id`
-	if err := s.db.QueryRowContext(ctx, ins, key, value, grant, skip, negate).Scan(&id); err != nil {
+	if err := db.QueryRowContext(ctx, ins, key, value, grant, skip, negate).Scan(&id); err != nil {
 		return 0, fmt.Errorf("creating permission row: %w", err)
 	}
 	return id, nil
@@ -389,7 +394,11 @@ func (s *Store) upsertPermissionRow(ctx context.Context, key string, value, gran
 // SetPermission writes a permission for a target on a tier: existing entries
 // for the same key on the same target are replaced.
 func (s *Store) SetPermission(ctx context.Context, tier PermTier, target PermTarget, key string, value, grant int, skip, negate bool) error {
-	permID, err := s.upsertPermissionRow(ctx, key, value, grant, skip, negate)
+	return setPermissionWith(ctx, s.db, tier, target, key, value, grant, skip, negate)
+}
+
+func setPermissionWith(ctx context.Context, db permissionExecutor, tier PermTier, target PermTarget, key string, value, grant int, skip, negate bool) error {
+	permID, err := upsertPermissionRow(ctx, db, key, value, grant, skip, negate)
 	if err != nil {
 		return err
 	}
@@ -428,10 +437,10 @@ func (s *Store) SetPermission(ctx context.Context, tier PermTier, target PermTar
 		return fmt.Errorf("unknown permission tier %q", tier)
 	}
 
-	if _, err := s.db.ExecContext(ctx, del, delArgs...); err != nil {
+	if _, err := db.ExecContext(ctx, del, delArgs...); err != nil {
 		return fmt.Errorf("replacing %s permission: %w", tier, err)
 	}
-	if _, err := s.db.ExecContext(ctx, ins, insArgs...); err != nil {
+	if _, err := db.ExecContext(ctx, ins, insArgs...); err != nil {
 		return fmt.Errorf("setting %s permission: %w", tier, err)
 	}
 	return nil
@@ -489,6 +498,10 @@ func (s *Store) ListPermissions(ctx context.Context, tier PermTier, target PermT
 
 // UnsetPermission removes a permission entry for a target on a tier.
 func (s *Store) UnsetPermission(ctx context.Context, tier PermTier, target PermTarget, key string) error {
+	return unsetPermissionWith(ctx, s.db, tier, target, key)
+}
+
+func unsetPermissionWith(ctx context.Context, db permissionExecutor, tier PermTier, target PermTarget, key string) error {
 	var del string
 	var args []any
 	switch tier {
@@ -510,8 +523,33 @@ func (s *Store) UnsetPermission(ctx context.Context, tier PermTier, target PermT
 	default:
 		return fmt.Errorf("unknown permission tier %q", tier)
 	}
-	if _, err := s.db.ExecContext(ctx, del, args...); err != nil {
+	if _, err := db.ExecContext(ctx, del, args...); err != nil {
 		return fmt.Errorf("unsetting %s permission: %w", tier, err)
+	}
+	return nil
+}
+
+// CopyPermissions atomically removes destination-only keys and writes the
+// source entries. Callers perform authorization before entering this store
+// operation; the transaction guarantees Replace cannot leave a partial copy.
+func (s *Store) CopyPermissions(ctx context.Context, tier PermTier, target PermTarget, remove []string, entries []PermEntry) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning permission copy: %w", err)
+	}
+	defer tx.Rollback()
+	for _, key := range remove {
+		if err := unsetPermissionWith(ctx, tx, tier, target, key); err != nil {
+			return err
+		}
+	}
+	for _, entry := range entries {
+		if err := setPermissionWith(ctx, tx, tier, target, entry.Key, entry.Value, entry.Grant, entry.Skip, entry.Negate); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing permission copy: %w", err)
 	}
 	return nil
 }

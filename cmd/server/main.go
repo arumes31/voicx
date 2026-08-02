@@ -639,7 +639,7 @@ func run() error {
 
 	// (232) the gRPC API on the reserved port: same backend, same
 	// admin-only credentials, plus Events.Subscribe on the event bus.
-	grpcServer := grpcserver.New(cfg.GRPCAddr, qBackend, events, logger)
+	grpcServer := grpcserver.New(cfg.GRPCAddr, qBackend, events, logger, queryServer)
 	grpcErr := make(chan error, 1)
 	go func() {
 		if err := grpcServer.Start(ctx); err != nil {

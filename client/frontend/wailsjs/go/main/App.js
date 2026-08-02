@@ -182,8 +182,8 @@ export function DeleteChannel(arg1) {
   return window['go']['main']['App']['DeleteChannel'](arg1);
 }
 
-export function DeleteIdentity(arg1) {
-  return window['go']['main']['App']['DeleteIdentity'](arg1);
+export function DeleteIdentity(arg1, arg2) {
+  return window['go']['main']['App']['DeleteIdentity'](arg1, arg2);
 }
 
 export function Disconnect() {

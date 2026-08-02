@@ -19,10 +19,13 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 	"golang.org/x/crypto/ssh"
 )
+
+const handshakeTimeout = 30 * time.Second
 
 // SSHServer is the SSH front end for a ServerQuery Server. It shares the
 // backend, the limits and the brute-force lockout state of the base server.
@@ -179,7 +182,18 @@ func (s *SSHServer) passwordCallback(ctx context.Context) func(ssh.ConnMetadata,
 func (s *SSHServer) serve(ctx context.Context, nConn net.Conn, cfg *ssh.ServerConfig) {
 	defer nConn.Close()
 
+	if err := nConn.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+		s.logger.Debug("setting query ssh handshake deadline failed", zap.Error(err))
+		return
+	}
 	sshConn, chans, globalReqs, err := ssh.NewServerConn(nConn, cfg)
+	if clearErr := nConn.SetDeadline(time.Time{}); clearErr != nil {
+		s.logger.Debug("clearing query ssh handshake deadline failed", zap.Error(clearErr))
+		if err == nil {
+			_ = sshConn.Close()
+		}
+		return
+	}
 	if err != nil {
 		s.logger.Debug("query ssh handshake failed",
 			zap.String("remote", nConn.RemoteAddr().String()), zap.Error(err))
@@ -260,7 +274,7 @@ func execCommand(payload []byte) string {
 		return ""
 	}
 	n := binary.BigEndian.Uint32(payload)
-	if int(n) > len(payload)-4 {
+	if n > uint32(len(payload)-4) {
 		return ""
 	}
 	return string(payload[4 : 4+n])

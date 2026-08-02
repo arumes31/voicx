@@ -109,5 +109,6 @@ clean:
 
 ## help: print this help
 help:
-	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make <target>\n\nTargets:\n"} \
-	/^[a-zA-Z_-]+:.*##/ { printf "  %-16s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+	@awk 'BEGIN {printf "\nUsage:\n  make <target>\n\nTargets:\n"} \
+	/^## [a-zA-Z_-]+:/ { line = substr($$0, 4); colon = index(line, ":"); \
+	  printf "  %-16s %s\n", substr(line, 1, colon - 1), substr(line, colon + 2) }' $(MAKEFILE_LIST)

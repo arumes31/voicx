@@ -491,6 +491,9 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 	if !client.isAuthed() && mt != netproto.MsgAuthenticate && mt != netproto.MsgAuthSignature && mt != netproto.MsgPing {
 		return s.sendError(client, errCodeNotAuthenticated, "not authenticated")
 	}
+	if client.rulesBlocked() && !allowedWhileRulesPending[mt] {
+		return s.sendError(client, errCodePermissionDenied, "accept the server rules before continuing")
+	}
 
 	switch mt {
 	case netproto.MsgAuthenticate:
@@ -673,6 +676,14 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 		)
 		return s.sendError(client, errCodeUnknown, fmt.Sprintf("unknown message type %d", f.Type))
 	}
+}
+
+// allowedWhileRulesPending is deliberately small: central dispatch denies new
+// message types by default until the client accepts the current rules.
+var allowedWhileRulesPending = map[netproto.MessageType]bool{
+	netproto.MsgServerRulesAccept: true,
+	netproto.MsgPing:              true,
+	netproto.MsgPong:              true,
 }
 
 // pingLoop sends a server-initiated Ping every 15s until stopped; matching

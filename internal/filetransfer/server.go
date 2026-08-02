@@ -189,6 +189,9 @@ type Server struct {
 	// links is the download-link registry (267), served by the health HTTP
 	// server at /dl/<token>.
 	links *LinkRegistry
+	// moveBlobFn is injectable in tests so metadata rollback can be exercised
+	// without depending on the host's volume layout.
+	moveBlobFn func(string, string) error
 
 	// OnTransferComplete, when set, is called with the direction and result
 	// ("ok"/"error") when a transfer finishes (metrics).
@@ -214,13 +217,14 @@ func New(cfg Config, st FileStore, logger *zap.Logger) *Server {
 		port, _ = strconv.Atoi(p)
 	}
 	return &Server{
-		cfg:       cfg,
-		store:     st,
-		logger:    logger,
-		port:      port,
-		links:     NewLinkRegistry(),
-		stopCh:    make(chan struct{}),
-		transfers: make(map[string]*transfer),
+		cfg:        cfg,
+		store:      st,
+		logger:     logger,
+		port:       port,
+		links:      NewLinkRegistry(),
+		moveBlobFn: moveBlob,
+		stopCh:     make(chan struct{}),
+		transfers:  make(map[string]*transfer),
 	}
 }
 
@@ -399,6 +403,11 @@ func (s *Server) MoveFile(ctx context.Context, channelID int64, folder, name str
 	if channelID == newChannelID && folder == newFolder && name == newName {
 		return errors.New("nothing to rename")
 	}
+	oldPath := s.filePath(channelID, folder, name)
+	newPath := s.filePath(newChannelID, newFolder, newName)
+	if err := os.MkdirAll(filepath.Dir(newPath), 0o750); err != nil {
+		return fmt.Errorf("creating target folder: %w", err)
+	}
 	// A move into an occupied name would silently orphan the blob already
 	// there, so refuse instead of overwriting.
 	if channelID != newChannelID || folder != newFolder || name != newName {
@@ -407,14 +416,16 @@ func (s *Server) MoveFile(ctx context.Context, channelID int64, folder, name str
 		}
 	}
 	if err := s.store.MoveFile(ctx, channelID, folder, name, newChannelID, newFolder, newName); err != nil {
+		if errors.Is(err, store.ErrFileExists) {
+			return fmt.Errorf("%s already exists in the target folder: %w", newName, err)
+		}
 		return err
 	}
-	oldPath := s.filePath(channelID, folder, name)
-	newPath := s.filePath(newChannelID, newFolder, newName)
-	if err := os.MkdirAll(filepath.Dir(newPath), 0o750); err != nil {
-		return fmt.Errorf("creating target folder: %w", err)
-	}
-	if err := moveBlob(oldPath, newPath); err != nil {
+	if err := s.moveBlobFn(oldPath, newPath); err != nil {
+		rollbackErr := s.store.MoveFile(ctx, newChannelID, newFolder, newName, channelID, folder, name)
+		if rollbackErr != nil {
+			return fmt.Errorf("moving file blob: %w (metadata rollback failed: %v)", err, rollbackErr)
+		}
 		return fmt.Errorf("moving file blob: %w", err)
 	}
 	return nil
@@ -429,12 +440,17 @@ func moveBlob(oldPath, newPath string) error {
 	if err == nil || errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
+	return copyBlobAndRemove(oldPath, newPath, err)
+}
+
+// copyBlobAndRemove is the cross-volume fallback after Rename fails.
+func copyBlobAndRemove(oldPath, newPath string, renameErr error) error {
 	src, openErr := os.Open(oldPath)
 	if openErr != nil {
 		if errors.Is(openErr, os.ErrNotExist) {
 			return nil
 		}
-		return err
+		return renameErr
 	}
 	defer src.Close()
 	dst, createErr := os.Create(newPath)

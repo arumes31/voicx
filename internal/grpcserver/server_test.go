@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"voicx/internal/auth"
 	"voicx/internal/eventbus"
 	"voicx/internal/query"
 	voicxv1 "voicx/v1"
@@ -56,7 +57,10 @@ func (s *stubBackend) DeleteChannel(_ context.Context, id int64) error {
 
 func (s *stubBackend) PermOverview(_ context.Context, uniqueID string, _ int64) ([]query.PermLine, error) {
 	if uniqueID != "user-uid" {
-		return nil, errors.New("user not found")
+		if uniqueID == "perm-boom" {
+			return nil, errors.New("database detail must not leak")
+		}
+		return nil, auth.ErrUserNotFound
 	}
 	return []query.PermLine{
 		{Key: "i_client_talk_power", Value: 50},
@@ -75,7 +79,8 @@ func startGRPC(t *testing.T, backend query.Backend, bus *eventbus.Bus) string {
 	addr := ln.Addr().String()
 	_ = ln.Close()
 
-	srv := New(addr, backend, bus, zap.NewNop())
+	limiter := query.New("127.0.0.1:0", zap.NewNop(), backend)
+	srv := New(addr, backend, bus, zap.NewNop(), limiter)
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Start(ctx) }()
@@ -182,6 +187,36 @@ func TestControlRPCs(t *testing.T) {
 	}
 	if len(perms.GetDenied()) != 1 || perms.GetDenied()[0] != voicxv1.Permission_PERMISSION_BAN {
 		t.Fatalf("denied = %v", perms.GetDenied())
+	}
+	if _, err := client.QueryPermissions(ctx, &voicxv1.QueryPermissionsRequest{UserId: "missing"}); status.Code(err) != codes.NotFound || status.Convert(err).Message() != "user not found" {
+		t.Fatalf("missing-user QueryPermissions = %v", err)
+	}
+	if _, err := client.QueryPermissions(ctx, &voicxv1.QueryPermissionsRequest{UserId: "perm-boom"}); status.Code(err) != codes.Internal || status.Convert(err).Message() != "internal error" {
+		t.Fatalf("backend-error QueryPermissions = %v", err)
+	}
+}
+
+func TestSubscribedTypesRejectsAllUnknownFilter(t *testing.T) {
+	all, wanted, err := subscribedTypes(&voicxv1.SubscribeEventsRequest{})
+	if err != nil || len(all) != len(allBusTypes) || wanted != nil {
+		t.Fatalf("empty filter = %v, %v, %v", all, wanted, err)
+	}
+	_, _, err = subscribedTypes(&voicxv1.SubscribeEventsRequest{EventTypes: []voicxv1.EventType{voicxv1.EventType(999)}})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("unknown-only filter error = %v", err)
+	}
+}
+
+func TestGRPCAddressMustBeLoopback(t *testing.T) {
+	for _, addr := range []string{"127.0.0.1:50051", "localhost:50051", "[::1]:50051"} {
+		if err := validateLoopbackAddr(addr); err != nil {
+			t.Errorf("validateLoopbackAddr(%q) = %v", addr, err)
+		}
+	}
+	for _, addr := range []string{":50051", "0.0.0.0:50051", "192.0.2.1:50051"} {
+		if err := validateLoopbackAddr(addr); err == nil {
+			t.Errorf("validateLoopbackAddr(%q) accepted public bind", addr)
+		}
 	}
 }
 

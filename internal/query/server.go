@@ -225,7 +225,7 @@ func (s *Server) runSession(ctx context.Context, sess *session) {
 
 // armIdleTimeout re-arms the read deadline when the transport has one.
 func (sess *session) armIdleTimeout(d time.Duration) {
-	if sess.setReadDeadline != nil {
+	if d > 0 && sess.setReadDeadline != nil {
 		_ = sess.setReadDeadline(time.Now().Add(d))
 	}
 }

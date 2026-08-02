@@ -393,6 +393,7 @@ async function deleteFile(e) {
 
 const uploadQueue = [];
 let uploadActive = false;
+const UPLOAD_WAIT_TIMEOUT_MS = 10 * 60 * 1000;
 
 // DROP_MAX caps the browser-File route: a dropped File has no path on disk we
 // can hand to Go, so its bytes must travel base64 inside one IPC argument.
@@ -433,6 +434,7 @@ function queueUploadPaths(paths) {
 // awaitUpload keeps the queue sequential (260): the next file starts only once
 // this one has left the active state.
 function awaitUpload(id) {
+    const deadline = Date.now() + UPLOAD_WAIT_TIMEOUT_MS;
     const check = setInterval(() => {
         const t = transfers.get(id);
         if (t && t.status !== "active") {
@@ -440,8 +442,22 @@ function awaitUpload(id) {
             uploadActive = false;
             if (t.status === "done") refreshFiles();
             pumpUploads();
+        } else if (Date.now() >= deadline) {
+            clearInterval(check);
+            uploadActive = false;
+            V().toast("upload status timed out; continuing the queue", "warn");
+            pumpUploads();
         }
     }, 300);
+}
+
+function bytesToBase64(bytes) {
+    const chunks = [];
+    const chunkSize = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+        chunks.push(String.fromCharCode(...bytes.subarray(offset, offset + chunkSize)));
+    }
+    return btoa(chunks.join(""));
 }
 
 async function pumpUploads() {
@@ -456,7 +472,7 @@ async function pumpUploads() {
             err = await App().UploadPathProgress(id, fb.channelID, folder, path);
         } else {
             const buf = await file.arrayBuffer();
-            const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+            const b64 = bytesToBase64(new Uint8Array(buf));
             err = await App().UploadFileProgress(id, fb.channelID, folder, file.name, b64);
         }
         if (err) {

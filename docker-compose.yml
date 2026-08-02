@@ -92,7 +92,8 @@ services:
       # --- Listen addresses (kept in sync with the published ports) ---
       VOICX_TCP_ADDR: ":10011"
       VOICX_UDP_ADDR: ":9987"
-      VOICX_GRPC_ADDR: ":50051"
+      # gRPC carries Basic credentials over plaintext and is loopback-only.
+      VOICX_GRPC_ADDR: "127.0.0.1:50051"
       VOICX_HEALTH_ADDR: ":9090"
       VOICX_QUERY_ADDR: ":10012"
 
@@ -222,7 +223,7 @@ services:
       - "--no-dtls"
       - "--realm=${TURN_REALM:-voicx}"
       - "--use-auth-secret"
-      - "--static-auth-secret=${TURN_SECRET:-change-me-turn-secret}"
+      - "--static-auth-secret=${TURN_SECRET:?TURN_SECRET must be set for the turn profile}"
       # Empty when TURN_EXTERNAL_IP is unset; coturn ignores the empty argument.
       - "${TURN_EXTERNAL_IP:+--external-ip=$TURN_EXTERNAL_IP}"
       - "--min-port=49152"

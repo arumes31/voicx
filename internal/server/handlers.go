@@ -802,7 +802,8 @@ func (s *TCPServer) handleChannelEdit(ctx context.Context, client *Client, f *ne
 	if s.deps == nil || s.deps.Channels == nil || s.deps.State == nil {
 		return s.sendError(client, errCodeUnavailable, "channel backend unavailable")
 	}
-	if _, ok := s.deps.State.GetChannel(msg.ChannelID); !ok {
+	channel, ok := s.deps.State.GetChannel(msg.ChannelID)
+	if !ok {
 		return s.sendError(client, errCodeNotFound, "channel not found")
 	}
 
@@ -816,9 +817,13 @@ func (s *TCPServer) handleChannelEdit(ctx context.Context, client *Client, f *ne
 	// Same power cap as channel creation (160): an editor may not raise the
 	// needed join power above their own join power, or they could lock
 	// themselves and their peers out of a channel they still administer.
-	if msg.NeededJoinPower != nil && *msg.NeededJoinPower > 0 && !pc.admin &&
-		pc.power(permissions.PermissionKeyChannelJoinPower) < *msg.NeededJoinPower {
-		return s.sendError(client, errCodePermissionDenied, "cannot set needed join power above your own join power")
+	if msg.NeededJoinPower != nil && !pc.admin {
+		if pc.power(permissions.PermissionKeyChannelJoinPower) < *msg.NeededJoinPower {
+			return s.sendError(client, errCodePermissionDenied, "cannot set needed join power above your own join power")
+		}
+		if *msg.NeededJoinPower < channel.NeededJoinPower {
+			return s.sendError(client, errCodePermissionDenied, "cannot reduce the channel's needed join power")
+		}
 	}
 
 	if err := s.deps.Channels.UpdateChannel(ctx, msg.ChannelID, channels.ChannelUpdate{
@@ -1303,7 +1308,7 @@ func (s *TCPServer) moveClient(clientID string, channelID int64) error {
 		s.rotateScopeKey(context.Background(), oldChannelID)
 	}
 	if client, ok := s.clientByID(clientID); ok {
-		s.deliverScopeKey(context.Background(), client, channelID)
+		_ = s.deliverScopeKey(context.Background(), client, channelID)
 		// (312) the channel a client stands in is implicitly subscribed, so a
 		// move changes the authoritative set even though nothing was asked.
 		_ = s.sendSubscriptionState(client)

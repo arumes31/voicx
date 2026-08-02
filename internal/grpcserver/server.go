@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
 	"voicx/internal/eventbus"
@@ -34,26 +35,40 @@ type Server struct {
 	bus     *eventbus.Bus
 	logger  *zap.Logger
 	grpc    *grpc.Server
+	limiter LoginLimiter
+	addrErr error
+}
+
+// LoginLimiter is the ServerQuery brute-force limiter shared by every admin
+// transport.
+type LoginLimiter interface {
+	LoginAllowed(ip string) bool
+	RecordLoginFailure(ip string)
+	ClearLoginFailures(ip string)
 }
 
 // New constructs a gRPC server bound to the ServerQuery backend and the event
 // bus.
-func New(addr string, backend query.Backend, bus *eventbus.Bus, logger *zap.Logger) *Server {
+func New(addr string, backend query.Backend, bus *eventbus.Bus, logger *zap.Logger, limiter LoginLimiter) *Server {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	s := &Server{Addr: addr, backend: backend, bus: bus, logger: logger}
+	s := &Server{Addr: addr, backend: backend, bus: bus, logger: logger, limiter: limiter}
+	s.addrErr = validateLoopbackAddr(addr)
 	s.grpc = grpc.NewServer(
 		grpc.UnaryInterceptor(s.unaryAuth),
 		grpc.StreamInterceptor(s.streamAuth),
 	)
 	voicxv1.RegisterEventsServer(s.grpc, &eventsService{bus: bus, logger: logger})
-	voicxv1.RegisterControlServer(s.grpc, &controlService{backend: backend, logger: logger})
+	voicxv1.RegisterControlServer(s.grpc, &controlService{backend: backend, logger: logger, authenticate: s.authenticateAdmin})
 	return s
 }
 
 // Start serves until ctx is cancelled or Stop is called.
 func (s *Server) Start(ctx context.Context) error {
+	if s.addrErr != nil {
+		return s.addrErr
+	}
 	ln, err := net.Listen("tcp", s.Addr)
 	if err != nil {
 		return fmt.Errorf("grpc listen on %s: %w", s.Addr, err)
@@ -66,6 +81,21 @@ func (s *Server) Start(ctx context.Context) error {
 	}()
 	if err := s.grpc.Serve(ln); err != nil && !strings.Contains(err.Error(), "use of closed") {
 		return fmt.Errorf("grpc serve: %w", err)
+	}
+	return nil
+}
+
+func validateLoopbackAddr(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid grpc address %q: %w", addr, err)
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("grpc address %q must be loopback-only because the listener is plaintext", addr)
 	}
 	return nil
 }
@@ -94,17 +124,48 @@ func (s *Server) authenticate(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", status.Error(codes.Unauthenticated, err.Error())
 	}
-	valid, admin, err := s.backend.Authenticate(ctx, uniqueID, password)
+	valid, err := s.authenticateAdmin(ctx, remoteIPFromContext(ctx), uniqueID, password)
 	if err != nil {
 		s.logger.Warn("grpc auth error", zap.Error(err))
 		return "", status.Error(codes.Internal, "internal error")
 	}
-	if !valid || !admin {
+	if !valid {
 		// Non-admins are refused like bad credentials: the API is admin-only
 		// and the distinction would confirm an account exists.
 		return "", status.Error(codes.Unauthenticated, "invalid credentials")
 	}
 	return uniqueID, nil
+}
+
+func (s *Server) authenticateAdmin(ctx context.Context, ip, uniqueID, password string) (bool, error) {
+	if s.limiter == nil {
+		return false, fmt.Errorf("login limiter unavailable")
+	}
+	if !s.limiter.LoginAllowed(ip) {
+		return false, nil
+	}
+	valid, admin, err := s.backend.Authenticate(ctx, uniqueID, password)
+	if err != nil {
+		return false, err
+	}
+	if !valid || !admin {
+		s.limiter.RecordLoginFailure(ip)
+		return false, nil
+	}
+	s.limiter.ClearLoginFailures(ip)
+	return true, nil
+}
+
+func remoteIPFromContext(ctx context.Context) string {
+	p, ok := peer.FromContext(ctx)
+	if !ok || p.Addr == nil {
+		return "unknown"
+	}
+	host, _, err := net.SplitHostPort(p.Addr.String())
+	if err != nil {
+		return p.Addr.String()
+	}
+	return host
 }
 
 // parseBasic decodes an HTTP Basic credential.

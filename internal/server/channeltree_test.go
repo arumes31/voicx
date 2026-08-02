@@ -28,6 +28,12 @@ type treeChannels struct {
 	updErr error
 }
 
+func (f *treeChannels) setUpdateError(err error) {
+	f.mu.Lock()
+	f.updErr = err
+	f.mu.Unlock()
+}
+
 func (f *treeChannels) CreateChannel(_ context.Context, spec channels.ChannelSpec) (int64, error) {
 	f.state.AddChannel(&state.Channel{ChannelID: 1, Name: spec.Name, ChannelType: int(spec.Type)})
 	return 1, nil
@@ -147,6 +153,32 @@ func TestChannelEditJoinPowerAboveOwnDenied(t *testing.T) {
 	}
 }
 
+func TestChannelEditJoinPowerReductionDenied(t *testing.T) {
+	perms := tieredWith(
+		boolPerm(permissions.PermissionKeyChannelModify, true),
+		intPerm(permissions.PermissionKeyChannelJoinPower, 75),
+	)
+	env, _ := startTreeEnv(t, &perms)
+	defer env.stop()
+	env.state.AddChannel(&state.Channel{ChannelID: 1, Name: "Lobby", ChannelType: 2, NeededJoinPower: 20})
+
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+	power := 0
+	send(t, conn, netproto.MsgChannelEdit, netproto.ChannelEdit{ChannelID: 1, NeededJoinPower: &power})
+	f := readOfType(t, conn, netproto.MsgError)
+	var e netproto.Error
+	if err := netproto.Decode(f, &e); err != nil {
+		t.Fatal(err)
+	}
+	if e.Code != errCodePermissionDenied {
+		t.Fatalf("error code = %d, want %d", e.Code, errCodePermissionDenied)
+	}
+	if ch, _ := env.state.GetChannel(1); ch.NeededJoinPower != 20 {
+		t.Fatalf("needed join power = %d, want unchanged 20", ch.NeededJoinPower)
+	}
+}
+
 // TestChannelEditReorderAndReparent verifies order index, parent and the
 // inheritance toggle round-trip through the edit path (163/168/157).
 func TestChannelEditReorderAndReparent(t *testing.T) {
@@ -190,7 +222,7 @@ func TestChannelEditInvalidMoveRefused(t *testing.T) {
 	env, fc := startTreeEnv(t, &perms)
 	defer env.stop()
 
-	fc.updErr = fmt.Errorf("%w: channel 2 is an ancestor of 3", channels.ErrInvalidMove)
+	fc.setUpdateError(fmt.Errorf("%w: channel 2 is an ancestor of 3", channels.ErrInvalidMove))
 	env.state.AddChannel(&state.Channel{ChannelID: 2, Name: "Parent", ChannelType: 2})
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")

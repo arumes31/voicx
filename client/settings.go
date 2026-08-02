@@ -295,8 +295,9 @@ func (a *App) autoAwayMessage() string {
 	if msg == "" {
 		msg = defaultAutoAwayMessage
 	}
-	if len(msg) > 200 {
-		msg = msg[:200]
+	runes := []rune(msg)
+	if len(runes) > 200 {
+		msg = string(runes[:200])
 	}
 	return msg
 }
@@ -388,6 +389,13 @@ func (a *App) settingsFile() string {
 
 // save persists the App's settings to its settings file.
 func (a *App) save() error {
+	a.settingsMu.Lock()
+	defer a.settingsMu.Unlock()
+	return a.saveLocked()
+}
+
+// saveLocked persists settings while settingsMu is held.
+func (a *App) saveLocked() error {
 	if path := a.settingsFile(); path != "" {
 		return saveSettingsAt(path, a.settings)
 	}
@@ -396,6 +404,8 @@ func (a *App) save() error {
 
 // GetSettings returns the current settings to the frontend.
 func (a *App) GetSettings() Settings {
+	a.settingsMu.Lock()
+	defer a.settingsMu.Unlock()
 	return a.settings
 }
 
@@ -404,7 +414,7 @@ func (a *App) GetSettings() Settings {
 // announced through here; the frontend has no other way to learn of it before
 // the next restart.
 func (a *App) emitSettingsUpdate() {
-	a.emitPlain("settings_update", a.settings)
+	a.emitPlain("settings_update", a.GetSettings())
 }
 
 // mergeGoOwned returns incoming with the fields the Go side maintains on its
@@ -443,8 +453,11 @@ func (a *App) SaveSettings(s Settings) string {
 	if s.Volume < 0 || s.Volume > 200 {
 		return "volume must be 0..200"
 	}
+	a.settingsMu.Lock()
 	a.settings = mergeGoOwned(a.settings, s)
-	if err := a.save(); err != nil {
+	err := a.saveLocked()
+	a.settingsMu.Unlock()
+	if err != nil {
 		return err.Error()
 	}
 	a.emitSettingsUpdate()

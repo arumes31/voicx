@@ -868,7 +868,7 @@ async function refreshIdentities(tbody) {
                 ? `Delete identity "${e.name}"?`
                 : `"${e.name}" has NEVER been exported. Deleting it loses that account on every server forever. Delete anyway?`;
             if (!confirm(warn)) return;
-            const err = await window.go.main.App.DeleteIdentity(e.id);
+            const err = await window.go.main.App.DeleteIdentity(e.id, true);
             if (err) V().toast("delete failed: " + err, "warn");
             refreshIdentities(tbody);
         }).classList.add("danger-btn");

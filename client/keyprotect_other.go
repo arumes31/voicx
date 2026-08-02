@@ -10,9 +10,9 @@ import "errors"
 // keyProtectionAvailable reports that no OS key protection is wired up here.
 func keyProtectionAvailable() bool { return false }
 
-// keyProtectionName is what the UI would show for this platform's protected
-// mode; it is unreachable while keyProtectionAvailable is false.
-const keyProtectionName = "none"
+// keyProtectionName identifies the protection used by files that can be read
+// on Windows but not on this platform.
+const keyProtectionName = "Windows DPAPI"
 
 // protectBytes is unsupported off Windows.
 func protectBytes(_ []byte) ([]byte, error) {

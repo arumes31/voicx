@@ -62,6 +62,16 @@ func TestChannelTreeOrderedRespectsOrderIndex(t *testing.T) {
 	}
 }
 
+func TestChannelTreeOrderedReturnsClones(t *testing.T) {
+	m := treeManager(&Channel{ChannelID: 1, Name: "original"})
+	ordered := m.ChannelTreeOrdered()
+	ordered[0].Name = "caller mutation"
+	got, ok := m.GetChannel(1)
+	if !ok || got.Name != "original" {
+		t.Fatalf("ChannelTreeOrdered exposed live channel: %+v", got)
+	}
+}
+
 // TestChannelPermissionChain verifies the chain stops at the first channel
 // that does not inherit (157).
 func TestChannelPermissionChain(t *testing.T) {

@@ -199,7 +199,7 @@ func Load() (*Config, error) {
 	v.SetDefault("dev_mode", true)
 	v.SetDefault("tcp_addr", ":10011")
 	v.SetDefault("udp_addr", ":9987")
-	v.SetDefault("grpc_addr", ":50051")
+	v.SetDefault("grpc_addr", "127.0.0.1:50051")
 	v.SetDefault("health_addr", ":9090")
 	v.SetDefault("query_addr", ":10012")
 	v.SetDefault("query_ssh_enabled", false)
@@ -297,6 +297,12 @@ func Load() (*Config, error) {
 		cfg.ChatLegacyHistory = strings.ToLower(cfg.ChatLegacyHistory)
 	default:
 		return nil, fmt.Errorf("invalid chat_legacy_history %q: must be \"encrypt\" or \"purge\"", cfg.ChatLegacyHistory)
+	}
+	if cfg.FileQuietHoursStart < 0 || cfg.FileQuietHoursStart > 23 {
+		return nil, fmt.Errorf("invalid file_quiet_hours_start %d: must be 0..23", cfg.FileQuietHoursStart)
+	}
+	if cfg.FileQuietHoursEnd < 0 || cfg.FileQuietHoursEnd > 23 {
+		return nil, fmt.Errorf("invalid file_quiet_hours_end %d: must be 0..23", cfg.FileQuietHoursEnd)
 	}
 
 	return cfg, nil

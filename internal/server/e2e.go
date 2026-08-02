@@ -43,9 +43,9 @@ func (s *TCPServer) handleKeyPublish(ctx context.Context, client *Client, f *net
 	}
 
 	// Key delivery: global scope + the client's current channel (if any).
-	s.deliverScopeKey(ctx, client, globalChatScope)
+	_ = s.deliverScopeKey(ctx, client, globalChatScope)
 	if sc, ok := s.deps.State.GetClient(client.ID); ok && sc.ChannelID != 0 {
-		s.deliverScopeKey(ctx, client, sc.ChannelID)
+		_ = s.deliverScopeKey(ctx, client, sc.ChannelID)
 	}
 	return nil
 }
@@ -90,13 +90,13 @@ func (s *TCPServer) handleKeyRequest(_ context.Context, client *Client, f *netpr
 // This is one of the three authorised minting sites: the caller has already
 // established that the client belongs to the scope, so a first generation may
 // be created here.
-func (s *TCPServer) deliverScopeKey(ctx context.Context, client *Client, scope int64) {
+func (s *TCPServer) deliverScopeKey(ctx context.Context, client *Client, scope int64) error {
 	if s.deps == nil || s.deps.State == nil || s.chatKeys == nil || !s.chatKeys.configured() {
-		return
+		return nil
 	}
 	sc, ok := s.deps.State.GetClient(client.ID)
 	if !ok || sc.E2EPublicKey == "" {
-		return
+		return nil
 	}
 	gen, _, err := s.chatKeys.EnsureScope(ctx, scope)
 	if err != nil {
@@ -105,7 +105,7 @@ func (s *TCPServer) deliverScopeKey(ctx context.Context, client *Client, scope i
 			zap.Int64("scope", scope),
 			zap.Error(err),
 		)
-		return
+		return err
 	}
 	ck, err := s.chatKeys.sealFor(ctx, scope, gen, sc.E2EPublicKey)
 	if err != nil {
@@ -114,14 +114,16 @@ func (s *TCPServer) deliverScopeKey(ctx context.Context, client *Client, scope i
 			zap.Int64("scope", scope),
 			zap.Error(err),
 		)
-		return
+		return err
 	}
 	if err := s.writeMessage(client, netproto.MsgChannelKey, ck); err != nil {
 		s.logger.Debug("delivering chat key failed",
 			zap.String("client_id", client.ID),
 			zap.Error(err),
 		)
+		return err
 	}
+	return nil
 }
 
 // scopeReadable reports whether the client may read a scope's messages: the
@@ -199,14 +201,14 @@ func (s *TCPServer) doRotateScopeKey(ctx context.Context, channelID int64) {
 	}
 	for _, member := range s.deps.State.ChannelMembers(channelID) {
 		if client, ok := s.clientByID(member.ClientID); ok {
-			s.deliverScopeKey(ctx, client, channelID)
+			_ = s.deliverScopeKey(ctx, client, channelID)
 		}
 	}
 	// (312) subscribers read this scope under the same generation, so leaving
 	// them out of the redistribution would strand every one of them on the
 	// retired key and turn their tab into a wall of ⚠ placeholders.
 	for _, client := range s.channelSubscribers(ctx, channelID) {
-		s.deliverScopeKey(ctx, client, channelID)
+		_ = s.deliverScopeKey(ctx, client, channelID)
 	}
 	s.logger.Debug("chat key rotated", zap.Int64("channel_id", channelID))
 }

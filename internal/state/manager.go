@@ -514,9 +514,9 @@ func (m *Manager) IsSubscribed(clientID string, channelID int64) bool {
 }
 
 // ClientChannelState returns the mutable fields subscription and chat-scope
-// checks need while still holding the manager read lock. GetClient returns a
-// live pointer for legacy callers; reading ChannelID from that pointer after
-// the lock is released races a concurrent MoveClient.
+// checks need while holding the manager read lock. GetClient returns a clone,
+// so callers that need a coherent ChannelID and E2EPublicKey pair use this
+// method instead of taking separate snapshots.
 func (m *Manager) ClientChannelState(clientID string) (channelID int64, e2ePublicKey string, ok bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

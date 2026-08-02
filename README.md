@@ -71,10 +71,14 @@ Loaded with viper. Precedence (highest first):
 | `dev_mode` | `VOICX_DEV_MODE` | `true` | Development (console) vs production (JSON) logger |
 | `tcp_addr` | `VOICX_TCP_ADDR` | `:10011` | Control listener address |
 | `udp_addr` | `VOICX_UDP_ADDR` | `:9987` | UDP keepalive listener address |
-| `grpc_addr` | `VOICX_GRPC_ADDR` | `:50051` | gRPC address (reserved) |
+| `grpc_addr` | `VOICX_GRPC_ADDR` | `127.0.0.1:50051` | plaintext gRPC address (loopback-only) |
 | `health_addr` | `VOICX_HEALTH_ADDR` | `:9090` | Health HTTP listener address |
 | `query_addr` | `VOICX_QUERY_ADDR` | `:10012` | ServerQuery listener address |
 | `file_addr` | `VOICX_FILE_ADDR` | `:30033` | File-transfer listener address |
+
+The gRPC administration API carries Basic credentials and therefore refuses
+non-loopback bind addresses. Put a TLS-terminating proxy on the same host in
+front of it if remote bot access is required.
 | `file_root` | `VOICX_FILE_ROOT` | `./data/files` | File storage root (`<channel>/<name>`) |
 | `file_max_kbps` | `VOICX_FILE_MAX_KBPS` | `0` | Per-connection bandwidth cap (KiB/s, 0=unlimited) |
 | `file_channel_quota_mb` | `VOICX_FILE_CHANNEL_QUOTA_MB` | `0` | Per-channel file quota (MiB, 0=unlimited) |
@@ -179,6 +183,8 @@ export E2E_ALICE_UID=<alice uid> E2E_ALICE_PASS=alicepw
 export E2E_BOB_UID=<bob uid>     E2E_BOB_PASS=bobpw
 export E2E_ADMIN_UID=<admin uid> E2E_ADMIN_PASS=adminpw
 make chaos                       # or: ./scripts/chaos-db.sh
+# equivalent direct invocation:
+go run ./cmd/e2e -chaos
 ```
 
 The whole checklist runs first, because the drill uses the channel it creates. With two authenticated sessions live and a third generating traffic (a ping every 200 ms, an encrypted channel message every second — slower than the pings so the 5-per-3s chat rate limit cannot be mistaken for a backend failure), it asserts:

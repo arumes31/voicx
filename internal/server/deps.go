@@ -169,6 +169,7 @@ type GroupStore interface {
 	SetGroupCosmetics(ctx context.Context, groupID int64, color *string, hoist *bool, sortID *int) error
 	SetPermission(ctx context.Context, tier store.PermTier, target store.PermTarget, key string, value, grant int, skip, negate bool) error
 	UnsetPermission(ctx context.Context, tier store.PermTier, target store.PermTarget, key string) error
+	CopyPermissions(ctx context.Context, tier store.PermTier, target store.PermTarget, remove []string, entries []store.PermEntry) error
 	// ListPermissions is the editor read path (wave 6b).
 	ListPermissions(ctx context.Context, tier store.PermTier, target store.PermTarget) ([]store.PermEntry, error)
 	Audit(ctx context.Context, actor, action, target, detail string)

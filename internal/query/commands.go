@@ -255,6 +255,16 @@ func (s *Server) clearLoginFailures(ip string) {
 	delete(s.lockouts, ip)
 }
 
+// LoginAllowed reports whether the shared ServerQuery brute-force limiter
+// currently permits another attempt from ip.
+func (s *Server) LoginAllowed(ip string) bool { return !s.lockedOut(ip) }
+
+// RecordLoginFailure feeds a failed attempt into the shared limiter.
+func (s *Server) RecordLoginFailure(ip string) { s.recordLoginFailure(ip) }
+
+// ClearLoginFailures clears the shared limiter after a successful login.
+func (s *Server) ClearLoginFailures(ip string) { s.clearLoginFailures(ip) }
+
 // cmdClientlist lists online clients.
 func (s *Server) cmdClientlist(ctx context.Context, sess *session) bool {
 	var b strings.Builder
@@ -1101,7 +1111,10 @@ func (s *Server) streamLog(ctx context.Context, sess *session, stream <-chan str
 			return true
 		case <-deadline.C:
 			return true
-		case line := <-stream:
+		case line, ok := <-stream:
+			if !ok {
+				return true
+			}
 			if lower != "" && !strings.Contains(strings.ToLower(line), lower) {
 				continue
 			}

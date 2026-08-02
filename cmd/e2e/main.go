@@ -13,6 +13,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
@@ -2022,6 +2023,8 @@ const (
 	chaosChatEvery = time.Second
 	// chaosPoll is the interval between health probes.
 	chaosPoll = 250 * time.Millisecond
+	// chaosCommandTimeout bounds each operator-supplied stop/start command.
+	chaosCommandTimeout = 30 * time.Second
 )
 
 // chaosSession drives one authenticated session from two goroutines: a reader
@@ -2177,7 +2180,9 @@ func runChaosCmd(cmdline string) (string, error) {
 	if len(fields) == 0 {
 		return "", errors.New("empty command")
 	}
-	out, err := exec.Command(fields[0], fields[1:]...).CombinedOutput() //nolint:gosec // operator-supplied drill command
+	ctx, cancel := context.WithTimeout(context.Background(), chaosCommandTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, fields[0], fields[1:]...).CombinedOutput() //nolint:gosec // operator-supplied drill command
 	return strings.TrimSpace(string(out)), err
 }
 

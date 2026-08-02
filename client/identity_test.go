@@ -227,15 +227,42 @@ func TestIdentityManagerLifecycle(t *testing.T) {
 		}
 	}
 
-	if err := a.DeleteIdentity(work.ID); err != "" {
+	if err := a.DeleteIdentity(work.ID, false); !strings.Contains(err, "explicit confirmation") {
+		t.Fatalf("unexported delete without confirmation = %q", err)
+	}
+	if err := a.DeleteIdentity(work.ID, true); err != "" {
 		t.Fatalf("delete: %s", err)
 	}
 	list = a.ListIdentities()
 	if len(list) != 1 || list[0].ID != first.ID || !list[0].Active {
 		t.Fatalf("deleting the active identity must fall back to a real one: %+v", list)
 	}
-	if err := a.DeleteIdentity(first.ID); err == "" {
+	if err := a.DeleteIdentity(first.ID, true); err == "" {
 		t.Fatal("deleting the last identity was allowed")
+	}
+}
+
+func TestIdentityIDsCannotEscapeStore(t *testing.T) {
+	a := identityTestApp(t, "off")
+	if err := a.CreateIdentity("second"); err != "" {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"../outside", `..\\outside`, "UPPER", "bad_name", ""} {
+		if _, err := identityPathFor(id); err == nil {
+			t.Errorf("identityPathFor(%q) accepted invalid ID", id)
+		}
+		if err := a.SwitchIdentity(id); err == "" {
+			t.Errorf("SwitchIdentity(%q) accepted invalid ID", id)
+		}
+		if err := a.RenameIdentity(id, "name"); err == "" {
+			t.Errorf("RenameIdentity(%q) accepted invalid ID", id)
+		}
+		if got := a.ImproveIdentityLevel(id, 1, 1); got.Error == "" {
+			t.Errorf("ImproveIdentityLevel(%q) accepted invalid ID", id)
+		}
+		if err := a.DeleteIdentity(id, true); err == "" {
+			t.Errorf("DeleteIdentity(%q) accepted invalid ID", id)
+		}
 	}
 }
 

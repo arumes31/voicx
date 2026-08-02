@@ -98,6 +98,9 @@ func (f *fakeFileStore) MoveFile(_ context.Context, channelID int64, folder, nam
 	if !ok {
 		return store.ErrFileNotFound
 	}
+	if _, exists := f.files[key(newChannelID, newFolder, newName)]; exists {
+		return store.ErrFileExists
+	}
 	delete(f.files, k)
 	rec.ChannelID = newChannelID
 	rec.Folder = newFolder
@@ -402,6 +405,36 @@ func TestMoveFileAcrossChannels(t *testing.T) {
 	}
 }
 
+func TestMoveFileRollsBackMetadataWhenBlobMoveFails(t *testing.T) {
+	ctx := context.Background()
+	fs := newFakeFileStore()
+	s := New(Config{Addr: ":0", RootDir: t.TempDir()}, fs, nil)
+	oldPath := s.filePath(7, "", "doc.txt")
+	if err := os.MkdirAll(filepath.Dir(oldPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(oldPath, []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.AddFile(ctx, store.FileRecord{ChannelID: 7, Name: "doc.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	s.moveBlobFn = func(string, string) error { return errors.New("injected blob failure") }
+
+	if err := s.MoveFile(ctx, 7, "", "doc.txt", 8, "shared", "doc.txt"); err == nil {
+		t.Fatal("MoveFile succeeded despite blob failure")
+	}
+	if _, err := fs.GetFile(ctx, 7, "", "doc.txt"); err != nil {
+		t.Fatalf("source metadata was not restored: %v", err)
+	}
+	if _, err := fs.GetFile(ctx, 8, "shared", "doc.txt"); !errors.Is(err, store.ErrFileNotFound) {
+		t.Fatalf("target metadata remains after rollback: %v", err)
+	}
+	if got, err := os.ReadFile(oldPath); err != nil || string(got) != "payload" {
+		t.Fatalf("source blob = %q, err=%v", got, err)
+	}
+}
+
 // TestMoveBlobCrossVolumeFallback verifies the copy+unlink path used when
 // Rename cannot cross a mount point (262).
 func TestMoveBlobCrossVolumeFallback(t *testing.T) {
@@ -411,8 +444,8 @@ func TestMoveBlobCrossVolumeFallback(t *testing.T) {
 	if err := os.WriteFile(src, []byte("payload"), 0o600); err != nil {
 		t.Fatalf("write src: %v", err)
 	}
-	if err := moveBlob(src, dst); err != nil {
-		t.Fatalf("moveBlob: %v", err)
+	if err := copyBlobAndRemove(src, dst, errors.New("injected cross-volume rename failure")); err != nil {
+		t.Fatalf("copyBlobAndRemove: %v", err)
 	}
 	if got, err := os.ReadFile(dst); err != nil || string(got) != "payload" {
 		t.Fatalf("moved blob = %q, err=%v", got, err)

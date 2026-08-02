@@ -483,7 +483,7 @@ func (s *TCPServer) handleTokenAdd(ctx context.Context, client *Client, f *netpr
 	if msg.ChannelID != 0 {
 		tokenType = 1
 	}
-	key, err := s.deps.Tokens.CreateTokenWithMeta(ctx, tokenType, msg.GroupID, msg.ChannelID, msg.Description, 1)
+	_, err := s.deps.Tokens.CreateTokenWithMeta(ctx, tokenType, msg.GroupID, msg.ChannelID, msg.Description, 1)
 	if err != nil {
 		s.logger.Warn("token create failed",
 			zap.String("client_id", client.ID),
@@ -496,16 +496,8 @@ func (s *TCPServer) handleTokenAdd(ctx context.Context, client *Client, f *netpr
 
 	resp, err := s.tokensResponse(ctx)
 	if err != nil {
-		// The key exists; without the list the caller would never learn it.
-		return s.writeMessage(client, netproto.MsgTokens, netproto.Tokens{
-			Entries: []netproto.TokenEntry{{
-				Token:       key,
-				GroupID:     msg.GroupID,
-				ChannelID:   msg.ChannelID,
-				Description: msg.Description,
-				CreatedAt:   time.Now().Unix(),
-			}},
-		})
+		s.logger.Warn("token created but refreshed list failed", zap.Error(err))
+		return s.sendError(client, errCodeUnavailable, "token created; token list refresh failed — re-list tokens")
 	}
 	return s.writeMessage(client, netproto.MsgTokens, resp)
 }

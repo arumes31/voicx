@@ -123,7 +123,10 @@ func (s *TCPServer) handleChannelSubscribe(ctx context.Context, client *Client, 
 	for _, id := range add {
 		// The caller is entitled to this scope, which is what authorises
 		// minting its first generation here.
-		s.deliverScopeKey(ctx, client, id)
+		if err := s.deliverScopeKey(ctx, client, id); err != nil {
+			s.deps.State.Unsubscribe(client.ID, []int64{id})
+			refused = append(refused, fmt.Sprintf("%d (key delivery failed)", id))
+		}
 	}
 	if len(refused) > 0 {
 		_ = s.sendError(client, errCodePermissionDenied,

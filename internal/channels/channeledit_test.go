@@ -196,6 +196,8 @@ func TestSetCleanupDelay(t *testing.T) {
 	}
 
 	mgr.SetCleanupDelay(0)
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
 	if got := mgr.cleanupDelayLocked(); got != DefaultCleanupDelay {
 		t.Fatalf("cleanup delay = %v, want the default %v", got, DefaultCleanupDelay)
 	}

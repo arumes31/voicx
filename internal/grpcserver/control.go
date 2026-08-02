@@ -4,6 +4,7 @@ package grpcserver
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 
@@ -11,6 +12,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"voicx/internal/auth"
 	"voicx/internal/query"
 	voicxv1 "voicx/v1"
 )
@@ -22,20 +24,21 @@ import (
 // would be a second, unchecked path to the file port.
 type controlService struct {
 	voicxv1.UnimplementedControlServer
-	backend query.Backend
-	logger  *zap.Logger
+	backend      query.Backend
+	logger       *zap.Logger
+	authenticate func(context.Context, string, string, string) (bool, error)
 }
 
 // Authenticate validates credentials. It is the one RPC that carries its own
 // credentials; every other RPC repeats them in the authorization metadata
 // header, so there is no session token to hand back and the field stays empty.
 func (c *controlService) Authenticate(ctx context.Context, req *voicxv1.AuthenticateRequest) (*voicxv1.AuthenticateResponse, error) {
-	ok, admin, err := c.backend.Authenticate(ctx, req.GetUsername(), req.GetPassword())
+	ok, err := c.authenticate(ctx, remoteIPFromContext(ctx), req.GetUsername(), req.GetPassword())
 	if err != nil {
 		c.logger.Warn("grpc authenticate error", zap.Error(err))
 		return nil, status.Error(codes.Internal, "internal error")
 	}
-	if !ok || !admin {
+	if !ok {
 		return &voicxv1.AuthenticateResponse{Success: false, Error: "invalid credentials"}, nil
 	}
 	return &voicxv1.AuthenticateResponse{Success: true, UserId: req.GetUsername()}, nil
@@ -148,7 +151,11 @@ func (c *controlService) QueryPermissions(ctx context.Context, req *voicxv1.Quer
 	}
 	lines, err := c.backend.PermOverview(ctx, req.GetUserId(), channelID)
 	if err != nil {
-		return nil, status.Error(codes.NotFound, err.Error())
+		if errors.Is(err, auth.ErrUserNotFound) {
+			return nil, status.Error(codes.NotFound, "user not found")
+		}
+		c.logger.Warn("grpc permission overview error", zap.Error(err))
+		return nil, status.Error(codes.Internal, "internal error")
 	}
 	resp := &voicxv1.QueryPermissionsResponse{}
 	for _, line := range lines {

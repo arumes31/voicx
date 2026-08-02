@@ -206,11 +206,29 @@ func identityIDFromName(dir, name string) string {
 
 // identityPathFor returns the file backing an identity ID.
 func identityPathFor(id string) (string, error) {
+	if err := validateIdentityID(id); err != nil {
+		return "", err
+	}
 	dir, err := identitiesDir()
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(dir, id+".json"), nil
+}
+
+// validateIdentityID accepts only the file-stem character set emitted by
+// identityIDFromName. In particular, path separators and traversal tokens are
+// never valid identity IDs.
+func validateIdentityID(id string) error {
+	if id == "" {
+		return errors.New("identity ID is required")
+	}
+	for _, r := range id {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+			return errors.New("invalid identity ID")
+		}
+	}
+	return nil
 }
 
 // resolveActiveIn returns the active identity's ID and file path for a store
@@ -701,18 +719,25 @@ func (a *App) RenameIdentity(id, name string) string {
 // DeleteIdentity removes an identity file (351). The last identity cannot be
 // deleted, and an identity that has never been exported needs the caller to
 // confirm: the key is the user's account on every server that has seen it.
-func (a *App) DeleteIdentity(id string) string {
-	dir, err := identitiesDir()
+func (a *App) DeleteIdentity(id string, confirmUnexported bool) string {
+	path, err := identityPathFor(id)
 	if err != nil {
 		return err.Error()
 	}
+	dir := filepath.Dir(path)
 	ids := identityIDs(dir)
 	if len(ids) <= 1 {
 		return "the last identity cannot be deleted"
 	}
-	path := filepath.Join(dir, id+".json")
 	if _, err := os.Stat(path); err != nil {
 		return "no such identity"
+	}
+	loaded, err := loadOrCreateIdentityAt(path)
+	if err != nil {
+		return err.Error()
+	}
+	if loaded.ExportedAt == 0 && !confirmUnexported {
+		return "identity has never been exported; explicit confirmation is required"
 	}
 	if err := os.Remove(path); err != nil {
 		return err.Error()

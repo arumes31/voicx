@@ -93,7 +93,7 @@ export function DMSearch(arg1:string,arg2:string,arg3:number):Promise<main.ChatS
 
 export function DeleteChannel(arg1:number):Promise<string>;
 
-export function DeleteIdentity(arg1:string):Promise<string>;
+export function DeleteIdentity(arg1:string,arg2:boolean):Promise<string>;
 
 export function Disconnect():Promise<void>;
 

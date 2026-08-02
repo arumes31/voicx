@@ -117,6 +117,9 @@ func (b *Bus) Subscribe(name string, types []string, buffer int) *Subscription {
 	if buffer <= 0 {
 		buffer = b.Buffer
 	}
+	if buffer < 1 {
+		buffer = 1
+	}
 	var filter map[string]bool
 	if len(types) > 0 {
 		filter = make(map[string]bool, len(types))
@@ -177,6 +180,10 @@ func (b *Bus) Publish(eventType string, data []byte) {
 		return
 	}
 	evt := Event{Seq: b.seq.Add(1), Type: eventType, Time: time.Now().UTC(), Data: append(json.RawMessage(nil), data...)}
+	maxDrops := b.MaxDrops
+	if maxDrops < 1 {
+		maxDrops = 1
+	}
 	var evict []*Subscription
 	for _, sub := range b.subs {
 		if !sub.wants(eventType) {
@@ -189,7 +196,7 @@ func (b *Bus) Publish(eventType string, data []byte) {
 		default:
 			sub.dropped.Add(1)
 			b.dropped.Add(1)
-			if sub.drops.Add(1) >= int64(b.MaxDrops) && sub.evicting.CompareAndSwap(false, true) {
+			if sub.drops.Add(1) >= int64(maxDrops) && sub.evicting.CompareAndSwap(false, true) {
 				evict = append(evict, sub)
 			}
 		}

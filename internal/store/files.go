@@ -9,10 +9,15 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/lib/pq"
 )
 
 // ErrFileNotFound is returned when a file record does not exist.
 var ErrFileNotFound = errors.New("file not found")
+
+// ErrFileExists is returned when a move targets an occupied channel/folder/name.
+var ErrFileExists = errors.New("file already exists")
 
 // FileRecord describes one uploaded file.
 type FileRecord struct {
@@ -159,6 +164,10 @@ func (s *Store) MoveFile(ctx context.Context, channelID int64, folder, name stri
 	          WHERE channel_id = $1 AND folder = $2 AND name = $3`
 	res, err := s.db.ExecContext(ctx, q, channelID, folder, name, newChannelID, newFolder, newName)
 	if err != nil {
+		var pqErr *pq.Error
+		if errors.As(err, &pqErr) && pqErr.Code == "23505" {
+			return fmt.Errorf("%w: %s", ErrFileExists, newName)
+		}
 		return fmt.Errorf("moving file: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {

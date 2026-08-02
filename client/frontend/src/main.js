@@ -975,8 +975,9 @@ function renderChannel(parentEl, ch, byParent, depth) {
     }
 }
 
-// (163) reorderChannel puts the dragged channel in the drop target's slot
-// among the target's siblings. The named field list is deliberate: parent_id
+// (163) reorderChannel puts the dragged channel strictly before or after the
+// drop target according to its current direction of travel. The named field
+// list is deliberate: parent_id
 // 0 is the legitimate "move to root" value and so has no sentinel, and a
 // re-parent drops the server's whole permission cache — so "parent" is only
 // named when the drop actually changes the parent.
@@ -985,9 +986,14 @@ async function reorderChannel(draggedID, target) {
     const dragged = state.channels.find((c) => c.ChannelID === draggedID);
     if (!dragged) return;
     const reparent = (dragged.ParentID || 0) !== (target.ParentID || 0);
+    const draggedPos = state.channels.findIndex((c) => c.ChannelID === draggedID);
+    const targetPos = state.channels.findIndex((c) => c.ChannelID === target.ChannelID);
+    const movingDown = draggedPos >= 0 && targetPos >= 0 && draggedPos < targetPos;
+    const targetOrder = target.OrderIndex || 0;
+    const order = movingDown ? targetOrder + 1 : targetOrder - 1;
     const err = await window.go.main.App.ChannelEditTree(
         draggedID, reparent ? "order,parent" : "order",
-        0, target.OrderIndex || 0, target.ParentID || 0, false);
+        0, order, target.ParentID || 0, false);
     if (err) toast("channel reorder failed: " + err, "warn");
 }
 

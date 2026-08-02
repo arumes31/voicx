@@ -27,6 +27,8 @@ type App struct {
 	tabsMu   sync.Mutex
 	activeID string
 	settings Settings
+	// settingsMu guards settings fields accessed by background goroutines.
+	settingsMu sync.Mutex
 	// settingsPath overrides the settings file location (tests; empty =
 	// default UserConfigDir path).
 	settingsPath string
@@ -89,11 +91,15 @@ func (a *App) windowWatch() {
 		}
 		// (292) the layered-window call needs an HWND, which only exists once
 		// the window is up; the first success ends the retry.
-		if !applied && setWindowOpacity(a.settings.WindowOpacity) == nil {
+		a.settingsMu.Lock()
+		opacity := a.settings.WindowOpacity
+		minimizeToTray := a.settings.MinimizeToTray
+		a.settingsMu.Unlock()
+		if !applied && setWindowOpacity(opacity) == nil {
 			applied = true
 		}
 		min := wailsRuntime.WindowIsMinimised(a.ctx)
-		if min && !wasMin && a.settings.MinimizeToTray {
+		if min && !wasMin && minimizeToTray {
 			// unminimise before hiding: a window hidden while minimised comes
 			// back minimised when the tray shows it again.
 			wailsRuntime.WindowUnminimise(a.ctx)
@@ -115,8 +121,10 @@ func (a *App) SetWindowOpacity(pct int) string {
 	if pct > 100 {
 		pct = 100
 	}
+	a.settingsMu.Lock()
 	a.settings.WindowOpacity = pct
-	_ = a.save()
+	_ = a.saveLocked()
+	a.settingsMu.Unlock()
 	if err := setWindowOpacity(pct); err != nil {
 		return err.Error()
 	}
@@ -256,10 +264,11 @@ func (a *App) AcceptServerRules(hash string) string {
 func (a *App) ClientID() string {
 	// the tab-switch identity refresh (281) can reach this while no manager is
 	// stored, and clientIDSnapshot takes its mutex before reading.
-	if a.cmLoad() == nil {
+	m := a.cmLoad()
+	if m == nil {
 		return ""
 	}
-	return a.cmLoad().clientIDSnapshot()
+	return m.clientIDSnapshot()
 }
 
 // SetPrioritySpeaker toggles the calling client's priority-speaker flag
@@ -376,10 +385,11 @@ func (a *App) SetScreenShare(active bool) string {
 	// the voice teardown declares "not sharing" while disconnecting, and a
 	// tab switch stores a nil manager: write takes its mutex before looking
 	// at the connection, so a nil manager panics rather than erroring.
-	if a.cmLoad() == nil {
+	m := a.cmLoad()
+	if m == nil {
 		return "not connected"
 	}
-	if err := a.cmLoad().write(netproto.MsgScreenShare, netproto.ScreenShare{Active: active}); err != nil {
+	if err := m.write(netproto.MsgScreenShare, netproto.ScreenShare{Active: active}); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -388,10 +398,11 @@ func (a *App) SetScreenShare(active bool) string {
 // SetVideoQuality requests a simulcast layer for the video this client
 // receives: "high", "mid", or "low" (server maps to RID f/h/q).
 func (a *App) SetVideoQuality(quality string) string {
-	if a.cmLoad() == nil {
+	m := a.cmLoad()
+	if m == nil {
 		return "not connected"
 	}
-	if err := a.cmLoad().write(netproto.MsgVideoQuality, netproto.VideoQuality{Quality: quality}); err != nil {
+	if err := m.write(netproto.MsgVideoQuality, netproto.VideoQuality{Quality: quality}); err != nil {
 		return err.Error()
 	}
 	return ""

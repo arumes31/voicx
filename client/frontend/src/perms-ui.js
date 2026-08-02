@@ -469,7 +469,9 @@ async function renderTrace(key) {
 // csvCell quotes a CSV field: RFC 4180 doubling, and always quoted so a key
 // or label containing a separator cannot shift the columns.
 function csvCell(v) {
-    return '"' + String(v ?? "").replace(/"/g, '""') + '"';
+    let cell = String(v ?? "");
+    if (/^[=+\-@]/.test(cell)) cell = "'" + cell;
+    return '"' + cell.replace(/"/g, '""') + '"';
 }
 
 // exportPerms saves the current target's grid (148). JSON round-trips into an
@@ -491,7 +493,7 @@ async function exportPerms(format) {
                 r.key, r.value, r.grant, r.skip ? 1 : 0, r.negate ? 1 : 0].map(csvCell).join(","));
         }
         name = base + ".csv";
-        body = lines.join("\n") + "\n";
+        body = lines.join("\r\n") + "\r\n";
     } else {
         name = base + ".json";
         body = JSON.stringify({

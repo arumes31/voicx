@@ -67,6 +67,23 @@ func TestSubscribeFilter(t *testing.T) {
 	}
 }
 
+func TestNonPositiveConfigurationIsClamped(t *testing.T) {
+	bus := New(zap.NewNop())
+	bus.Buffer = 0
+	bus.MaxDrops = 0
+	defer bus.Close()
+
+	sub := bus.Subscribe("clamped", nil, 0)
+	if sub == nil {
+		t.Fatal("Subscribe returned nil")
+	}
+	bus.Publish("first", nil)  // fills the clamped one-event buffer
+	bus.Publish("second", nil) // exercises the clamped drop threshold
+	if bus.Stats().Dropped != 1 {
+		t.Fatalf("drop stats = %+v", bus.Stats())
+	}
+}
+
 // TestSlowSubscriberIsDroppedThenEvicted verifies the drop policy: a consumer
 // that stops reading loses events instead of blocking the publisher, and is
 // evicted once it is hopeless (231).

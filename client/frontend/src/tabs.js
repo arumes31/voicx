@@ -6,6 +6,7 @@
 // on "tab_reset" we clear chat/tree and the replay rebuilds them.
 const V = () => window.__voicx;
 const App = () => window.go.main.App;
+let activeTabID = "";
 
 // bookmarkFor resolves the bookmark a tab was opened from (284), so the tab
 // can carry its colour. The nickname actually sent is either the bookmark's
@@ -92,6 +93,7 @@ function renderTabs(tabs) {
 // and every action that reports "the current server address".
 async function refreshTabIdentity(tabID) {
     const { state } = V();
+    const activatedTabID = tabID;
     if (!tabID) {
         state.myClientID = "";
         state.myNickname = "";
@@ -99,12 +101,14 @@ async function refreshTabIdentity(tabID) {
         state.lastConnect = null;
         return;
     }
-    try {
-        state.myClientID = await App().ClientID();
-    } catch { state.myClientID = ""; }
-    try {
-        state.isAdmin = await App().IsAdmin();
-    } catch { state.isAdmin = false; }
+    let myClientID = "";
+    try { myClientID = await App().ClientID(); } catch { /* disconnected */ }
+    if (activeTabID !== activatedTabID) return;
+    state.myClientID = myClientID;
+    let isAdmin = false;
+    try { isAdmin = await App().IsAdmin(); } catch { /* disconnected */ }
+    if (activeTabID !== activatedTabID) return;
+    state.isAdmin = isAdmin;
     const saved = state.tabConnects.get(tabID);
     if (saved) {
         state.lastConnect = saved;
@@ -112,7 +116,11 @@ async function refreshTabIdentity(tabID) {
         // Passwords are never journaled, so a tab whose own connect call has
         // not returned yet gets an address-only record; connectFromLogin
         // replaces it with the credential-bearing one either way.
-        const info = (await App().ListTabs()).find((x) => x.id === tabID);
+        let info = null;
+        try {
+            info = (await App().ListTabs()).find((x) => x.id === tabID) || null;
+        } catch { /* keep the address unknown until the next refresh */ }
+        if (activeTabID !== activatedTabID) return;
         state.lastConnect = info
             ? { addr: info.addr, nick: info.nickname, pw: "", spw: "", bookmark: "" }
             : null;
@@ -126,6 +134,7 @@ async function refreshTabIdentity(tabID) {
 // the newly activated tab's journaled frames.
 function onTabReset(tabID) {
     const { state, $ } = V();
+    activeTabID = tabID || "";
     // Voice is active-tab only this wave: tear it down on every switch.
     if (state.pc) {
         try { state.pc.close(); } catch { /* already closed */ }

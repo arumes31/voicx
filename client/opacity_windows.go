@@ -1,4 +1,4 @@
-//go:build windows
+//go:build windows && (amd64 || arm64)
 
 // opacity_windows.go implements window transparency (292) with the Win32
 // layered-window API. Wails v2 has no opacity option, but the window is an
@@ -34,6 +34,15 @@ func setWindowOpacity(pct int) error {
 	}
 	if pct < opacityFloor {
 		pct = opacityFloor
+	}
+	for name, proc := range map[string]interface{ Find() error }{
+		"GetWindowLongPtrW":          procGetWindowLongPtr,
+		"SetWindowLongPtrW":          procSetWindowLongPtr,
+		"SetLayeredWindowAttributes": procSetLayeredWindowAttributes,
+	} {
+		if err := proc.Find(); err != nil {
+			return fmt.Errorf("window opacity unavailable: %s: %w", name, err)
+		}
 	}
 	hwnd := findMainWindow()
 	if hwnd == 0 {

@@ -905,15 +905,32 @@ func (s *TCPServer) handlePermCopy(ctx context.Context, client *Client, f *netpr
 	}
 
 	s.permWriteMu.Lock()
-	defer s.permWriteMu.Unlock()
+	errCode, errMessage, src := s.doPermCopyLocked(ctx, pc, fromTier, fromTarget, toTier, toTarget, msg.Replace)
+	s.permWriteMu.Unlock()
+	if errMessage != "" {
+		return s.sendError(client, errCode, errMessage)
+	}
 
+	s.audit(ctx, client.UniqueID, "perm_copy",
+		fmt.Sprintf("%s:%s->%s:%s", msg.FromKind, msg.FromID, msg.ToKind, msg.ToID),
+		fmt.Sprintf("entries=%d replace=%t channel_id=%d", len(src), msg.Replace, msg.ChannelID))
+	if s.deps.Perms != nil {
+		s.deps.Perms.InvalidateAll()
+	}
+	s.notifyPermsInvalid("perm_copy", s.permAudience(ctx, toTier, toTarget))
+	return nil
+}
+
+// doPermCopyLocked performs only the permission-store work and returns an
+// error response for the caller to send after releasing permWriteMu.
+func (s *TCPServer) doPermCopyLocked(ctx context.Context, pc *permChecker, fromTier store.PermTier, fromTarget store.PermTarget, toTier store.PermTier, toTarget store.PermTarget, replace bool) (uint16, string, []store.PermEntry) {
 	src, err := s.deps.Groups.ListPermissions(ctx, fromTier, fromTarget)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "perm lookup failed")
+		return errCodeUnavailable, "perm lookup failed", nil
 	}
 	dstEntries, err := s.deps.Groups.ListPermissions(ctx, toTier, toTarget)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "perm lookup failed")
+		return errCodeUnavailable, "perm lookup failed", nil
 	}
 	current := make(map[string]store.PermEntry, len(dstEntries))
 	for _, e := range dstEntries {
@@ -923,45 +940,25 @@ func (s *TCPServer) handlePermCopy(ctx context.Context, client *Client, f *netpr
 	for _, e := range src {
 		copied[e.Key] = true
 		if !s.grantCapOkWrite(pc, current, e.Key, e.Value, e.Grant) {
-			return s.sendError(client, errCodePermissionDenied, "grant cap exceeded: "+e.Key+" is outside your own grant")
+			return errCodePermissionDenied, "grant cap exceeded: " + e.Key + " is outside your own grant", nil
 		}
 	}
-	if msg.Replace {
+	var remove []string
+	if replace {
 		for key, e := range current {
 			if copied[key] {
 				continue
 			}
 			if !s.grantCapOk(pc, key, e.Value, e.Grant) {
-				return s.sendError(client, errCodePermissionDenied, "grant cap exceeded: replacing would clear "+key+", which is outside your own grant")
+				return errCodePermissionDenied, "grant cap exceeded: replacing would clear " + key + ", which is outside your own grant", nil
 			}
+			remove = append(remove, key)
 		}
 	}
-
-	// Replace makes the destination an exact copy rather than a merge, so the
-	// entries the source does not carry go first.
-	if msg.Replace {
-		for key := range current {
-			if copied[key] {
-				continue
-			}
-			if err := s.deps.Groups.UnsetPermission(ctx, toTier, toTarget, key); err != nil {
-				return s.sendError(client, errCodeUnavailable, "perm copy failed: "+err.Error())
-			}
-		}
+	if err := s.deps.Groups.CopyPermissions(ctx, toTier, toTarget, remove, src); err != nil {
+		return errCodeUnavailable, "perm copy failed: " + err.Error(), nil
 	}
-	for _, e := range src {
-		if err := s.deps.Groups.SetPermission(ctx, toTier, toTarget, e.Key, e.Value, e.Grant, e.Skip, e.Negate); err != nil {
-			return s.sendError(client, errCodeUnavailable, "perm copy failed: "+err.Error())
-		}
-	}
-	s.audit(ctx, client.UniqueID, "perm_copy",
-		fmt.Sprintf("%s:%s->%s:%s", msg.FromKind, msg.FromID, msg.ToKind, msg.ToID),
-		fmt.Sprintf("entries=%d replace=%t channel_id=%d", len(src), msg.Replace, msg.ChannelID))
-	if s.deps.Perms != nil {
-		s.deps.Perms.InvalidateAll()
-	}
-	s.notifyPermsInvalid("perm_copy", s.permAudience(ctx, toTier, toTarget))
-	return nil
+	return 0, "", src
 }
 
 // --- permission templates (142) ----------------------------------------------

@@ -235,10 +235,11 @@ func (s *TCPServer) handleFileRename(ctx context.Context, client *Client, f *net
 		// as a delete from the source, so it needs the upload right THERE:
 		// managing a file in one channel must not be a way to push it into a
 		// channel the mover cannot write to.
-		if s.deps.State != nil {
-			if _, ok := s.deps.State.GetChannel(target); !ok {
-				return s.sendError(client, errCodeNotFound, "target channel not found")
-			}
+		if s.deps.State == nil {
+			return s.sendError(client, errCodeUnavailable, "state backend unavailable")
+		}
+		if _, ok := s.deps.State.GetChannel(target); !ok {
+			return s.sendError(client, errCodeNotFound, "target channel not found")
 		}
 		pc, err := s.permCheckerInChannel(ctx, client, target)
 		if err != nil {

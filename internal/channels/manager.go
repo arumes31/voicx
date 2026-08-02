@@ -354,14 +354,6 @@ func (m *ChannelManager) UpdateChannel(ctx context.Context, channelID int64, upd
 	if upd.NeededJoinPower != nil && *upd.NeededJoinPower < 0 {
 		return fmt.Errorf("%w: needed join power must be >= 0", ErrInvalidSpec)
 	}
-	// The move is validated before anything is written so an illegal
-	// re-parent is refused instead of splitting the tree (168).
-	if upd.ParentID != nil {
-		if err := m.validateMove(ctx, channelID, *upd.ParentID); err != nil {
-			return err
-		}
-	}
-
 	// Build the SET clause from the non-nil fields only.
 	var sets []string
 	var args []any
@@ -420,15 +412,32 @@ func (m *ChannelManager) UpdateChannel(ctx context.Context, channelID int64, upd
 		return nil // nothing to do
 	}
 
+	tx, err := m.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning channel update: %w", err)
+	}
+	defer tx.Rollback()
+	// Validate and write under the same transaction. validateMoveTx locks the
+	// moved channel and each prospective ancestor before reading its parent, so
+	// a concurrent move cannot validate against a stale chain.
+	if upd.ParentID != nil {
+		if err := m.validateMoveTx(ctx, tx, channelID, *upd.ParentID); err != nil {
+			return err
+		}
+	}
+
 	args = append(args, channelID)
 	q := fmt.Sprintf("UPDATE channels SET %s WHERE id = $%d",
 		strings.Join(sets, ", "), len(args))
-	res, err := m.store.DB().ExecContext(ctx, q, args...)
+	res, err := tx.ExecContext(ctx, q, args...)
 	if err != nil {
 		return fmt.Errorf("updating channel: %w", err)
 	}
 	if rows, _ := res.RowsAffected(); rows == 0 {
 		return ErrChannelNotFound
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing channel update: %w", err)
 	}
 
 	// Mirror the change into the in-memory state.
@@ -598,41 +607,43 @@ func (m *ChannelManager) CleanupTimersCount() int {
 	return len(m.timers)
 }
 
-// validateMove checks that channelID may be re-parented under newParentID
+// validateMoveTx checks that channelID may be re-parented under newParentID
 // (168). Parent 0 (root) is always legal; otherwise the parent must exist, and
 // must not be the channel itself or one of its descendants — a cycle would cut
 // the subtree out of the tree and out of the join-power inheritance chain.
-func (m *ChannelManager) validateMove(ctx context.Context, channelID, newParentID int64) error {
+func (m *ChannelManager) validateMoveTx(ctx context.Context, tx *sql.Tx, channelID, newParentID int64) error {
+	var lockedID int64
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM channels WHERE id = $1 FOR UPDATE`, channelID).Scan(&lockedID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrChannelNotFound
+		}
+		return fmt.Errorf("locking channel: %w", err)
+	}
 	if newParentID == 0 {
 		return nil
 	}
-	if newParentID == channelID {
-		return fmt.Errorf("%w: channel %d cannot be its own parent", ErrInvalidMove, channelID)
-	}
-	if err := m.channelExists(ctx, newParentID); err != nil {
-		if errors.Is(err, ErrChannelNotFound) {
-			return fmt.Errorf("%w: parent channel %d does not exist", ErrInvalidMove, newParentID)
+
+	current := newParentID
+	for depth := 0; ; depth++ {
+		if current == channelID {
+			return fmt.Errorf("%w: channel %d is an ancestor of %d", ErrInvalidMove, channelID, newParentID)
 		}
-		return fmt.Errorf("checking parent channel: %w", err)
+		var parent sql.NullInt64
+		err := tx.QueryRowContext(ctx, `SELECT parent_id FROM channels WHERE id = $1 FOR UPDATE`, current).Scan(&parent)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) && depth == 0 {
+				return fmt.Errorf("%w: parent channel %d does not exist", ErrInvalidMove, newParentID)
+			}
+			return fmt.Errorf("checking channel ancestry: %w", err)
+		}
+		if depth >= maxChannelDepth {
+			return fmt.Errorf("%w: parent ancestry exceeds maximum depth %d", ErrInvalidMove, maxChannelDepth)
+		}
+		if !parent.Valid || parent.Int64 == 0 {
+			return nil
+		}
+		current = parent.Int64
 	}
-	// The prospective parent's own ancestor chain must not contain the channel
-	// being moved.
-	const q = `WITH RECURSIVE up(id, parent_id, depth) AS (
-	              SELECT id, parent_id, 0 FROM channels WHERE id = $1
-	              UNION ALL
-	              SELECT c.id, c.parent_id, up.depth + 1
-	              FROM channels c JOIN up ON c.id = up.parent_id
-	              WHERE up.depth < $3
-	           )
-	           SELECT EXISTS(SELECT 1 FROM up WHERE id = $2)`
-	var cycle bool
-	if err := m.store.DB().QueryRowContext(ctx, q, newParentID, channelID, maxChannelDepth).Scan(&cycle); err != nil {
-		return fmt.Errorf("checking channel ancestry: %w", err)
-	}
-	if cycle {
-		return fmt.Errorf("%w: channel %d is an ancestor of %d", ErrInvalidMove, channelID, newParentID)
-	}
-	return nil
 }
 
 // assignChannelAdmin gives the channel's creator the channel-admin group on

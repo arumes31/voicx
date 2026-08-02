@@ -7,6 +7,8 @@ import (
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"voicx/internal/eventbus"
 	voicxv1 "voicx/v1"
@@ -71,11 +73,15 @@ var allBusTypes = []string{
 
 // subscribedTypes turns the request filter into a bus type filter plus the
 // proto types the caller actually asked for. A nil proto filter means "all".
-func subscribedTypes(req *voicxv1.SubscribeEventsRequest) ([]string, map[voicxv1.EventType]bool) {
+func subscribedTypes(req *voicxv1.SubscribeEventsRequest) ([]string, map[voicxv1.EventType]bool, error) {
+	requested := req.GetEventTypes()
+	if len(requested) == 0 {
+		return allBusTypes, nil, nil
+	}
 	wanted := map[voicxv1.EventType]bool{}
 	seen := map[string]bool{}
 	var busTypes []string
-	for _, t := range req.GetEventTypes() {
+	for _, t := range requested {
 		name, ok := busTypeFor[t]
 		if !ok {
 			continue
@@ -87,16 +93,19 @@ func subscribedTypes(req *voicxv1.SubscribeEventsRequest) ([]string, map[voicxv1
 		}
 	}
 	if len(wanted) == 0 {
-		return allBusTypes, nil
+		return nil, nil, status.Error(codes.InvalidArgument, "event_types contains no supported values")
 	}
-	return busTypes, wanted
+	return busTypes, wanted, nil
 }
 
 // Subscribe streams server events until the client goes away or the bus drops
 // the subscriber for not keeping up.
 func (e *eventsService) Subscribe(req *voicxv1.SubscribeEventsRequest, stream grpc.ServerStreamingServer[voicxv1.Event]) error {
 	caller := callerOf(stream)
-	busTypes, wanted := subscribedTypes(req)
+	busTypes, wanted, err := subscribedTypes(req)
+	if err != nil {
+		return err
+	}
 	sub := e.bus.Subscribe("grpc:"+caller, busTypes, 0)
 	if sub == nil {
 		return nil
