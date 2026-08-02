@@ -22,6 +22,11 @@ jobs:
           install-mode: goinstall
           working-directory: .
 
+      - name: prepare embedded frontend for client lint
+        run: |
+          mkdir -p client/frontend/dist
+          touch client/frontend/dist/.lint-placeholder
+
       - name: golangci-lint (client)
         uses: golangci/golangci-lint-action@v6
         with:

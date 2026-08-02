@@ -73,6 +73,7 @@ type UDPServer struct {
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
+	started  chan struct{} // closed after the UDP socket is bound
 
 	// Atomic counters. Use atomic.Load/Store to access.
 	packetsReceived    atomic.Uint64
@@ -96,6 +97,7 @@ func NewUDP(cfg *config.Config, logger *zap.Logger) *UDPServer {
 		},
 		inbound:     make(chan udpPacket, udpInboundCap),
 		stopCh:      make(chan struct{}),
+		started:     make(chan struct{}),
 		rateLimiter: newIPRateLimiter(cfg.UDPRateLimitPPS, cfg.UDPRateBurst),
 	}
 }
@@ -114,6 +116,7 @@ func (s *UDPServer) Start(ctx context.Context) error {
 		return fmt.Errorf("udp listen on %s: %w", s.cfg.UDPAddr, err)
 	}
 	s.conn = conn
+	close(s.started)
 	s.logger.Info("UDP media listener started", zap.String("addr", s.cfg.UDPAddr))
 
 	// Close the socket when the context is cancelled so ReadFromUDP unblocks.

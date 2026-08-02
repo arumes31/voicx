@@ -48,6 +48,14 @@ func TestUDPServerStartShutdownPingPong(t *testing.T) {
 	go func() {
 		startErr <- s.Start(ctx)
 	}()
+	select {
+	case <-s.started:
+		// The socket is bound; UDP dial cannot race the listener startup.
+	case err := <-startErr:
+		t.Fatalf("Start returned before binding: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("UDP server did not bind within 3 seconds")
+	}
 
 	// Resolve the server address and dial a UDP client.
 	srvAddr, err := net.ResolveUDPAddr("udp", addr)
@@ -55,25 +63,16 @@ func TestUDPServerStartShutdownPingPong(t *testing.T) {
 		t.Fatalf("resolve server addr: %v", err)
 	}
 
-	var conn *net.UDPConn
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		conn, err = net.DialUDP("udp", nil, srvAddr)
-		if err == nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	conn, err := net.DialUDP("udp", nil, srvAddr)
 	if err != nil {
 		t.Fatalf("dial udp server: %v", err)
 	}
 	defer conn.Close()
 
 	// Send a UDPMsgPing packet and expect a UDPMsgPong reply. The ping is
-	// retried because UDP is lossy: the datagram can be discarded if it
-	// arrives before the server has bound its socket.
+	// retried because UDP delivery itself is lossy even after the socket binds.
 	buf := make([]byte, 64)
-	deadline = time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	var n int
 	for {
 		if _, err := conn.Write([]byte{netproto.UDPMsgPing}); err != nil {
