@@ -1959,10 +1959,80 @@ function recallSent(e) {
         input.selectionStart = input.selectionEnd = input.value.length;
     }
 }
+function closeEmojiPanel() {
     if (emojiPanel) {
         emojiPanel.remove();
         emojiPanel = null;
     }
+}
+
+function openPMKeepView(uid) {
+    const c = V().state.clients.find((x) => x.unique_id === uid);
+    pmTabs.set(uid, { uid, nick: c?.nickname || uid, unread: 0, offline: false, pendingRead: "" });
+    renderTabs();
+}
+
+// --- file staging: paste / drop (98/100) ---------------------------------------
+
+function stageFiles(fileList) {
+    for (const f of fileList) {
+        if (f.size > ATTACH_MAX_BYTES) {
+            V().toast(`${f.name || "file"} is larger than ${Math.round(ATTACH_MAX_BYTES / 1048576)} MB — use the file browser`, "warn");
+            continue;
+        }
+        const reader = new FileReader();
+        reader.onload = () => {
+            const dataURL = reader.result;
+            const rawName = (f.name || "image.png").replace(/[\[\]#]/g, "_");
+            const extIdx = rawName.lastIndexOf(".");
+            const uniqueId = Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 6);
+            let uniqueName = rawName;
+            if (extIdx > 0) {
+                uniqueName = rawName.slice(0, extIdx) + "_" + uniqueId + rawName.slice(extIdx);
+            } else {
+                uniqueName = rawName + "_" + uniqueId;
+            }
+            pendingFiles.push({
+                name: uniqueName,
+                dataBase64: dataURL.split(",")[1] || "",
+                isImage: f.type.startsWith("image/"),
+                dataURL: f.type.startsWith("image/") ? dataURL : null,
+            });
+            renderFilePreview();
+        };
+        reader.onerror = () => V().toast("could not read " + (f.name || "file"), "warn");
+        reader.readAsDataURL(f);
+    }
+}
+
+function renderFilePreview() {
+    const row = $("file-preview-row");
+    row.innerHTML = "";
+    row.classList.toggle("hidden", pendingFiles.length === 0);
+    pendingFiles.forEach((f, i) => {
+        const item = document.createElement("div");
+        item.className = "file-preview";
+        if (f.dataURL) {
+            const img = document.createElement("img");
+            img.src = f.dataURL;
+            img.alt = f.name;
+            item.appendChild(img);
+        } else {
+            const chip = document.createElement("span");
+            chip.className = "file-chip";
+            chip.textContent = "📎 " + f.name;
+            item.appendChild(chip);
+        }
+        const x = document.createElement("button");
+        x.textContent = "✕";
+        x.title = "remove";
+        x.onclick = () => {
+            pendingFiles.splice(i, 1);
+            renderFilePreview();
+        };
+        item.appendChild(x);
+        row.appendChild(item);
+    });
 }
 
 function insertAtCursor(text) {
