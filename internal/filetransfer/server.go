@@ -199,7 +199,10 @@ type Server struct {
 	// ("ok"/"error") when a transfer finishes (metrics).
 	OnTransferComplete func(direction, result string)
 
-	listener net.Listener
+	lifecycleMu sync.Mutex
+	listener    net.Listener
+	started     bool
+	closed      bool
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -654,6 +657,22 @@ func (s *Server) CheckRoot() error {
 // Start binds the listener and serves connections until ctx is cancelled or
 // Close is called.
 func (s *Server) Start(ctx context.Context) error {
+	s.lifecycleMu.Lock()
+	if s.closed {
+		s.lifecycleMu.Unlock()
+		return nil
+	}
+	if s.started {
+		s.lifecycleMu.Unlock()
+		return errors.New("filetransfer server already started")
+	}
+	s.started = true
+	// Establish a positive parent count before Close can call Wait. The accept
+	// loop owns this count until it exits; connection workers are its children.
+	s.wg.Add(1)
+	s.lifecycleMu.Unlock()
+	defer s.wg.Done()
+
 	ln, err := net.Listen("tcp", s.cfg.Addr)
 	if err != nil {
 		return fmt.Errorf("filetransfer listen on %s: %w", s.cfg.Addr, err)
@@ -664,13 +683,14 @@ func (s *Server) Start(ctx context.Context) error {
 			MinVersion:   tls.VersionTLS12,
 		})
 	}
-	// Keep the accept loop represented in the WaitGroup before publishing the
-	// listener. Close may wait while the loop is still accepting and adding
-	// connection workers; a positive parent count makes those Adds legal and
-	// prevents Wait from returning between Accept and Add.
-	s.wg.Add(1)
-	defer s.wg.Done()
+	s.lifecycleMu.Lock()
+	if s.closed {
+		s.lifecycleMu.Unlock()
+		_ = ln.Close()
+		return nil
+	}
 	s.listener = ln
+	s.lifecycleMu.Unlock()
 	if s.cfg.QuietHoursStart != s.cfg.QuietHoursEnd {
 		s.logger.Info("file transfer quiet hours active",
 			zap.Int("start_hour", s.cfg.QuietHoursStart),
@@ -720,9 +740,14 @@ func (s *Server) Start(ctx context.Context) error {
 func (s *Server) Close() error {
 	var err error
 	s.stopOnce.Do(func() {
+		s.lifecycleMu.Lock()
+		s.closed = true
 		close(s.stopCh)
-		if s.listener != nil {
-			err = s.listener.Close()
+		ln := s.listener
+		s.listener = nil
+		s.lifecycleMu.Unlock()
+		if ln != nil {
+			err = ln.Close()
 		}
 	})
 	s.wg.Wait()

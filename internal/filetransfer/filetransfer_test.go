@@ -21,6 +21,43 @@ type fakeFileStore struct {
 	added []store.FileRecord
 }
 
+func TestServerCloseBeforeStart(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0", RootDir: t.TempDir()}, newFakeFileStore(), nil)
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("Start after Close: %v", err)
+	}
+}
+
+func TestServerStartCloseConcurrent(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		s := New(Config{Addr: "127.0.0.1:0", RootDir: t.TempDir()}, newFakeFileStore(), nil)
+		startErr := make(chan error, 1)
+		closeErr := make(chan error, 1)
+		go func() { startErr <- s.Start(context.Background()) }()
+		go func() { closeErr <- s.Close() }()
+
+		select {
+		case err := <-startErr:
+			if err != nil {
+				t.Fatalf("iteration %d Start: %v", i, err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("iteration %d Start did not stop", i)
+		}
+		select {
+		case err := <-closeErr:
+			if err != nil {
+				t.Fatalf("iteration %d Close: %v", i, err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("iteration %d Close did not return", i)
+		}
+	}
+}
+
 func newFakeFileStore() *fakeFileStore {
 	return &fakeFileStore{files: make(map[string]store.FileRecord)}
 }

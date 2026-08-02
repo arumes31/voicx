@@ -34,13 +34,21 @@ func startServer(t *testing.T, fs FileStore) (string, *Server) {
 	go func() { errCh <- s.Start(ctx) }()
 
 	deadline := time.Now().Add(3 * time.Second)
+	ready := false
 	for time.Now().Before(deadline) {
 		conn, err := net.Dial("tcp", addr)
 		if err == nil {
 			_ = conn.Close()
+			ready = true
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	if !ready {
+		cancel()
+		_ = s.Close()
+		startErr := <-errCh
+		t.Fatalf("file-transfer server did not become ready: %v", startErr)
 	}
 	t.Cleanup(func() {
 		cancel()
