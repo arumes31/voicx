@@ -444,6 +444,15 @@ func TestEncryptedEventTransformation(t *testing.T) {
 	if out := cm.maybeDecryptEvent(announcement); !strings.Contains(out, "maintenance") || strings.Contains(out, announcementCipher) {
 		t.Fatalf("announcement output = %s", out)
 	}
+	invalidGeneration := wrap("announcement", map[string]any{
+		"text":   "ciphertext",
+		"enc":    true,
+		"key_id": uint64(1) << 32,
+	})
+	if out := cm.maybeDecryptEvent(invalidGeneration); !strings.Contains(out, decryptFailedText) ||
+		strings.Contains(out, "ciphertext") || strings.Contains(out, `"key_id"`) {
+		t.Fatalf("invalid key generation output = %s", out)
+	}
 
 	for _, unchanged := range []string{
 		"not json",
@@ -507,6 +516,32 @@ func TestEventJSONHelpers(t *testing.T) {
 			t.Parallel()
 			if got := jsonInt64(tc.in); got != tc.want {
 				t.Fatalf("jsonInt64(%#v) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+
+	uint32Tests := []struct {
+		name string
+		in   any
+		want uint32
+		ok   bool
+	}{
+		{name: "json number", in: json.Number("12"), want: 12, ok: true},
+		{name: "maximum", in: json.Number("4294967295"), want: ^uint32(0), ok: true},
+		{name: "string", in: " 14 ", want: 14, ok: true},
+		{name: "float", in: float64(15), want: 15, ok: true},
+		{name: "zero", in: json.Number("0")},
+		{name: "negative", in: json.Number("-1")},
+		{name: "oversized", in: json.Number("4294967296")},
+		{name: "fractional", in: float64(1.5)},
+		{name: "unsupported", in: true},
+	}
+	for _, tc := range uint32Tests {
+		t.Run("uint32 "+tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := jsonUint32(tc.in)
+			if got != tc.want || ok != tc.ok {
+				t.Fatalf("jsonUint32(%#v) = %d/%v, want %d/%v", tc.in, got, ok, tc.want, tc.ok)
 			}
 		})
 	}

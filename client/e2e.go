@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -714,7 +715,10 @@ func (m *connManager) decryptEventField(envType, field string, data json.RawMess
 	}
 	blob, _ := obj[field].(string)
 	scope := jsonInt64(obj["channel_id"]) // absent on announcements = global
-	keyID := uint32(jsonInt64(obj["key_id"]))
+	keyID, ok := jsonUint32(obj["key_id"])
+	if !ok {
+		return finishEventField(envType, field, obj, decryptFailedText, payload)
+	}
 
 	text, ok := m.resolveScopeText(scope, keyID, blob)
 	if !ok {
@@ -876,4 +880,30 @@ func jsonInt64(v any) int64 {
 		return i
 	}
 	return 0
+}
+
+// jsonUint32 reads a positive 32-bit identifier without allowing signed,
+// fractional, or oversized wire values to wrap during conversion.
+func jsonUint32(v any) (uint32, bool) {
+	var (
+		u   uint64
+		err error
+	)
+	switch n := v.(type) {
+	case json.Number:
+		u, err = strconv.ParseUint(n.String(), 10, 32)
+	case string:
+		u, err = strconv.ParseUint(strings.TrimSpace(n), 10, 32)
+	case float64:
+		if n != math.Trunc(n) || n < 1 || n > math.MaxUint32 {
+			return 0, false
+		}
+		u = uint64(n)
+	default:
+		return 0, false
+	}
+	if err != nil || u == 0 {
+		return 0, false
+	}
+	return uint32(u), true
 }

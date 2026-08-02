@@ -844,6 +844,9 @@ func (a *App) ftTarget(init netproto.FileTransferInitResponse) (ftEndpoint, erro
 	if fingerprint == "" {
 		fingerprint = control // server did not state it; same certificate anyway
 	}
+	if fingerprint == "" {
+		return ftEndpoint{}, errors.New("file transfer TLS fingerprint is missing — refusing the transfer")
+	}
 	if control != "" && !secureEqualFold(fingerprint, control) {
 		return ftEndpoint{}, errors.New("file transfer certificate does not match the server — refusing the transfer")
 	}
@@ -1011,6 +1014,9 @@ func ftDial(ep ftEndpoint) (net.Conn, error) {
 	if !ep.tls {
 		return net.DialTimeout("tcp", ep.addr, 15*time.Second)
 	}
+	if ep.fingerprint == "" {
+		return nil, errors.New("file transfer TLS fingerprint is missing")
+	}
 	return tls.DialWithDialer(&net.Dialer{Timeout: 15 * time.Second}, "tcp", ep.addr, &tls.Config{
 		InsecureSkipVerify:    true, // pinned below — same TOFU model as client/tofu.go
 		MinVersion:            tls.VersionTLS12,
@@ -1018,12 +1024,14 @@ func ftDial(ep ftEndpoint) (net.Conn, error) {
 	})
 }
 
-// pinFingerprint builds the certificate check for the data port. An empty pin
-// means the control channel itself is plaintext (dev server), so there is
-// nothing trustworthy to compare against and the connection is unverified.
+// pinFingerprint builds the mandatory certificate check for the data port.
+// An empty pin fails closed because server-generated self-signed certificates
+// have no PKI trust anchor; the established control-channel pin is that anchor.
 func pinFingerprint(want string) func([][]byte, [][]*x509.Certificate) error {
 	if want == "" {
-		return nil
+		return func([][]byte, [][]*x509.Certificate) error {
+			return errors.New("file transfer TLS fingerprint is missing")
+		}
 	}
 	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 		if len(rawCerts) == 0 {
