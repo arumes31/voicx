@@ -63,7 +63,7 @@ function renderTables(text) {
         const header = tableCells(lines[i]);
         const separator = i + 1 < lines.length ? tableCells(lines[i + 1]) : [];
         const isTable = lines[i].includes("|") && header.length > 1 && separator.length === header.length &&
-            separator.every((cell) => /^:?-{3,}:?$/.test(cell));
+            separator.every((cell) => /^:?-+:?$/.test(cell));
         if (!isTable) {
             out.push(lines[i]);
             continue;
@@ -120,6 +120,7 @@ export function renderMarkdown(text) {
     // :shortcode: emoji (95).
     t = t.replace(/:([a-z0-9_+-]+):/gi, (m, name) => EMOJI[name.toLowerCase()] || m);
     t = renderTables(t);
+    t = t.replace(/\n?(<div class="md-table-wrap">[\s\S]*?<\/table><\/div>)\n?/g, "$1");
     t = t.replace(/\n/g, "<br>");
     // Restore stashed code.
     t = t.replace(/\u0001(\d+)\u0002/g, (_m, i) => stash[Number(i)]);

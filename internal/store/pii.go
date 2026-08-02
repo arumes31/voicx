@@ -5,12 +5,16 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 )
+
+var ErrNoPII = errors.New("no PII record")
 
 // PIICipher encrypts individual columns with AES-256-GCM. The user id and
 // column name are authenticated as associated data, preventing ciphertext
@@ -37,6 +41,11 @@ func NewPIICipher(key []byte) (*PIICipher, error) {
 func LoadOrCreatePIICipher(path string) (*PIICipher, error) {
 	key, err := os.ReadFile(path)
 	if err == nil {
+		if info, statErr := os.Stat(path); statErr != nil {
+			return nil, fmt.Errorf("checking PII key permissions: %w", statErr)
+		} else if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+			return nil, fmt.Errorf("PII key permissions %o are too broad; want 0600", info.Mode().Perm())
+		}
 		return NewPIICipher(key)
 	}
 	if !errors.Is(err, os.ErrNotExist) {
@@ -60,8 +69,25 @@ func LoadOrCreatePIICipher(path string) (*PIICipher, error) {
 		_ = f.Close()
 		return nil, fmt.Errorf("writing PII key: %w", err)
 	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("syncing PII key: %w", err)
+	}
 	if err := f.Close(); err != nil {
 		return nil, fmt.Errorf("closing PII key: %w", err)
+	}
+	if runtime.GOOS != "windows" {
+		dir, err := os.Open(filepath.Dir(path))
+		if err != nil {
+			return nil, fmt.Errorf("opening PII key directory for sync: %w", err)
+		}
+		if err := dir.Sync(); err != nil {
+			_ = dir.Close()
+			return nil, fmt.Errorf("syncing PII key directory: %w", err)
+		}
+		if err := dir.Close(); err != nil {
+			return nil, fmt.Errorf("closing PII key directory: %w", err)
+		}
 	}
 	return NewPIICipher(key)
 }
@@ -90,31 +116,32 @@ func piiAAD(userID int64, field string) []byte {
 	return []byte(fmt.Sprintf("voicx:pii:%d:%s", userID, field))
 }
 
-func (s *Store) SetUserPII(ctx context.Context, userID int64, email, lastIP string) error {
+func (s *Store) SetUserPII(ctx context.Context, userID int64, email, lastIP *string) error {
 	if s.pii == nil {
 		return errors.New("PII cipher is not configured")
 	}
 	var emailEnc, ipEnc []byte
 	var err error
-	if email != "" {
-		emailEnc, err = s.pii.seal(email, piiAAD(userID, "email"))
+	if email != nil && *email != "" {
+		emailEnc, err = s.pii.seal(*email, piiAAD(userID, "email"))
 		if err != nil {
 			return fmt.Errorf("encrypting email: %w", err)
 		}
 	}
-	if lastIP != "" {
-		ipEnc, err = s.pii.seal(lastIP, piiAAD(userID, "last_ip"))
+	if lastIP != nil && *lastIP != "" {
+		ipEnc, err = s.pii.seal(*lastIP, piiAAD(userID, "last_ip"))
 		if err != nil {
 			return fmt.Errorf("encrypting IP: %w", err)
 		}
 	}
 	const q = `INSERT INTO user_private_data (user_id, email_enc, last_ip_enc)
-	          VALUES ($1, $2, $3)
+	          VALUES ($1, CASE WHEN $2 THEN $3::bytea ELSE NULL END,
+	                  CASE WHEN $4 THEN $5::bytea ELSE NULL END)
 	          ON CONFLICT (user_id) DO UPDATE SET
-	          email_enc = COALESCE(EXCLUDED.email_enc, user_private_data.email_enc),
-	          last_ip_enc = COALESCE(EXCLUDED.last_ip_enc, user_private_data.last_ip_enc),
+	          email_enc = CASE WHEN $2 THEN EXCLUDED.email_enc ELSE user_private_data.email_enc END,
+	          last_ip_enc = CASE WHEN $4 THEN EXCLUDED.last_ip_enc ELSE user_private_data.last_ip_enc END,
 	          updated_at = NOW()`
-	if _, err := s.db.ExecContext(ctx, q, userID, emailEnc, ipEnc); err != nil {
+	if _, err := s.db.ExecContext(ctx, q, userID, email != nil, emailEnc, lastIP != nil, ipEnc); err != nil {
 		return fmt.Errorf("storing encrypted PII: %w", err)
 	}
 	return nil
@@ -128,6 +155,9 @@ func (s *Store) UserPII(ctx context.Context, userID int64) (email, lastIP string
 	const q = `SELECT COALESCE(email_enc, ''::bytea), COALESCE(last_ip_enc, ''::bytea)
 	          FROM user_private_data WHERE user_id = $1`
 	if err := s.db.QueryRowContext(ctx, q, userID).Scan(&emailEnc, &ipEnc); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", ErrNoPII
+		}
 		return "", "", err
 	}
 	if len(emailEnc) > 0 {
@@ -138,6 +168,9 @@ func (s *Store) UserPII(ctx context.Context, userID int64) (email, lastIP string
 	}
 	if len(ipEnc) > 0 {
 		lastIP, err = s.pii.open(ipEnc, piiAAD(userID, "last_ip"))
+		if err != nil {
+			return "", "", err
+		}
 	}
-	return email, lastIP, err
+	return email, lastIP, nil
 }

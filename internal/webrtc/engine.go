@@ -4,9 +4,13 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"fmt"
+	"math/big"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/cc"
@@ -89,11 +93,7 @@ func New(logger *zap.Logger, iceServers []string, enableAV1 bool) (*Engine, erro
 	if len(parsedICE) == 0 {
 		parsedICE = []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}
 	}
-	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("webrtc: generating DTLS key: %w", err)
-	}
-	certificate, err := webrtc.GenerateCertificate(privateKey)
+	certificate, err := generateDTLSCertificate(time.Now())
 	if err != nil {
 		return nil, fmt.Errorf("webrtc: generating DTLS certificate: %w", err)
 	}
@@ -121,6 +121,32 @@ func New(logger *zap.Logger, iceServers []string, enableAV1 bool) (*Engine, erro
 		zap.String("dtls_fingerprint", e.fingerprint),
 	)
 	return e, nil
+}
+
+// generateDTLSCertificate keeps the process-ephemeral identity usable for a
+// long-running server. Pion v3.3.6's GenerateCertificate expires after about
+// one month; the key here is still replaced on every process start, while the
+// X.509 validity covers servers that legitimately remain up for years.
+func generateDTLSCertificate(now time.Time) (*webrtc.Certificate, error) {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generating key: %w", err)
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, fmt.Errorf("generating serial: %w", err)
+	}
+	return webrtc.NewCertificate(privateKey, x509.Certificate{
+		Issuer:                pkix.Name{CommonName: "voicx ephemeral DTLS"},
+		Subject:               pkix.Name{CommonName: "voicx ephemeral DTLS"},
+		SerialNumber:          serial,
+		Version:               2,
+		NotBefore:             now.Add(-24 * time.Hour),
+		NotAfter:              now.AddDate(10, 0, 0),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	})
 }
 
 // NewPeerConnection creates a new webrtc.PeerConnection using the engine's

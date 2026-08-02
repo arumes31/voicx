@@ -7,6 +7,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -16,6 +17,27 @@ import (
 	"voicx/internal/netproto"
 	"voicx/internal/permissions"
 )
+
+func TestTypingTrackerCleanupIsRateLimited(t *testing.T) {
+	tracker := newTypingTracker()
+	now := time.Now()
+	tracker.lastCleanup = now
+	for i := 0; i <= 10_000; i++ {
+		tracker.last[fmt.Sprintf("old-%d", i)] = now.Add(-time.Minute)
+	}
+	if !tracker.allow("first", now.Add(time.Second)) {
+		t.Fatal("new typing key was unexpectedly throttled")
+	}
+	if len(tracker.last) <= 10_000 {
+		t.Fatal("cleanup ran again inside the cleanup interval")
+	}
+	if !tracker.allow("second", now.Add(10*time.Second)) {
+		t.Fatal("second typing key was unexpectedly throttled")
+	}
+	if len(tracker.last) != 2 {
+		t.Fatalf("entries after scheduled cleanup = %d, want 2", len(tracker.last))
+	}
+}
 
 // chatPair sets up two authed, key-published clients in channel 1 and
 // returns them, bob's unsealed scope key, its generation, and bob's X25519

@@ -15,6 +15,7 @@ if [ -z "${LOADTEST_ARGS:-}" ]; then
 	exit 2
 fi
 
+export TURN_SECRET
 export VOICX_TURN_URIS="turn:127.0.0.1:8666?transport=tcp"
 docker compose --profile turn --profile chaos-network up -d --build voicx coturn toxiproxy
 
@@ -33,7 +34,7 @@ flap() {
 	while true; do
 		sleep 8
 		curl -fsS -X POST "$api/proxies/turn_tcp/toxics" -H 'Content-Type: application/json' \
-			-d '{"name":"loss_burst","type":"timeout","stream":"downstream","toxicity":1,"attributes":{"timeout":250}}' >/dev/null || true
+			-d '{"name":"loss_burst","type":"timeout","stream":"downstream","toxicity":1,"attributes":{"timeout":0}}' >/dev/null || true
 		sleep 1
 		curl -fsS -X DELETE "$api/proxies/turn_tcp/toxics/loss_burst" >/dev/null || true
 	done

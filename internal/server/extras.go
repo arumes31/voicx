@@ -74,13 +74,20 @@ func (s *TCPServer) iconDir() string {
 
 // handleAvatarSet validates and stores the client's avatar, replacing any
 // previous one, and announces the change.
-func (s *TCPServer) handleAvatarSet(_ context.Context, client *Client, f *netproto.Frame) error {
+func (s *TCPServer) handleAvatarSet(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.AvatarSet
 	if err := netproto.Decode(f, &msg); err != nil {
 		return s.sendError(client, errCodeMalformed, "malformed avatar_set: "+err.Error())
 	}
 	if client.UserID == 0 {
 		return s.sendError(client, errCodePermissionDenied, "guests cannot upload avatars")
+	}
+	pc, err := s.permCheckerFor(ctx, client)
+	if err != nil {
+		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+	}
+	if !pc.granted(permissions.PermissionKeyClientAvatarUpload) {
+		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyClientAvatarUpload))
 	}
 
 	raw, ext, err := decodeImage(msg.DataBase64)
@@ -768,7 +775,7 @@ func (s *TCPServer) handlePermissionsQuery(ctx context.Context, client *Client, 
 				Skip:       p.Skip,
 				Negate:     p.Negate,
 				SourceTier: sourceTier.String(),
-				Inherited:  sourceTier == permissions.TierServerGroup || sourceTier == permissions.TierClientSpecific || sourceTier == permissions.TierChannelGroup,
+				Inherited:  sourceTier != tier,
 			})
 		}
 	}

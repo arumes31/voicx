@@ -300,21 +300,28 @@ async function openChannelPermissionMatrix() {
         const result = q(".pm-matrix-result");
         result.innerHTML = `<div class="empty-state">resolving ${selected.length * keys.length} cells…</div>`;
         const values = new Map();
-        await Promise.all(selected.flatMap((channelID) => keys.map(async (key) => {
-            try {
-                const trace = await App().PermTrace(uid, key, channelID);
-                values.set(channelID + ":" + key, { value: trace.effective, tier: trace.effective_tier || "unset" });
-            } catch {
-                values.set(channelID + ":" + key, { value: "?", tier: "error" });
+        const pending = selected.flatMap((channelID) => keys.map((key) => ({ channelID, key })));
+        let next = 0;
+        const worker = async () => {
+            while (next < pending.length) {
+                const { channelID, key } = pending[next++];
+                try {
+                    const trace = await App().PermTrace(uid, key, channelID);
+                    values.set(channelID + ":" + key, { value: trace.effective, tier: trace.effective_tier || "unset" });
+                } catch {
+                    values.set(channelID + ":" + key, { value: "?", tier: "error" });
+                }
             }
-        })));
+        };
+        await Promise.all(Array.from({ length: Math.min(6, pending.length) }, worker));
         let html = `<table class="perm-grid trace-grid"><thead><tr><th>permission</th>`;
         for (const id of selected) html += `<th>${esc(channels.find((ch) => ch.ChannelID === id)?.Name || id)}</th>`;
         html += "</tr></thead><tbody>";
         for (const key of keys) {
             html += `<tr><td class="mono">${esc(key)}</td>`;
             const rowValues = selected.map((id) => values.get(id + ":" + key));
-            const differs = new Set(rowValues.map((v) => String(v?.value))).size > 1;
+            const actualValues = rowValues.filter((v) => v?.value !== "?").map((v) => String(v?.value));
+            const differs = new Set(actualValues).size > 1;
             for (const v of rowValues) html += `<td class="${differs ? "winning" : ""}" title="source: ${esc(v?.tier)}"><b>${esc(v?.value)}</b><br><span class="pm-dim">${esc(v?.tier)}</span></td>`;
             html += "</tr>";
         }

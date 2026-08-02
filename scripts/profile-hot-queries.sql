@@ -7,6 +7,10 @@
 \else
 \set user_id 1
 \endif
+\if :{?cursor_id}
+\else
+\set cursor_id 9223372036854775807
+\endif
 
 \echo 'chat history: newest page by channel'
 EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS)
@@ -22,7 +26,7 @@ EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS)
 SELECT id, body_enc, key_id
 FROM chat_messages
 WHERE channel_id = :channel_id
-  AND id < COALESCE((SELECT MAX(id) FROM chat_messages), 9223372036854775807)
+  AND id < :cursor_id
 ORDER BY id DESC
 LIMIT 50;
 

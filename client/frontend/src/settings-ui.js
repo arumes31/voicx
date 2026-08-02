@@ -246,13 +246,22 @@ function pageServer() {
     form.appendChild(row("Default Opus DTX", dtx));
     form.appendChild(row("Default Opus stereo", stereo));
     form.appendChild(hint("Codec defaults apply to newly created channels. Existing channels keep their explicit settings."));
+    const applyToForm = (cfg) => {
+        Object.assign(values, cfg);
+        maxClients.value = cfg.max_clients;
+        timeout.value = cfg.client_timeout_seconds;
+        bitrate.value = cfg.opus_bitrate;
+        fec.checked = !!cfg.opus_fec;
+        dtx.checked = !!cfg.opus_dtx;
+        stereo.checked = !!cfg.opus_stereo;
+    };
     const apply = document.createElement("button");
     apply.textContent = "Apply server configuration";
     apply.onclick = async () => {
         apply.disabled = true;
         try {
             const result = await window.go.main.App.SetServerConfig(values);
-            Object.assign(values, result);
+            applyToForm(result);
             status.textContent = "Server configuration saved and active.";
             V().toast("server configuration updated");
         } catch (err) {
@@ -265,13 +274,7 @@ function pageServer() {
     form.appendChild(row("Runtime settings", apply));
 
     window.go.main.App.GetServerConfig().then((cfg) => {
-        Object.assign(values, cfg);
-        maxClients.value = cfg.max_clients;
-        timeout.value = cfg.client_timeout_seconds;
-        bitrate.value = cfg.opus_bitrate;
-        fec.checked = !!cfg.opus_fec;
-        dtx.checked = !!cfg.opus_dtx;
-        stereo.checked = !!cfg.opus_stereo;
+        applyToForm(cfg);
         status.textContent = "Changes take effect immediately and are restored after restart.";
         form.hidden = false;
     }).catch((err) => {

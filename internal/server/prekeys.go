@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	"voicx/internal/e2ee"
 	"voicx/internal/netproto"
@@ -38,6 +40,13 @@ func (s *TCPServer) handlePreKeyPublish(ctx context.Context, client *Client, f *
 		seen[key.KeyID] = true
 		oneTime = append(oneTime, store.PreKey{KeyID: key.KeyID, PublicKey: key.PublicKey, OneTime: true})
 	}
+	previousIdentity, err := s.deps.PreKeys.PreKeyIdentity(ctx, client.UserID)
+	if err != nil && !errors.Is(err, store.ErrNoPreKeyBundle) {
+		return s.sendError(client, errCodeUnavailable, "loading stored prekey identity failed")
+	}
+	if len(previousIdentity) > 0 && !e2ee.EqualFingerprint(previousIdentity, msg.IdentityDH) {
+		s.audit(ctx, client.UniqueID, "e2ee_identity_changed", client.UniqueID, "signed prekey identity changed")
+	}
 	if err := s.deps.PreKeys.PublishPreKeyBundle(ctx, client.UserID, store.PreKeyBundle{
 		IdentityDH: msg.IdentityDH, SigningPublic: msg.SigningPublic,
 		SignedPreKeyID: msg.SignedPreKeyID, SignedPreKey: msg.SignedPreKey, Signature: msg.Signature,
@@ -53,6 +62,12 @@ func (s *TCPServer) handlePreKeyQuery(ctx context.Context, client *Client, f *ne
 	if err := netproto.Decode(f, &msg); err != nil || msg.UniqueID == "" {
 		return s.sendError(client, errCodeMalformed, "target unique ID is required")
 	}
+	if client.UserID <= 0 {
+		return s.sendError(client, errCodePermissionDenied, "registered account required for asynchronous prekeys")
+	}
+	if s.chatRate != nil && !s.chatRate.allow(client.UniqueID+":prekey", time.Now()) {
+		return s.sendError(client, errCodeMalformed, "prekey query rate limit exceeded")
+	}
 	if s.deps == nil || s.deps.PreKeys == nil || s.deps.Auth == nil {
 		return s.sendError(client, errCodeUnavailable, "prekey directory unavailable")
 	}
@@ -62,10 +77,10 @@ func (s *TCPServer) handlePreKeyQuery(ctx context.Context, client *Client, f *ne
 	}
 	bundle, err := s.deps.PreKeys.ConsumePreKeyBundle(ctx, target.ID)
 	if err != nil {
+		if errors.Is(err, store.ErrNoPreKeyBundle) {
+			return s.sendError(client, errCodeNotFound, "prekey bundle not found")
+		}
 		return s.sendError(client, errCodeUnavailable, "loading prekey bundle failed")
-	}
-	if bundle == nil {
-		return s.sendError(client, errCodeNotFound, "prekey bundle not found")
 	}
 	response := netproto.PreKeyBundle{
 		UniqueID: msg.UniqueID, IdentityDH: bundle.IdentityDH, SigningPublic: bundle.SigningPublic,

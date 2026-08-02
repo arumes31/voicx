@@ -11,16 +11,20 @@ import (
 	"time"
 )
 
-const maxLogDirectoryBytes int64 = 50 << 20
+const (
+	maxLogDirectoryBytes int64 = 50 << 20
+	pruneCheckBytes      int64 = 1 << 20
+)
 
 type dailyLogWriter struct {
-	mu       sync.Mutex
-	dir      string
-	baseName string
-	file     *os.File
-	day      string
-	maxBytes int64
-	now      func() time.Time
+	mu         sync.Mutex
+	dir        string
+	baseName   string
+	file       *os.File
+	day        string
+	maxBytes   int64
+	sincePrune int64
+	now        func() time.Time
 }
 
 func newDailyLogWriter(dir, baseName string) (*dailyLogWriter, error) {
@@ -48,7 +52,10 @@ func (w *dailyLogWriter) open() error {
 		return err
 	}
 	w.file = f
-	return w.prune()
+	// Retention cleanup must not make an otherwise usable log writer fail.
+	// Rotation and the periodic write threshold will retry pruning later.
+	_ = w.prune()
+	return nil
 }
 
 func (w *dailyLogWriter) Write(p []byte) (int, error) {
@@ -61,6 +68,10 @@ func (w *dailyLogWriter) Write(p []byte) (int, error) {
 	}
 	n, err := w.file.Write(p)
 	if err == nil {
+		w.sincePrune += int64(n)
+	}
+	if err == nil && w.sincePrune >= pruneCheckBytes {
+		w.sincePrune = 0
 		_ = w.prune()
 	}
 	return n, err
@@ -94,8 +105,12 @@ func (w *dailyLogWriter) prune() error {
 	var files []logFile
 	var total int64
 	active := filepath.Join(w.dir, w.baseName)
+	ext := filepath.Ext(w.baseName)
+	stem := strings.TrimSuffix(w.baseName, ext)
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".log") {
+		name := entry.Name()
+		owned := name == w.baseName || isRotatedLogName(name, stem, ext)
+		if entry.IsDir() || !owned {
 			continue
 		}
 		info, err := entry.Info()
@@ -120,6 +135,27 @@ func (w *dailyLogWriter) prune() error {
 	return nil
 }
 
+func isRotatedLogName(name, stem, ext string) bool {
+	if !strings.HasPrefix(name, stem+"-") || !strings.HasSuffix(name, ext) {
+		return false
+	}
+	suffix := strings.TrimSuffix(strings.TrimPrefix(name, stem+"-"), ext)
+	parts := strings.Split(suffix, "-")
+	if len(parts) < 1 || len(parts) > 2 || len(parts[0]) != 8 || !allDigits(parts[0]) {
+		return false
+	}
+	return len(parts) == 1 || (parts[1] != "" && allDigits(parts[1]))
+}
+
+func allDigits(value string) bool {
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func (w *dailyLogWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -129,15 +165,32 @@ func (w *dailyLogWriter) Close() error {
 	return w.file.Close()
 }
 
-var chatLogMu sync.Mutex
+var (
+	chatLogMu      sync.Mutex
+	chatLogWriters = map[string]*dailyLogWriter{}
+)
 
 func appendDailyLog(dir, name, line string) {
 	chatLogMu.Lock()
 	defer chatLogMu.Unlock()
-	w, err := newDailyLogWriter(dir, name)
-	if err != nil {
-		return
+	key := filepath.Clean(dir) + "\x00" + name
+	w := chatLogWriters[key]
+	if w == nil {
+		var err error
+		w, err = newDailyLogWriter(dir, name)
+		if err != nil {
+			return
+		}
+		chatLogWriters[key] = w
 	}
 	_, _ = io.WriteString(w, line)
-	_ = w.Close()
+}
+
+func closeDailyLogs() {
+	chatLogMu.Lock()
+	defer chatLogMu.Unlock()
+	for key, writer := range chatLogWriters {
+		_ = writer.Close()
+		delete(chatLogWriters, key)
+	}
 }

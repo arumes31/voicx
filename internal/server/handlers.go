@@ -733,9 +733,16 @@ func (s *TCPServer) handleCreateChannel(ctx context.Context, client *Client, f *
 	s.configMu.RUnlock()
 	if msg.OpusBitrate == 0 {
 		msg.OpusBitrate = defaultBitrate
-		msg.OpusFEC = defaultFEC
-		msg.OpusDTX = defaultDTX
-		msg.OpusStereo = defaultStereo
+	}
+	opusFEC, opusDTX, opusStereo := defaultFEC, defaultDTX, defaultStereo
+	if msg.OpusFEC != nil {
+		opusFEC = *msg.OpusFEC
+	}
+	if msg.OpusDTX != nil {
+		opusDTX = *msg.OpusDTX
+	}
+	if msg.OpusStereo != nil {
+		opusStereo = *msg.OpusStereo
 	}
 	channelID, err := s.deps.Channels.CreateChannel(ctx, channels.ChannelSpec{
 		Name:            msg.Name,
@@ -747,9 +754,9 @@ func (s *TCPServer) handleCreateChannel(ctx context.Context, client *Client, f *
 		NeededJoinPower: msg.NeededJoinPower,
 		CreatedBy:       client.UserID,
 		OpusBitrate:     msg.OpusBitrate,
-		OpusFEC:         msg.OpusFEC,
-		OpusDTX:         msg.OpusDTX,
-		OpusStereo:      msg.OpusStereo,
+		OpusFEC:         opusFEC,
+		OpusDTX:         opusDTX,
+		OpusStereo:      opusStereo,
 	})
 	if err != nil {
 		s.logger.Warn("create channel failed",

@@ -17,6 +17,25 @@ import (
 	"golang.org/x/crypto/nacl/secretbox"
 )
 
+func TestReactionCacheExpiresAndIsBounded(t *testing.T) {
+	s := &Store{}
+	s.cacheReactions(1, map[string]int{"👍": 1})
+	value, ok := s.reactionCache.Load(int64(1))
+	if !ok {
+		t.Fatal("reaction cache entry missing")
+	}
+	value.(*reactionCacheEntry).expiresAt.Store(time.Now().Add(-time.Second).UnixNano())
+	if _, ok := s.cachedReactions(1); ok {
+		t.Fatal("expired reaction cache entry returned")
+	}
+	for id := int64(1); id <= maxReactionCacheEntries+1; id++ {
+		s.cacheReactions(id, map[string]int{})
+	}
+	if s.reactionCacheSize > maxReactionCacheEntries {
+		t.Fatalf("reaction cache size = %d, max %d", s.reactionCacheSize, maxReactionCacheEntries)
+	}
+}
+
 // testScopeKey is deterministic per fill byte so a test can seal and open
 // without a key manager.
 func testScopeKey(fill byte) [32]byte {

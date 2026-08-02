@@ -72,3 +72,80 @@ func TestSignedPreKeyTamperRejected(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+func TestInitiateX3DHOmitOneTimeKeyID(t *testing.T) {
+	alice, _ := GenerateX25519()
+	bob, _ := GenerateX25519()
+	signed, _ := GenerateX25519()
+	_, signingPrivate, _ := ed25519.GenerateKey(rand.Reader)
+	bundle := NewPreKeyBundle(bob, signingPrivate, 1, signed, 99, KeyPair{})
+	_, initial, err := InitiateX3DH(alice.Private, bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial.OneTimePreKeyID != 0 {
+		t.Fatalf("one-time key id = %d, want 0", initial.OneTimePreKeyID)
+	}
+}
+
+func TestRatchetRejectsTamperWithoutAdvancing(t *testing.T) {
+	secret := make([]byte, 32)
+	sender := NewRatchet(secret, true)
+	receiver := NewRatchet(secret, false)
+	m0, _ := sender.Encrypt([]byte("zero"), nil)
+	_, _ = sender.Encrypt([]byte("one"), nil)
+	m2, _ := sender.Encrypt([]byte("two"), nil)
+	tampered := m2
+	tampered.Ciphertext = append([]byte(nil), m2.Ciphertext...)
+	tampered.Ciphertext[len(tampered.Ciphertext)-1] ^= 1
+	if _, err := receiver.Decrypt(tampered, nil); err == nil {
+		t.Fatal("tampered future message decrypted")
+	}
+	if receiver.SkippedCount() != 0 {
+		t.Fatalf("failed authentication committed %d skipped keys", receiver.SkippedCount())
+	}
+	if got, err := receiver.Decrypt(m0, nil); err != nil || string(got) != "zero" {
+		t.Fatalf("message after failed authentication = %q, %v", got, err)
+	}
+}
+
+func TestRatchetKeepsSkippedKeyAfterTamper(t *testing.T) {
+	secret := make([]byte, 32)
+	sender := NewRatchet(secret, true)
+	receiver := NewRatchet(secret, false)
+	m0, _ := sender.Encrypt([]byte("zero"), nil)
+	_, _ = sender.Encrypt([]byte("one"), nil)
+	m2, _ := sender.Encrypt([]byte("two"), nil)
+	if _, err := receiver.Decrypt(m2, nil); err != nil {
+		t.Fatal(err)
+	}
+	tampered := m0
+	tampered.Ciphertext = append([]byte(nil), m0.Ciphertext...)
+	tampered.Ciphertext[len(tampered.Ciphertext)-1] ^= 1
+	if _, err := receiver.Decrypt(tampered, nil); err == nil {
+		t.Fatal("tampered skipped message decrypted")
+	}
+	if receiver.SkippedCount() != 2 {
+		t.Fatalf("skipped count after tamper = %d, want 2", receiver.SkippedCount())
+	}
+	if got, err := receiver.Decrypt(m0, nil); err != nil || string(got) != "zero" {
+		t.Fatalf("valid skipped message = %q, %v", got, err)
+	}
+}
+
+func TestRatchetAcceptsDelayedPreviousStep(t *testing.T) {
+	secret := make([]byte, 32)
+	sender := NewRatchet(secret, true)
+	receiver := NewRatchet(secret, false)
+	delayed, _ := sender.Encrypt([]byte("old"), nil)
+	dh := []byte("new ratchet material")
+	sender.RatchetStep(dh)
+	receiver.RatchetStep(dh)
+	current, _ := sender.Encrypt([]byte("new"), nil)
+	if got, err := receiver.Decrypt(current, nil); err != nil || string(got) != "new" {
+		t.Fatalf("current step = %q, %v", got, err)
+	}
+	if got, err := receiver.Decrypt(delayed, nil); err != nil || string(got) != "old" {
+		t.Fatalf("delayed previous step = %q, %v", got, err)
+	}
+}

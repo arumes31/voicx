@@ -6,6 +6,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -24,6 +25,47 @@ func testDBStore(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { s.Close() })
 	return s
+}
+
+func TestCompressPermissionAuditConcurrent(t *testing.T) {
+	s := testDBStore(t)
+	ctx := context.Background()
+	target := fmt.Sprintf("concurrent-%d", time.Now().UnixNano())
+	const rows = 40
+	for i := 0; i < rows; i++ {
+		s.Audit(ctx, "test", "perm_set", target, "")
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE audit_log SET created_at=NOW()-INTERVAL '2 days' WHERE target=$1`, target); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = s.DB().ExecContext(context.Background(), `DELETE FROM audit_log WHERE target=$1`, target)
+		_, _ = s.DB().ExecContext(context.Background(), `DELETE FROM audit_log_daily WHERE target=$1`, target)
+	})
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := s.CompressPermissionAudit(ctx, time.Now())
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var count int
+	if err := s.DB().QueryRowContext(ctx, `SELECT COALESCE(SUM(event_count), 0) FROM audit_log_daily WHERE target=$1`, target).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != rows {
+		t.Fatalf("compressed event count = %d, want %d", count, rows)
+	}
 }
 
 // seedTestUser inserts a throwaway user row and removes it (cascading) at

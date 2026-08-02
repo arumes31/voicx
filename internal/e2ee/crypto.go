@@ -23,6 +23,7 @@ var (
 	ErrInvalidSignature = errors.New("invalid signed prekey signature")
 	ErrTooManySkipped   = errors.New("message gap exceeds skipped-key limit")
 	ErrSkippedKeyGone   = errors.New("skipped message key is unavailable")
+	ErrUnknownStep      = errors.New("ratchet step is outside the receive window")
 )
 
 type KeyPair struct {
@@ -120,15 +121,17 @@ func InitiateX3DH(identityPrivate []byte, bundle PreKeyBundle) ([]byte, X3DHInit
 		return nil, X3DHInitial{}, err
 	}
 	material := append(append(dh1, dh2...), dh3...)
+	oneTimePreKeyID := uint32(0)
 	if len(bundle.OneTimePreKey) > 0 {
 		dh4, err := exchange(ephemeral.Private, bundle.OneTimePreKey)
 		if err != nil {
 			return nil, X3DHInitial{}, err
 		}
 		material = append(material, dh4...)
+		oneTimePreKeyID = bundle.OneTimePreKeyID
 	}
 	return hkdf(material, nil, []byte("voicx:x3dh"), 32), X3DHInitial{
-		EphemeralPublic: ephemeral.Public, SignedPreKeyID: bundle.SignedPreKeyID, OneTimePreKeyID: bundle.OneTimePreKeyID,
+		EphemeralPublic: ephemeral.Public, SignedPreKeyID: bundle.SignedPreKeyID, OneTimePreKeyID: oneTimePreKeyID,
 	}, nil
 }
 
@@ -183,8 +186,15 @@ func chainStep(chain []byte) (next, message []byte) {
 }
 
 type Message struct {
-	Number     uint32
-	Ciphertext []byte // nonce || AES-GCM ciphertext
+	RatchetStep uint32
+	Number      uint32
+	Ciphertext  []byte // nonce || AES-GCM ciphertext
+}
+
+type receiveChain struct {
+	chain   []byte
+	number  uint32
+	skipped map[uint32][]byte
 }
 
 // Ratchet provides per-message forward-secret chain keys and a bounded
@@ -194,10 +204,10 @@ type Ratchet struct {
 	mu        sync.Mutex
 	root      []byte
 	sendChain []byte
-	recvChain []byte
 	sendN     uint32
-	recvN     uint32
-	skipped   map[uint32][]byte
+	sendStep  uint32
+	recvStep  uint32
+	receive   map[uint32]*receiveChain
 	initiator bool
 }
 
@@ -206,9 +216,9 @@ func NewRatchet(sharedSecret []byte, initiator bool) *Ratchet {
 	a := hkdf(root, nil, []byte("voicx:double-ratchet:a"), 32)
 	b := hkdf(root, nil, []byte("voicx:double-ratchet:b"), 32)
 	if initiator {
-		return &Ratchet{root: root, sendChain: a, recvChain: b, skipped: map[uint32][]byte{}, initiator: true}
+		return &Ratchet{root: root, sendChain: a, receive: map[uint32]*receiveChain{0: {chain: b, skipped: map[uint32][]byte{}}}, initiator: true}
 	}
-	return &Ratchet{root: root, sendChain: b, recvChain: a, skipped: map[uint32][]byte{}}
+	return &Ratchet{root: root, sendChain: b, receive: map[uint32]*receiveChain{0: {chain: a, skipped: map[uint32][]byte{}}}}
 }
 
 func (r *Ratchet) RatchetStep(dhSecret []byte) {
@@ -218,18 +228,31 @@ func (r *Ratchet) RatchetStep(dhSecret []byte) {
 	a := hkdf(r.root, nil, []byte("voicx:double-ratchet:a"), 32)
 	b := hkdf(r.root, nil, []byte("voicx:double-ratchet:b"), 32)
 	if r.initiator {
-		r.sendChain, r.recvChain = a, b
+		r.sendChain = a
+		r.recvStep++
+		r.receive[r.recvStep] = &receiveChain{chain: b, skipped: map[uint32][]byte{}}
 	} else {
-		r.sendChain, r.recvChain = b, a
+		r.sendChain = b
+		r.recvStep++
+		r.receive[r.recvStep] = &receiveChain{chain: a, skipped: map[uint32][]byte{}}
 	}
-	r.sendN, r.recvN = 0, 0
-	r.skipped = map[uint32][]byte{}
+	r.sendStep++
+	r.sendN = 0
+	// A delayed packet can identify and use the immediately preceding receive
+	// chain. Older steps are deliberately discarded to bound retained key
+	// material independently of message-number gaps.
+	for step := range r.receive {
+		if step+1 < r.recvStep {
+			delete(r.receive, step)
+		}
+	}
 }
 
-func messageAAD(number uint32, aad []byte) []byte {
-	out := make([]byte, 4+len(aad))
-	binary.BigEndian.PutUint32(out, number)
-	copy(out[4:], aad)
+func messageAAD(step, number uint32, aad []byte) []byte {
+	out := make([]byte, 8+len(aad))
+	binary.BigEndian.PutUint32(out, step)
+	binary.BigEndian.PutUint32(out[4:], number)
+	copy(out[8:], aad)
 	return out
 }
 
@@ -269,49 +292,74 @@ func (r *Ratchet) Encrypt(plain, aad []byte) (Message, error) {
 	defer r.mu.Unlock()
 	next, key := chainStep(r.sendChain)
 	number := r.sendN
-	blob, err := sealAES(key, plain, messageAAD(number, aad))
+	blob, err := sealAES(key, plain, messageAAD(r.sendStep, number, aad))
 	if err != nil {
 		return Message{}, err
 	}
 	r.sendChain = next
 	r.sendN++
-	return Message{Number: number, Ciphertext: blob}, nil
+	return Message{RatchetStep: r.sendStep, Number: number, Ciphertext: blob}, nil
 }
 
 func (r *Ratchet) Decrypt(message Message, aad []byte) ([]byte, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if message.Number < r.recvN {
-		key, ok := r.skipped[message.Number]
+	state, ok := r.receive[message.RatchetStep]
+	if !ok {
+		return nil, ErrUnknownStep
+	}
+	if message.Number < state.number {
+		key, ok := state.skipped[message.Number]
 		if !ok {
 			return nil, ErrSkippedKeyGone
 		}
-		delete(r.skipped, message.Number)
-		return openAES(key, message.Ciphertext, messageAAD(message.Number, aad))
+		plain, err := openAES(key, message.Ciphertext, messageAAD(message.RatchetStep, message.Number, aad))
+		if err != nil {
+			return nil, err
+		}
+		delete(state.skipped, message.Number)
+		return plain, nil
 	}
-	if uint64(message.Number-r.recvN) > MaxSkippedKeys || len(r.skipped)+int(message.Number-r.recvN) > MaxSkippedKeys {
+	gap := message.Number - state.number
+	if uint64(gap) > MaxSkippedKeys || r.skippedCountLocked()+int(gap) > MaxSkippedKeys {
 		return nil, ErrTooManySkipped
 	}
-	for r.recvN < message.Number {
-		next, key := chainStep(r.recvChain)
-		r.recvChain = next
-		r.skipped[r.recvN] = key
-		r.recvN++
+	// Stage every derived key locally. Authentication failure must not advance
+	// the receive chain or consume any skipped-key capacity.
+	chain := state.chain
+	number := state.number
+	pending := make(map[uint32][]byte, gap)
+	for number < message.Number {
+		next, key := chainStep(chain)
+		chain = next
+		pending[number] = key
+		number++
 	}
-	next, key := chainStep(r.recvChain)
-	plain, err := openAES(key, message.Ciphertext, messageAAD(message.Number, aad))
+	next, key := chainStep(chain)
+	plain, err := openAES(key, message.Ciphertext, messageAAD(message.RatchetStep, message.Number, aad))
 	if err != nil {
 		return nil, err
 	}
-	r.recvChain = next
-	r.recvN++
+	for skippedNumber, skippedKey := range pending {
+		state.skipped[skippedNumber] = skippedKey
+	}
+	state.chain = next
+	state.number = message.Number + 1
 	return plain, nil
 }
 
 func (r *Ratchet) SkippedCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return len(r.skipped)
+	return r.skippedCountLocked()
+}
+
+func (r *Ratchet) skippedCountLocked() int {
+	total := 0
+	for _, state := range r.receive {
+		total += len(state.skipped)
+	}
+	return total
 }
 
 // DeriveMessageKey exposes the common HKDF construction for protocol layers

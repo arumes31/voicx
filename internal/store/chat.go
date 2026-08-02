@@ -238,8 +238,14 @@ func (s *Store) ChatPins(ctx context.Context, channelID int64) ([]PinnedMessage,
 // it if present. It returns the full updated reaction map (emoji -> count)
 // and whether the reaction is now present for this user.
 type reactionCacheEntry struct {
-	counts atomic.Pointer[map[string]int]
+	counts    atomic.Pointer[map[string]int]
+	expiresAt atomic.Int64
 }
+
+const (
+	reactionCacheTTL        = 30 * time.Second
+	maxReactionCacheEntries = 10_000
+)
 
 func cloneReactionCounts(in map[string]int) map[string]int {
 	out := make(map[string]int, len(in))
@@ -250,10 +256,17 @@ func cloneReactionCounts(in map[string]int) map[string]int {
 }
 
 func (s *Store) cacheReactions(messageID int64, counts map[string]int) {
-	value, _ := s.reactionCache.LoadOrStore(messageID, &reactionCacheEntry{})
+	s.reactionCacheMu.Lock()
+	defer s.reactionCacheMu.Unlock()
+	value, loaded := s.reactionCache.LoadOrStore(messageID, &reactionCacheEntry{})
+	if !loaded {
+		s.reactionCacheSize++
+	}
 	entry := value.(*reactionCacheEntry)
 	snapshot := cloneReactionCounts(counts)
 	entry.counts.Store(&snapshot)
+	entry.expiresAt.Store(time.Now().Add(reactionCacheTTL).UnixNano())
+	s.pruneReactionCacheLocked(time.Now())
 }
 
 func (s *Store) cachedReactions(messageID int64) (map[string]int, bool) {
@@ -262,11 +275,48 @@ func (s *Store) cachedReactions(messageID int64) (map[string]int, bool) {
 		return nil, false
 	}
 	entry := value.(*reactionCacheEntry)
+	if expiresAt := entry.expiresAt.Load(); expiresAt == 0 || time.Now().UnixNano() >= expiresAt {
+		s.invalidateReactionCache(messageID)
+		return nil, false
+	}
 	snapshot := entry.counts.Load()
 	if snapshot == nil {
 		return nil, false
 	}
 	return cloneReactionCounts(*snapshot), true
+}
+
+func (s *Store) invalidateReactionCache(messageID int64) {
+	s.reactionCacheMu.Lock()
+	defer s.reactionCacheMu.Unlock()
+	if _, loaded := s.reactionCache.LoadAndDelete(messageID); loaded {
+		s.reactionCacheSize--
+	}
+}
+
+func (s *Store) pruneReactionCacheLocked(now time.Time) {
+	if s.reactionCacheSize <= maxReactionCacheEntries {
+		return
+	}
+	nowNanos := now.UnixNano()
+	s.reactionCache.Range(func(key, value any) bool {
+		entry := value.(*reactionCacheEntry)
+		if entry.expiresAt.Load() <= nowNanos {
+			if _, loaded := s.reactionCache.LoadAndDelete(key); loaded {
+				s.reactionCacheSize--
+			}
+		}
+		return true
+	})
+	if s.reactionCacheSize <= maxReactionCacheEntries {
+		return
+	}
+	s.reactionCache.Range(func(key, _ any) bool {
+		if _, loaded := s.reactionCache.LoadAndDelete(key); loaded {
+			s.reactionCacheSize--
+		}
+		return s.reactionCacheSize > maxReactionCacheEntries
+	})
 }
 
 func (s *Store) ToggleReaction(ctx context.Context, messageID int64, uniqueID, emoji string) (map[string]int, bool, error) {
@@ -300,6 +350,7 @@ func (s *Store) ToggleReaction(ctx context.Context, messageID int64, uniqueID, e
 	if err := tx.Commit(); err != nil {
 		return nil, false, fmt.Errorf("committing reaction toggle: %w", err)
 	}
+	s.invalidateReactionCache(messageID)
 	s.cacheReactions(messageID, counts)
 	return counts, added, nil
 }
@@ -388,6 +439,26 @@ func (s *Store) SetServerSetting(ctx context.Context, key, value string, keyID u
 	          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, key_id = EXCLUDED.key_id`
 	if _, err := s.db.ExecContext(ctx, q, key, value, keyID); err != nil {
 		return fmt.Errorf("setting server setting: %w", err)
+	}
+	return nil
+}
+
+// SetServerSettings persists a related set of values in one transaction.
+func (s *Store) SetServerSettings(ctx context.Context, values map[string]string, keyID uint32) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning server settings update: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	const q = `INSERT INTO server_settings (key, value, key_id) VALUES ($1, $2, $3)
+	          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, key_id = EXCLUDED.key_id`
+	for key, value := range values {
+		if _, err := tx.ExecContext(ctx, q, key, value, keyID); err != nil {
+			return fmt.Errorf("setting server setting %s: %w", key, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing server settings update: %w", err)
 	}
 	return nil
 }

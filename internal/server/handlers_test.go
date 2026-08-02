@@ -447,6 +447,16 @@ func (f *fakeChat) SetServerSetting(_ context.Context, key, value string, keyID 
 	return nil
 }
 
+func (f *fakeChat) SetServerSettings(_ context.Context, values map[string]string, keyID uint32) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for key, value := range values {
+		f.settings[key] = value
+		f.settingID[key] = keyID
+	}
+	return nil
+}
+
 func (f *fakeChat) GetServerSetting(_ context.Context, key string) (string, uint32, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

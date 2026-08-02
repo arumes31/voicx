@@ -157,13 +157,32 @@ func (s *Store) UnassignServerGroup(ctx context.Context, groupID, userID int64) 
 // previous membership on that channel is replaced; the table's PK covers the
 // group ID and cannot express that with ON CONFLICT alone.
 func (s *Store) AssignChannelGroup(ctx context.Context, groupID, userID, channelID int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning channel group assignment: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := assignChannelGroupTx(ctx, tx, groupID, userID, channelID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing channel group assignment: %w", err)
+	}
+	return nil
+}
+
+func assignChannelGroupTx(ctx context.Context, tx *sql.Tx, groupID, userID, channelID int64) error {
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+		fmt.Sprintf("channel-group:%d:%d", userID, channelID)); err != nil {
+		return fmt.Errorf("locking channel group membership: %w", err)
+	}
 	const del = `DELETE FROM channel_group_members WHERE user_id = $1 AND channel_id = $2`
-	if _, err := s.db.ExecContext(ctx, del, userID, channelID); err != nil {
+	if _, err := tx.ExecContext(ctx, del, userID, channelID); err != nil {
 		return fmt.Errorf("replacing channel group membership: %w", err)
 	}
 	const ins = `INSERT INTO channel_group_members (user_id, channel_id, channel_group_id)
 	          VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`
-	if _, err := s.db.ExecContext(ctx, ins, userID, channelID, groupID); err != nil {
+	if _, err := tx.ExecContext(ctx, ins, userID, channelID, groupID); err != nil {
 		return fmt.Errorf("assigning channel group: %w", err)
 	}
 	return nil
@@ -172,18 +191,26 @@ func (s *Store) AssignChannelGroup(ctx context.Context, groupID, userID, channel
 // ApplyChannelGroupAutoAssignment selects the highest-priority enabled rule
 // for a subscribed channel and atomically replaces the user's channel group.
 func (s *Store) ApplyChannelGroupAutoAssignment(ctx context.Context, userID, channelID int64) (int64, bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, false, fmt.Errorf("beginning channel-group auto assignment: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
 	const rule = `SELECT channel_group_id FROM channel_group_auto_rules
 	              WHERE channel_id = $1 AND enabled
 	              ORDER BY priority DESC, id LIMIT 1`
 	var groupID int64
-	if err := s.db.QueryRowContext(ctx, rule, channelID).Scan(&groupID); err != nil {
-		if err == sql.ErrNoRows {
+	if err := tx.QueryRowContext(ctx, rule, channelID).Scan(&groupID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
 			return 0, false, nil
 		}
 		return 0, false, fmt.Errorf("looking up channel-group auto rule: %w", err)
 	}
-	if err := s.AssignChannelGroup(ctx, groupID, userID, channelID); err != nil {
+	if err := assignChannelGroupTx(ctx, tx, groupID, userID, channelID); err != nil {
 		return 0, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, false, fmt.Errorf("committing channel-group auto assignment: %w", err)
 	}
 	return groupID, true, nil
 }
@@ -634,6 +661,10 @@ func (s *Store) CompressPermissionAudit(ctx context.Context, cutoff time.Time) (
 		return 0, fmt.Errorf("beginning audit compression: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	const auditCompressionLock int64 = 0x564F494358415544
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, auditCompressionLock); err != nil {
+		return 0, fmt.Errorf("locking audit compression: %w", err)
+	}
 	const aggregate = `INSERT INTO audit_log_daily (day, action, target, event_count)
 	                   SELECT created_at::date, action, target, COUNT(*)
 	                   FROM audit_log

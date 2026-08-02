@@ -195,8 +195,9 @@ type slowTracker struct {
 }
 
 type typingTracker struct {
-	mu   sync.Mutex
-	last map[string]time.Time
+	mu          sync.Mutex
+	last        map[string]time.Time
+	lastCleanup time.Time
 }
 
 func newTypingTracker() *typingTracker { return &typingTracker{last: map[string]time.Time{}} }
@@ -208,12 +209,13 @@ func (t *typingTracker) allow(key string, now time.Time) bool {
 		return false
 	}
 	t.last[key] = now
-	if len(t.last) > 10_000 {
+	if len(t.last) > 10_000 && now.Sub(t.lastCleanup) >= 10*time.Second {
 		for candidate, seen := range t.last {
 			if now.Sub(seen) > 10*time.Second {
 				delete(t.last, candidate)
 			}
 		}
+		t.lastCleanup = now
 	}
 	return true
 }
@@ -331,7 +333,7 @@ func (s *TCPServer) routeScopedChat(ctx context.Context, client *Client, msg net
 			if err != nil {
 				return s.sendError(client, errCodeUnavailable, "reply target lookup failed")
 			}
-			if parent == nil || parent.ChannelID != channelID {
+			if parent == nil || parent.DeletedAt != nil || parent.ChannelID != channelID {
 				return s.sendError(client, errCodeMalformed, "reply target is not in this chat")
 			}
 		}

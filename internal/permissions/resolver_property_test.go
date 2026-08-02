@@ -53,3 +53,18 @@ func TestDetectConflictingOverride(t *testing.T) {
 		t.Fatalf("conflicts = %+v, want one", conflicts)
 	}
 }
+
+func TestDetectConflictsIsSorted(t *testing.T) {
+	tp := NewTieredPermissions()
+	server, channel := NewPermissionSet(), NewPermissionSet()
+	for _, key := range []PermissionKey{"z_test_permission", "a_test_permission"} {
+		server.Set(&Permission{Key: key, Type: PermissionTypeBoolean, Value: 1})
+		channel.Set(&Permission{Key: key, Type: PermissionTypeBoolean, Value: 0})
+	}
+	tp.Set(TierServerGroup, server)
+	tp.Set(TierChannelClient, channel)
+	conflicts := DetectConflicts(tp)
+	if len(conflicts) != 2 || conflicts[0].Key != "a_test_permission" || conflicts[1].Key != "z_test_permission" {
+		t.Fatalf("conflicts are not sorted: %+v", conflicts)
+	}
+}

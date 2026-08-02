@@ -3,8 +3,16 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"strings"
+
+	"voicx/internal/e2ee"
 )
+
+const maxPreKeysPerPublish = 200
+
+var ErrNoPreKeyBundle = errors.New("no prekey bundle available")
 
 type PreKey struct {
 	KeyID     uint32
@@ -25,6 +33,21 @@ type PreKeyBundle struct {
 // PublishPreKeyBundle atomically replaces the device's signed bundle and
 // replenishes its one-time prekeys.
 func (s *Store) PublishPreKeyBundle(ctx context.Context, userID int64, bundle PreKeyBundle, oneTime []PreKey) error {
+	if !e2ee.VerifyPreKeyBundle(e2ee.PreKeyBundle{
+		IdentityDH: bundle.IdentityDH, SigningPublic: bundle.SigningPublic,
+		SignedPreKeyID: bundle.SignedPreKeyID, SignedPreKey: bundle.SignedPreKey, Signature: bundle.Signature,
+	}) {
+		return errors.New("invalid signed prekey bundle")
+	}
+	if len(oneTime) > maxPreKeysPerPublish {
+		return fmt.Errorf("too many one-time prekeys: %d (max %d)", len(oneTime), maxPreKeysPerPublish)
+	}
+	for i := range oneTime {
+		oneTime[i].OneTime = true
+	}
+	if err := validatePreKeys(oneTime); err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -40,19 +63,23 @@ func (s *Store) PublishPreKeyBundle(ctx context.Context, userID int64, bundle Pr
 		int64(bundle.SignedPreKeyID), bundle.SignedPreKey, bundle.Signature); err != nil {
 		return fmt.Errorf("publishing prekey bundle: %w", err)
 	}
-	const keyUpsert = `INSERT INTO e2ee_prekeys (user_id, key_id, public_key, signature, one_time)
-	                  VALUES ($1, $2, $3, $4, TRUE)
-	                  ON CONFLICT (user_id, key_id) DO UPDATE SET public_key=EXCLUDED.public_key,
-	                  signature=EXCLUDED.signature, one_time=TRUE, consumed_at=NULL`
-	for _, key := range oneTime {
-		if len(key.PublicKey) != 32 {
-			return fmt.Errorf("one-time prekey %d has invalid size", key.KeyID)
-		}
-		if _, err := tx.ExecContext(ctx, keyUpsert, userID, int64(key.KeyID), key.PublicKey, key.Signature); err != nil {
-			return fmt.Errorf("publishing one-time prekey: %w", err)
-		}
+	if err := upsertPreKeys(ctx, tx, userID, oneTime); err != nil {
+		return fmt.Errorf("publishing one-time prekeys: %w", err)
 	}
 	return tx.Commit()
+}
+
+// PreKeyIdentity returns the identity currently stored in the signed bundle
+// without consuming a one-time prekey.
+func (s *Store) PreKeyIdentity(ctx context.Context, userID int64) ([]byte, error) {
+	var identity []byte
+	if err := s.db.QueryRowContext(ctx, `SELECT identity_dh FROM e2ee_prekey_bundles WHERE user_id=$1`, userID).Scan(&identity); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNoPreKeyBundle
+		}
+		return nil, fmt.Errorf("loading prekey identity: %w", err)
+	}
+	return identity, nil
 }
 
 // ConsumePreKeyBundle returns the current signed bundle and consumes at most
@@ -69,8 +96,8 @@ func (s *Store) ConsumePreKeyBundle(ctx context.Context, userID int64) (*PreKeyB
 	var signedID int64
 	if err := tx.QueryRowContext(ctx, bundleQuery, userID).Scan(&bundle.IdentityDH, &bundle.SigningPublic,
 		&signedID, &bundle.SignedPreKey, &bundle.Signature); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNoPreKeyBundle
 		}
 		return nil, fmt.Errorf("loading prekey bundle: %w", err)
 	}
@@ -81,7 +108,7 @@ func (s *Store) ConsumePreKeyBundle(ctx context.Context, userID int64) (*PreKeyB
 	var key PreKey
 	var keyID int64
 	err = tx.QueryRowContext(ctx, oneTimeQuery, userID).Scan(&keyID, &key.PublicKey, &key.Signature)
-	if err != nil && err != sql.ErrNoRows {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("loading one-time prekey: %w", err)
 	}
 	if err == nil {
@@ -98,24 +125,54 @@ func (s *Store) ConsumePreKeyBundle(ctx context.Context, userID int64) (*PreKeyB
 }
 
 func (s *Store) PublishPreKeys(ctx context.Context, userID int64, keys []PreKey) error {
+	if len(keys) > maxPreKeysPerPublish {
+		return fmt.Errorf("too many prekeys: %d (max %d)", len(keys), maxPreKeysPerPublish)
+	}
+	if err := validatePreKeys(keys); err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	const q = `INSERT INTO e2ee_prekeys (user_id, key_id, public_key, signature, one_time)
-	          VALUES ($1, $2, $3, $4, $5)
-	          ON CONFLICT (user_id, key_id) DO UPDATE SET public_key = EXCLUDED.public_key,
-	          signature = EXCLUDED.signature, one_time = EXCLUDED.one_time, consumed_at = NULL`
+	if err := upsertPreKeys(ctx, tx, userID, keys); err != nil {
+		return fmt.Errorf("publishing prekeys: %w", err)
+	}
+	return tx.Commit()
+}
+
+type preKeyExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func validatePreKeys(keys []PreKey) error {
 	for _, key := range keys {
 		if len(key.PublicKey) != 32 {
 			return fmt.Errorf("prekey %d has %d bytes, want 32", key.KeyID, len(key.PublicKey))
 		}
-		if _, err := tx.ExecContext(ctx, q, userID, key.KeyID, key.PublicKey, key.Signature, key.OneTime); err != nil {
-			return fmt.Errorf("publishing prekey: %w", err)
-		}
 	}
-	return tx.Commit()
+	return nil
+}
+
+func upsertPreKeys(ctx context.Context, execer preKeyExecer, userID int64, keys []PreKey) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	values := make([]string, 0, len(keys))
+	args := make([]any, 0, 1+len(keys)*4)
+	args = append(args, userID)
+	for i, key := range keys {
+		base := 2 + i*4
+		values = append(values, fmt.Sprintf("($1, $%d, $%d, $%d, $%d)", base, base+1, base+2, base+3))
+		args = append(args, int64(key.KeyID), key.PublicKey, key.Signature, key.OneTime)
+	}
+	q := `INSERT INTO e2ee_prekeys (user_id, key_id, public_key, signature, one_time) VALUES ` +
+		strings.Join(values, ",") + ` ON CONFLICT (user_id, key_id) DO UPDATE SET
+		public_key=EXCLUDED.public_key, signature=EXCLUDED.signature,
+		one_time=EXCLUDED.one_time, consumed_at=NULL`
+	_, err := execer.ExecContext(ctx, q, args...)
+	return err
 }
 
 // ConsumePreKey locks and consumes one one-time prekey exactly once.
@@ -130,8 +187,8 @@ func (s *Store) ConsumePreKey(ctx context.Context, userID int64) (*PreKey, error
 	          ORDER BY key_id LIMIT 1 FOR UPDATE SKIP LOCKED`
 	var key PreKey
 	if err := tx.QueryRowContext(ctx, q, userID).Scan(&key.KeyID, &key.PublicKey, &key.Signature); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNoPreKeyBundle
 		}
 		return nil, err
 	}

@@ -163,7 +163,7 @@ services:
       - ./scripts/postgres-backup.sh:/usr/local/bin/postgres-backup.sh:ro
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - "if [ -n \"$$BACKUP_REMOTE\" ]; then apk add --no-cache rclone; fi; while true; do sleep $$(($$(date -d tomorrow +%s) - $$(date +%s) + 8100)); /bin/sh /usr/local/bin/postgres-backup.sh; done"
+      - "if [ -n \"$$BACKUP_REMOTE\" ]; then apk add --no-cache rclone; fi; while true; do h=$$(date -u +%H); m=$$(date -u +%M); s=$$(date -u +%S); h=$${h#0}; m=$${m#0}; s=$${s#0}; now=$$((h * 3600 + m * 60 + s)); if [ $$now -lt 8100 ]; then delay=$$((8100 - now)); else delay=$$((86400 - now + 8100)); fi; sleep $$delay; /bin/sh /usr/local/bin/postgres-backup.sh; done"
 
   # ---------------------------------------------------------------------------
   # redis — cache / pub-sub / session store

@@ -6,6 +6,7 @@ import (
 	"embed"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,10 +20,12 @@ var migrationsFS embed.FS
 // Store wraps a *sql.DB connection pool and a logger, providing access to the
 // voicx PostgreSQL database.
 type Store struct {
-	db            *sql.DB
-	logger        *zap.Logger
-	reactionCache sync.Map // message id -> *reactionCacheEntry
-	pii           *PIICipher
+	db                *sql.DB
+	logger            *zap.Logger
+	reactionCache     sync.Map // message id -> *reactionCacheEntry
+	reactionCacheMu   sync.Mutex
+	reactionCacheSize int
+	pii               *PIICipher
 }
 
 // SetPIICipher installs the process-local field cipher used by PII methods.
@@ -109,6 +112,18 @@ func (s *Store) Migrate() error {
 		if err != nil {
 			return fmt.Errorf("reading migration %s: %w", name, err)
 		}
+		if noTransactionMigration(content) {
+			if err := applyNonTransactionalMigration(s.db, string(content)); err != nil {
+				return fmt.Errorf("applying non-transactional migration %s: %w", name, err)
+			}
+			if _, err := s.db.Exec(`INSERT INTO schema_migrations (filename) VALUES ($1)`, name); err != nil {
+				return fmt.Errorf("recording migration %s: %w", name, err)
+			}
+			if s.logger != nil {
+				s.logger.Info("migration applied", zap.String("file", name))
+			}
+			continue
+		}
 		// The ledger INSERT must commit with the file itself; a crash between
 		// the two would re-run a destructive migration.
 		tx, err := s.db.Begin()
@@ -128,6 +143,33 @@ func (s *Store) Migrate() error {
 		}
 		if s.logger != nil {
 			s.logger.Info("migration applied", zap.String("file", name))
+		}
+	}
+	return nil
+}
+
+func noTransactionMigration(content []byte) bool {
+	for _, line := range strings.Split(string(content), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return line == "-- voicx:no-transaction"
+		}
+	}
+	return false
+}
+
+// applyNonTransactionalMigration executes each top-level statement through
+// *sql.DB so PostgreSQL gives it its own autocommit transaction. Marked files
+// are intentionally limited to simple DDL and must not contain procedural
+// blocks whose bodies include semicolons.
+func applyNonTransactionalMigration(db *sql.DB, content string) error {
+	for _, statement := range strings.Split(content, ";") {
+		statement = strings.TrimSpace(statement)
+		if statement == "" {
+			continue
+		}
+		if _, err := db.Exec(statement); err != nil {
+			return err
 		}
 	}
 	return nil

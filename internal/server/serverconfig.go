@@ -104,10 +104,14 @@ func (s *TCPServer) handleServerConfigSet(ctx context.Context, client *Client, f
 		"default_opus_dtx":       strconv.FormatBool(msg.OpusDTX),
 		"default_opus_stereo":    strconv.FormatBool(msg.OpusStereo),
 	}
-	for key, value := range values {
-		if err := s.deps.Chat.SetServerSetting(ctx, key, value, 0); err != nil {
-			return s.sendError(client, errCodeUnavailable, fmt.Sprintf("saving %s failed", key))
-		}
+	batch, ok := s.deps.Chat.(interface {
+		SetServerSettings(context.Context, map[string]string, uint32) error
+	})
+	if !ok {
+		return s.sendError(client, errCodeUnavailable, "settings store does not support atomic updates")
+	}
+	if err := batch.SetServerSettings(ctx, values, 0); err != nil {
+		return s.sendError(client, errCodeUnavailable, "saving server configuration failed")
 	}
 	s.configMu.Lock()
 	s.cfg.MaxClients = msg.MaxClients

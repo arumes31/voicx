@@ -1061,9 +1061,16 @@ async function openE2EEDiagnostics() {
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
     overlay.querySelector(".verify-safety")?.addEventListener("click", async () => {
         const settings = V().state.settings;
-        settings.e2ee_verified = settings.e2ee_verified || {};
-        settings.e2ee_verified[peer] = d.safety_number;
-        await app().SaveSettings(settings);
+        const previous = settings.e2ee_verified;
+        settings.e2ee_verified = { ...(previous || {}), [peer]: d.safety_number };
+        try {
+            const err = await app().SaveSettings(settings);
+            if (err) throw new Error(err);
+        } catch (err) {
+            settings.e2ee_verified = previous;
+            V().toast("saving safety verification failed: " + err, "warn");
+            return;
+        }
         overlay.remove();
         V().toast("safety number verified");
     });
@@ -1544,6 +1551,8 @@ export function addChat(d) {
 
     const chID = m.channelID ?? 0;
     const key = "ch:" + chID;
+    const position = pushMsg(key, m);
+    if (position === "duplicate") return;
     const directMention = m.mentions.includes(st.myUniqueID) && !m.self;
     const roleMention = !m.self && /@(admin|moderator|member|guest)\b/i.test(m.text || "");
     if (directMention) {
@@ -1566,8 +1575,6 @@ export function addChat(d) {
                 { channelID: m.channelID, className: directMention || roleMention ? "mentions" : "messages", kind: directMention || roleMention ? "warn" : "info" });
         }
     }
-    const position = pushMsg(key, m);
-    if (position === "duplicate") return;
     if (key === activeKey()) {
         if (position === "append") appendLive(m);
         else renderView();
@@ -1623,13 +1630,13 @@ function routeDM(d, m) {
     const tab = pmTabs.get(peer) || { uid: peer, nick: m.self ? peer : m.from, unread: 0, offline: false, pendingRead: "" };
     if (!pmTabs.has(peer)) pmTabs.set(peer, tab);
     if (!m.self) tab.nick = m.from;
-	if (!m.self) {
-		window.__voicxNotify?.notify("dm", (m.from || "someone") + ": " + (m.text || "").slice(0, 80),
-			{ uid: peer, className: "messages", kind: "info" });
-	}
 
     const key = "dm:" + peer;
     if (pushMsg(key, m) === "duplicate") return;
+    if (!m.self) {
+        window.__voicxNotify?.notify("dm", (m.from || "someone") + ": " + (m.text || "").slice(0, 80),
+            { uid: peer, className: "messages", kind: "info" });
+    }
     dmRecord(peer, tab.nick, m); // (122) both directions, so a restart replays the thread
 
     if (m.offline && !m.self) {

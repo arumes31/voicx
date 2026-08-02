@@ -288,7 +288,7 @@ func (a *App) CreateChannel(name, topic string, parentID int64, channelType, max
 	if err := a.cmLoad().write(netproto.MsgCreateChannel, netproto.CreateChannel{
 		Name: name, Topic: topic, ParentID: parentID, Type: channelType,
 		MaxClients: maxClients, Password: password, NeededJoinPower: neededJoinPower,
-		OpusBitrate: opusBitrate, OpusFEC: opusFEC, OpusDTX: opusDTX, OpusStereo: opusStereo,
+		OpusBitrate: opusBitrate, OpusFEC: &opusFEC, OpusDTX: &opusDTX, OpusStereo: &opusStereo,
 	}); err != nil {
 		return err.Error()
 	}

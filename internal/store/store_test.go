@@ -140,7 +140,12 @@ func applyPreLedgerMigrations(t *testing.T, s *Store, stopBefore string) {
 		if err != nil {
 			t.Fatalf("reading migration %s: %v", name, err)
 		}
-		if _, err := s.DB().Exec(string(content)); err != nil {
+		if noTransactionMigration(content) {
+			err = applyNonTransactionalMigration(s.DB(), string(content))
+		} else {
+			_, err = s.DB().Exec(string(content))
+		}
+		if err != nil {
 			t.Fatalf("applying migration %s: %v", name, err)
 		}
 	}

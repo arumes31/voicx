@@ -39,6 +39,9 @@ func TestEngineDTLSCertificateIsStableForRun(t *testing.T) {
 	if len(a.pc.GetConfiguration().Certificates) != 1 || len(b.pc.GetConfiguration().Certificates) != 1 {
 		t.Fatal("peer connections did not receive the engine certificate")
 	}
+	if e.certificate.Expires().Before(time.Now().AddDate(9, 0, 0)) {
+		t.Fatalf("DTLS certificate expires too soon: %v", e.certificate.Expires())
+	}
 }
 
 func TestKeyframeBurstSuppression(t *testing.T) {
@@ -56,14 +59,17 @@ func TestKeyframeBurstSuppression(t *testing.T) {
 }
 
 func TestSoftClipMix(t *testing.T) {
-	dst := make([]float32, 3)
-	SoftClipMix(dst, []float32{0.5, 1, -1}, []float32{0.5, 1, -1})
+	dst := make([]float32, 4)
+	SoftClipMix(dst, []float32{0.25, 0.5, 1, -1}, []float32{0.25, 0.5, 1, -1})
 	for i, v := range dst {
 		if v < -1 || v > 1 || math.IsNaN(float64(v)) {
 			t.Fatalf("sample %d = %v", i, v)
 		}
 	}
-	if !(dst[1] < 1 && dst[1] > dst[0]) {
+	if dst[0] != 0.5 {
+		t.Fatalf("linear sample changed: %v", dst)
+	}
+	if !(dst[2] < 1 && dst[2] > dst[1] && dst[3] == -dst[2]) {
 		t.Fatalf("limiter did not soft-clip monotonically: %v", dst)
 	}
 }

@@ -76,6 +76,7 @@ type SpoolStore interface {
 type PreKeyStore interface {
 	PublishPreKeyBundle(ctx context.Context, userID int64, bundle store.PreKeyBundle, oneTime []store.PreKey) error
 	ConsumePreKeyBundle(ctx context.Context, userID int64) (*store.PreKeyBundle, error)
+	PreKeyIdentity(ctx context.Context, userID int64) ([]byte, error)
 }
 
 // VoiceBackend is the subset of webrtc.Voice the TCP server needs for the

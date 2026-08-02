@@ -1,6 +1,9 @@
 package permissions
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+)
 
 // Conflict describes two effective inputs that disagree. Resolution remains
 // deterministic; this diagnostic exists so an administrator can see a
@@ -24,7 +27,12 @@ func DetectConflicts(tp TieredPermissions) []Conflict {
 			}
 		}
 	}
+	orderedKeys := make([]PermissionKey, 0, len(keys))
 	for key := range keys {
+		orderedKeys = append(orderedKeys, key)
+	}
+	sort.Slice(orderedKeys, func(i, j int) bool { return orderedKeys[i] < orderedKeys[j] })
+	for _, key := range orderedKeys {
 		var winner *Permission
 		var winnerTier Tier
 		for _, tier := range tierOrder {

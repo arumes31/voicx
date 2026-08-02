@@ -1,2 +1,4 @@
-# Nightly at 02:15 UTC. Install inside a container/host that has pg_dump.
-15 2 * * * /app/scripts/postgres-backup.sh
+# Nightly at 02:15 UTC. The root-owned environment file must be mode 0600 and
+# provide DATABASE_URL (plus optional BACKUP_* values) without exposing it in
+# the crontab or process arguments.
+15 2 * * * set -a; . /run/secrets/voicx-backup.env; set +a; /app/scripts/postgres-backup.sh

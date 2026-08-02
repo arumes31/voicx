@@ -152,6 +152,7 @@ func (a *App) shutdown(_ context.Context) {
 	for _, ts := range a.tabsRegistry() {
 		ts.cm.disconnect()
 	}
+	closeDailyLogs()
 }
 
 // Connect dials the server and authenticates. nickname is the account

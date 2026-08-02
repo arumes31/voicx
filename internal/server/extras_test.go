@@ -196,7 +196,8 @@ func TestServerPassword(t *testing.T) {
 
 // TestAvatarSetGet verifies avatar validation and the set/get round-trip.
 func TestAvatarSetGet(t *testing.T) {
-	env := startTestEnv(t, nil)
+	perms := tieredWith(boolPerm(permissions.PermissionKeyClientAvatarUpload, true))
+	env := startTestEnv(t, &perms)
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
@@ -233,7 +234,8 @@ func TestAvatarSetGet(t *testing.T) {
 
 // TestAvatarOversize verifies oversized images are rejected.
 func TestAvatarOversize(t *testing.T) {
-	env := startTestEnv(t, nil)
+	perms := tieredWith(boolPerm(permissions.PermissionKeyClientAvatarUpload, true))
+	env := startTestEnv(t, &perms)
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
@@ -254,7 +256,8 @@ func TestAvatarOversize(t *testing.T) {
 
 // TestAvatarChangedEvent verifies other clients get avatar_changed on set.
 func TestAvatarChangedEvent(t *testing.T) {
-	env := startTestEnv(t, nil)
+	perms := tieredWith(boolPerm(permissions.PermissionKeyClientAvatarUpload, true))
+	env := startTestEnv(t, &perms)
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
@@ -270,6 +273,24 @@ func TestAvatarChangedEvent(t *testing.T) {
 	}
 	if ue.ClientID != userID {
 		t.Fatalf("avatar_changed client = %q, want %q", ue.ClientID, userID)
+	}
+}
+
+func TestAvatarSetRequiresPermission(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+
+	send(t, conn, netproto.MsgAvatarSet, netproto.AvatarSet{DataBase64: b64(tinyPNG)})
+	f := readOfType(t, conn, netproto.MsgError)
+	var e netproto.Error
+	if err := netproto.Decode(f, &e); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if e.Code != errCodePermissionDenied {
+		t.Fatalf("error code = %d, want %d", e.Code, errCodePermissionDenied)
 	}
 }
 

@@ -541,9 +541,9 @@ type CreateChannel struct {
 	Password        string `json:"password,omitempty"`
 	NeededJoinPower int    `json:"needed_join_power,omitempty"`
 	OpusBitrate     int    `json:"opus_bitrate,omitempty"`
-	OpusFEC         bool   `json:"opus_fec,omitempty"`
-	OpusDTX         bool   `json:"opus_dtx,omitempty"`
-	OpusStereo      bool   `json:"opus_stereo,omitempty"`
+	OpusFEC         *bool  `json:"opus_fec,omitempty"`
+	OpusDTX         *bool  `json:"opus_dtx,omitempty"`
+	OpusStereo      *bool  `json:"opus_stereo,omitempty"`
 }
 
 // ChannelEdit requests editing a channel's settings. Nil pointer fields are
