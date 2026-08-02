@@ -55,6 +55,11 @@ jobs:
           cache: npm
           cache-dependency-path: client/frontend/package-lock.json
 
+      - name: install linux client dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxtst-dev libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev
+
       - name: build frontend assets
         working-directory: client/frontend
         run: |
