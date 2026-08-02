@@ -180,6 +180,107 @@ export function checkChannelWatch() {
 }
 
 // ---------------------------------------------------------------------------
+// Server rules gate (216)
+// ---------------------------------------------------------------------------
+
+let rulesOverlay = null;
+let rulesHash = "";
+
+// resetServerRules removes a gate when its server tab is closed or switched
+// away from. If the newly active tab also has pending rules, its journaled
+// server_rules frame immediately creates the correct gate again.
+export function resetServerRules() {
+    if (rulesOverlay) rulesOverlay.remove();
+    rulesOverlay = null;
+    rulesHash = "";
+}
+
+export function showServerRules(json) {
+    let rules;
+    try {
+        rules = typeof json === "string" ? JSON.parse(json) : json;
+    } catch {
+        V().toast("server sent malformed rules", "warn");
+        return;
+    }
+    if (!rules?.text || !rules?.hash) {
+        resetServerRules(); // an empty ServerRules frame is the accept ack
+        return;
+    }
+
+    // The rules gate owns the first-join decision. Do not leave a lower-priority
+    // startup reminder hidden underneath it.
+    document.querySelector(".alpha-notice")?.remove();
+    document.querySelector(".identity-backup-nag")?.remove();
+    resetServerRules();
+    rulesHash = rules.hash;
+
+    const overlay = document.createElement("div");
+    overlay.className = "dlg-overlay server-rules-gate";
+    overlay.dataset.blocking = "true";
+    const dlg = document.createElement("div");
+    dlg.className = "dlg dlg-wide";
+    const title = document.createElement("h3");
+    title.textContent = "Server rules";
+    const intro = document.createElement("p");
+    intro.className = "dlg-text";
+    intro.textContent = "You must accept these rules before joining channels or using chat.";
+    const body = document.createElement("div");
+    body.className = "dlg-text server-rules-text";
+    body.textContent = rules.text; // operator text is data, never HTML
+    const status = document.createElement("div");
+    status.className = "set-hint";
+    const buttons = document.createElement("div");
+    buttons.className = "dlg-buttons";
+    const decline = document.createElement("button");
+    decline.className = "dlg-cancel";
+    decline.textContent = "Decline and disconnect";
+    const accept = document.createElement("button");
+    accept.className = "dlg-ok";
+    accept.textContent = "Accept";
+    buttons.appendChild(decline);
+    buttons.appendChild(accept);
+    dlg.appendChild(title);
+    dlg.appendChild(intro);
+    dlg.appendChild(body);
+    dlg.appendChild(status);
+    dlg.appendChild(buttons);
+    overlay.appendChild(dlg);
+    document.body.appendChild(overlay);
+    rulesOverlay = overlay;
+
+    decline.onclick = async () => {
+        decline.disabled = true;
+        accept.disabled = true;
+        status.textContent = "disconnecting…";
+        await App().Disconnect();
+        resetServerRules();
+    };
+    accept.onclick = async () => {
+        decline.disabled = true;
+        accept.disabled = true;
+        status.textContent = "recording acceptance…";
+        const acceptedHash = rulesHash;
+        const err = await App().AcceptServerRules(acceptedHash);
+        if (err) {
+            status.textContent = err;
+            decline.disabled = false;
+            accept.disabled = false;
+            return;
+        }
+        // Success is acknowledged by an empty ServerRules frame. A timeout
+        // keeps a dropped response from stranding the user behind dead buttons.
+        setTimeout(() => {
+            if (rulesOverlay === overlay && rulesHash === acceptedHash) {
+                status.textContent = "no response from server — try again";
+                decline.disabled = false;
+                accept.disabled = false;
+            }
+        }, 10000);
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Alpha notice (215)
 // ---------------------------------------------------------------------------
 
@@ -187,8 +288,9 @@ export function maybeAlphaNotice(force = false) {
     const s = V().state.settings;
     const ver = V().state.clientVersion || "";
     if (!s || !ver || (!force && s.alpha_dismissed === ver)) return;
+    if (document.querySelector(".server-rules-gate")) return;
     const overlay = document.createElement("div");
-    overlay.className = "dlg-overlay";
+    overlay.className = "dlg-overlay alpha-notice";
     overlay.innerHTML = `
         <div class="dlg">
             <h3>voicx is alpha software</h3>
@@ -223,6 +325,7 @@ let backupNagSnoozed = false;
 // never been backed up (353).
 export async function maybeIdentityBackupNag(force = false) {
     if (backupNagSnoozed && !force) return;
+    if (document.querySelector(".server-rules-gate")) return;
     if (document.querySelector(".identity-backup-nag")) return;
     let pending = false;
     try {
@@ -267,8 +370,9 @@ export function initNotifications() {
     window.__voicxNotify = {
         notify, checkBuddyOnline, resetBuddyWatch, matchKeyword,
         checkChannelWatch, channelOverride, saveChannelOverride, maybeAlphaNotice,
-        maybeIdentityBackupNag,
+        maybeIdentityBackupNag, resetServerRules,
     };
+    window.runtime.EventsOn("server_rules", showServerRules);
     const badge = document.getElementById("alpha-badge");
     if (badge) badge.onclick = () => maybeAlphaNotice(true);
     setTimeout(() => maybeAlphaNotice(false), 1200);

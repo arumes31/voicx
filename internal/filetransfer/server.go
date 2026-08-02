@@ -634,6 +634,12 @@ func (s *Server) Start(ctx context.Context) error {
 			MinVersion:   tls.VersionTLS12,
 		})
 	}
+	// Keep the accept loop represented in the WaitGroup before publishing the
+	// listener. Close may wait while the loop is still accepting and adding
+	// connection workers; a positive parent count makes those Adds legal and
+	// prevents Wait from returning between Accept and Add.
+	s.wg.Add(1)
+	defer s.wg.Done()
 	s.listener = ln
 	if s.cfg.QuietHoursStart != s.cfg.QuietHoursEnd {
 		s.logger.Info("file transfer quiet hours active",

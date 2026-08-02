@@ -334,6 +334,17 @@ body {
     display: flex; align-items: center; justify-content: center;
     background: rgba(4, 8, 12, 0.6);
 }
+
+.server-rules-gate {
+    z-index: 10000;
+}
+
+.server-rules-text {
+    max-height: min(52vh, 34rem);
+    overflow: auto;
+    white-space: pre-wrap;
+    user-select: text;
+}
 .dlg {
     width: 340px; padding: 20px;
     background: var(--bg-raised); border: 1px solid var(--border); border-radius: 10px;
@@ -464,6 +475,8 @@ body {
     font-size: 0.9286rem; color: var(--text-dim); cursor: pointer;
 }
 .ctx-menu a:hover { background: var(--bg-hover); color: var(--text); }
+.ctx-menu a.disabled { opacity: .45; cursor: not-allowed; }
+.ctx-menu a.disabled:hover { background: none; color: var(--text-dim); }
 .ctx-menu a:first-child { color: var(--text); font-weight: 600; }
 
 /* ---------------------------------------------------------------- client info */

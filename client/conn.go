@@ -62,6 +62,8 @@ type connManager struct {
 	// switch can replay them (281).
 	lastSnapshot    string
 	lastChannelList string
+	// lastSubscriptions is the newest authoritative subscription set (312).
+	lastSubscriptions string
 	// iceServers are the ICE servers delivered by the server in the
 	// AuthResponse (nil = use client defaults).
 	iceServers []netproto.ICEServer
@@ -389,6 +391,10 @@ func (m *connManager) openMOTD(resp netproto.AuthResponse) string {
 func (m *connManager) disconnectLocked() {
 	m.iceServers = nil
 	m.motd = ""
+	// (312) subscriptions are per connection and the server forgets them on
+	// disconnect, so keeping the cached set would show tabs that no longer
+	// receive anything.
+	m.lastSubscriptions = ""
 	if m.conn != nil {
 		m.closed = true
 		_ = m.conn.Close()
@@ -571,6 +577,17 @@ func (m *connManager) dispatch(f *netproto.Frame) {
 		// advance the send key, and a waiter in awaitScopeText wakes on the
 		// install.
 		m.handleChatKeyBundle(f)
+	case netproto.MsgSubscriptionState:
+		// (312) always the authoritative full set, so it is cached and
+		// replayed verbatim on a tab switch like the other state frames.
+		m.mu.Lock()
+		m.lastSubscriptions = string(f.Payload)
+		m.mu.Unlock()
+		m.emit("subscriptions", string(f.Payload))
+	case netproto.MsgServerRules:
+		// (216) The webview owns the blocking prompt, but the frame stays a
+		// typed backend event so operator text is never interpreted as markup.
+		m.emit("server_rules", string(f.Payload))
 	case netproto.MsgChannelList:
 		m.mu.Lock()
 		m.lastChannelList = string(f.Payload)

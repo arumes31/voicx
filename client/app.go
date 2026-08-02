@@ -233,6 +233,24 @@ func (a *App) MOTD() string {
 	return a.cmLoad().motdSnapshot()
 }
 
+// AcceptServerRules accepts exactly the rules revision displayed by the
+// blocking first-join prompt (216). The server answers with another
+// ServerRules frame: an empty payload closes the gate, while changed rules
+// replace the prompt and require a fresh click.
+func (a *App) AcceptServerRules(hash string) string {
+	if hash == "" {
+		return "rules hash is required"
+	}
+	m := a.cmLoad()
+	if m == nil {
+		return "not connected"
+	}
+	if err := m.write(netproto.MsgServerRulesAccept, netproto.ServerRulesAccept{Hash: hash}); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
 // ClientID returns the server-assigned client ID of the current connection
 // ("" when not connected).
 func (a *App) ClientID() string {

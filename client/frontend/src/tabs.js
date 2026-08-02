@@ -134,6 +134,7 @@ function onTabReset(tabID) {
     state.channels = [];
     state.clients = [];
     window.__voicxNotify?.resetBuddyWatch(); // (383) buddy alerts re-arm per connect
+    window.__voicxNotify?.resetServerRules?.(); // (216) gate belongs to one server tab
     state.myChannelID = 0;
     state.selectedClientID = "";
     state.trackUsers.clear();

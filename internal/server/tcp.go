@@ -659,6 +659,8 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 		return s.handleTokenDelete(ctx, client, f)
 	case netproto.MsgServerRulesAccept:
 		return s.handleServerRulesAccept(ctx, client, f)
+	case netproto.MsgChannelSubscribe:
+		return s.handleChannelSubscribe(ctx, client, f)
 	case netproto.MsgPing:
 		return s.handlePing(ctx, client, f)
 	case netproto.MsgPong:

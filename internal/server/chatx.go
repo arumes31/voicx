@@ -326,7 +326,7 @@ func (s *TCPServer) routeScopedChat(ctx context.Context, client *Client, msg net
 		s.deps.Broadcast.BroadcastEvent(eventChat, raw)
 		s.metricsSink().IncChatMessage("global")
 	} else {
-		s.deps.Broadcast.BroadcastToChannel(channelID, payload)
+		s.broadcastChannelScoped(ctx, channelID, payload)
 		s.metricsSink().IncChatMessage("channel")
 	}
 	return nil
@@ -747,7 +747,7 @@ func (s *TCPServer) handleChatHistory(ctx context.Context, client *Client, f *ne
 	if s.deps == nil || s.deps.Chat == nil || s.deps.State == nil {
 		return s.sendError(client, errCodeUnavailable, "chat store unavailable")
 	}
-	if !s.scopeReadable(client, msg.ChannelID) {
+	if !s.scopeReadable(ctx, client, msg.ChannelID) {
 		return s.sendError(client, errCodePermissionDenied, "not a member of this channel")
 	}
 	memberPub := s.publishedKey(client)
@@ -880,7 +880,7 @@ func (s *TCPServer) handleChatEdit(ctx context.Context, client *Client, f *netpr
 
 	// Uniform wire format: the edit event carries ciphertext like any other
 	// chat frame, whatever the sender did.
-	s.broadcastScope(stored.ChannelID, eventChatEdited, map[string]any{
+	s.broadcastScope(ctx, stored.ChannelID, eventChatEdited, map[string]any{
 		"message_id": msg.MessageID,
 		"channel_id": stored.ChannelID,
 		"body":       bodyEnc,
@@ -920,7 +920,7 @@ func (s *TCPServer) handleChatDelete(ctx context.Context, client *Client, f *net
 	if err := s.deps.Chat.DeleteChatMessage(ctx, msg.MessageID); err != nil {
 		return s.sendError(client, errCodeNotFound, "delete failed: "+err.Error())
 	}
-	s.broadcastScope(stored.ChannelID, eventChatDeleted, map[string]any{
+	s.broadcastScope(ctx, stored.ChannelID, eventChatDeleted, map[string]any{
 		"message_id": msg.MessageID,
 		"channel_id": stored.ChannelID,
 		"deleted_by": client.UniqueID,
@@ -928,10 +928,11 @@ func (s *TCPServer) handleChatDelete(ctx context.Context, client *Client, f *net
 	return nil
 }
 
-// broadcastScope broadcasts an event to a channel's members (channelID 0 =
-// everyone). Note the two broadcast paths differ: BroadcastToChannel takes a
-// pre-wrapped envelope, BroadcastEvent wraps the data itself.
-func (s *TCPServer) broadcastScope(channelID int64, eventType string, data any) {
+// broadcastScope broadcasts an event to a channel's members and subscribers
+// (channelID 0 = everyone). Note the two broadcast paths differ:
+// broadcastChannelScoped takes a pre-wrapped envelope, BroadcastEvent wraps
+// the data itself.
+func (s *TCPServer) broadcastScope(ctx context.Context, channelID int64, eventType string, data any) {
 	if channelID == 0 {
 		raw, err := json.Marshal(data)
 		if err != nil {
@@ -944,7 +945,7 @@ func (s *TCPServer) broadcastScope(channelID int64, eventType string, data any) 
 	if err != nil {
 		return
 	}
-	s.deps.Broadcast.BroadcastToChannel(channelID, payload)
+	s.broadcastChannelScoped(ctx, channelID, payload)
 }
 
 // ---------------------------------------------------------------------------
@@ -990,7 +991,7 @@ func (s *TCPServer) handleChatPin(ctx context.Context, client *Client, f *netpro
 	if !msg.Pinned {
 		event = eventChatUnpinned
 	}
-	s.broadcastScope(msg.ChannelID, event, map[string]any{
+	s.broadcastScope(ctx, msg.ChannelID, event, map[string]any{
 		"message_id": msg.MessageID,
 		"channel_id": msg.ChannelID,
 		"by":         client.UniqueID,
@@ -1011,7 +1012,7 @@ func (s *TCPServer) handleChatPins(ctx context.Context, client *Client, f *netpr
 	if s.deps == nil || s.deps.Chat == nil {
 		return s.sendError(client, errCodeUnavailable, "chat store unavailable")
 	}
-	if !s.scopeReadable(client, msg.ChannelID) {
+	if !s.scopeReadable(ctx, client, msg.ChannelID) {
 		return s.sendError(client, errCodePermissionDenied, "not a member of this channel")
 	}
 	memberPub := s.publishedKey(client)
@@ -1064,7 +1065,7 @@ func (s *TCPServer) handleChatReact(ctx context.Context, client *Client, f *netp
 	if err != nil {
 		return s.sendError(client, errCodeUnavailable, "reaction failed")
 	}
-	s.broadcastScope(stored.ChannelID, eventChatReaction, map[string]any{
+	s.broadcastScope(ctx, stored.ChannelID, eventChatReaction, map[string]any{
 		"message_id": msg.MessageID,
 		"channel_id": stored.ChannelID,
 		"reactions":  counts,
@@ -1096,7 +1097,7 @@ type typingEvent struct {
 // A relay the sender is not entitled to is DROPPED rather than answered with
 // an error: an indicator is fire-and-forget, and a client that left a channel
 // mid-keystroke should not get an error frame for it.
-func (s *TCPServer) handleTyping(_ context.Context, client *Client, f *netproto.Frame) error {
+func (s *TCPServer) handleTyping(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.Typing
 	if err := netproto.Decode(f, &msg); err != nil {
 		return s.sendError(client, errCodeMalformed, "malformed typing: "+err.Error())
@@ -1123,14 +1124,14 @@ func (s *TCPServer) handleTyping(_ context.Context, client *Client, f *netproto.
 		// Same gate as history: without it any client could fake "X is
 		// typing" into a channel it never joined, which is the metadata half
 		// of the leak scopeReadable closes for bodies.
-		if !s.scopeReadable(client, msg.ChannelID) {
+		if !s.scopeReadable(ctx, client, msg.ChannelID) {
 			return nil
 		}
 		payload, err := eventEnvelope(eventTyping, data)
 		if err != nil {
 			return err
 		}
-		s.deps.Broadcast.BroadcastToChannel(msg.ChannelID, payload)
+		s.broadcastChannelScoped(ctx, msg.ChannelID, payload)
 	default:
 		raw, err := json.Marshal(data)
 		if err != nil {

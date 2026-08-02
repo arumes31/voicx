@@ -170,6 +170,53 @@ func (a *App) ChatPins(channelID int64) (netproto.ChatPinsResponse, error) {
 }
 
 // ---------------------------------------------------------------------------
+// Channel subscriptions (312)
+// ---------------------------------------------------------------------------
+
+// SubscribeChannels asks the server to (un)subscribe the given channels. The
+// answer is never returned here: the server replies with the authoritative
+// full set on MsgSubscriptionState, which arrives on the read loop as the
+// "subscriptions" event. Returning a set from here would give the UI a second
+// source of truth that could disagree with it.
+func (a *App) SubscribeChannels(channelIDs []int64, subscribe bool) string {
+	if len(channelIDs) == 0 {
+		return "no channels given"
+	}
+	m := a.cmLoad()
+	if m == nil {
+		return "not connected"
+	}
+	if err := m.write(netproto.MsgChannelSubscribe, netproto.ChannelSubscribe{
+		ChannelIDs: channelIDs, Subscribe: subscribe,
+	}); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+// Subscriptions returns the newest authoritative subscription set the server
+// pushed on this connection. A background server tab drops live events, so
+// this is how a tab switch recovers the set without a round trip (281/312).
+func (a *App) Subscriptions() []int64 {
+	m := a.cmLoad()
+	if m == nil {
+		return []int64{}
+	}
+	m.mu.Lock()
+	raw := m.lastSubscriptions
+	m.mu.Unlock()
+	out := []int64{}
+	if raw == "" {
+		return out
+	}
+	var st netproto.SubscriptionState
+	if err := json.Unmarshal([]byte(raw), &st); err != nil {
+		return out
+	}
+	return append(out, st.ChannelIDs...)
+}
+
+// ---------------------------------------------------------------------------
 // Chat moderation lists (117/118)
 // ---------------------------------------------------------------------------
 

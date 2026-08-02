@@ -26,11 +26,18 @@ const PAGE = 50; // history page size (103)
 // ---------------------------------------------------------------------------
 
 // view: {kind:"channel"} (follows state.myChannelID) | {kind:"global"} |
-// {kind:"dm", uid}. store key: "ch:<id>" ("ch:0" = global) or "dm:<uid>".
+// {kind:"dm", uid} | {kind:"chan", id} (a subscribed channel I am not in,
+// 312/311). store key: "ch:<id>" ("ch:0" = global) or "dm:<uid>".
 let view = { kind: "channel" };
+// subscriptions is the server's authoritative set (312): every id it lists,
+// including the channel I stand in, which the server adds implicitly. It is
+// replaced wholesale, never merged, so the client cannot accumulate drift.
+let subscriptions = [];
 const store = new Map(); // key -> {msgs, hasMore, end, loading, loaded}
 const unread = new Map(); // channelID -> {n, mention}
 const pmTabs = new Map(); // uid -> {uid, nick, unread, offline, pendingRead}
+const chanTabs = new Map(); // channelID -> {id}; derived from SubscriptionState
+let pendingChannelTab = 0; // activate only after the server confirms subscription
 const receipts = new Map(); // clientMsgID -> "delivered" | "read"
 const myReactions = new Map(); // messageID -> Set(emoji) I toggled this session.
 // NOTE (97): history only carries reaction COUNTS, not who reacted, so the
@@ -96,7 +103,27 @@ function activeKey() {
     const st = V().state;
     if (view.kind === "global") return "ch:0";
     if (view.kind === "dm") return "dm:" + view.uid;
+    if (view.kind === "chan") return "ch:" + view.id;
     return "ch:" + (st.myChannelID || 0);
+}
+
+// activeChannelID returns the channel the active view reads, or null for the
+// global and DM views.
+function activeChannelID() {
+    if (view.kind === "chan") return view.id;
+    if (view.kind === "channel") return V().state.myChannelID || null;
+    return null;
+}
+
+// channelName resolves a channel id to its tree name, falling back to the id
+// so a tab for a channel the snapshot has not caught up with still reads.
+function channelName(id) {
+    const ch = V().state.channels.find((c) => c.ChannelID === id);
+    return ch ? ch.Name : String(id);
+}
+
+function subscribed(channelID) {
+    return subscriptions.includes(Number(channelID));
 }
 
 // normalize converts a live ChatBroadcast or a ChatHistoryEntry into the
@@ -1001,6 +1028,83 @@ function activatePM(uid) {
     setView({ kind: "dm", uid });
 }
 
+function activateChannel(channelID) {
+    const id = Number(channelID);
+    if (!id || !subscribed(id)) return;
+    $("chat-scope").value = "channel";
+    $("chat-target").classList.add("hidden");
+    setView(id === V().state.myChannelID ? { kind: "channel" } : { kind: "chan", id });
+}
+
+export function isSubscribed(channelID) {
+    return subscribed(channelID);
+}
+
+export async function setChannelSubscription(channelID, subscribe) {
+    const id = Number(channelID);
+    if (!id) return false;
+    if (!subscribe && id === V().state.myChannelID) {
+        V().toast("your joined channel is always subscribed", "info", "alert");
+        return false;
+    }
+    const err = await app().SubscribeChannels([id], !!subscribe);
+    if (err) {
+        V().toast((subscribe ? "subscribe" : "unsubscribe") + " failed: " + err, "warn");
+        return false;
+    }
+    return true;
+}
+
+export async function openChannelTab(channelID) {
+    const id = Number(channelID);
+    if (!id) return;
+    if (subscribed(id)) {
+        activateChannel(id);
+        return;
+    }
+    pendingChannelTab = id;
+    if (!await setChannelSubscription(id, true)) pendingChannelTab = 0;
+}
+
+function closeChannelTab(channelID) {
+    const id = Number(channelID);
+    if (id === V().state.myChannelID) {
+        V().toast("move to another channel before unsubscribing", "info", "alert");
+        return;
+    }
+    setChannelSubscription(id, false);
+}
+
+// SubscriptionState is a full authoritative set. Replacing the local model
+// makes rejection, revocation, deletion and missed events self-healing.
+export function onSubscriptions(json) {
+    let state;
+    try {
+        state = typeof json === "string" ? JSON.parse(json) : json;
+    } catch {
+        V().toast("server sent malformed subscriptions", "warn");
+        return;
+    }
+    subscriptions = [...new Set((state?.channel_ids || []).map(Number).filter((id) => id > 0))]
+        .sort((a, b) => a - b);
+    chanTabs.clear();
+    for (const id of subscriptions) chanTabs.set(id, { id });
+
+    if (view.kind === "chan" && !subscribed(view.id)) {
+        setView({ kind: "channel" });
+    } else {
+        renderTabs();
+        updateHeader();
+    }
+    if (pendingChannelTab && subscribed(pendingChannelTab)) {
+        const id = pendingChannelTab;
+        pendingChannelTab = 0;
+        activateChannel(id);
+    } else if (pendingChannelTab) {
+        pendingChannelTab = 0;
+    }
+}
+
 // closePM closes the TAB. Dropping the in-memory window is safe now that the
 // conversation is on disk sealed: the next open replays it from the local log
 // instead of starting empty. Destroying that log is a separate, explicit act
@@ -1020,7 +1124,39 @@ function closePM(uid) {
 function renderTabs() {
     const bar = $("pm-tabs");
     bar.innerHTML = "";
-    bar.classList.toggle("hidden", pmTabs.size === 0);
+    bar.classList.toggle("hidden", pmTabs.size === 0 && chanTabs.size === 0);
+    for (const tab of chanTabs.values()) {
+        const id = tab.id;
+        const current = id === V().state.myChannelID;
+        const active = activeChannelID() === id && view.kind !== "global" && view.kind !== "dm";
+        const el = document.createElement("div");
+        el.className = "pm-tab channel-tab" + (active ? " active" : "");
+        el.title = current ? "joined channel" : "subscribed channel";
+        const name = document.createElement("span");
+        name.className = "pm-tab-name";
+        name.textContent = "# " + channelName(id);
+        el.appendChild(name);
+        const badge = unread.get(id);
+        if (badge?.n > 0) {
+            const dot = document.createElement("span");
+            dot.className = "pm-unread" + (badge.mention ? " mention" : "");
+            dot.textContent = badge.n;
+            el.appendChild(dot);
+        }
+        if (!current) {
+            const x = document.createElement("button");
+            x.className = "pm-close";
+            x.textContent = "✕";
+            x.title = "unsubscribe and close tab";
+            x.onclick = (e) => {
+                e.stopPropagation();
+                closeChannelTab(id);
+            };
+            el.appendChild(x);
+        }
+        el.onclick = () => activateChannel(id);
+        bar.appendChild(el);
+    }
     for (const tab of pmTabs.values()) {
         const el = document.createElement("div");
         el.className = "pm-tab" + (view.kind === "dm" && view.uid === tab.uid ? " active" : "");
@@ -1391,6 +1527,7 @@ export function addChat(d) {
         u.mention = u.mention || m.mentioned;
         unread.set(chID, u);
         V().renderTree();
+        renderTabs();
     }
 }
 
@@ -1574,7 +1711,7 @@ const TYPING_IDLE_MS = 6000; // no keystroke this long ends the local session
 function typingScopeOf() {
     if (view.kind === "dm") return [0, view.uid];
     if (view.kind === "global") return [0, ""];
-    return [V().state.myChannelID || 0, ""];
+    return [activeChannelID() || 0, ""];
 }
 
 // resetTypingOut ends the local composing session: the next keystroke pings
@@ -1685,7 +1822,7 @@ export async function sendMessage() {
 
     const scope = $("chat-scope").value;
     let target = "";
-    if (scope === "channel") target = String(st.myChannelID || "");
+    if (scope === "channel") target = String(activeChannelID() || "");
     if (scope === "direct") {
         target = $("chat-target").value.trim();
         lastDMTarget = target;
@@ -1695,7 +1832,7 @@ export async function sendMessage() {
     // Files are sealed with their own key and uploaded under a content-derived
     // name; the returned token carries that key inside the encrypted message
     // body, so the attachment is as private as the message (91-135).
-    const chID = scope === "channel" ? st.myChannelID : 0;
+    const chID = scope === "channel" ? (activeChannelID() || 0) : 0;
     for (const f of files) {
         let token;
         try {
@@ -2047,7 +2184,7 @@ async function loadPinsPanel() {
         closePinsPanel();
         return;
     }
-    const chID = view.kind === "global" ? 0 : V().state.myChannelID;
+    const chID = view.kind === "global" ? 0 : (activeChannelID() || 0);
     pinsPanel.innerHTML = "";
     const head = document.createElement("div");
     head.className = "chat-pop-head";
@@ -2198,7 +2335,7 @@ async function searchAll() {
         showSearchResults(q.toLowerCase(), dm.messages || [], dm.scanned || 0, dm.undecryptable || 0);
         return;
     }
-    const chID = view.kind === "global" ? 0 : V().state.myChannelID;
+    const chID = view.kind === "global" ? 0 : (activeChannelID() || 0);
     btn.disabled = true;
     btn.textContent = "searching…";
     // The paging loop lives in Go now: the keys never cross into the webview
@@ -2305,7 +2442,7 @@ function updateHeader() {
     } else if (view.kind === "dm") {
         title = "DM — " + (pmTabs.get(view.uid)?.nick || view.uid);
     } else {
-        const ch = st.channels.find((c) => c.ChannelID === st.myChannelID);
+        const ch = st.channels.find((c) => c.ChannelID === activeChannelID());
         if (ch) {
             title = "# " + ch.Name;
             topic = ch.Topic || "";
@@ -2332,7 +2469,7 @@ function updateHeader() {
 
 function openDescription() {
     const st = V().state;
-    const ch = st.channels.find((c) => c.ChannelID === st.myChannelID);
+    const ch = st.channels.find((c) => c.ChannelID === activeChannelID());
     const overlay = document.createElement("div");
     overlay.className = "dlg-overlay";
     const dlg = document.createElement("div");
@@ -2413,7 +2550,7 @@ async function exportChat() {
     }
     const name = view.kind === "dm" ? "dm-" + view.uid.slice(0, 8)
         : view.kind === "global" ? "global"
-        : (V().state.channels.find((c) => c.ChannelID === V().state.myChannelID)?.Name || "channel");
+        : (V().state.channels.find((c) => c.ChannelID === activeChannelID())?.Name || "channel");
 
     const pass = await askExportPassphrase();
     if (pass === null) return; // cancelled
@@ -2424,7 +2561,7 @@ async function exportChat() {
     try {
         res = view.kind === "dm"
             ? await app().DMExportHistory(view.uid)
-            : await app().ChatExportHistory(view.kind === "global" ? 0 : (V().state.myChannelID || 0), 0);
+            : await app().ChatExportHistory(view.kind === "global" ? 0 : (activeChannelID() || 0), 0);
     } catch (e) {
         V().toast("export failed: " + e, "warn");
     }
@@ -2540,6 +2677,9 @@ export async function onConnect() {
         st.myUniqueID = await app().IdentityUID();
     } catch { /* best-effort */ }
     restorePMTabs(); // (122) conversations that survived the last restart
+    try {
+        onSubscriptions({ channel_ids: await app().Subscriptions() });
+    } catch { /* the live authoritative event is still the primary path */ }
     // (133) surface the server MOTD once per connect. It is a server notice,
     // not a message: styling it as one would put it next to a shield or a lock
     // it has not earned.
@@ -2552,8 +2692,11 @@ export async function onConnect() {
 export function onMyChannelChanged() {
     const st = V().state;
     if (unread.delete(st.myChannelID)) V().renderTree();
-    if (view.kind === "channel") renderView();
+    if (view.kind === "chan" && view.id === st.myChannelID) {
+        setView({ kind: "channel" });
+    } else if (view.kind === "channel") renderView();
     else updateHeader();
+    renderTabs();
 }
 
 // resetView clears all per-server chat state (281 tab switch): message
@@ -2564,6 +2707,9 @@ export function resetView() {
     store.clear();
     unread.clear();
     pmTabs.clear();
+    chanTabs.clear();
+    subscriptions = [];
+    pendingChannelTab = 0;
     replyTo = null;
     pendingFiles = [];
     lastDMTarget = "";
@@ -2689,6 +2835,9 @@ function openQS() {
     for (const tab of pmTabs.values()) {
         items.push({ label: "✉ " + tab.nick, hint: "PM tab", action: () => activatePM(tab.uid) });
     }
+    for (const tab of chanTabs.values()) {
+        items.push({ label: "# " + channelName(tab.id), hint: "channel tab", action: () => activateChannel(tab.id) });
+    }
 
     qsOverlay = document.createElement("div");
     qsOverlay.className = "dlg-overlay qs-overlay";
@@ -2811,6 +2960,7 @@ function handleTabComplete(e) {
 // ---------------------------------------------------------------------------
 
 export function initChat() {
+    window.runtime.EventsOn("subscriptions", onSubscriptions);
     const log = $("chat-log");
 
     applyChatPrefs();
@@ -2955,6 +3105,9 @@ export function initChat() {
         applyChatPrefs,
         chatUnread: (chID) => unread.get(chID) || null,
         refreshHeader,
+        openChannelTab,
+        setChannelSubscription,
+        isSubscribed,
     });
 
     renderTabs();

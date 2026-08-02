@@ -92,7 +92,7 @@ func (a *App) relayTabEvent(tabID, name string, payload any) {
 	case "snapshot":
 		ts.journal = ts.journal[:0]
 		ts.journal = append(ts.journal, journalEntry{name, text})
-	case "channellist", "event":
+	case "channellist", "subscriptions", "server_rules", "event":
 		ts.journal = append(ts.journal, journalEntry{name, text})
 		if len(ts.journal) > journalCap {
 			ts.journal = ts.journal[len(ts.journal)-journalCap:]

@@ -632,6 +632,7 @@ window.runtime.EventsOn("event", (json) => {
             break;
         case "channel_deleted":
             state.channels = state.channels.filter((c) => c.ChannelID !== d.channel_id);
+            chatUI.refreshHeader();
             break;
         case "channel_updated": {
             const ch = state.channels.find((c) => c.ChannelID === d.channel_id);
@@ -651,6 +652,7 @@ window.runtime.EventsOn("event", (json) => {
                 // follow it or the next edit dialog offers a stale parent.
                 ch.ParentID = d.parent_id || 0;
                 if (d.channel_id === state.myChannelID) applyChannelAudio();
+                chatUI.refreshHeader();
             }
             break;
         }
@@ -2117,6 +2119,11 @@ document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
         const dlg = [...document.querySelectorAll(".dlg-overlay")].pop();
         if (dlg) {
+            if (dlg.dataset.blocking === "true") {
+                e.preventDefault();
+                e.stopPropagation();
+                return;
+            }
             dlg.remove();
             e.stopPropagation();
             return;

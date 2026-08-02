@@ -1,5 +1,19 @@
 export namespace main {
-	
+
+	export class BeepSpec {
+	    freq: number;
+	    duration_ms: number;
+
+	    static createFrom(source: any = {}) {
+	        return new BeepSpec(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.freq = source["freq"];
+	        this.duration_ms = source["duration_ms"];
+	    }
+	}
 	export class Bookmark {
 	    name: string;
 	    addr: string;
@@ -11,11 +25,11 @@ export namespace main {
 	    profile?: string;
 	    nickname_override?: string;
 	    avatar_override_b64?: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new Bookmark(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.name = source["name"];
@@ -30,20 +44,138 @@ export namespace main {
 	        this.avatar_override_b64 = source["avatar_override_b64"];
 	    }
 	}
+	export class ChannelOverride {
+	    messages?: string;
+	    mentions?: string;
+	    joins?: string;
+	    muted?: boolean;
+	    watch_threshold?: number;
+
+	    static createFrom(source: any = {}) {
+	        return new ChannelOverride(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.messages = source["messages"];
+	        this.mentions = source["mentions"];
+	        this.joins = source["joins"];
+	        this.muted = source["muted"];
+	        this.watch_threshold = source["watch_threshold"];
+	    }
+	}
+	export class ChatExportResult {
+	    text: string;
+	    messages: number;
+	    undecryptable: number;
+	    complete: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new ChatExportResult(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.text = source["text"];
+	        this.messages = source["messages"];
+	        this.undecryptable = source["undecryptable"];
+	        this.complete = source["complete"];
+	    }
+	}
+	export class ChatSearchResult {
+	    messages: netproto.ChatHistoryEntry[];
+	    scanned: number;
+	    undecryptable: number;
+
+	    static createFrom(source: any = {}) {
+	        return new ChatSearchResult(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.messages = this.convertValues(source["messages"], netproto.ChatHistoryEntry);
+	        this.scanned = source["scanned"];
+	        this.undecryptable = source["undecryptable"];
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
 	export class Contact {
 	    unique_id: string;
 	    label?: string;
 	    nick_history?: string[];
-	
+	    notify_online?: boolean;
+
 	    static createFrom(source: any = {}) {
 	        return new Contact(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.unique_id = source["unique_id"];
 	        this.label = source["label"];
 	        this.nick_history = source["nick_history"];
+	        this.notify_online = source["notify_online"];
+	    }
+	}
+	export class DMEntry {
+	    seq: number;
+	    from_unique_id: string;
+	    from_nickname: string;
+	    body: string;
+	    sent_at: number;
+	    self?: boolean;
+	    client_msg_id?: string;
+	    offline?: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new DMEntry(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.seq = source["seq"];
+	        this.from_unique_id = source["from_unique_id"];
+	        this.from_nickname = source["from_nickname"];
+	        this.body = source["body"];
+	        this.sent_at = source["sent_at"];
+	        this.self = source["self"];
+	        this.client_msg_id = source["client_msg_id"];
+	        this.offline = source["offline"];
+	    }
+	}
+	export class DMPeer {
+	    unique_id: string;
+	    nickname?: string;
+	    messages: number;
+	    last_at: number;
+
+	    static createFrom(source: any = {}) {
+	        return new DMPeer(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.unique_id = source["unique_id"];
+	        this.nickname = source["nickname"];
+	        this.messages = source["messages"];
+	        this.last_at = source["last_at"];
 	    }
 	}
 	export class HotkeyProfile {
@@ -54,11 +186,11 @@ export namespace main {
 	    compact_toggle?: string;
 	    zen_toggle?: string;
 	    deafen_toggle?: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new HotkeyProfile(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.ptt = source["ptt"];
@@ -70,15 +202,79 @@ export namespace main {
 	        this.deafen_toggle = source["deafen_toggle"];
 	    }
 	}
+	export class IdentityEntry {
+	    id: string;
+	    name: string;
+	    unique_id: string;
+	    active: boolean;
+	    created_at?: string;
+	    exported_at?: string;
+	    security_level: number;
+	    protection: string;
+	    path: string;
+	    error?: string;
+
+	    static createFrom(source: any = {}) {
+	        return new IdentityEntry(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.unique_id = source["unique_id"];
+	        this.active = source["active"];
+	        this.created_at = source["created_at"];
+	        this.exported_at = source["exported_at"];
+	        this.security_level = source["security_level"];
+	        this.protection = source["protection"];
+	        this.path = source["path"];
+	        this.error = source["error"];
+	    }
+	}
+	export class IdentityLevelResult {
+	    level: number;
+	    counter: number;
+	    error?: string;
+
+	    static createFrom(source: any = {}) {
+	        return new IdentityLevelResult(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.level = source["level"];
+	        this.counter = source["counter"];
+	        this.error = source["error"];
+	    }
+	}
+	export class NotifyChannels {
+	    toast: boolean;
+	    sound: boolean;
+	    flash: boolean;
+	    native: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new NotifyChannels(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.toast = source["toast"];
+	        this.sound = source["sound"];
+	        this.flash = source["flash"];
+	        this.native = source["native"];
+	    }
+	}
 	export class RecentServer {
 	    addr: string;
 	    nickname: string;
 	    last_used: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new RecentServer(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.addr = source["addr"];
@@ -87,6 +283,7 @@ export namespace main {
 	    }
 	}
 	export class Settings {
+	    settings_version: number;
 	    bookmarks: Bookmark[];
 	    recents: RecentServer[];
 	    always_on_top: boolean;
@@ -98,6 +295,7 @@ export namespace main {
 	    user_css: string;
 	    ui_font: string;
 	    ui_font_size: number;
+	    window_opacity: number;
 	    language: string;
 	    reduce_motion: boolean;
 	    sidebar_width: number;
@@ -166,13 +364,19 @@ export namespace main {
 	    last_seen_version: string;
 	    active_identity?: string;
 	    identity_key_protection?: string;
-	
+	    notify_matrix?: Record<string, NotifyChannels>;
+	    custom_sounds?: Record<string, BeepSpec>;
+	    channel_notify?: Record<string, ChannelOverride>;
+	    keywords?: Record<string, Array<string>>;
+	    alpha_dismissed: string;
+
 	    static createFrom(source: any = {}) {
 	        return new Settings(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.settings_version = source["settings_version"];
 	        this.bookmarks = this.convertValues(source["bookmarks"], Bookmark);
 	        this.recents = this.convertValues(source["recents"], RecentServer);
 	        this.always_on_top = source["always_on_top"];
@@ -184,6 +388,7 @@ export namespace main {
 	        this.user_css = source["user_css"];
 	        this.ui_font = source["ui_font"];
 	        this.ui_font_size = source["ui_font_size"];
+	        this.window_opacity = source["window_opacity"];
 	        this.language = source["language"];
 	        this.reduce_motion = source["reduce_motion"];
 	        this.sidebar_width = source["sidebar_width"];
@@ -252,8 +457,13 @@ export namespace main {
 	        this.last_seen_version = source["last_seen_version"];
 	        this.active_identity = source["active_identity"];
 	        this.identity_key_protection = source["identity_key_protection"];
+	        this.notify_matrix = this.convertValues(source["notify_matrix"], NotifyChannels, true);
+	        this.custom_sounds = this.convertValues(source["custom_sounds"], BeepSpec, true);
+	        this.channel_notify = this.convertValues(source["channel_notify"], ChannelOverride, true);
+	        this.keywords = source["keywords"];
+	        this.alpha_dismissed = source["alpha_dismissed"];
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -272,52 +482,6 @@ export namespace main {
 		    return a;
 		}
 	}
-	export class IdentityEntry {
-	    id: string;
-	    name: string;
-	    unique_id: string;
-	    active: boolean;
-	    created_at?: string;
-	    exported_at?: string;
-	    security_level: number;
-	    protection: string;
-	    path: string;
-	    error?: string;
-
-	    static createFrom(source: any = {}) {
-	        return new IdentityEntry(source);
-	    }
-
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.id = source["id"];
-	        this.name = source["name"];
-	        this.unique_id = source["unique_id"];
-	        this.active = source["active"];
-	        this.created_at = source["created_at"];
-	        this.exported_at = source["exported_at"];
-	        this.security_level = source["security_level"];
-	        this.protection = source["protection"];
-	        this.path = source["path"];
-	        this.error = source["error"];
-	    }
-	}
-	export class IdentityLevelResult {
-	    level: number;
-	    counter: number;
-	    error?: string;
-
-	    static createFrom(source: any = {}) {
-	        return new IdentityLevelResult(source);
-	    }
-
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.level = source["level"];
-	        this.counter = source["counter"];
-	        this.error = source["error"];
-	    }
-	}
 	export class TabInfo {
 	    id: string;
 	    addr: string;
@@ -326,11 +490,11 @@ export namespace main {
 	    active: boolean;
 	    unread: number;
 	    mentions: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new TabInfo(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -348,11 +512,11 @@ export namespace main {
 	    url: string;
 	    sha256url: string;
 	    size: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new UpdateInfo(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.available = source["available"];
@@ -366,11 +530,11 @@ export namespace main {
 	    unique_id: string;
 	    created_at?: string;
 	    path: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new identityInfo(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.unique_id = source["unique_id"];
@@ -382,7 +546,7 @@ export namespace main {
 }
 
 export namespace netproto {
-	
+
 	export class AuditEntry {
 	    id: number;
 	    actor: string;
@@ -390,11 +554,11 @@ export namespace netproto {
 	    target: string;
 	    detail: string;
 	    created_at: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new AuditEntry(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -407,16 +571,16 @@ export namespace netproto {
 	}
 	export class AuditLogResponse {
 	    entries: AuditEntry[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new AuditLogResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.entries = this.convertValues(source["entries"], AuditEntry);
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -439,16 +603,102 @@ export namespace netproto {
 	    unique_id: string;
 	    data_base64: string;
 	    content_type: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new AvatarData(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.unique_id = source["unique_id"];
 	        this.data_base64 = source["data_base64"];
 	        this.content_type = source["content_type"];
+	    }
+	}
+	export class BanEntry {
+	    id: number;
+	    type: number;
+	    value: string;
+	    reason?: string;
+	    banned_by?: string;
+	    created_at: number;
+	    expires_at?: number;
+
+	    static createFrom(source: any = {}) {
+	        return new BanEntry(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.type = source["type"];
+	        this.value = source["value"];
+	        this.reason = source["reason"];
+	        this.banned_by = source["banned_by"];
+	        this.created_at = source["created_at"];
+	        this.expires_at = source["expires_at"];
+	    }
+	}
+	export class BanListResponse {
+	    bans: BanEntry[];
+
+	    static createFrom(source: any = {}) {
+	        return new BanListResponse(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.bans = this.convertValues(source["bans"], BanEntry);
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class ChannelIconData {
+	    channel_id: number;
+	    data_base64: string;
+	    content_type?: string;
+
+	    static createFrom(source: any = {}) {
+	        return new ChannelIconData(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.channel_id = source["channel_id"];
+	        this.data_base64 = source["data_base64"];
+	        this.content_type = source["content_type"];
+	    }
+	}
+	export class ChannelKey {
+	    channel_id: number;
+	    key_id: number;
+	    sealed_key: string;
+
+	    static createFrom(source: any = {}) {
+	        return new ChannelKey(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.channel_id = source["channel_id"];
+	        this.key_id = source["key_id"];
+	        this.sealed_key = source["sealed_key"];
 	    }
 	}
 	export class ChatFilterResponse {
@@ -469,80 +719,32 @@ export namespace netproto {
 	        this.from_config = source["from_config"];
 	    }
 	}
-	export class BanEntry {
-	    id: number;
-	    type: number;
-	    value: string;
-	    reason?: string;
-	    banned_by?: string;
-	    created_at: number;
-	    expires_at?: number;
-	
-	    static createFrom(source: any = {}) {
-	        return new BanEntry(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.id = source["id"];
-	        this.type = source["type"];
-	        this.value = source["value"];
-	        this.reason = source["reason"];
-	        this.banned_by = source["banned_by"];
-	        this.created_at = source["created_at"];
-	        this.expires_at = source["expires_at"];
-	    }
-	}
-	export class BanListResponse {
-	    bans: BanEntry[];
-	
-	    static createFrom(source: any = {}) {
-	        return new BanListResponse(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.bans = this.convertValues(source["bans"], BanEntry);
-	    }
-	
-		convertValues(a: any, classs: any, asMap: boolean = false): any {
-		    if (!a) {
-		        return a;
-		    }
-		    if (a.slice && a.map) {
-		        return (a as any[]).map(elem => this.convertValues(elem, classs));
-		    } else if ("object" === typeof a) {
-		        if (asMap) {
-		            for (const key of Object.keys(a)) {
-		                a[key] = new classs(a[key]);
-		            }
-		            return a;
-		        }
-		        return new classs(a);
-		    }
-		    return a;
-		}
-	}
 	export class ChatHistoryEntry {
 	    id: number;
 	    from_unique_id: string;
 	    from_nickname: string;
-	    body: string;
+	    body_enc?: string;
+	    key_id?: number;
+	    body?: string;
+	    enc_verified?: boolean;
 	    sent_at: number;
 	    edited_at?: number;
 	    deleted?: boolean;
 	    reactions?: Record<string, number>;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new ChatHistoryEntry(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
 	        this.from_unique_id = source["from_unique_id"];
 	        this.from_nickname = source["from_nickname"];
+	        this.body_enc = source["body_enc"];
+	        this.key_id = source["key_id"];
 	        this.body = source["body"];
+	        this.enc_verified = source["enc_verified"];
 	        this.sent_at = source["sent_at"];
 	        this.edited_at = source["edited_at"];
 	        this.deleted = source["deleted"];
@@ -552,17 +754,23 @@ export namespace netproto {
 	export class ChatHistoryResponse {
 	    channel_id: number;
 	    messages: ChatHistoryEntry[];
-	
+	    keys?: ChannelKey[];
+	    refused?: number[];
+	    truncated?: boolean;
+
 	    static createFrom(source: any = {}) {
 	        return new ChatHistoryResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.channel_id = source["channel_id"];
 	        this.messages = this.convertValues(source["messages"], ChatHistoryEntry);
+	        this.keys = this.convertValues(source["keys"], ChannelKey);
+	        this.refused = source["refused"];
+	        this.truncated = source["truncated"];
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -586,11 +794,11 @@ export namespace netproto {
 	    pinned_by: string;
 	    pinned_at: number;
 	    message?: ChatHistoryEntry;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new ChatPinEntry(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.message_id = source["message_id"];
@@ -598,7 +806,7 @@ export namespace netproto {
 	        this.pinned_at = source["pinned_at"];
 	        this.message = this.convertValues(source["message"], ChatHistoryEntry);
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -620,17 +828,23 @@ export namespace netproto {
 	export class ChatPinsResponse {
 	    channel_id: number;
 	    pins: ChatPinEntry[];
-	
+	    keys?: ChannelKey[];
+	    refused?: number[];
+	    truncated?: boolean;
+
 	    static createFrom(source: any = {}) {
 	        return new ChatPinsResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.channel_id = source["channel_id"];
 	        this.pins = this.convertValues(source["pins"], ChatPinEntry);
+	        this.keys = this.convertValues(source["keys"], ChannelKey);
+	        this.refused = source["refused"];
+	        this.truncated = source["truncated"];
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -661,11 +875,11 @@ export namespace netproto {
 	    port?: number;
 	    bytes_in: number;
 	    bytes_out: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new ClientInfoResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.client_id = source["client_id"];
@@ -681,15 +895,67 @@ export namespace netproto {
 	        this.bytes_out = source["bytes_out"];
 	    }
 	}
+	export class ComplaintEntry {
+	    target_unique_id: string;
+	    target_nickname?: string;
+	    from_unique_id: string;
+	    from_nickname?: string;
+	    reason: string;
+	    created_at: number;
+
+	    static createFrom(source: any = {}) {
+	        return new ComplaintEntry(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.target_unique_id = source["target_unique_id"];
+	        this.target_nickname = source["target_nickname"];
+	        this.from_unique_id = source["from_unique_id"];
+	        this.from_nickname = source["from_nickname"];
+	        this.reason = source["reason"];
+	        this.created_at = source["created_at"];
+	    }
+	}
+	export class Complaints {
+	    entries: ComplaintEntry[];
+
+	    static createFrom(source: any = {}) {
+	        return new Complaints(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.entries = this.convertValues(source["entries"], ComplaintEntry);
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
 	export class EmojiData {
 	    name: string;
 	    data_base64: string;
 	    content_type: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new EmojiData(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.name = source["name"];
@@ -700,11 +966,11 @@ export namespace netproto {
 	export class EmojiEntry {
 	    name: string;
 	    file_name: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new EmojiEntry(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.name = source["name"];
@@ -713,16 +979,16 @@ export namespace netproto {
 	}
 	export class EmojiListResponse {
 	    emojis: EmojiEntry[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new EmojiListResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.emojis = this.convertValues(source["emojis"], EmojiEntry);
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -749,11 +1015,12 @@ export namespace netproto {
 	    uploader?: string;
 	    // Go type: time
 	    uploaded_at: any;
-	
+	    encrypted?: boolean;
+
 	    static createFrom(source: any = {}) {
 	        return new FileEntry(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.name = source["name"];
@@ -762,8 +1029,9 @@ export namespace netproto {
 	        this.sha256 = source["sha256"];
 	        this.uploader = source["uploader"];
 	        this.uploaded_at = this.convertValues(source["uploaded_at"], null);
+	        this.encrypted = source["encrypted"];
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -786,11 +1054,11 @@ export namespace netproto {
 	    path: string;
 	    health_port: number;
 	    expires_at: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new FileLinkResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.path = source["path"];
@@ -803,11 +1071,11 @@ export namespace netproto {
 	    folders?: string[];
 	    used_bytes: number;
 	    quota_bytes: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new FileListResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.entries = this.convertValues(source["entries"], FileEntry);
@@ -815,7 +1083,7 @@ export namespace netproto {
 	        this.used_bytes = source["used_bytes"];
 	        this.quota_bytes = source["quota_bytes"];
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -836,16 +1104,16 @@ export namespace netproto {
 	}
 	export class FileVersionsResponse {
 	    entries: FileEntry[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new FileVersionsResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.entries = this.convertValues(source["entries"], FileEntry);
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -872,11 +1140,11 @@ export namespace netproto {
 	    icon?: string;
 	    color?: string;
 	    hoist?: boolean;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new GroupEntry(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -892,11 +1160,11 @@ export namespace netproto {
 	    group_id: number;
 	    data_base64?: string;
 	    content_type?: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new GroupIconData(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.group_id = source["group_id"];
@@ -907,17 +1175,17 @@ export namespace netproto {
 	export class GroupListResponse {
 	    type: string;
 	    groups: GroupEntry[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new GroupListResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.type = source["type"];
 	        this.groups = this.convertValues(source["groups"], GroupEntry);
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -940,11 +1208,11 @@ export namespace netproto {
 	    unique_id: string;
 	    nickname?: string;
 	    expires_at?: number;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new GroupMemberEntry(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.unique_id = source["unique_id"];
@@ -956,18 +1224,18 @@ export namespace netproto {
 	    type: string;
 	    group_id: number;
 	    members: GroupMemberEntry[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new GroupMembersResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.type = source["type"];
 	        this.group_id = source["group_id"];
 	        this.members = this.convertValues(source["members"], GroupMemberEntry);
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -990,11 +1258,11 @@ export namespace netproto {
 	    urls: string[];
 	    username?: string;
 	    credential?: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new ICEServer(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.urls = source["urls"];
@@ -1008,11 +1276,11 @@ export namespace netproto {
 	    grant: number;
 	    skip?: boolean;
 	    negate?: boolean;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new PermissionEntry(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.key = source["key"];
@@ -1025,17 +1293,17 @@ export namespace netproto {
 	export class PermListResponse {
 	    tier: string;
 	    entries: PermissionEntry[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new PermListResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.tier = source["tier"];
 	        this.entries = this.convertValues(source["entries"], PermissionEntry);
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -1062,11 +1330,11 @@ export namespace netproto {
 	    skip: boolean;
 	    negate: boolean;
 	    winning?: boolean;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new PermTraceEntry(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.tier = source["tier"];
@@ -1083,11 +1351,11 @@ export namespace netproto {
 	    effective: number;
 	    effective_tier: string;
 	    entries: PermTraceEntry[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new PermTraceResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.key = source["key"];
@@ -1095,7 +1363,7 @@ export namespace netproto {
 	        this.effective_tier = source["effective_tier"];
 	        this.entries = this.convertValues(source["entries"], PermTraceEntry);
 	    }
-	
+
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -1114,15 +1382,29 @@ export namespace netproto {
 		    return a;
 		}
 	}
-	
+
+	export class ServerBannerData {
+	    data_base64: string;
+	    content_type?: string;
+
+	    static createFrom(source: any = {}) {
+	        return new ServerBannerData(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.data_base64 = source["data_base64"];
+	        this.content_type = source["content_type"];
+	    }
+	}
 	export class ServerIconData {
 	    data_base64?: string;
 	    content_type?: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new ServerIconData(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.data_base64 = source["data_base64"];
@@ -1137,11 +1419,11 @@ export namespace netproto {
 	    channels_online: number;
 	    max_clients: number;
 	    motd?: string;
-	
+
 	    static createFrom(source: any = {}) {
 	        return new ServerInfoResponse(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.name = source["name"];
@@ -1151,6 +1433,74 @@ export namespace netproto {
 	        this.channels_online = source["channels_online"];
 	        this.max_clients = source["max_clients"];
 	        this.motd = source["motd"];
+	    }
+	}
+	export class TokenEntry {
+	    token: string;
+	    group_id: number;
+	    group_name?: string;
+	    channel_id?: number;
+	    description?: string;
+	    created_at: number;
+	    used_by?: string;
+
+	    static createFrom(source: any = {}) {
+	        return new TokenEntry(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.token = source["token"];
+	        this.group_id = source["group_id"];
+	        this.group_name = source["group_name"];
+	        this.channel_id = source["channel_id"];
+	        this.description = source["description"];
+	        this.created_at = source["created_at"];
+	        this.used_by = source["used_by"];
+	    }
+	}
+	export class Tokens {
+	    entries: TokenEntry[];
+
+	    static createFrom(source: any = {}) {
+	        return new Tokens(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.entries = this.convertValues(source["entries"], TokenEntry);
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class TrackSlot {
+	    track_id: string;
+	    slot: string;
+
+	    static createFrom(source: any = {}) {
+	        return new TrackSlot(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.track_id = source["track_id"];
+	        this.slot = source["slot"];
 	    }
 	}
 

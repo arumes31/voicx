@@ -71,11 +71,13 @@ func TestTabJournalAndBadges(t *testing.T) {
 
 	a.relayTabEvent(ts2.info.ID, "snapshot", `{"root_channels":[]}`)
 	a.relayTabEvent(ts2.info.ID, "channellist", `{"channels":[]}`)
+	a.relayTabEvent(ts2.info.ID, "subscriptions", `{"channel_ids":[7]}`)
+	a.relayTabEvent(ts2.info.ID, "server_rules", `{"text":"be kind","hash":"v1"}`)
 	a.relayTabEvent(ts2.info.ID, "event", `{"type":"chat","data":{"from":"bob","text":"hello"}}`)
 	a.relayTabEvent(ts2.info.ID, "event", `{"type":"chat","data":{"from":"bob","text":"hey @friend you there"}}`)
 
-	if len(ts2.journal) != 4 {
-		t.Fatalf("journal = %d entries, want 4", len(ts2.journal))
+	if len(ts2.journal) != 6 {
+		t.Fatalf("journal = %d entries, want 6", len(ts2.journal))
 	}
 	if ts2.info.Unread != 2 {
 		t.Fatalf("unread = %d, want 2", ts2.info.Unread)

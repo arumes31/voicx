@@ -512,6 +512,8 @@ const QUALITY_PRESETS = {
 
 function openChannelMenu(x, y, channel) {
     closeMenu();
+    const isCurrent = channel.ChannelID === V().state.myChannelID;
+    const isSubscribed = !!window.__voicxChat?.isSubscribed?.(channel.ChannelID);
     // (320) recent channels for quick rejoin.
     const recent = (V().recentChannels ? V().recentChannels() : [])
         .map((id) => V().state.channels.find((c) => c.ChannelID === id))
@@ -521,6 +523,9 @@ function openChannelMenu(x, y, channel) {
     menuEl = document.createElement("div");
     menuEl.className = "ctx-menu";
     menuEl.innerHTML = `
+        <a data-act="open-chat">Open chat tab</a>
+        <a data-act="subscription" class="${isCurrent ? "disabled" : ""}">${isCurrent ? "✓ Joined (always subscribed)" : isSubscribed ? "✓ Unsubscribe" : "Subscribe"}</a>
+        <div class="ctx-divider"></div>
         <a data-act="edit">Edit channel</a>
         <a data-act="notify">Notifications…</a>
         <a data-act="create-sub">Create sub-channel…</a>
@@ -532,6 +537,14 @@ function openChannelMenu(x, y, channel) {
     menuEl.style.left = Math.min(x, window.innerWidth - 240) + "px";
     menuEl.style.top = Math.min(y, window.innerHeight - 260) + "px";
     menuEl.onclick = (e) => e.stopPropagation();
+    menuEl.querySelector('[data-act="open-chat"]').onclick = () => {
+        closeMenu();
+        window.__voicxChat?.openChannelTab?.(channel.ChannelID);
+    };
+    menuEl.querySelector('[data-act="subscription"]').onclick = () => {
+        closeMenu();
+        if (!isCurrent) window.__voicxChat?.setChannelSubscription?.(channel.ChannelID, !isSubscribed);
+    };
     menuEl.querySelector('[data-act="edit"]').onclick = () => {
         closeMenu();
         openChannelEdit(channel);

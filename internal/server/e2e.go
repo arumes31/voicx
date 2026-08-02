@@ -125,18 +125,28 @@ func (s *TCPServer) deliverScopeKey(ctx context.Context, client *Client, scope i
 }
 
 // scopeReadable reports whether the client may read a scope's messages: the
-// global scope is open to everyone, a channel only to its current members.
-// A current member may fetch EVERY generation of that scope — refusing older
-// generations while still serving their rows would be theatre.
-func (s *TCPServer) scopeReadable(client *Client, scope int64) bool {
+// global scope is open to everyone, a channel to its current members and to
+// its entitled subscribers (312). A reader may fetch EVERY generation of that
+// scope — refusing older generations while still serving their rows would be
+// theatre.
+func (s *TCPServer) scopeReadable(ctx context.Context, client *Client, scope int64) bool {
 	if scope == globalChatScope {
 		return true
 	}
 	if s.deps == nil || s.deps.State == nil {
 		return false
 	}
-	sc, ok := s.deps.State.GetClient(client.ID)
-	return ok && sc.ChannelID == scope
+	channelID, _, ok := s.deps.State.ClientChannelState(client.ID)
+	if !ok {
+		return false
+	}
+	if channelID == scope {
+		return true
+	}
+	// (312) a subscriber already holds this scope's current generation, so
+	// withholding history and pins would only hide the scrollback it can
+	// decrypt while the live relay flows.
+	return s.deps.State.IsSubscribed(client.ID, scope) && s.subscribeAllowed(ctx, client, scope)
 }
 
 // rotateScopeKey rotates a channel's chat key (a member left) and
@@ -192,6 +202,12 @@ func (s *TCPServer) doRotateScopeKey(ctx context.Context, channelID int64) {
 			s.deliverScopeKey(ctx, client, channelID)
 		}
 	}
+	// (312) subscribers read this scope under the same generation, so leaving
+	// them out of the redistribution would strand every one of them on the
+	// retired key and turn their tab into a wall of ⚠ placeholders.
+	for _, client := range s.channelSubscribers(ctx, channelID) {
+		s.deliverScopeKey(ctx, client, channelID)
+	}
 	s.logger.Debug("chat key rotated", zap.Int64("channel_id", channelID))
 }
 
@@ -217,7 +233,7 @@ func (s *TCPServer) handleChatKeyRequest(ctx context.Context, client *Client, f 
 	if !ok || sc.E2EPublicKey == "" {
 		return s.sendError(client, errCodePermissionDenied, "e2e public key not published")
 	}
-	if !s.scopeReadable(client, msg.ChannelID) {
+	if !s.scopeReadable(ctx, client, msg.ChannelID) {
 		return s.writeMessage(client, netproto.MsgChatKeyBundle, netproto.ChatKeyBundle{
 			ChannelID: msg.ChannelID,
 			Refused:   msg.KeyIDs,

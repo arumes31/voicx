@@ -449,6 +449,11 @@ func (s *TCPServer) finishAuth(ctx context.Context, client *Client, id authIdent
 	if err := s.sendSnapshot(client); err != nil {
 		return err
 	}
+	// (312) Seed the client's channel-tab model with the authoritative set.
+	// The current channel is implicit and therefore cannot be unsubscribed.
+	if err := s.sendSubscriptionState(client); err != nil {
+		return err
+	}
 
 	// (133) active announcement, if any — after the snapshot so clients
 	// process it as the first live event. It stays here rather than moving
@@ -467,7 +472,7 @@ func (s *TCPServer) finishAuth(ctx context.Context, client *Client, id authIdent
 		s.deliverSpooled(ctx, client, id.userID)
 	}
 
-	// (215) the rules gate arms last in the handshake: the client already has
+	// (216) the rules gate arms last in the handshake: the client already has
 	// the tree and its own identity, so the modal goes up over a rendered UI
 	// and a failing rules read costs it none of that.
 	s.sendPendingRules(ctx, client, id.guest)
@@ -761,6 +766,10 @@ func (s *TCPServer) handleDeleteChannel(ctx context.Context, client *Client, f *
 		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyChannelDelete))
 	}
 
+	// (312) taken before the delete: removing the channel from the state
+	// manager is what drops its subscriptions, leaving nobody to notify.
+	subscribers := s.subscriberIDsOf(msg.ChannelID)
+
 	if err := s.deps.Channels.DeleteChannel(ctx, msg.ChannelID); err != nil {
 		if errors.Is(err, channels.ErrChannelNotFound) {
 			return s.sendError(client, errCodeNotFound, "channel not found")
@@ -774,6 +783,7 @@ func (s *TCPServer) handleDeleteChannel(ctx context.Context, client *Client, f *
 	}
 
 	s.broadcastEvent(eventChannelDeleted, channelEvent{ChannelID: msg.ChannelID})
+	s.pushSubscriptionStateTo(subscribers)
 	s.audit(ctx, client.UniqueID, "channel_delete", fmt.Sprintf("%d", msg.ChannelID), "")
 	if s.deps.State != nil {
 		s.metricsSink().SetChannelsActive(s.deps.State.ChannelCount())
@@ -953,6 +963,9 @@ func (s *TCPServer) handleMoveClient(ctx context.Context, client *Client, f *net
 	if !ok || !target.isAuthed() {
 		return s.sendError(client, errCodeNotFound, "target client not found")
 	}
+	if target.rulesBlocked() {
+		return s.sendError(client, errCodePermissionDenied, "target must accept the server rules before joining a channel")
+	}
 
 	if err := s.checkPowerOver(ctx, client, target,
 		permissions.PermissionKeyClientMovePower,
@@ -1068,16 +1081,16 @@ func (s *TCPServer) handleChatSend(ctx context.Context, client *Client, f *netpr
 			}
 			channelID = id
 		}
-		// Membership FIRST, before anything touches chatKeys: routeScopedChat
-		// may ensure a scope's first generation, and reaching that with an
+		// Read entitlement FIRST, before anything touches chatKeys: members and
+		// entitled subscribers may write the channel tab they can read, while
+		// routeScopedChat may ensure a scope's first generation. Reaching it with an
 		// attacker-supplied channel id is a disk-exhaustion DoS (91).
 		if channelID != 0 {
 			if s.deps.State == nil {
 				return s.sendError(client, errCodeUnavailable, "state backend unavailable")
 			}
-			sc, ok := s.deps.State.GetClient(client.ID)
-			if !ok || sc.ChannelID != channelID {
-				return s.sendError(client, errCodePermissionDenied, "not a member of this channel")
+			if !s.scopeReadable(ctx, client, channelID) {
+				return s.sendError(client, errCodePermissionDenied, "not a member or subscriber of this channel")
 			}
 		}
 		if msg.Enc {
@@ -1291,6 +1304,9 @@ func (s *TCPServer) moveClient(clientID string, channelID int64) error {
 	}
 	if client, ok := s.clientByID(clientID); ok {
 		s.deliverScopeKey(context.Background(), client, channelID)
+		// (312) the channel a client stands in is implicitly subscribed, so a
+		// move changes the authoritative set even though nothing was asked.
+		_ = s.sendSubscriptionState(client)
 	}
 	s.broadcastEvent(eventUserMoved, userEvent{ClientID: clientID, ChannelID: channelID})
 	return nil
