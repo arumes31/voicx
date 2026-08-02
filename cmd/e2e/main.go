@@ -233,7 +233,7 @@ func awaitScopeKey(conn net.Conn, c *client, scope int64) error {
 		if _, ok := c.scopeLatest[scope]; ok {
 			return nil
 		}
-		if _, err := readOfType(conn, netproto.MsgChannelKey, deadline.Sub(time.Now())); err != nil {
+		if _, err := readOfType(conn, netproto.MsgChannelKey, time.Until(deadline)); err != nil {
 			return fmt.Errorf("no chat key for scope %d: %w", scope, err)
 		}
 	}
@@ -872,7 +872,7 @@ func checkJoin(c *checkCtx) error {
 func waitForMove(conn net.Conn, clientID string) error {
 	deadline := time.Now().Add(readTimeout)
 	for time.Now().Before(deadline) {
-		env, err := readEvent(conn, "user_moved", deadline.Sub(time.Now()))
+		env, err := readEvent(conn, "user_moved", time.Until(deadline))
 		if err != nil {
 			return err
 		}
@@ -896,7 +896,7 @@ func waitForMove(conn net.Conn, clientID string) error {
 func readChat(conn net.Conn, wantText string) error {
 	deadline := time.Now().Add(readTimeout)
 	for time.Now().Before(deadline) {
-		env, err := readEvent(conn, "chat", deadline.Sub(time.Now()))
+		env, err := readEvent(conn, "chat", time.Until(deadline))
 		if err != nil {
 			return err
 		}
