@@ -15,14 +15,19 @@ const App = () => window.go.main.App;
 function initResizablePanes() {
     const sidebar = document.getElementById("sidebar");
     const details = document.getElementById("details");
+    const body = document.getElementById("app-body");
     const s = V().state.settings || {};
+
+    const setPaneWidth = (field, width) => {
+        const variable = field === "sidebar_width" ? "--sidebar-width" : "--details-width";
+        if (width > 120) body.style.setProperty(variable, width + "px");
+        else body.style.removeProperty(variable);
+    };
 
     const apply = () => {
         const w = V().state.settings || {};
-        if (w.sidebar_width > 120) sidebar.style.width = w.sidebar_width + "px";
-        else sidebar.style.width = "";
-        if (w.details_width > 120) details.style.width = w.details_width + "px";
-        else details.style.width = "";
+        setPaneWidth("sidebar_width", w.sidebar_width);
+        setPaneWidth("details_width", w.details_width);
     };
 
     const makeHandle = (el, field, invert) => {
@@ -36,7 +41,7 @@ function initResizablePanes() {
             startW = el.getBoundingClientRect().width;
             const onMove = (ev) => {
                 const w = Math.max(160, Math.min(560, startW + (invert ? startX - ev.clientX : ev.clientX - startX)));
-                el.style.width = w + "px";
+                setPaneWidth(field, w);
                 (V().state.settings ||= {})[field] = Math.round(w);
             };
             const onUp = () => {

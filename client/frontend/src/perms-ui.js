@@ -1712,7 +1712,13 @@ async function redeemToken(token) {
     }
     const err = await App().TokenUse(token);
     if (err) V().toast("redeem failed: " + err, "warn");
-    else V().toast("privilege key sent for redemption…");
+}
+
+function redeemPendingToken() {
+    if (!pendingToken || !V().state.myClientID) return;
+    const token = pendingToken;
+    pendingToken = "";
+    redeemToken(token);
 }
 
 // openTokenRedeem takes a raw key or a voicx:// invite link. This is the only
@@ -1721,7 +1727,7 @@ function openTokenRedeem() {
     const { overlay, q } = modal("confirm-dlg", `
         <h3>Use a privilege key</h3>
         <div class="dlg-text">
-            <p class="pm-dim">Paste a privilege key or a <span class="mono">voicx://</span> invite link. Guests cannot redeem keys — log into an account first.</p>
+            <p class="pm-dim">Paste a privilege key or a <span class="mono">voicx://</span> invite link. Any connected user can redeem a valid key.</p>
             <input class="dlg-input mono tk-use-input" placeholder="key or voicx://host:port?token=…" />
             <div class="pm-dim tk-use-hint"></div>
         </div>
@@ -1758,17 +1764,8 @@ function openTokenRedeem() {
 // --- wiring ------------------------------------------------------------------
 
 export function initPermsUI() {
-    // Grant-cap / permission errors from fire-and-forget writes arrive here
-    // (the server sends MsgError); surface them as toasts.
-    window.runtime.EventsOn("servererror", (msg) => {
-        const s = String(msg);
-        // Token redemption is silent on success, so its failures (unknown key,
-        // no uses left, guest) only ever arrive here.
-        if (s.includes("grant cap") || s.includes("insufficient permission") ||
-            s.includes("token") || s.includes("privilege")) {
-            V().toast("server: " + s, "warn");
-        }
-    });
+    // Fire-and-forget failures are surfaced once by main.js. Keeping a second
+    // permission-specific listener here used to duplicate the same warning.
     // (151) push-based cache invalidation: the server tells every client whose
     // resolution could have moved to refetch. group_edit also carries the
     // cosmetics, so it refreshes the group list and the tree as well.
@@ -1790,6 +1787,8 @@ export function initPermsUI() {
         if (env.type !== "token_used") return;
         const d = env.data || {};
         if (d.client_id && d.client_id !== V().state.myClientID) return;
+        if (d.promoted) V().state.isGuest = false;
+        if (!d.group_id) V().state.isAdmin = true;
         V().toast(d.group_id ? "privilege key redeemed" : "privilege key redeemed — you are now a server admin");
         V().refreshPermissions();
         refreshGroups().then(() => V().renderTree());
@@ -1798,10 +1797,7 @@ export function initPermsUI() {
     // A key handed over while offline (invite link) redeems on the first
     // snapshot after login — the point at which the account row exists.
     window.runtime.EventsOn("snapshot", () => {
-        if (!pendingToken) return;
-        const token = pendingToken;
-        pendingToken = "";
-        redeemToken(token);
+        redeemPendingToken();
     });
 
     window.__voicxPerms = {
@@ -1810,7 +1806,7 @@ export function initPermsUI() {
         refreshGroups, groupColorFor, primaryGroup, hoistedGroups, groupIconURL,
         canPermManage, canAuditView, canGroupManage, canBan, canKickChannel, canKickServer,
         canChatFilterManage, canTokenList,
-        inviteLink, parseInviteLink,
+        inviteLink, parseInviteLink, redeemPendingToken,
         esc,
     };
 }

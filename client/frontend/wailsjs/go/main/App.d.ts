@@ -185,6 +185,8 @@ export function ImproveIdentityLevel(arg1:string,arg2:number,arg3:number):Promis
 
 export function IsAdmin():Promise<boolean>;
 
+export function IsGuest():Promise<boolean>;
+
 export function JoinChannel(arg1:number):Promise<string>;
 
 export function KickClient(arg1:string,arg2:boolean,arg3:boolean,arg4:string,arg5:number):Promise<string>;

@@ -19,6 +19,7 @@ const settings = {
 test.beforeEach(async ({ page }) => {
     await page.addInitScript(({ initialSettings }) => {
         window.__events = {};
+        window.__calls = {};
         window.__savedSettings = null;
         window.__tabs = [];
         window.runtime = {
@@ -29,11 +30,13 @@ test.beforeEach(async ({ page }) => {
         const app = new Proxy({}, {
             get(_target, method) {
                 return async (...args) => {
+                    window.__calls[method] = (window.__calls[method] || 0) + 1;
                     if (method === "GetSettings") return structuredClone(initialSettings);
                     if (method === "SaveSettings") { window.__savedSettings = structuredClone(args[0]); return ""; }
                     if (method === "ListTabs") return structuredClone(window.__tabs);
                     if (method === "ClientID") return window.__activeClient || "client-a";
                     if (method === "IsAdmin") return true;
+                    if (method === "IsGuest") return false;
                     if (method === "IdentityUID") return "playwright-identity";
                     if (method === "ClientVersionShort") return "test";
                     if (method === "GetPermissions") return [];
@@ -84,4 +87,97 @@ test("switches active server tabs without retaining stale identity", async ({ pa
     await page.locator('.srv-tab[data-tab-id="tab-b"]').click();
     await expect(page.locator('.srv-tab[data-tab-id="tab-b"]')).toHaveClass(/active/);
     await expect.poll(() => page.evaluate(() => window.__voicx.state.myClientID)).toBe("client-b");
+});
+
+test("keeps details contextual and opens it when a user is selected", async ({ page }) => {
+    await page.evaluate(() => {
+        document.getElementById("login-overlay").classList.add("hidden");
+        document.getElementById("app").classList.remove("hidden");
+    });
+    await expect(page.locator("body")).toHaveClass(/details-collapsed/);
+    await page.evaluate(() => {
+        for (const cb of window.__events.snapshot || []) cb(JSON.stringify({
+            root_channels: [{
+                ChannelID: 1,
+                ParentID: 0,
+                Name: "Lobby",
+                clients: [{
+                    client_id: "client-a",
+                    unique_id: "user-a",
+                    nickname: "Alice",
+                    channel_id: 1,
+                    is_speaking: false,
+                }],
+                children: [],
+            }],
+        }));
+    });
+    await page.locator('.client[data-clid="client-a"]').click();
+    await expect(page.locator("body")).not.toHaveClass(/details-collapsed/);
+    await expect(page.locator("#client-card .card-nick")).toHaveText("Alice");
+    await page.getByRole("button", { name: "Close details" }).click();
+    await expect(page.locator("body")).toHaveClass(/details-collapsed/);
+    await expect(page.locator("#details-toggle")).toBeVisible();
+});
+
+test("lets a guest redeem a privilege key and promotes the live session", async ({ page }) => {
+    await page.evaluate(() => {
+        window.__voicx.state.myClientID = "guest-client";
+        window.__voicx.state.isGuest = true;
+        window.__voicxPerms.openTokenRedeem();
+    });
+    await expect(page.locator(".tk-use-input")).toBeVisible();
+    await page.locator(".tk-use-input").fill("bootstrap-key");
+    await page.getByRole("button", { name: "Redeem", exact: true }).click();
+    await expect.poll(() => page.evaluate(() => window.__calls.TokenUse || 0)).toBe(1);
+
+    await page.evaluate(() => {
+        const event = JSON.stringify({
+            type: "token_used",
+            data: { client_id: "guest-client", group_id: 5, promoted: true },
+        });
+        for (const cb of window.__events.event || []) cb(event);
+    });
+    await expect.poll(() => page.evaluate(() => window.__voicx.state.isGuest)).toBe(false);
+    await expect(page.locator(".toast")).toContainText("privilege key redeemed");
+});
+
+test("nests connected members below channels and offers them as direct-message targets", async ({ page }) => {
+    await page.evaluate(() => {
+        document.getElementById("login-overlay").classList.add("hidden");
+        document.getElementById("app").classList.remove("hidden");
+        window.__voicx.state.myClientID = "client-a";
+        window.__voicx.state.myChannelID = 1;
+        for (const cb of window.__events.snapshot || []) cb(JSON.stringify({
+            root_channels: [
+                {
+                    ChannelID: 1, ParentID: 0, Name: "Lobby",
+                    clients: [
+                        { client_id: "client-a", unique_id: "user-a", nickname: "Alice", channel_id: 1, is_speaking: false },
+                        { client_id: "client-b", unique_id: "user-b", nickname: "Bob", channel_id: 1, is_speaking: true },
+                    ],
+                    children: [],
+                },
+                {
+                    ChannelID: 2, ParentID: 0, Name: "Workshop",
+                    clients: [
+                        { client_id: "client-c", unique_id: "user-c", nickname: "Carol", channel_id: 2, is_speaking: true },
+                    ],
+                    children: [],
+                },
+            ],
+        }));
+    });
+
+    const lobby = page.locator('.channel-node:has(> .channel[data-chid="1"])');
+    await expect(lobby.locator(':scope > .channel-members > .client')).toHaveCount(2);
+    await expect(page.locator('.channel[data-chid="1"] .client')).toHaveCount(0);
+    await expect(page.locator('.client[data-clid="client-b"] .client-voice-state')).toBeVisible();
+    await expect(page.locator('.client[data-clid="client-c"] .client-voice-state')).toHaveCount(0);
+
+    await page.locator("#chat-scope").selectOption("direct");
+    await page.locator("#chat-target").focus();
+    await expect(page.locator("#chat-target-options .target-option")).toHaveCount(2);
+    await page.locator("#chat-target-options .target-option", { hasText: "Carol" }).click();
+    await expect(page.locator("#chat-target")).toHaveValue("user-c");
 });

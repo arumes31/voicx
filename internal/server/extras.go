@@ -336,14 +336,7 @@ func (s *TCPServer) handleTokenUse(ctx context.Context, client *Client, f *netpr
 	if msg.Token == "" {
 		return s.sendError(client, errCodeMalformed, "empty token")
 	}
-	// Redemption writes server-group membership or the admin flag against a
-	// users row; a guest has none, so redeeming would either fail on the FK
-	// or grant nothing that survives the session (174).
-	if client.UserID == 0 {
-		return s.sendError(client, errCodePermissionDenied, "guests cannot redeem privilege tokens: register or log in first")
-	}
-
-	groupID, err := s.deps.Tokens.UseToken(ctx, msg.Token, client.UserID)
+	grant, err := s.deps.Tokens.UseTokenForIdentity(ctx, msg.Token, client.UserID, client.UniqueID, client.Username)
 	if err != nil {
 		if errors.Is(err, store.ErrTokenNotFound) {
 			return s.sendError(client, errCodeNotFound, "unknown token")
@@ -357,6 +350,7 @@ func (s *TCPServer) handleTokenUse(ctx context.Context, client *Client, f *netpr
 		)
 		return s.sendError(client, errCodeUnavailable, "token use failed")
 	}
+	client.promote(grant.UserID, grant.Admin)
 
 	// Invalidate the cached permissions so the grant takes effect now.
 	if s.deps.Perms != nil {
@@ -366,19 +360,21 @@ func (s *TCPServer) handleTokenUse(ctx context.Context, client *Client, f *netpr
 				channelID = sc.ChannelID
 			}
 		}
-		s.deps.Perms.Invalidate(client.UserID, channelID)
+		s.deps.Perms.Invalidate(grant.UserID, channelID)
 	}
 
 	s.logger.Info("privilege token used",
 		zap.String("client_id", client.ID),
-		zap.Int64("group_id", groupID),
+		zap.Int64("group_id", grant.GroupID),
+		zap.Bool("promoted", grant.Promoted),
 	)
-	s.audit(ctx, client.UniqueID, "token_use", fmt.Sprintf("group:%d", groupID), "")
+	s.audit(ctx, client.UniqueID, "token_use", fmt.Sprintf("group:%d", grant.GroupID), "")
 	if s.deps.Broadcast != nil {
 		payload, err := eventEnvelope(eventTokenUsed, struct {
 			ClientID string `json:"client_id"`
 			GroupID  int64  `json:"group_id"`
-		}{ClientID: client.ID, GroupID: groupID})
+			Promoted bool   `json:"promoted,omitempty"`
+		}{ClientID: client.ID, GroupID: grant.GroupID, Promoted: grant.Promoted})
 		if err == nil {
 			_ = s.deps.Broadcast.BroadcastToClient(client.ID, payload)
 		}

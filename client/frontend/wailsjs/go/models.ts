@@ -1,13 +1,13 @@
 export namespace main {
-
+	
 	export class BeepSpec {
 	    freq: number;
 	    duration_ms: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new BeepSpec(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.freq = source["freq"];
@@ -25,11 +25,11 @@ export namespace main {
 	    profile?: string;
 	    nickname_override?: string;
 	    avatar_override_b64?: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new Bookmark(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.name = source["name"];
@@ -50,11 +50,11 @@ export namespace main {
 	    joins?: string;
 	    muted?: boolean;
 	    watch_threshold?: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ChannelOverride(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.messages = source["messages"];
@@ -69,11 +69,11 @@ export namespace main {
 	    messages: number;
 	    undecryptable: number;
 	    complete: boolean;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ChatExportResult(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.text = source["text"];
@@ -86,18 +86,18 @@ export namespace main {
 	    messages: netproto.ChatHistoryEntry[];
 	    scanned: number;
 	    undecryptable: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ChatSearchResult(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.messages = this.convertValues(source["messages"], netproto.ChatHistoryEntry);
 	        this.scanned = source["scanned"];
 	        this.undecryptable = source["undecryptable"];
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -121,11 +121,11 @@ export namespace main {
 	    label?: string;
 	    nick_history?: string[];
 	    notify_online?: boolean;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new Contact(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.unique_id = source["unique_id"];
@@ -143,11 +143,11 @@ export namespace main {
 	    self?: boolean;
 	    client_msg_id?: string;
 	    offline?: boolean;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new DMEntry(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.seq = source["seq"];
@@ -165,11 +165,11 @@ export namespace main {
 	    nickname?: string;
 	    messages: number;
 	    last_at: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new DMPeer(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.unique_id = source["unique_id"];
@@ -187,11 +187,11 @@ export namespace main {
 	    scope_keys: number;
 	    refused_keys: number;
 	    pending_key_pulls: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new E2EEDiagnostics(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.cipher = source["cipher"];
@@ -212,11 +212,11 @@ export namespace main {
 	    compact_toggle?: string;
 	    zen_toggle?: string;
 	    deafen_toggle?: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new HotkeyProfile(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.ptt = source["ptt"];
@@ -239,11 +239,11 @@ export namespace main {
 	    protection: string;
 	    path: string;
 	    error?: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new IdentityEntry(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -262,11 +262,11 @@ export namespace main {
 	    level: number;
 	    counter: number;
 	    error?: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new IdentityLevelResult(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.level = source["level"];
@@ -279,11 +279,11 @@ export namespace main {
 	    sound: boolean;
 	    flash: boolean;
 	    native: boolean;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new NotifyChannels(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.toast = source["toast"];
@@ -296,11 +296,11 @@ export namespace main {
 	    addr: string;
 	    nickname: string;
 	    last_used: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new RecentServer(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.addr = source["addr"];
@@ -397,11 +397,11 @@ export namespace main {
 	    channel_notify?: Record<string, ChannelOverride>;
 	    keywords?: Record<string, Array<string>>;
 	    alpha_dismissed: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new Settings(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.settings_version = source["settings_version"];
@@ -493,7 +493,7 @@ export namespace main {
 	        this.keywords = source["keywords"];
 	        this.alpha_dismissed = source["alpha_dismissed"];
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -520,11 +520,11 @@ export namespace main {
 	    active: boolean;
 	    unread: number;
 	    mentions: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new TabInfo(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -542,11 +542,11 @@ export namespace main {
 	    url: string;
 	    sha256url: string;
 	    size: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new UpdateInfo(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.available = source["available"];
@@ -560,11 +560,11 @@ export namespace main {
 	    unique_id: string;
 	    created_at?: string;
 	    path: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new identityInfo(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.unique_id = source["unique_id"];
@@ -576,7 +576,7 @@ export namespace main {
 }
 
 export namespace netproto {
-
+	
 	export class AuditEntry {
 	    id: number;
 	    actor: string;
@@ -584,11 +584,11 @@ export namespace netproto {
 	    target: string;
 	    detail: string;
 	    created_at: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new AuditEntry(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -601,16 +601,16 @@ export namespace netproto {
 	}
 	export class AuditLogResponse {
 	    entries: AuditEntry[];
-
+	
 	    static createFrom(source: any = {}) {
 	        return new AuditLogResponse(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.entries = this.convertValues(source["entries"], AuditEntry);
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -633,11 +633,11 @@ export namespace netproto {
 	    unique_id: string;
 	    data_base64: string;
 	    content_type: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new AvatarData(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.unique_id = source["unique_id"];
@@ -653,11 +653,11 @@ export namespace netproto {
 	    banned_by?: string;
 	    created_at: number;
 	    expires_at?: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new BanEntry(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -671,16 +671,16 @@ export namespace netproto {
 	}
 	export class BanListResponse {
 	    bans: BanEntry[];
-
+	
 	    static createFrom(source: any = {}) {
 	        return new BanListResponse(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.bans = this.convertValues(source["bans"], BanEntry);
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -703,11 +703,11 @@ export namespace netproto {
 	    channel_id: number;
 	    data_base64: string;
 	    content_type?: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ChannelIconData(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.channel_id = source["channel_id"];
@@ -719,11 +719,11 @@ export namespace netproto {
 	    channel_id: number;
 	    key_id: number;
 	    sealed_key: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ChannelKey(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.channel_id = source["channel_id"];
@@ -736,11 +736,11 @@ export namespace netproto {
 	    link_blacklist: string;
 	    link_whitelist: string;
 	    from_config?: boolean;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ChatFilterResponse(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.word_filter = source["word_filter"];
@@ -763,11 +763,11 @@ export namespace netproto {
 	    edited_at?: number;
 	    deleted?: boolean;
 	    reactions?: Record<string, number>;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ChatHistoryEntry(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -791,11 +791,11 @@ export namespace netproto {
 	    keys?: ChannelKey[];
 	    refused?: number[];
 	    truncated?: boolean;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ChatHistoryResponse(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.channel_id = source["channel_id"];
@@ -804,7 +804,7 @@ export namespace netproto {
 	        this.refused = source["refused"];
 	        this.truncated = source["truncated"];
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -828,11 +828,11 @@ export namespace netproto {
 	    pinned_by: string;
 	    pinned_at: number;
 	    message?: ChatHistoryEntry;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ChatPinEntry(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.message_id = source["message_id"];
@@ -840,7 +840,7 @@ export namespace netproto {
 	        this.pinned_at = source["pinned_at"];
 	        this.message = this.convertValues(source["message"], ChatHistoryEntry);
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -865,11 +865,11 @@ export namespace netproto {
 	    keys?: ChannelKey[];
 	    refused?: number[];
 	    truncated?: boolean;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ChatPinsResponse(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.channel_id = source["channel_id"];
@@ -878,7 +878,7 @@ export namespace netproto {
 	        this.refused = source["refused"];
 	        this.truncated = source["truncated"];
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -909,11 +909,11 @@ export namespace netproto {
 	    port?: number;
 	    bytes_in: number;
 	    bytes_out: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ClientInfoResponse(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.client_id = source["client_id"];
@@ -936,11 +936,11 @@ export namespace netproto {
 	    from_nickname?: string;
 	    reason: string;
 	    created_at: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ComplaintEntry(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.target_unique_id = source["target_unique_id"];
@@ -953,16 +953,16 @@ export namespace netproto {
 	}
 	export class Complaints {
 	    entries: ComplaintEntry[];
-
+	
 	    static createFrom(source: any = {}) {
 	        return new Complaints(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.entries = this.convertValues(source["entries"], ComplaintEntry);
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -985,11 +985,11 @@ export namespace netproto {
 	    name: string;
 	    data_base64: string;
 	    content_type: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new EmojiData(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.name = source["name"];
@@ -1000,11 +1000,11 @@ export namespace netproto {
 	export class EmojiEntry {
 	    name: string;
 	    file_name: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new EmojiEntry(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.name = source["name"];
@@ -1013,16 +1013,16 @@ export namespace netproto {
 	}
 	export class EmojiListResponse {
 	    emojis: EmojiEntry[];
-
+	
 	    static createFrom(source: any = {}) {
 	        return new EmojiListResponse(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.emojis = this.convertValues(source["emojis"], EmojiEntry);
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -1050,11 +1050,11 @@ export namespace netproto {
 	    // Go type: time
 	    uploaded_at: any;
 	    encrypted?: boolean;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new FileEntry(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.name = source["name"];
@@ -1065,7 +1065,7 @@ export namespace netproto {
 	        this.uploaded_at = this.convertValues(source["uploaded_at"], null);
 	        this.encrypted = source["encrypted"];
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -1088,11 +1088,11 @@ export namespace netproto {
 	    path: string;
 	    health_port: number;
 	    expires_at: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new FileLinkResponse(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.path = source["path"];
@@ -1105,11 +1105,11 @@ export namespace netproto {
 	    folders?: string[];
 	    used_bytes: number;
 	    quota_bytes: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new FileListResponse(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.entries = this.convertValues(source["entries"], FileEntry);
@@ -1117,7 +1117,7 @@ export namespace netproto {
 	        this.used_bytes = source["used_bytes"];
 	        this.quota_bytes = source["quota_bytes"];
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -1138,16 +1138,16 @@ export namespace netproto {
 	}
 	export class FileVersionsResponse {
 	    entries: FileEntry[];
-
+	
 	    static createFrom(source: any = {}) {
 	        return new FileVersionsResponse(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.entries = this.convertValues(source["entries"], FileEntry);
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -1174,11 +1174,11 @@ export namespace netproto {
 	    icon?: string;
 	    color?: string;
 	    hoist?: boolean;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new GroupEntry(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.id = source["id"];
@@ -1194,11 +1194,11 @@ export namespace netproto {
 	    group_id: number;
 	    data_base64?: string;
 	    content_type?: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new GroupIconData(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.group_id = source["group_id"];
@@ -1209,17 +1209,17 @@ export namespace netproto {
 	export class GroupListResponse {
 	    type: string;
 	    groups: GroupEntry[];
-
+	
 	    static createFrom(source: any = {}) {
 	        return new GroupListResponse(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.type = source["type"];
 	        this.groups = this.convertValues(source["groups"], GroupEntry);
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -1242,11 +1242,11 @@ export namespace netproto {
 	    unique_id: string;
 	    nickname?: string;
 	    expires_at?: number;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new GroupMemberEntry(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.unique_id = source["unique_id"];
@@ -1258,18 +1258,18 @@ export namespace netproto {
 	    type: string;
 	    group_id: number;
 	    members: GroupMemberEntry[];
-
+	
 	    static createFrom(source: any = {}) {
 	        return new GroupMembersResponse(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.type = source["type"];
 	        this.group_id = source["group_id"];
 	        this.members = this.convertValues(source["members"], GroupMemberEntry);
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -1292,11 +1292,11 @@ export namespace netproto {
 	    urls: string[];
 	    username?: string;
 	    credential?: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ICEServer(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.urls = source["urls"];
@@ -1312,11 +1312,11 @@ export namespace netproto {
 	    negate?: boolean;
 	    source_tier?: string;
 	    inherited?: boolean;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new PermissionEntry(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.key = source["key"];
@@ -1331,17 +1331,17 @@ export namespace netproto {
 	export class PermListResponse {
 	    tier: string;
 	    entries: PermissionEntry[];
-
+	
 	    static createFrom(source: any = {}) {
 	        return new PermListResponse(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.tier = source["tier"];
 	        this.entries = this.convertValues(source["entries"], PermissionEntry);
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -1368,11 +1368,11 @@ export namespace netproto {
 	    skip: boolean;
 	    negate: boolean;
 	    winning?: boolean;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new PermTraceEntry(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.tier = source["tier"];
@@ -1389,11 +1389,11 @@ export namespace netproto {
 	    effective: number;
 	    effective_tier: string;
 	    entries: PermTraceEntry[];
-
+	
 	    static createFrom(source: any = {}) {
 	        return new PermTraceResponse(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.key = source["key"];
@@ -1401,7 +1401,7 @@ export namespace netproto {
 	        this.effective_tier = source["effective_tier"];
 	        this.entries = this.convertValues(source["entries"], PermTraceEntry);
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -1420,15 +1420,15 @@ export namespace netproto {
 		    return a;
 		}
 	}
-
+	
 	export class ServerBannerData {
 	    data_base64: string;
 	    content_type?: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ServerBannerData(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.data_base64 = source["data_base64"];
@@ -1442,11 +1442,11 @@ export namespace netproto {
 	    opus_fec: boolean;
 	    opus_dtx: boolean;
 	    opus_stereo: boolean;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ServerConfig(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.max_clients = source["max_clients"];
@@ -1460,11 +1460,11 @@ export namespace netproto {
 	export class ServerIconData {
 	    data_base64?: string;
 	    content_type?: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ServerIconData(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.data_base64 = source["data_base64"];
@@ -1479,11 +1479,11 @@ export namespace netproto {
 	    channels_online: number;
 	    max_clients: number;
 	    motd?: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new ServerInfoResponse(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.name = source["name"];
@@ -1503,11 +1503,11 @@ export namespace netproto {
 	    description?: string;
 	    created_at: number;
 	    used_by?: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new TokenEntry(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.token = source["token"];
@@ -1521,16 +1521,16 @@ export namespace netproto {
 	}
 	export class Tokens {
 	    entries: TokenEntry[];
-
+	
 	    static createFrom(source: any = {}) {
 	        return new Tokens(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.entries = this.convertValues(source["entries"], TokenEntry);
 	    }
-
+	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
 		    if (!a) {
 		        return a;
@@ -1552,11 +1552,11 @@ export namespace netproto {
 	export class TrackSlot {
 	    track_id: string;
 	    slot: string;
-
+	
 	    static createFrom(source: any = {}) {
 	        return new TrackSlot(source);
 	    }
-
+	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.track_id = source["track_id"];

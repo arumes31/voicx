@@ -44,6 +44,7 @@ const state = {
     myNickname: "",
     myChannelID: 0,
     isAdmin: false,       // server admin flag from the auth response (6b UI gating)
+    isGuest: true,        // anonymous sessions cannot perform account-only actions
     myPerms: new Map(),   // own resolved permissions: key -> {value, grant, skip, negate}
     serverGroups: [],     // server group list (6b tree presentation)
     groupByUID: new Map(), // unique_id -> [group entries, sorted by sort_id]
@@ -229,6 +230,10 @@ async function connectFromLogin() {
         try {
             state.isAdmin = await window.go.main.App.IsAdmin();
         } catch { state.isAdmin = false; }
+        try {
+            state.isGuest = await window.go.main.App.IsGuest();
+        } catch { state.isGuest = !pw; }
+        P()?.redeemPendingToken?.();
         $("conn-pill").textContent = addr;
         $("conn-pill").classList.add("up");
         $("conn-lock").classList.remove("hidden");
@@ -318,6 +323,9 @@ window.runtime.EventsOn("disconnected", () => {
     teardownVoice();
     resetVoiceUI();
     stopQualitySampler();
+    state.selectedClientID = "";
+    state.isGuest = true;
+    setDetailsOpen(false);
     $("conn-pill").textContent = "offline";
     $("conn-pill").classList.remove("up");
 
@@ -349,6 +357,10 @@ window.runtime.EventsOn("disconnected", () => {
                 try {
                     state.isAdmin = await window.go.main.App.IsAdmin();
                 } catch { state.isAdmin = false; }
+                try {
+                    state.isGuest = await window.go.main.App.IsGuest();
+                } catch { state.isGuest = !c.pw; }
+                P()?.redeemPendingToken?.();
                 $("conn-pill").textContent = c.addr;
                 $("conn-pill").classList.add("up");
                 $("login-overlay").classList.add("hidden");
@@ -364,7 +376,10 @@ window.runtime.EventsOn("disconnected", () => {
     showLogin();
 });
 
-window.runtime.EventsOn("servererror", (msg) => sysMsg("server: " + msg));
+window.runtime.EventsOn("servererror", (msg) => {
+    const text = String(msg).replace(/^\d+:\s*/, "");
+    toast(text || "The server rejected that action", "warn");
+});
 
 // (282) the Go side maintains settings of its own (recents on every connect),
 // so the merged blob it pushes is the authoritative cache — without this the
@@ -874,14 +889,17 @@ function renderTree() {
         }
     }
     for (const ch of byParent.get(0) || []) renderChannel(root, ch, byParent, 0);
+    renderDirectTargets();
     renderClientCard();
     chatUI.refreshHeader(); // (111) topic/title follows tree + channel updates
 }
 
 function renderChannel(parentEl, ch, byParent, depth) {
+    const node = document.createElement("div");
+    node.className = "channel-node";
+    node.style.setProperty("--depth", depth);
     const el = document.createElement("div");
     el.className = "channel" + (ch.ChannelID === state.myChannelID ? " mine" : "");
-    el.style.setProperty("--depth", depth);
     el.dataset.chid = ch.ChannelID;
     el.tabIndex = 0; // (298) keyboard navigation
     el.setAttribute("role", "treeitem"); // (343)
@@ -920,8 +938,8 @@ function renderChannel(parentEl, ch, byParent, depth) {
     }
     el.onclick = () => window.go.main.App.JoinChannel(ch.ChannelID);
     // (163) drag a channel onto another to take that channel's slot among its
-    // siblings. Member rows and sub-channels live inside this element, so
-    // their own dragstart bubbles through here and must not be relabelled.
+    // siblings. The header is separate from its member/child branch, so a
+    // member drag can never be relabelled as a channel drag.
     el.draggable = true;
     el.addEventListener("dragstart", (e) => {
         if (e.target !== el) return;
@@ -957,7 +975,8 @@ function renderChannel(parentEl, ch, byParent, depth) {
             window.go.main.App.MoveClient(target.client_id, ch.ChannelID);
         }
     });
-    parentEl.appendChild(el);
+    node.appendChild(el);
+    parentEl.appendChild(node);
 
     // (302) collapsed channels hide their members and children; (349) in
     // windowed mode every channel off my branch counts as collapsed unless
@@ -968,10 +987,22 @@ function renderChannel(parentEl, ch, byParent, depth) {
             !state.expandedVirtual.has(ch.ChannelID);
     }
     if (!collapsed) {
-        for (const c of state.clients.filter((c) => c.channel_id === ch.ChannelID)) {
-            el.appendChild(clientRow(c));
+        const members = state.clients.filter((c) => c.channel_id === ch.ChannelID);
+        if (members.length > 0) {
+            const list = document.createElement("div");
+            list.className = "channel-members";
+            list.setAttribute("role", "group");
+            list.setAttribute("aria-label", ch.Name + " members");
+            for (const c of members) list.appendChild(clientRow(c));
+            node.appendChild(list);
         }
-        for (const child of byParent.get(ch.ChannelID) || []) renderChannel(el, child, byParent, depth + 1);
+        const children = byParent.get(ch.ChannelID) || [];
+        if (children.length > 0) {
+            const branch = document.createElement("div");
+            branch.className = "channel-children";
+            for (const child of children) renderChannel(branch, child, byParent, depth + 1);
+            node.appendChild(branch);
+        }
     }
 }
 
@@ -999,14 +1030,15 @@ async function reorderChannel(draggedID, target) {
 
 function clientRow(c) {
     const row = document.createElement("div");
-    row.className = "client" + (c.is_speaking ? " speaking" : "") +
+    const speakingHere = state.myChannelID !== 0 && c.channel_id === state.myChannelID && c.is_speaking;
+    row.className = "client" + (speakingHere ? " speaking" : "") +
         (state.multiSelect.has(c.client_id) ? " selected" : "") +
         (c.status === "away" || c.status === "busy" || c.status === "invisible" ? " " + c.status : "");
     row.dataset.clid = c.client_id;
     row.tabIndex = 0; // (298) keyboard navigation
     row.setAttribute("role", "treeitem"); // (343)
     row.setAttribute("aria-label", (c.nickname || c.unique_id || "user") +
-        (c.status ? ", " + c.status : "") + (c.is_speaking ? ", speaking" : "") +
+        (c.status ? ", " + c.status : "") + (speakingHere ? ", speaking" : "") +
         (c.priority_speaker ? ", priority speaker" : "") +
         (c.client_id === state.myClientID && state.muted ? ", muted" : "") +
         (c.client_id === state.myClientID && state.deafened ? ", deafened" : ""));
@@ -1104,6 +1136,14 @@ function clientRow(c) {
         icons.title = "muted locally";
         row.appendChild(icons);
     }
+    if (speakingHere) {
+        const voice = document.createElement("span");
+        voice.className = "client-voice-state";
+        voice.title = "Talking in your channel";
+        voice.setAttribute("aria-label", "talking");
+        voice.innerHTML = "<i></i><i></i><i></i>";
+        row.appendChild(voice);
+    }
     row.onclick = (e) => {
         e.stopPropagation();
         // (306) ctrl/shift multi-select; plain click selects just this user.
@@ -1122,6 +1162,7 @@ function clientRow(c) {
             state.multiSelect = new Set([c.client_id]);
         }
         state.selectedClientID = c.client_id;
+        setDetailsOpen(true);
         renderTree();
     };
     return row;
@@ -1257,6 +1298,26 @@ function renderClientCard() {
     }
 }
 
+// The inspector is contextual: keep the workspace wide until the user selects
+// somebody or explicitly asks for server/permission details. At narrower
+// widths CSS presents the same panel as a drawer instead of shrinking chat.
+function setDetailsOpen(open) {
+    const details = $("details");
+    const toggle = $("details-toggle");
+    document.body.classList.toggle("details-collapsed", !open);
+    details.setAttribute("aria-hidden", String(!open));
+    toggle.setAttribute("aria-expanded", String(open));
+}
+
+$("details-close").onclick = () => setDetailsOpen(false);
+$("details-toggle").onclick = () => setDetailsOpen(true);
+document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !document.body.classList.contains("details-collapsed") &&
+        !document.querySelector(".dlg-overlay")) {
+        setDetailsOpen(false);
+    }
+});
+
 // ---------------------------------------------------------------------------
 // Chat
 // ---------------------------------------------------------------------------
@@ -1303,9 +1364,76 @@ function sysMsg(text) {
     log.scrollTop = log.scrollHeight;
 }
 
-$("chat-scope").onchange = () => {
-    $("chat-target").classList.toggle("hidden", $("chat-scope").value !== "direct");
+function setDirectTargetVisible(visible) {
+    $("chat-target-picker").classList.toggle("hidden", !visible);
+    if (visible) renderDirectTargets();
+    else hideDirectTargets();
+}
+
+function directTargetClients(filter = "") {
+    const needle = filter.trim().toLowerCase();
+    return state.clients
+        .filter((client) => client.client_id !== state.myClientID && client.unique_id)
+        .filter((client) => !needle || `${client.nickname || ""} ${client.unique_id}`.toLowerCase().includes(needle))
+        .sort((a, b) => {
+            const aHere = a.channel_id === state.myChannelID ? 0 : 1;
+            const bHere = b.channel_id === state.myChannelID ? 0 : 1;
+            return aHere - bHere || (a.nickname || a.unique_id).localeCompare(b.nickname || b.unique_id);
+        });
+}
+
+function hideDirectTargets() {
+    $("chat-target-options").classList.add("hidden");
+    $("chat-target").setAttribute("aria-expanded", "false");
+}
+
+function renderDirectTargets(show = false) {
+    const input = $("chat-target");
+    const options = $("chat-target-options");
+    const clients = directTargetClients(input.value);
+    options.innerHTML = "";
+    if (clients.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "target-empty";
+        empty.textContent = state.clients.length > 1 ? "No matching connected members" : "No other members connected";
+        options.appendChild(empty);
+    }
+    for (const client of clients) {
+        const option = document.createElement("button");
+        option.type = "button";
+        option.className = "target-option" + (client.channel_id === state.myChannelID ? " same-channel" : "");
+        option.setAttribute("role", "option");
+        const channel = state.channels.find((item) => item.ChannelID === client.channel_id);
+        option.innerHTML = `<span class="target-option-dot"></span><span class="target-option-copy"><strong></strong><small class="target-option-meta mono"></small></span><span class="target-option-channel"></span>`;
+        option.querySelector("strong").textContent = client.nickname || client.unique_id;
+        option.querySelector("small").textContent = client.unique_id;
+        option.querySelector(".target-option-channel").textContent = channel?.Name || "no channel";
+        option.onclick = () => {
+            input.value = client.unique_id;
+            hideDirectTargets();
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+            $("chat-text").focus();
+        };
+        options.appendChild(option);
+    }
+    if (show && !$("chat-target-picker").classList.contains("hidden")) {
+        options.classList.remove("hidden");
+        input.setAttribute("aria-expanded", "true");
+    }
+}
+
+$("chat-target").addEventListener("focus", () => renderDirectTargets(true));
+$("chat-target").addEventListener("input", () => renderDirectTargets(true));
+$("chat-target-toggle").onclick = () => {
+    const opening = $("chat-target-options").classList.contains("hidden");
+    renderDirectTargets(opening);
+    if (opening) $("chat-target").focus();
 };
+document.addEventListener("pointerdown", (event) => {
+    if (!event.target.closest("#chat-target-picker")) hideDirectTargets();
+});
+
+$("chat-scope").onchange = () => setDirectTargetVisible($("chat-scope").value === "direct");
 
 async function sendChat() {
     // Rich send flow (reply prefix, staged file uploads, DM tabs) is in
@@ -2232,7 +2360,7 @@ window.__voicx = {
     state, $, toast, sysMsg, beep, showLogin, disconnect, sendChat, setPTT,
     setDeafened, refreshPermissions, applyVoiceState, applyOutputSettings,
     startVADMonitor: startVoiceMonitor, stopVADMonitor: stopVoiceMonitor,
-    connectFromLogin, renderTree,
+    connectFromLogin, renderTree, setDetailsOpen, setDirectTargetVisible,
     clientName, initials, fetchAvatar,
     applyAppearance, toggleCompact, recentChannels,
     // (70) shared system audio controls for the screen tile's context menu.

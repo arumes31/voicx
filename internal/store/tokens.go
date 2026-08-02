@@ -36,6 +36,16 @@ type Token struct {
 	UsedBy      string
 }
 
+// TokenGrant is the result of a successful privilege-token redemption.
+// Promoted is true when the redeemer had no users row and one was created in
+// the same transaction as the grant.
+type TokenGrant struct {
+	UserID   int64
+	GroupID  int64
+	Admin    bool
+	Promoted bool
+}
+
 // CreateToken generates a random token key and inserts a token row.
 // groupID 0 means the token grants server admin on use.
 func (s *Store) CreateToken(ctx context.Context, tokenType int, groupID int64, maxUses int) (string, error) {
@@ -114,9 +124,17 @@ func (s *Store) DeleteToken(ctx context.Context, key string) error {
 // grant (server-group membership, or server admin when group_id is 0). It
 // returns the granted group ID (0 = server admin grant).
 func (s *Store) UseToken(ctx context.Context, key string, userID int64) (int64, error) {
+	grant, err := s.UseTokenForIdentity(ctx, key, userID, "", "")
+	return grant.GroupID, err
+}
+
+// UseTokenForIdentity redeems a token for either an existing user or a guest.
+// A guest is promoted to a passwordless identity account inside the same
+// transaction, so an invalid/exhausted token cannot leave an orphan account.
+func (s *Store) UseTokenForIdentity(ctx context.Context, key string, userID int64, uniqueID, nickname string) (TokenGrant, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("beginning token tx: %w", err)
+		return TokenGrant{}, fmt.Errorf("beginning token tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -130,12 +148,28 @@ func (s *Store) UseToken(ctx context.Context, key string, userID int64) (int64, 
 	err = tx.QueryRowContext(ctx, sel, key).Scan(&tokenID, &groupID, &uses, &maxUses)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return 0, ErrTokenNotFound
+			return TokenGrant{}, ErrTokenNotFound
 		}
-		return 0, fmt.Errorf("querying token: %w", err)
+		return TokenGrant{}, fmt.Errorf("querying token: %w", err)
 	}
 	if uses >= maxUses {
-		return 0, ErrTokenExhausted
+		return TokenGrant{}, ErrTokenExhausted
+	}
+
+	grant := TokenGrant{UserID: userID}
+	if grant.UserID == 0 {
+		if uniqueID == "" {
+			return TokenGrant{}, errors.New("guest identity is required")
+		}
+		const ensureUser = `INSERT INTO users (unique_id, nickname, created_at)
+		                    VALUES ($1, $2, NOW())
+		                    ON CONFLICT (unique_id) DO UPDATE
+		                    SET nickname = CASE WHEN users.nickname = '' THEN EXCLUDED.nickname ELSE users.nickname END
+		                    RETURNING id`
+		if err := tx.QueryRowContext(ctx, ensureUser, uniqueID, nickname).Scan(&grant.UserID); err != nil {
+			return TokenGrant{}, fmt.Errorf("promoting guest identity: %w", err)
+		}
+		grant.Promoted = true
 	}
 
 	// used_by records the redeemer for the token manager (174). It is resolved
@@ -144,29 +178,29 @@ func (s *Store) UseToken(ctx context.Context, key string, userID int64) (int64, 
 	const upd = `UPDATE tokens SET uses = uses + 1,
 	                              used_by = COALESCE((SELECT unique_id FROM users WHERE id = $2), '')
 	            WHERE id = $1`
-	if _, err := tx.ExecContext(ctx, upd, tokenID, userID); err != nil {
-		return 0, fmt.Errorf("consuming token: %w", err)
+	if _, err := tx.ExecContext(ctx, upd, tokenID, grant.UserID); err != nil {
+		return TokenGrant{}, fmt.Errorf("consuming token: %w", err)
 	}
 
-	granted := int64(0)
 	if groupID.Valid && groupID.Int64 != 0 {
 		const ins = `INSERT INTO server_group_members (user_id, server_group_id)
 		            VALUES ($1, $2) ON CONFLICT DO NOTHING`
-		if _, err := tx.ExecContext(ctx, ins, userID, groupID.Int64); err != nil {
-			return 0, fmt.Errorf("assigning server group: %w", err)
+		if _, err := tx.ExecContext(ctx, ins, grant.UserID, groupID.Int64); err != nil {
+			return TokenGrant{}, fmt.Errorf("assigning server group: %w", err)
 		}
-		granted = groupID.Int64
+		grant.GroupID = groupID.Int64
 	} else {
 		// Group-less token: grant server admin.
-		if _, err := tx.ExecContext(ctx, `UPDATE users SET is_admin = TRUE WHERE id = $1`, userID); err != nil {
-			return 0, fmt.Errorf("granting admin: %w", err)
+		if _, err := tx.ExecContext(ctx, `UPDATE users SET is_admin = TRUE WHERE id = $1`, grant.UserID); err != nil {
+			return TokenGrant{}, fmt.Errorf("granting admin: %w", err)
 		}
+		grant.Admin = true
 	}
 
 	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("committing token use: %w", err)
+		return TokenGrant{}, fmt.Errorf("committing token use: %w", err)
 	}
-	return granted, nil
+	return grant, nil
 }
 
 // HasAdminUser reports whether any user has the admin flag.

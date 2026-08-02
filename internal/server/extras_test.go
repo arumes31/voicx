@@ -31,18 +31,22 @@ type fakeTokens struct {
 	nextID    int64
 }
 
-func (f *fakeTokens) UseToken(_ context.Context, key string, _ int64) (int64, error) {
+func (f *fakeTokens) UseTokenForIdentity(_ context.Context, key string, userID int64, _ string, _ string) (store.TokenGrant, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.used = append(f.used, key)
 	if f.exhausted[key] {
-		return 0, store.ErrTokenExhausted
+		return store.TokenGrant{}, store.ErrTokenExhausted
 	}
 	g, ok := f.grants[key]
 	if !ok {
-		return 0, store.ErrTokenNotFound
+		return store.TokenGrant{}, store.ErrTokenNotFound
 	}
-	return g, nil
+	promoted := userID == 0
+	if promoted {
+		userID = 99
+	}
+	return store.TokenGrant{UserID: userID, GroupID: g, Admin: g == 0, Promoted: promoted}, nil
 }
 
 func (f *fakeTokens) ListTokens(context.Context) ([]store.Token, error) {
@@ -1274,9 +1278,9 @@ func TestTokenAddGranted(t *testing.T) {
 	}
 }
 
-// TestTokenUseGuestRejected verifies a guest cannot redeem a token: the grant
-// has no users row to land on.
-func TestTokenUseGuestRejected(t *testing.T) {
+// TestTokenUseGuestPromotes verifies every connected identity can redeem a
+// token and a guest becomes a durable user before the grant is applied.
+func TestTokenUseGuestPromotes(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	env.tokens.grants = map[string]int64{"tok-abc": 5}
@@ -1294,12 +1298,21 @@ func TestTokenUseGuestRejected(t *testing.T) {
 	}
 
 	send(t, conn, netproto.MsgTokenUse, netproto.TokenUse{Token: "tok-abc"})
-	if e := readError(t, conn); e.Code != errCodePermissionDenied {
-		t.Fatalf("guest redeem error = %d, want %d", e.Code, errCodePermissionDenied)
+	data := readEventOfType(t, conn, eventTokenUsed)
+	var event struct {
+		ClientID string `json:"client_id"`
+		GroupID  int64  `json:"group_id"`
+		Promoted bool   `json:"promoted"`
+	}
+	if err := json.Unmarshal(data, &event); err != nil {
+		t.Fatalf("decode token event: %v", err)
+	}
+	if event.ClientID != ar.ClientID || event.GroupID != 5 || !event.Promoted {
+		t.Fatalf("guest token event = %+v", event)
 	}
 	env.tokens.mu.Lock()
 	defer env.tokens.mu.Unlock()
-	if len(env.tokens.used) != 0 {
-		t.Fatalf("guest redemption reached the store: %v", env.tokens.used)
+	if len(env.tokens.used) != 1 || env.tokens.used[0] != "tok-abc" {
+		t.Fatalf("guest redemption did not reach the store: %v", env.tokens.used)
 	}
 }

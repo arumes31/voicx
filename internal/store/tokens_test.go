@@ -90,6 +90,50 @@ func TestTokenMetaDB(t *testing.T) {
 	}
 }
 
+// TestGuestTokenPromotionDB verifies that guest promotion and redemption are
+// atomic and that the promoted identity owns the resulting grant.
+func TestGuestTokenPromotionDB(t *testing.T) {
+	s := testDBStore(t)
+	ctx := context.Background()
+	suffix := fmt.Sprint(time.Now().UnixNano())
+	uniqueID := "guest_token_" + suffix
+	t.Cleanup(func() {
+		_, _ = s.DB().ExecContext(ctx, `DELETE FROM users WHERE unique_id = $1`, uniqueID)
+	})
+
+	if _, err := s.UseTokenForIdentity(ctx, "missing", 0, uniqueID, "guest"); !errors.Is(err, ErrTokenNotFound) {
+		t.Fatalf("missing token error = %v, want ErrTokenNotFound", err)
+	}
+	var count int
+	if err := s.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE unique_id = $1`, uniqueID).Scan(&count); err != nil {
+		t.Fatalf("counting guest rows: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("invalid token created %d guest rows", count)
+	}
+
+	key, err := s.CreateToken(ctx, 0, 0, 1)
+	if err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+	t.Cleanup(func() { _ = s.DeleteToken(ctx, key) })
+	grant, err := s.UseTokenForIdentity(ctx, key, 0, uniqueID, "guest")
+	if err != nil {
+		t.Fatalf("UseTokenForIdentity: %v", err)
+	}
+	if grant.UserID == 0 || !grant.Admin || !grant.Promoted || grant.GroupID != 0 {
+		t.Fatalf("guest grant = %+v", grant)
+	}
+
+	var admin bool
+	if err := s.DB().QueryRowContext(ctx, `SELECT is_admin FROM users WHERE id = $1`, grant.UserID).Scan(&admin); err != nil {
+		t.Fatalf("querying promoted guest: %v", err)
+	}
+	if !admin {
+		t.Fatal("promoted guest did not receive admin grant")
+	}
+}
+
 // TestDeleteComplaintsAgainstDB covers the targeted and blanket clears.
 func TestDeleteComplaintsAgainstDB(t *testing.T) {
 	s := testDBStore(t)

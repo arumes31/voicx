@@ -98,6 +98,7 @@ async function refreshTabIdentity(tabID) {
         state.myClientID = "";
         state.myNickname = "";
         state.isAdmin = false;
+        state.isGuest = true;
         state.lastConnect = null;
         return;
     }
@@ -109,6 +110,11 @@ async function refreshTabIdentity(tabID) {
     try { isAdmin = await App().IsAdmin(); } catch { /* disconnected */ }
     if (activeTabID !== activatedTabID) return;
     state.isAdmin = isAdmin;
+    let isGuest = true;
+    try { isGuest = await App().IsGuest(); } catch { /* disconnected */ }
+    if (activeTabID !== activatedTabID) return;
+    state.isGuest = isGuest;
+    window.__voicxPerms?.redeemPendingToken?.();
     const saved = state.tabConnects.get(tabID);
     if (saved) {
         state.lastConnect = saved;
@@ -146,6 +152,7 @@ function onTabReset(tabID) {
     window.__voicxNotify?.resetServerRules?.(); // (216) gate belongs to one server tab
     state.myChannelID = 0;
     state.selectedClientID = "";
+    V().setDetailsOpen(false);
     state.trackUsers.clear();
     window.__voicxChat?.resetView?.();
     V().renderTree();

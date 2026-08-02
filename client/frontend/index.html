@@ -6,7 +6,7 @@
     <title>voicx</title>
     <link rel="stylesheet" href="/src/style.css" />
 </head>
-<body>
+<body class="details-collapsed">
     <!-- Login overlay -->
     <div id="login-overlay">
         <div class="login-card">
@@ -44,7 +44,7 @@
                 <button id="notif-bell" class="icon-btn" title="Notifications (346)" aria-label="notifications">🔔<span id="notif-badge" class="hidden"></span></button>
                 <span id="conn-pill" class="pill">offline</span>
             </div>
-            <div class="pane-head">CHANNELS <button id="channel-create-btn" class="icon-btn pane-head-btn" title="Create channel">+</button></div>
+            <div class="pane-head sidebar-head"><span>CHANNELS</span><button id="channel-create-btn" class="icon-btn pane-head-btn" title="Create channel">+</button></div>
             <div id="tree-tools">
                 <input id="tree-filter" placeholder="filter… (319)" />
                 <button id="tree-collapse" class="icon-btn" title="Collapse all (302)">▾</button>
@@ -110,7 +110,11 @@
                     <option value="global">global</option>
                     <option value="direct">direct</option>
                 </select>
-                <input id="chat-target" class="hidden" placeholder="target unique id" />
+                <div id="chat-target-picker" class="hidden">
+                    <input id="chat-target" placeholder="find connected member or enter UID" role="combobox" aria-label="Direct message recipient" aria-autocomplete="list" aria-expanded="false" aria-controls="chat-target-options" autocomplete="off" />
+                    <button id="chat-target-toggle" type="button" aria-label="Show connected members" title="Show connected members">⌄</button>
+                    <div id="chat-target-options" class="hidden" role="listbox"></div>
+                </div>
                 <input id="chat-text" placeholder="message…" />
                 <input id="chat-file" type="file" multiple class="hidden" />
                 <button id="chat-attach" class="icon-btn" title="Attach files (or paste / drop them here)">📎</button>
@@ -122,14 +126,18 @@
             <video id="local-video" autoplay playsinline muted class="hidden"></video>
         </main>
 
-        <aside id="details">
-            <div class="pane-head">DETAILS</div>
+        <aside id="details" aria-hidden="true">
+            <div class="details-head">
+                <div class="pane-head">DETAILS</div>
+                <button id="details-close" class="icon-btn" title="Close details" aria-label="Close details">✕</button>
+            </div>
             <div id="client-card"></div>
             <div class="pane-head">SERVER</div>
             <div id="news-area"></div>
             <div class="pane-head">PERMISSIONS</div>
             <div id="perm-area"></div>
         </aside>
+        <button id="details-toggle" title="Open details" aria-label="Open details" aria-expanded="false">Details</button>
         </div>
     </div>
 

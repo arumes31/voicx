@@ -68,7 +68,7 @@ function openContextMenu(x, y, client) {
             return;
         }
         $("chat-scope").value = "direct";
-        $("chat-target").classList.remove("hidden");
+        V().setDirectTargetVisible(true);
         $("chat-target").value = client.unique_id;
         $("chat-text").focus();
     };

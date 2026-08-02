@@ -145,7 +145,7 @@ type FileTransferBackend interface {
 // TokenBackend is the subset of the store needed to redeem and administer
 // privilege tokens (174).
 type TokenBackend interface {
-	UseToken(ctx context.Context, key string, userID int64) (groupID int64, err error)
+	UseTokenForIdentity(ctx context.Context, key string, userID int64, uniqueID, nickname string) (store.TokenGrant, error)
 	ListTokens(ctx context.Context) ([]store.Token, error)
 	CreateTokenWithMeta(ctx context.Context, tokenType int, groupID, channelID int64, description string, maxUses int) (string, error)
 	DeleteToken(ctx context.Context, key string) error

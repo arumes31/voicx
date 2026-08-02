@@ -106,6 +106,14 @@ func (c *Client) setIdentity(uniqueID, nickname string, userID int64, admin bool
 	c.authed = true
 }
 
+// promote records the durable identity created by a guest token redemption.
+func (c *Client) promote(userID int64, admin bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.UserID = userID
+	c.admin = c.admin || admin
+}
+
 // uniqueID returns the client's authenticated unique ID ("" before auth).
 func (c *Client) uniqueID() string {
 	c.mu.RLock()

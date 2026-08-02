@@ -1030,7 +1030,7 @@ export function openPM(uid, nick) {
 function activatePM(uid) {
     // Keep the scope selector in sync so sendChat routes to the tab's user.
     $("chat-scope").value = "direct";
-    $("chat-target").classList.remove("hidden");
+    V().setDirectTargetVisible(true);
     $("chat-target").value = uid;
     setView({ kind: "dm", uid });
 }
@@ -1081,7 +1081,7 @@ function activateChannel(channelID) {
     const id = Number(channelID);
     if (!id || !subscribed(id)) return;
     $("chat-scope").value = "channel";
-    $("chat-target").classList.add("hidden");
+    V().setDirectTargetVisible(false);
     setView(id === V().state.myChannelID ? { kind: "channel" } : { kind: "chan", id });
 }
 
@@ -1163,7 +1163,7 @@ function closePM(uid) {
     store.delete("dm:" + uid);
     if (view.kind === "dm" && view.uid === uid) {
         $("chat-scope").value = "channel";
-        $("chat-target").classList.add("hidden");
+        V().setDirectTargetVisible(false);
         setView({ kind: "channel" });
         return;
     }

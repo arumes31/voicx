@@ -57,6 +57,7 @@ type connManager struct {
 	uniqueID string
 	nickname string
 	isAdmin  bool
+	isGuest  bool
 	closed   bool
 	// lastSnapshot/lastChannelList cache the latest state frames so a tab
 	// switch can replay them (281).
@@ -328,6 +329,7 @@ func (m *connManager) connectWith(addr string, authMsg netproto.Authenticate, si
 	m.uniqueID = resp.UniqueID
 	m.nickname = resp.Nickname
 	m.isAdmin = resp.IsAdmin
+	m.isGuest = authMsg.Anonymous
 	m.iceServers = resp.ICEServers
 	m.motd = motd
 	m.closed = false
@@ -438,6 +440,15 @@ func (m *connManager) isAdminSnapshot() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.isAdmin
+}
+
+// isGuestSnapshot reports whether the current session authenticated through
+// the anonymous guest flow. Guest identities can be stable, so the unique ID
+// alone is not a reliable way for the frontend to distinguish an account.
+func (m *connManager) isGuestSnapshot() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.isGuest
 }
 
 // connected reports whether a live connection exists.
@@ -568,6 +579,7 @@ func (m *connManager) dispatch(f *netproto.Frame) {
 		// the backend; DMs decrypt asynchronously and re-emit, which is what
 		// the empty return means.
 		if out := m.maybeDecryptEvent(string(f.Payload)); out != "" {
+			m.applySessionEvent(out)
 			m.emit("event", out)
 		}
 	case netproto.MsgChannelKey:
@@ -626,6 +638,30 @@ func (m *connManager) dispatch(f *netproto.Frame) {
 	default:
 		// Unknown frame: ignore.
 	}
+}
+
+// applySessionEvent keeps the bound session flags aligned with grants that
+// take effect after authentication. In particular, a guest token redemption
+// promotes the identity and an admin token changes IsAdmin immediately.
+func (m *connManager) applySessionEvent(raw string) {
+	var env struct {
+		Type string `json:"type"`
+		Data struct {
+			GroupID  int64 `json:"group_id"`
+			Promoted bool  `json:"promoted"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(raw), &env); err != nil || env.Type != "token_used" {
+		return
+	}
+	m.mu.Lock()
+	if env.Data.Promoted {
+		m.isGuest = false
+	}
+	if env.Data.GroupID == 0 {
+		m.isAdmin = true
+	}
+	m.mu.Unlock()
 }
 
 // emit sends a backend event to the sink.

@@ -366,6 +366,10 @@ export function IsAdmin() {
   return window['go']['main']['App']['IsAdmin']();
 }
 
+export function IsGuest() {
+  return window['go']['main']['App']['IsGuest']();
+}
+
 export function JoinChannel(arg1) {
   return window['go']['main']['App']['JoinChannel'](arg1);
 }

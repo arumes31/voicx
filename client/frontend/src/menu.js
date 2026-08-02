@@ -410,7 +410,7 @@ export function initMenu() {
     const permissions = buildMenu(t("menu.permissions"), [
         menuAction(t("menu.viewMyPerms"), () => {
             V().refreshPermissions();
-            $("details").scrollIntoView({ behavior: "smooth" });
+            V().setDetailsOpen(true);
         }),
         menuAction(t("menu.permManager"), () => {
             if (!V().state.myClientID) return V().toast("not connected", "warn");
@@ -458,6 +458,10 @@ export function initMenu() {
 
     // View menu: window/integration toggles (wave 8a/8c).
     const view = buildMenu(t("menu.view"), [
+        menuAction("Toggle details", () => {
+            V().setDetailsOpen(document.body.classList.contains("details-collapsed"));
+        }),
+        divider(),
         menuAction(t("menu.compact"), () => V().toggleCompact()),
         menuAction(t("menu.zen"), () => window.__voicxPolish.toggleZen()),
         menuAction("Pop out chat", () => window.__voicxPolish.toggleChatPopout()),

@@ -19,6 +19,13 @@ func (a *App) IsAdmin() bool {
 	return a.cmLoad() != nil && a.cmLoad().isAdminSnapshot()
 }
 
+// IsGuest reports whether the active connection is an anonymous guest
+// session. The frontend uses this to stop account-only actions before they
+// reach the server.
+func (a *App) IsGuest() bool {
+	return a.cmLoad() != nil && a.cmLoad().isGuestSnapshot()
+}
+
 // --- group list / CRUD -------------------------------------------------------
 
 // GroupList returns the groups of a type ("server" or "channel").
