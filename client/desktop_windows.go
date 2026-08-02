@@ -4,6 +4,7 @@ package main
 
 import (
 	"runtime"
+	"sync"
 
 	"github.com/getlantern/systray"
 )
@@ -32,9 +33,18 @@ func runWindowsDesktop(lifecycle windowsDesktopLifecycle) {
 
 	go func() {
 		defer close(trayDone)
+		var readyOnce sync.Once
+		defer readyOnce.Do(func() { close(trayReady) })
+
+		readyProxy := make(chan struct{})
+		go func() {
+			<-readyProxy
+			readyOnce.Do(func() { close(trayReady) })
+		}()
+
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
-		guardCrash("tray", func() { lifecycle.runTray(trayReady) })
+		guardCrash("tray", func() { lifecycle.runTray(readyProxy) })
 	}()
 
 	<-trayReady

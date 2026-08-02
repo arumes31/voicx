@@ -17,10 +17,11 @@ func TestWindowsChordPressedRequiresKeyAndModifiers(t *testing.T) {
 
 	mods := []hotkey.Modifier{hotkey.ModCtrl, hotkey.ModShift}
 	key := hotkey.KeyM
+	vk, _ := windowsVirtualKey(key)
 	if windowsChordPressed(mods, key) {
 		t.Fatal("empty keyboard state matched the chord")
 	}
-	pressed[uintptr(key)] = true
+	pressed[vk] = true
 	if windowsChordPressed(mods, key) {
 		t.Fatal("main key without modifiers matched the chord")
 	}
@@ -32,7 +33,7 @@ func TestWindowsChordPressedRequiresKeyAndModifiers(t *testing.T) {
 	if !windowsChordPressed(mods, key) {
 		t.Fatal("fully held chord did not match")
 	}
-	delete(pressed, uintptr(key))
+	delete(pressed, vk)
 	if windowsChordPressed(mods, key) {
 		t.Fatal("released main key still matched the chord")
 	}
@@ -41,11 +42,38 @@ func TestWindowsChordPressedRequiresKeyAndModifiers(t *testing.T) {
 func TestWindowsChordPressedAcceptsEitherWinKey(t *testing.T) {
 	original := keyPressed
 	t.Cleanup(func() { keyPressed = original })
-	pressed := map[uintptr]bool{uintptr(hotkey.KeyTab): true, vkRWin: true}
+	tabVk, _ := windowsVirtualKey(hotkey.KeyTab)
+	pressed := map[uintptr]bool{tabVk: true, vkRWin: true}
 	keyPressed = func(key uintptr) bool { return pressed[key] }
 
 	if !windowsChordPressed([]hotkey.Modifier{hotkey.ModWin}, hotkey.KeyTab) {
 		t.Fatal("right Windows key did not satisfy Win modifier")
+	}
+}
+
+func TestWindowsVirtualKeyMapping(t *testing.T) {
+	tests := []struct {
+		key    hotkey.Key
+		wantVK uintptr
+	}{
+		{hotkey.KeyM, 0x4D},
+		{hotkey.KeyTab, 0x09},
+		{hotkey.KeyUp, 0x26},
+		{hotkey.KeyDown, 0x28},
+		{hotkey.KeyLeft, 0x25},
+		{hotkey.KeyRight, 0x27},
+		{hotkey.KeyF20, 0x83},
+	}
+
+	for _, tt := range tests {
+		vk, ok := windowsVirtualKey(tt.key)
+		if !ok {
+			t.Errorf("windowsVirtualKey(%v) returned ok=false", tt.key)
+			continue
+		}
+		if vk != tt.wantVK {
+			t.Errorf("windowsVirtualKey(%v) = 0x%X, want 0x%X", tt.key, vk, tt.wantVK)
+		}
 	}
 }
 

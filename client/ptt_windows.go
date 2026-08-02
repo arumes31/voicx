@@ -62,7 +62,8 @@ func monitorPassiveHotkey(
 }
 
 func windowsChordPressed(mods []hotkey.Modifier, key hotkey.Key) bool {
-	if !keyPressed(uintptr(key)) {
+	vk, ok := windowsVirtualKey(key)
+	if !ok || !keyPressed(vk) {
 		return false
 	}
 	for _, mod := range mods {
@@ -86,6 +87,40 @@ func windowsChordPressed(mods []hotkey.Modifier, key hotkey.Key) bool {
 		}
 	}
 	return true
+}
+
+func windowsVirtualKey(key hotkey.Key) (uintptr, bool) {
+	if key >= hotkey.KeyA && key <= hotkey.KeyZ {
+		return 0x41 + uintptr(key-hotkey.KeyA), true
+	}
+	if key >= hotkey.Key0 && key <= hotkey.Key9 {
+		return 0x30 + uintptr(key-hotkey.Key0), true
+	}
+	if key >= hotkey.KeyF1 && key <= hotkey.KeyF20 {
+		return 0x70 + uintptr(key-hotkey.KeyF1), true
+	}
+	switch key {
+	case hotkey.KeySpace:
+		return 0x20, true
+	case hotkey.KeyTab:
+		return 0x09, true
+	case hotkey.KeyReturn:
+		return 0x0D, true
+	case hotkey.KeyEscape:
+		return 0x1B, true
+	case hotkey.KeyDelete:
+		return 0x2E, true
+	case hotkey.KeyUp:
+		return 0x26, true
+	case hotkey.KeyDown:
+		return 0x28, true
+	case hotkey.KeyLeft:
+		return 0x25, true
+	case hotkey.KeyRight:
+		return 0x27, true
+	default:
+		return 0, false
+	}
 }
 
 func windowsKeyPressed(key uintptr) bool {

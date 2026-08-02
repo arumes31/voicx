@@ -165,11 +165,20 @@ func (s *Store) UseTokenForIdentity(ctx context.Context, key string, userID int6
 		                    VALUES ($1, $2, NOW())
 		                    ON CONFLICT (unique_id) DO UPDATE
 		                    SET nickname = CASE WHEN users.nickname = '' THEN EXCLUDED.nickname ELSE users.nickname END
-		                    RETURNING id`
-		if err := tx.QueryRowContext(ctx, ensureUser, uniqueID, nickname).Scan(&grant.UserID); err != nil {
+		                    RETURNING id, (xmax = 0) AS inserted, COALESCE(password_hash, '') AS password_hash`
+		var (
+			inserted     bool
+			passwordHash string
+		)
+		if err := tx.QueryRowContext(ctx, ensureUser, uniqueID, nickname).Scan(&grant.UserID, &inserted, &passwordHash); err != nil {
 			return TokenGrant{}, fmt.Errorf("promoting guest identity: %w", err)
 		}
-		grant.Promoted = true
+		if !inserted && passwordHash != "" {
+			return TokenGrant{}, fmt.Errorf("user %s already exists with credentials", uniqueID)
+		}
+		if inserted {
+			grant.Promoted = true
+		}
 	}
 
 	// used_by records the redeemer for the token manager (174). It is resolved

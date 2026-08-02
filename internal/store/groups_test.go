@@ -27,9 +27,22 @@ func testDBStore(t *testing.T) *Store {
 	return s
 }
 
+// TestCompressPermissionAuditConcurrent tests concurrent audit compression.
+// Note: This test requires a dedicated isolated database/store so that
+// CompressPermissionAudit does not mutate unrelated audit history.
 func TestCompressPermissionAuditConcurrent(t *testing.T) {
 	s := testDBStore(t)
 	ctx := context.Background()
+
+	// Enforce isolation before inserting rows so CompressPermissionAudit
+	// cannot select or delete pre-existing matching rows outside this test.
+	if _, err := s.DB().ExecContext(ctx, `DELETE FROM audit_log WHERE created_at <= NOW()`); err != nil {
+		t.Fatalf("cleaning pre-existing audit_log: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `DELETE FROM audit_log_daily`); err != nil {
+		t.Fatalf("cleaning pre-existing audit_log_daily: %v", err)
+	}
+
 	target := fmt.Sprintf("concurrent-%d", time.Now().UnixNano())
 	const rows = 40
 	for i := 0; i < rows; i++ {

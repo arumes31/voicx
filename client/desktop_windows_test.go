@@ -39,3 +39,17 @@ func TestRunWindowsDesktopLifecycle(t *testing.T) {
 		t.Fatalf("lifecycle events = %v, want %v", events, want)
 	}
 }
+
+func TestRunWindowsDesktopTrayFailure(t *testing.T) {
+	wailsRan := false
+	runWindowsDesktop(windowsDesktopLifecycle{
+		runWails: func() { wailsRan = true },
+		runTray: func(ready chan<- struct{}) {
+			// Simulates tray failing / exiting before initializing
+		},
+		quitTray: func() {},
+	})
+	if !wailsRan {
+		t.Fatalf("wails did not run when tray setup failed to initialize")
+	}
+}

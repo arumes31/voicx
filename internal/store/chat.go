@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -452,7 +453,13 @@ func (s *Store) SetServerSettings(ctx context.Context, values map[string]string,
 	defer func() { _ = tx.Rollback() }()
 	const q = `INSERT INTO server_settings (key, value, key_id) VALUES ($1, $2, $3)
 	          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, key_id = EXCLUDED.key_id`
-	for key, value := range values {
+	keys := make([]string, 0, len(values))
+	for k := range values {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		value := values[key]
 		if _, err := tx.ExecContext(ctx, q, key, value, keyID); err != nil {
 			return fmt.Errorf("setting server setting %s: %w", key, err)
 		}

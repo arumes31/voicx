@@ -39,12 +39,19 @@ func NewPIICipher(key []byte) (*PIICipher, error) {
 // LoadOrCreatePIICipher keeps the master key outside PostgreSQL. Creation is
 // atomic and refuses permissive replacement of an existing key.
 func LoadOrCreatePIICipher(path string) (*PIICipher, error) {
-	key, err := os.ReadFile(path)
+	rf, err := os.Open(path)
 	if err == nil {
-		if info, statErr := os.Stat(path); statErr != nil {
+		defer rf.Close()
+		info, statErr := rf.Stat()
+		if statErr != nil {
 			return nil, fmt.Errorf("checking PII key permissions: %w", statErr)
-		} else if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		}
+		if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
 			return nil, fmt.Errorf("PII key permissions %o are too broad; want 0600", info.Mode().Perm())
+		}
+		key, readErr := io.ReadAll(rf)
+		if readErr != nil {
+			return nil, fmt.Errorf("reading PII key: %w", readErr)
 		}
 		return NewPIICipher(key)
 	}
@@ -54,26 +61,26 @@ func LoadOrCreatePIICipher(path string) (*PIICipher, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("creating PII key directory: %w", err)
 	}
-	key = make([]byte, 32)
-	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+	newKey := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, newKey); err != nil {
 		return nil, fmt.Errorf("generating PII key: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	wf, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return LoadOrCreatePIICipher(path)
 		}
 		return nil, fmt.Errorf("creating PII key: %w", err)
 	}
-	if _, err := f.Write(key); err != nil {
-		_ = f.Close()
+	if _, err := wf.Write(newKey); err != nil {
+		_ = wf.Close()
 		return nil, fmt.Errorf("writing PII key: %w", err)
 	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
+	if err := wf.Sync(); err != nil {
+		_ = wf.Close()
 		return nil, fmt.Errorf("syncing PII key: %w", err)
 	}
-	if err := f.Close(); err != nil {
+	if err := wf.Close(); err != nil {
 		return nil, fmt.Errorf("closing PII key: %w", err)
 	}
 	if runtime.GOOS != "windows" {
@@ -89,7 +96,7 @@ func LoadOrCreatePIICipher(path string) (*PIICipher, error) {
 			return nil, fmt.Errorf("closing PII key directory: %w", err)
 		}
 	}
-	return NewPIICipher(key)
+	return NewPIICipher(newKey)
 }
 
 func (c *PIICipher) seal(plain string, aad []byte) ([]byte, error) {

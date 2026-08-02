@@ -148,6 +148,15 @@ func (s *Store) Migrate() error {
 	return nil
 }
 
+// noTransactionMigration reports whether a migration file starts with the
+// `-- voicx:no-transaction` marker.
+//
+// Every statement in marked non-transactional migration files MUST be idempotent,
+// recommending `IF NOT EXISTS` forms where applicable (e.g. `CREATE INDEX CONCURRENTLY IF NOT EXISTS`).
+//
+// Note: Failed `CREATE INDEX CONCURRENTLY` executions may leave an `INVALID` index
+// in the database that `IF NOT EXISTS` will not repair. If a failed concurrent index creation
+// occurs, manually drop the invalid index using `DROP INDEX <index_name>` before re-running.
 func noTransactionMigration(content []byte) bool {
 	for _, line := range strings.Split(string(content), "\n") {
 		line = strings.TrimSpace(line)
