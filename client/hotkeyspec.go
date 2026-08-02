@@ -9,13 +9,7 @@ import (
 	"golang.design/x/hotkey"
 )
 
-// specModifiers maps modifier names to hotkey modifiers.
-var specModifiers = map[string]hotkey.Modifier{
-	"ctrl":  hotkey.ModCtrl,
-	"alt":   hotkey.ModAlt,
-	"shift": hotkey.ModShift,
-	"win":   hotkey.ModWin,
-}
+
 
 // specKeys maps key names to hotkey keys (only keys the hotkey package
 // defines on Windows are listed).
