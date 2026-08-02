@@ -229,6 +229,11 @@ func run() error {
 	if err := dbStore.Migrate(); err != nil {
 		return fmt.Errorf("running migrations: %w", err)
 	}
+	piiCipher, err := store.LoadOrCreatePIICipher(cfg.PIIKeyFile)
+	if err != nil {
+		return fmt.Errorf("loading PII encryption key: %w", err)
+	}
+	dbStore.SetPIICipher(piiCipher)
 	logger.Info("database migrations applied")
 
 	// (91) chat key material. --reset-chat-keys runs first so an operator who
@@ -262,6 +267,15 @@ func run() error {
 	if cfg.DefaultGroupsEnabled {
 		if defaultGuestGroupID, err = ensureServerGroup(context.Background(), dbStore, "Guest", 0); err != nil {
 			return fmt.Errorf("ensuring default Guest group: %w", err)
+		}
+		for _, key := range []permissions.PermissionKey{
+			permissions.PermissionKeyFTFileUploadPower,
+			permissions.PermissionKeyClientAvatarUpload,
+		} {
+			if err := dbStore.SetPermission(context.Background(), store.PermTierServerGroup,
+				store.PermTarget{GroupID: defaultGuestGroupID}, string(key), 0, 0, false, true); err != nil {
+				return fmt.Errorf("hardening default Guest group %s: %w", key, err)
+			}
 		}
 		if defaultMemberGroupID, err = ensureServerGroup(context.Background(), dbStore, "Member", 100); err != nil {
 			return fmt.Errorf("ensuring default Member group: %w", err)
@@ -371,6 +385,27 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go func() {
+		run := func() {
+			count, err := dbStore.CompressPermissionAudit(ctx, time.Now().AddDate(0, 0, -30))
+			if err != nil && ctx.Err() == nil {
+				logger.Warn("permission audit compression failed", zap.Error(err))
+			} else if count > 0 {
+				logger.Info("permission audit compressed", zap.Int64("rows", count))
+			}
+		}
+		run()
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				run()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	// Initialize the Pion WebRTC engine and the voice facade (engine + SFU
 	// router) that the TCP control server drives via signaling messages.
@@ -439,6 +474,7 @@ func run() error {
 	// Start the health/readiness HTTP endpoint. /healthz reports liveness;
 	// /readyz pings Postgres. /metrics serves Prometheus metrics.
 	m := metrics.New()
+	m.RegisterDBPool(dbStore.DB())
 	voiceRouter.SetForwardObserver(m.IncRTPForwarded)
 	healthServer := health.New(cfg.HealthAddr, logger, func(context.Context) error {
 		// Retry once on transient pool errors (e.g. "driver: bad connection"
@@ -451,6 +487,7 @@ func run() error {
 		return err
 	})
 	healthServer.Handle("/metrics", m.Handler())
+	healthServer.Handle("/api/v1/schema/version", health.SchemaVersionHandler(dbStore.SchemaVersion))
 	healthErr := make(chan error, 1)
 	go func() {
 		healthErr <- healthServer.Start()
@@ -533,6 +570,9 @@ func run() error {
 
 	// Start the TCP control listener, wired to the auth, state, channels,
 	// broadcast, permissions, and voice backends.
+	if err := server.LoadPersistedServerConfig(context.Background(), cfg, dbStore); err != nil {
+		return fmt.Errorf("loading persisted server configuration: %w", err)
+	}
 	tcpServer := server.New(cfg, logger, &server.Deps{
 		Auth:               authSvc,
 		State:              stateManager,
@@ -542,6 +582,7 @@ func run() error {
 		Resolver:           permResolver,
 		Bans:               dbStore,
 		Spool:              dbStore,
+		PreKeys:            dbStore,
 		Voice:              voice,
 		Recorder:           rec,
 		FileTransfer:       ftServer,

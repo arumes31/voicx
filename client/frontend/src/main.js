@@ -2214,7 +2214,9 @@ async function refreshPermissions() {
         let html = `<table class="perm-grid"><thead><tr><th>key</th><th>value</th><th>flags</th></tr></thead><tbody>`;
         for (const e of entries) {
             const flags = [e.skip ? "skip" : "", e.negate ? "negate" : ""].filter(Boolean).join(",");
-            html += `<tr><td class="mono">${e.key}</td><td><span class="pill-val">${e.value}</span></td><td>${flags}</td></tr>`;
+            const inherited = e.inherited ? " inherited" : "";
+            const source = e.source_tier ? `effective from ${e.source_tier}${e.inherited ? " (inherited)" : ""}` : "effective permission";
+            html += `<tr class="${inherited}" title="${source}"><td class="mono">${e.key}</td><td><span class="pill-val">${e.value}</span></td><td>${flags}${e.source_tier ? ` · ${e.source_tier}` : ""}</td></tr>`;
         }
         area.innerHTML = html + "</tbody></table>";
     } catch {

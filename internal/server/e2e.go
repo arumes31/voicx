@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"time"
 
 	"go.uber.org/zap"
@@ -43,9 +44,13 @@ func (s *TCPServer) handleKeyPublish(ctx context.Context, client *Client, f *net
 	}
 
 	// Key delivery: global scope + the client's current channel (if any).
-	_ = s.deliverScopeKey(ctx, client, globalChatScope)
+	if err := s.deliverScopeKey(ctx, client, globalChatScope); err != nil {
+		return fmt.Errorf("delivering global scope key: %w", err)
+	}
 	if sc, ok := s.deps.State.GetClient(client.ID); ok && sc.ChannelID != 0 {
-		_ = s.deliverScopeKey(ctx, client, sc.ChannelID)
+		if err := s.deliverScopeKey(ctx, client, sc.ChannelID); err != nil {
+			return fmt.Errorf("delivering channel scope key: %w", err)
+		}
 	}
 	return nil
 }
@@ -201,14 +206,26 @@ func (s *TCPServer) doRotateScopeKey(ctx context.Context, channelID int64) {
 	}
 	for _, member := range s.deps.State.ChannelMembers(channelID) {
 		if client, ok := s.clientByID(member.ClientID); ok {
-			_ = s.deliverScopeKey(ctx, client, channelID)
+			if err := s.deliverScopeKey(ctx, client, channelID); err != nil {
+				s.logger.Warn("delivering rotated key to member failed",
+					zap.String("client_id", member.ClientID),
+					zap.Int64("channel_id", channelID),
+					zap.Error(err),
+				)
+			}
 		}
 	}
 	// (312) subscribers read this scope under the same generation, so leaving
 	// them out of the redistribution would strand every one of them on the
 	// retired key and turn their tab into a wall of ⚠ placeholders.
 	for _, client := range s.channelSubscribers(ctx, channelID) {
-		_ = s.deliverScopeKey(ctx, client, channelID)
+		if err := s.deliverScopeKey(ctx, client, channelID); err != nil {
+			s.logger.Warn("delivering rotated key to subscriber failed",
+				zap.String("client_id", client.ID),
+				zap.Int64("channel_id", channelID),
+				zap.Error(err),
+			)
+		}
 	}
 	s.logger.Debug("chat key rotated", zap.Int64("channel_id", channelID))
 }

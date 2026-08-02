@@ -333,7 +333,7 @@ func TestEditSealsUnderCurrentGeneration(t *testing.T) {
 	cm.scopeKeys.put(7, 9, cur)
 	cm.scopeKeys.putGen(7, 4, old) // archival generation from a history page
 
-	if err := app.ChatEditMessage(7, 11, "corrected text"); err != "" {
+	if err := app.ChatEditMessage(7, 11, "corrected text", 1); err != "" {
 		t.Fatalf("ChatEditMessage: %s", err)
 	}
 	select {
@@ -353,7 +353,7 @@ func TestEditSealsUnderCurrentGeneration(t *testing.T) {
 
 	// With no generation at all the edit is refused locally rather than sent
 	// in the clear.
-	if err := app.ChatEditMessage(42, 11, "x"); err == "" {
+	if err := app.ChatEditMessage(42, 11, "x", 1); err == "" {
 		t.Fatal("an edit for a scope with no key was accepted")
 	}
 }

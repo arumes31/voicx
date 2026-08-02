@@ -1,0 +1,9 @@
+## clientlist
+clid=c-1 client_unique_identifier=admin-uid client_nickname=admin\suser cid=1
+error id=0 msg=ok
+## channellist
+cid=1 pid=0 channel_name=Lobby channel_type=2 total_clients=1
+error id=0 msg=ok
+## serverinfo
+virtualserver_name=voicx\stest virtualserver_uptime=90 virtualserver_clientsonline=1 virtualserver_maxclients=1024 virtualserver_channels_online=1
+error id=0 msg=ok

@@ -6,6 +6,7 @@ package health
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -24,6 +25,26 @@ type Server struct {
 	logger *zap.Logger
 	mux    *http.ServeMux
 	srv    *http.Server
+}
+
+// SchemaVersionHandler reports the newest successfully applied migration.
+// The callback keeps the health package independent from a database driver.
+func SchemaVersionHandler(probe func(context.Context) (string, error)) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), readyTimeout)
+		defer cancel()
+		version, err := probe(ctx)
+		if err != nil {
+			http.Error(w, "schema version unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"version": version})
+	})
 }
 
 // New constructs a Server that will listen on addr. ready is the readiness

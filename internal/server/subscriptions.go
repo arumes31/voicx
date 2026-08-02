@@ -26,6 +26,8 @@ import (
 	"strings"
 	"time"
 
+	"go.uber.org/zap"
+
 	"voicx/internal/netproto"
 	"voicx/internal/permissions"
 )
@@ -126,6 +128,20 @@ func (s *TCPServer) handleChannelSubscribe(ctx context.Context, client *Client, 
 		if err := s.deliverScopeKey(ctx, client, id); err != nil {
 			s.deps.State.Unsubscribe(client.ID, []int64{id})
 			refused = append(refused, fmt.Sprintf("%d (key delivery failed)", id))
+			continue
+		}
+		if client.UserID != 0 && s.deps.Groups != nil {
+			groupID, applied, err := s.deps.Groups.ApplyChannelGroupAutoAssignment(ctx, client.UserID, id)
+			if err != nil {
+				s.logger.Warn("channel-group auto assignment failed", zap.Int64("channel_id", id), zap.Error(err))
+			} else if applied {
+				if s.deps.Perms != nil {
+					s.deps.Perms.Invalidate(client.UserID, id)
+				}
+				s.audit(ctx, "system", "channel_group_auto_assign", client.UniqueID,
+					fmt.Sprintf("channel=%d group=%d", id, groupID))
+				s.notifyPermsInvalid("channel_group_auto_assign", []string{client.UniqueID})
+			}
 		}
 	}
 	if len(refused) > 0 {

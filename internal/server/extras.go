@@ -79,6 +79,9 @@ func (s *TCPServer) handleAvatarSet(_ context.Context, client *Client, f *netpro
 	if err := netproto.Decode(f, &msg); err != nil {
 		return s.sendError(client, errCodeMalformed, "malformed avatar_set: "+err.Error())
 	}
+	if client.UserID == 0 {
+		return s.sendError(client, errCodePermissionDenied, "guests cannot upload avatars")
+	}
 
 	raw, ext, err := decodeImage(msg.DataBase64)
 	if err != nil {
@@ -754,18 +757,26 @@ func (s *TCPServer) handlePermissionsQuery(ctx context.Context, client *Client, 
 				continue
 			}
 			seen[key] = true
-			p, _, err := pc.resolver.Resolve(pc.tp, key)
+			p, sourceTier, err := pc.resolver.Resolve(pc.tp, key)
 			if err != nil {
 				continue
 			}
 			resp.Entries = append(resp.Entries, netproto.PermissionEntry{
-				Key:    string(p.Key),
-				Value:  p.Value,
-				Grant:  p.Grant,
-				Skip:   p.Skip,
-				Negate: p.Negate,
+				Key:        string(p.Key),
+				Value:      p.Value,
+				Grant:      p.Grant,
+				Skip:       p.Skip,
+				Negate:     p.Negate,
+				SourceTier: sourceTier.String(),
+				Inherited:  sourceTier == permissions.TierServerGroup || sourceTier == permissions.TierClientSpecific || sourceTier == permissions.TierChannelGroup,
 			})
 		}
+	}
+	for _, conflict := range permissions.DetectConflicts(pc.tp) {
+		resp.Conflicts = append(resp.Conflicts, netproto.PermissionConflict{
+			Key: string(conflict.Key), WinningTier: conflict.WinningTier.String(),
+			ShadowedTier: conflict.ShadowedTier.String(), Message: conflict.Message,
+		})
 	}
 	return s.writeMessage(client, netproto.MsgPermissionsResponse, resp)
 }
@@ -790,15 +801,19 @@ func (s *TCPServer) handleScreenShare(ctx context.Context, client *Client, f *ne
 	if !pc.videoPublishAllowed() {
 		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyClientVideoPublish))
 	}
+	if msg.Active && msg.MaxHeight > 720 && !pc.allowedByDefault(permissions.PermissionKeyClientScreenShare1080p) {
+		return s.sendError(client, errCodePermissionDenied, "1080p screen sharing is not permitted; use a 720p preset")
+	}
 
 	sc, ok := s.deps.State.GetClient(client.ID)
 	if !ok || sc.ChannelID == 0 {
 		return s.sendError(client, errCodeNotFound, "not in a channel")
 	}
 	payload, err := eventEnvelope(eventScreenshareChanged, struct {
-		ClientID string `json:"client_id"`
-		Active   bool   `json:"active"`
-	}{ClientID: client.ID, Active: msg.Active})
+		ClientID  string `json:"client_id"`
+		Active    bool   `json:"active"`
+		MaxHeight int    `json:"max_height,omitempty"`
+	}{ClientID: client.ID, Active: msg.Active, MaxHeight: msg.MaxHeight})
 	if err != nil {
 		return err
 	}

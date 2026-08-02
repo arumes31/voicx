@@ -178,6 +178,32 @@ export namespace main {
 	        this.last_at = source["last_at"];
 	    }
 	}
+	export class E2EEDiagnostics {
+	    cipher: string;
+	    peer_unique_id?: string;
+	    safety_number?: string;
+	    peer_key_available: boolean;
+	    cached_peers: number;
+	    scope_keys: number;
+	    refused_keys: number;
+	    pending_key_pulls: number;
+
+	    static createFrom(source: any = {}) {
+	        return new E2EEDiagnostics(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.cipher = source["cipher"];
+	        this.peer_unique_id = source["peer_unique_id"];
+	        this.safety_number = source["safety_number"];
+	        this.peer_key_available = source["peer_key_available"];
+	        this.cached_peers = source["cached_peers"];
+	        this.scope_keys = source["scope_keys"];
+	        this.refused_keys = source["refused_keys"];
+	        this.pending_key_pulls = source["pending_key_pulls"];
+	    }
+	}
 	export class HotkeyProfile {
 	    ptt?: string;
 	    mute_toggle?: string;
@@ -326,6 +352,7 @@ export namespace main {
 	    notify_connection: boolean;
 	    play_sounds: boolean;
 	    whisper_sound: boolean;
+	    chat_notification_level: string;
 	    whisper_clients: string[];
 	    whisper_channels: number[];
 	    whisper_active: boolean;
@@ -346,6 +373,7 @@ export namespace main {
 	    camera_fps: number;
 	    low_bandwidth: boolean;
 	    allow_plaintext: boolean;
+	    e2ee_verified?: Record<string, string>;
 	    chat_timestamps: string;
 	    chat_density: string;
 	    chat_font_size: number;
@@ -419,6 +447,7 @@ export namespace main {
 	        this.notify_connection = source["notify_connection"];
 	        this.play_sounds = source["play_sounds"];
 	        this.whisper_sound = source["whisper_sound"];
+	        this.chat_notification_level = source["chat_notification_level"];
 	        this.whisper_clients = source["whisper_clients"];
 	        this.whisper_channels = source["whisper_channels"];
 	        this.whisper_active = source["whisper_active"];
@@ -439,6 +468,7 @@ export namespace main {
 	        this.camera_fps = source["camera_fps"];
 	        this.low_bandwidth = source["low_bandwidth"];
 	        this.allow_plaintext = source["allow_plaintext"];
+	        this.e2ee_verified = source["e2ee_verified"];
 	        this.chat_timestamps = source["chat_timestamps"];
 	        this.chat_density = source["chat_density"];
 	        this.chat_font_size = source["chat_font_size"];
@@ -723,6 +753,8 @@ export namespace netproto {
 	    id: number;
 	    from_unique_id: string;
 	    from_nickname: string;
+	    reply_to_id?: number;
+	    version: number;
 	    body_enc?: string;
 	    key_id?: number;
 	    body?: string;
@@ -741,6 +773,8 @@ export namespace netproto {
 	        this.id = source["id"];
 	        this.from_unique_id = source["from_unique_id"];
 	        this.from_nickname = source["from_nickname"];
+	        this.reply_to_id = source["reply_to_id"];
+	        this.version = source["version"];
 	        this.body_enc = source["body_enc"];
 	        this.key_id = source["key_id"];
 	        this.body = source["body"];
@@ -1276,6 +1310,8 @@ export namespace netproto {
 	    grant: number;
 	    skip?: boolean;
 	    negate?: boolean;
+	    source_tier?: string;
+	    inherited?: boolean;
 
 	    static createFrom(source: any = {}) {
 	        return new PermissionEntry(source);
@@ -1288,6 +1324,8 @@ export namespace netproto {
 	        this.grant = source["grant"];
 	        this.skip = source["skip"];
 	        this.negate = source["negate"];
+	        this.source_tier = source["source_tier"];
+	        this.inherited = source["inherited"];
 	    }
 	}
 	export class PermListResponse {
@@ -1395,6 +1433,28 @@ export namespace netproto {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.data_base64 = source["data_base64"];
 	        this.content_type = source["content_type"];
+	    }
+	}
+	export class ServerConfig {
+	    max_clients: number;
+	    client_timeout_seconds: number;
+	    opus_bitrate: number;
+	    opus_fec: boolean;
+	    opus_dtx: boolean;
+	    opus_stereo: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new ServerConfig(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.max_clients = source["max_clients"];
+	        this.client_timeout_seconds = source["client_timeout_seconds"];
+	        this.opus_bitrate = source["opus_bitrate"];
+	        this.opus_fec = source["opus_fec"];
+	        this.opus_dtx = source["opus_dtx"];
+	        this.opus_stereo = source["opus_stereo"];
 	    }
 	}
 	export class ServerIconData {

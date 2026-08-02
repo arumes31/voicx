@@ -50,8 +50,8 @@ export function ChatDeleteMessage(arg1) {
   return window['go']['main']['App']['ChatDeleteMessage'](arg1);
 }
 
-export function ChatEditMessage(arg1, arg2, arg3) {
-  return window['go']['main']['App']['ChatEditMessage'](arg1, arg2, arg3);
+export function ChatEditMessage(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['ChatEditMessage'](arg1, arg2, arg3, arg4);
 }
 
 export function ChatExportHistory(arg1, arg2) {
@@ -210,6 +210,10 @@ export function DownloadPath(arg1) {
   return window['go']['main']['App']['DownloadPath'](arg1);
 }
 
+export function E2EEDiagnostics(arg1) {
+  return window['go']['main']['App']['E2EEDiagnostics'](arg1);
+}
+
 export function EmojiDelete(arg1) {
   return window['go']['main']['App']['EmojiDelete'](arg1);
 }
@@ -284,6 +288,10 @@ export function GetICEServers() {
 
 export function GetPermissions() {
   return window['go']['main']['App']['GetPermissions']();
+}
+
+export function GetServerConfig() {
+  return window['go']['main']['App']['GetServerConfig']();
 }
 
 export function GetSettings() {
@@ -466,6 +474,10 @@ export function SendChatRead(arg1, arg2) {
   return window['go']['main']['App']['SendChatRead'](arg1, arg2);
 }
 
+export function SendChatReply(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['SendChatReply'](arg1, arg2, arg3, arg4);
+}
+
 export function SendICECandidate(arg1, arg2, arg3) {
   return window['go']['main']['App']['SendICECandidate'](arg1, arg2, arg3);
 }
@@ -538,6 +550,14 @@ export function SetScreenShare(arg1) {
   return window['go']['main']['App']['SetScreenShare'](arg1);
 }
 
+export function SetScreenShareQuality(arg1, arg2) {
+  return window['go']['main']['App']['SetScreenShareQuality'](arg1, arg2);
+}
+
+export function SetServerConfig(arg1) {
+  return window['go']['main']['App']['SetServerConfig'](arg1);
+}
+
 export function SetStatus(arg1, arg2) {
   return window['go']['main']['App']['SetStatus'](arg1, arg2);
 }
@@ -560,6 +580,10 @@ export function Subscriptions() {
 
 export function SwitchIdentity(arg1) {
   return window['go']['main']['App']['SwitchIdentity'](arg1);
+}
+
+export function SystemCPUPercent() {
+  return window['go']['main']['App']['SystemCPUPercent']();
 }
 
 export function TokenAdd(arg1, arg2, arg3) {

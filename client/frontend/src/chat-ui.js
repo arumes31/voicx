@@ -8,9 +8,8 @@
 // join/leave collapsing (131), announcement banner (132), MOTD (133), scroll
 // lock (134) and the Ctrl+K quick switcher (135).
 //
-// Threads (108) build on the reply-to prefix rather than a second mechanism:
-// a reply is still "↪ <nick>: " text on the wire, and the chain is resolved
-// here. No protocol reply field was added.
+// Threads prefer the protocol reply_to_id field. The legacy quote-prefix
+// resolver remains for history written by older clients.
 import { renderMarkdown, escapeHTML, EMOJI } from "./markdown.js";
 import { playEvent } from "./sounds.js";
 import { pickIcon } from "./image-tools.js";
@@ -63,6 +62,10 @@ let typingTimer = null; // single expiry sweep for every scope
 let typingSentAt = 0; // last outgoing ping (throttle)
 let typingScope = ""; // scope of that ping, so a scope switch re-pings at once
 let typingIdle = null; // idle timer that ends the local composing session
+let typingDebounce = null;
+const sentHistory = [];
+let sentHistoryPos = 0;
+let sentHistoryDraft = "";
 
 // Custom server emoji (95): list + data-URL cache.
 let customEmoji = [];
@@ -151,6 +154,8 @@ function normalize(d, chID) {
         enc: !!d.enc || !!d.enc_verified,
         offline: !!d.offline,
         clientMsgID: d.client_msg_id || "",
+        replyToID: Number(d.reply_to_id) || 0,
+        version: Number(d.version) || 1,
         channelID,
         self: false,
         mentioned: false,
@@ -456,6 +461,7 @@ function renderBody(container, m) {
         quoteNick = qm[1];
         text = text.slice(qm[0].length);
     }
+    if (!quoteNick && m.replyToID) quoteNick = findMsg(m.replyToID)?.from || "message";
     const parts = text.split(/\[file:([^\]]+)\]/);
     let html = "";
     for (let i = 0; i < parts.length; i += 2) html += renderMarkdown(parts[i]);
@@ -761,7 +767,7 @@ function startEdit(m) {
         const t = input.value.trim();
         refreshMsgEl(m); // the chat_edited broadcast refreshes the text
         if (t && t !== m.text) {
-            const err = await app().ChatEditMessage(m.channelID ?? 0, m.id, t);
+            const err = await app().ChatEditMessage(m.channelID ?? 0, m.id, t, m.version || 1);
             if (err) V().toast("edit failed: " + err, "warn");
         }
     };
@@ -807,8 +813,8 @@ async function ensurePins(key) {
 }
 
 // --- reply-to (107) ------------------------------------------------------------
-// The server protocol has no reply field, so a reply is sent as plain text
-// prefixed "↪ <nick>: " — clients render that prefix as a clickable quote.
+// New replies carry a stable message id. Quote-prefix parsing below keeps old
+// stored messages and mixed-version servers readable.
 
 function setReply(m) {
     replyTo = m;
@@ -846,6 +852,7 @@ function quotedNick(m) {
 // from that nick at or before the reply. The prefix carries no id, so this is
 // best-effort by construction — the same rule the quote jump has always used.
 function resolveParent(msgs, m) {
+    if (m.replyToID) return msgs.find((candidate) => candidate.id === m.replyToID) || null;
     const nick = quotedNick(m);
     if (!nick) return null;
     let target = null;
@@ -1026,6 +1033,41 @@ function activatePM(uid) {
     $("chat-target").classList.remove("hidden");
     $("chat-target").value = uid;
     setView({ kind: "dm", uid });
+}
+
+async function openE2EEDiagnostics() {
+    const peer = view.kind === "dm" ? view.uid : "";
+    let d;
+    try { d = await app().E2EEDiagnostics(peer); }
+    catch (err) { V().toast("encryption diagnostics failed: " + err, "warn"); return; }
+    const overlay = document.createElement("div");
+    overlay.className = "dlg-overlay";
+    const verified = peer && d.safety_number && V().state.settings?.e2ee_verified?.[peer] === d.safety_number;
+    const changed = peer && V().state.settings?.e2ee_verified?.[peer] && !verified;
+    overlay.innerHTML = `<div class="dlg e2ee-diagnostics">
+        <h3>End-to-end encryption</h3>
+        <div class="e2ee-status ${changed ? "warn" : verified ? "ok" : ""}">${changed ? "⚠ Safety number changed" : verified ? "✓ Safety number verified" : peer ? "Safety number not verified" : "Channel-key diagnostics"}</div>
+        <dl>
+            <dt>Cipher</dt><dd>${escapeHTML(d.cipher || "unknown")}</dd>
+            <dt>Cached peer keys</dt><dd>${d.cached_peers || 0}</dd>
+            <dt>Channel generations</dt><dd>${d.scope_keys || 0}</dd>
+            <dt>Missing/refused keys</dt><dd>${d.refused_keys || 0}</dd>
+            <dt>Handshakes in flight</dt><dd>${d.pending_key_pulls || 0}</dd>
+        </dl>
+        ${peer ? `<label>Safety number</label><pre class="safety-number">${escapeHTML(d.safety_number || "peer key unavailable")}</pre>` : ""}
+        <div class="dlg-buttons">${peer && d.safety_number ? '<button class="dlg-ok verify-safety">Mark verified</button>' : ""}<button class="dlg-cancel">Close</button></div>
+    </div>`;
+    overlay.querySelector(".dlg-cancel").onclick = () => overlay.remove();
+    overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+    overlay.querySelector(".verify-safety")?.addEventListener("click", async () => {
+        const settings = V().state.settings;
+        settings.e2ee_verified = settings.e2ee_verified || {};
+        settings.e2ee_verified[peer] = d.safety_number;
+        await app().SaveSettings(settings);
+        overlay.remove();
+        V().toast("safety number verified");
+    });
+    document.body.appendChild(overlay);
 }
 
 function activateChannel(channelID) {
@@ -1502,10 +1544,10 @@ export function addChat(d) {
 
     const chID = m.channelID ?? 0;
     const key = "ch:" + chID;
-    if (m.mentions.includes(st.myUniqueID) && !m.self) {
+    const directMention = m.mentions.includes(st.myUniqueID) && !m.self;
+    const roleMention = !m.self && /@(admin|moderator|member|guest)\b/i.test(m.text || "");
+    if (directMention) {
         m.mentioned = true; // (106) accent highlight
-        window.__voicxNotify?.notify("mention", (m.from || "someone") + ": " + (m.text || "").slice(0, 80),
-            { channelID: m.channelID, className: "mentions", kind: "warn" });
     } else if (!m.self) {
         // (388) keyword highlights: whole-word match gets mention treatment.
         const kw = window.__voicxNotify?.matchKeyword(m.text || "");
@@ -1515,9 +1557,20 @@ export function addChat(d) {
                 { channelID: m.channelID, className: "mentions", kind: "warn" });
         }
     }
-    pushMsg(key, m);
+    if (!m.self) {
+        const level = st.settings?.chat_notification_level || "all";
+        const allowed = level === "all" || (level === "channel_mentions" && directMention) || (level === "role_mentions" && roleMention);
+        if (allowed) {
+            const event = directMention || roleMention ? "mention" : "channel_message";
+            window.__voicxNotify?.notify(event, (m.from || "someone") + ": " + (m.text || "").slice(0, 80),
+                { channelID: m.channelID, className: directMention || roleMention ? "mentions" : "messages", kind: directMention || roleMention ? "warn" : "info" });
+        }
+    }
+    const position = pushMsg(key, m);
+    if (position === "duplicate") return;
     if (key === activeKey()) {
-        appendLive(m);
+        if (position === "append") appendLive(m);
+        else renderView();
     } else if (!m.self && !window.__voicxNotify?.channelOverride?.(chID)?.muted) {
         // (104) unread badge for a non-selected channel. A muted channel (387)
         // suppresses the badge too — silencing only the sound would still nag
@@ -1533,9 +1586,14 @@ export function addChat(d) {
 
 function pushMsg(key, m) {
     const st = getStore(key);
-    st.msgs.push(m);
+    if (m.id && st.msgs.some((existing) => existing.id === m.id)) return "duplicate";
+    if (m.clientMsgID && st.msgs.some((existing) => existing.clientMsgID === m.clientMsgID && existing.self === m.self)) return "duplicate";
+    const index = m.id ? st.msgs.findIndex((existing) => existing.id && existing.id > m.id) : -1;
+    if (index >= 0) st.msgs.splice(index, 0, m);
+    else st.msgs.push(m);
     const max = V().state.settings?.chat_max_lines || 200;
     while (st.msgs.length > Math.max(max, PAGE)) st.msgs.shift();
+    return index >= 0 ? "insert" : "append";
 }
 
 function appendLive(m) {
@@ -1565,9 +1623,13 @@ function routeDM(d, m) {
     const tab = pmTabs.get(peer) || { uid: peer, nick: m.self ? peer : m.from, unread: 0, offline: false, pendingRead: "" };
     if (!pmTabs.has(peer)) pmTabs.set(peer, tab);
     if (!m.self) tab.nick = m.from;
+	if (!m.self) {
+		window.__voicxNotify?.notify("dm", (m.from || "someone") + ": " + (m.text || "").slice(0, 80),
+			{ uid: peer, className: "messages", kind: "info" });
+	}
 
     const key = "dm:" + peer;
-    pushMsg(key, m);
+    if (pushMsg(key, m) === "duplicate") return;
     dmRecord(peer, tab.nick, m); // (122) both directions, so a restart replays the thread
 
     if (m.offline && !m.self) {
@@ -1645,6 +1707,7 @@ export function onChatEdited(d) {
     if (!m) return;
     m.text = d.body ?? "";
     m.edited = true;
+    m.version = Number(d.version) || (m.version + 1);
     m.mentioned = !m.self && mentionsMe(m.text); // an edit can add or drop my name
     threadCache.clear(); // an edit can add or remove the reply prefix (108)
     refreshMsgEl(m);
@@ -1703,9 +1766,10 @@ export function onEmojiAdded() {
 // There is no stop message: the relay is fire-and-forget, so the sender pings
 // while composing and every receiver expires the entry on its own.
 
-const TYPING_PING_MS = 3000; // matches the ~3s throttle the relay documents
-const TYPING_TTL_MS = 6000; // must exceed the ping interval or it flickers
-const TYPING_IDLE_MS = 6000; // no keystroke this long ends the local session
+const TYPING_DEBOUNCE_MS = 300;
+const TYPING_PING_MS = 2000; // matches the server's per-scope throttle
+const TYPING_TTL_MS = 4500; // must exceed the ping interval or it flickers
+const TYPING_IDLE_MS = 3000;
 
 // typingScopeOf returns [channelID, toUniqueID] for the active view.
 function typingScopeOf() {
@@ -1724,6 +1788,10 @@ function resetTypingOut() {
         clearTimeout(typingIdle);
         typingIdle = null;
     }
+    if (typingDebounce) {
+        clearTimeout(typingDebounce);
+        typingDebounce = null;
+    }
 }
 
 // noteTyping pings the relay while the user composes. An empty input is not
@@ -1734,14 +1802,18 @@ function noteTyping() {
         resetTypingOut();
         return;
     }
-    const [chID, uid] = typingScopeOf();
-    const scope = chID + "|" + uid;
-    const now = Date.now();
-    if (scope !== typingScope || now - typingSentAt >= TYPING_PING_MS) {
-        typingScope = scope;
-        typingSentAt = now;
-        app().SendTyping(chID, uid);
-    }
+    const send = () => {
+        typingDebounce = null;
+        const [chID, uid] = typingScopeOf();
+        const scope = chID + "|" + uid;
+        const now = Date.now();
+        if (scope !== typingScope || now - typingSentAt >= TYPING_PING_MS) {
+            typingScope = scope;
+            typingSentAt = now;
+            app().SendTyping(chID, uid);
+        }
+    };
+    if (!typingDebounce) typingDebounce = setTimeout(send, TYPING_DEBOUNCE_MS);
     if (typingIdle) clearTimeout(typingIdle);
     typingIdle = setTimeout(resetTypingOut, TYPING_IDLE_MS);
 }
@@ -1809,7 +1881,7 @@ function renderTyping() {
 }
 
 // ---------------------------------------------------------------------------
-// Sending (reply prefix 107, file uploads 98/100)
+// Sending (reply ids 601, file uploads 98/100)
 // ---------------------------------------------------------------------------
 
 export async function sendMessage() {
@@ -1846,15 +1918,39 @@ export async function sendMessage() {
     }
 
     if (text) {
-        if (replyTo) {
-            text = `↪ ${replyTo.from}: ${text}`;
-            clearReply();
-        }
-        const err = await app().SendChat(scope, target, text);
+        const parentID = scope === "direct" ? 0 : (replyTo?.id || 0);
+        const err = parentID
+            ? await app().SendChatReply(scope, target, text, parentID)
+            : await app().SendChat(scope, target, text);
+        rememberSent(text);
+        if (replyTo) clearReply();
         if (err) V().sysMsg("chat failed: " + err);
     }
     input.value = "";
     resetTypingOut(); // (120) the message landed; stop claiming to be composing
+}
+
+function rememberSent(text) {
+    if (!text || sentHistory[sentHistory.length - 1] === text) return;
+    sentHistory.push(text);
+    if (sentHistory.length > 100) sentHistory.shift();
+    sentHistoryPos = sentHistory.length;
+    sentHistoryDraft = "";
+}
+
+function recallSent(e) {
+    const input = $("chat-text");
+    if (e.key === "ArrowUp" && (input.selectionStart === 0 || sentHistoryPos < sentHistory.length) && sentHistoryPos > 0) {
+        e.preventDefault();
+        if (sentHistoryPos === sentHistory.length) sentHistoryDraft = input.value;
+        input.value = sentHistory[--sentHistoryPos];
+        input.selectionStart = input.selectionEnd = input.value.length;
+    } else if (e.key === "ArrowDown" && input.selectionEnd === input.value.length && sentHistoryPos < sentHistory.length) {
+        e.preventDefault();
+        sentHistoryPos++;
+        input.value = sentHistoryPos === sentHistory.length ? sentHistoryDraft : sentHistory[sentHistoryPos];
+        input.selectionStart = input.selectionEnd = input.value.length;
+    }
 }
 
 function openPMKeepView(uid) {
@@ -3019,6 +3115,7 @@ export function initChat() {
     // Header buttons.
     $("chat-pins-btn").onclick = togglePinsPanel;
     $("chat-info-btn").onclick = openDescription;
+    $("chat-e2ee-btn").onclick = openE2EEDiagnostics;
     $("chat-export-btn").onclick = exportChat;
     $("chat-search-btn").onclick = openSearch;
     $("chat-search-close").onclick = closeSearch;
@@ -3046,6 +3143,15 @@ export function initChat() {
     // File paste + drop + picker (98/100).
     $("chat-text").addEventListener("paste", (e) => {
         const files = [...(e.clipboardData?.files || [])];
+        if (files.length === 0) {
+            for (const item of [...(e.clipboardData?.items || [])]) {
+                if (item.kind !== "file" || !item.type.startsWith("image/")) continue;
+                const raw = item.getAsFile();
+                if (!raw) continue;
+                const ext = item.type.split("/")[1]?.replace("jpeg", "jpg") || "png";
+                files.push(raw.name ? raw : new File([raw], `clipboard-${Date.now()}.${ext}`, { type: item.type }));
+            }
+        }
         if (files.length) {
             e.preventDefault();
             stageFiles(files);
@@ -3078,6 +3184,7 @@ export function initChat() {
 
     // @nick completion (106) + typing indicator (120).
     $("chat-text").addEventListener("keydown", (e) => {
+        if (e.key === "ArrowUp" || e.key === "ArrowDown") recallSent(e);
         if (e.key === "Tab") handleTabComplete(e);
         else tabCycle = null;
     });

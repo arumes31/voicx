@@ -1,0 +1,2 @@
+# Nightly at 02:15 UTC. Install inside a container/host that has pg_dump.
+15 2 * * * /app/scripts/postgres-backup.sh

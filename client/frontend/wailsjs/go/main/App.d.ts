@@ -27,7 +27,7 @@ export function ChannelIconSet(arg1:number,arg2:string,arg3:number):Promise<stri
 
 export function ChatDeleteMessage(arg1:number):Promise<string>;
 
-export function ChatEditMessage(arg1:number,arg2:number,arg3:string):Promise<string>;
+export function ChatEditMessage(arg1:number,arg2:number,arg3:string,arg4:number):Promise<string>;
 
 export function ChatExportHistory(arg1:number,arg2:number):Promise<main.ChatExportResult>;
 
@@ -107,6 +107,8 @@ export function DownloadFileProgress(arg1:string,arg2:number,arg3:string,arg4:st
 
 export function DownloadPath(arg1:string):Promise<string>;
 
+export function E2EEDiagnostics(arg1:string):Promise<main.E2EEDiagnostics>;
+
 export function EmojiDelete(arg1:string):Promise<string>;
 
 export function EmojiGet(arg1:string):Promise<netproto.EmojiData>;
@@ -144,6 +146,8 @@ export function GetClientInfo(arg1:string):Promise<netproto.ClientInfoResponse>;
 export function GetICEServers():Promise<Array<netproto.ICEServer>>;
 
 export function GetPermissions():Promise<Array<netproto.PermissionEntry>>;
+
+export function GetServerConfig():Promise<netproto.ServerConfig>;
 
 export function GetSettings():Promise<main.Settings>;
 
@@ -235,6 +239,8 @@ export function SendChatDelivered(arg1:string,arg2:string):Promise<string>;
 
 export function SendChatRead(arg1:string,arg2:string):Promise<string>;
 
+export function SendChatReply(arg1:string,arg2:string,arg3:string,arg4:number):Promise<string>;
+
 export function SendICECandidate(arg1:string,arg2:string,arg3:number):Promise<void>;
 
 export function SendTyping(arg1:number,arg2:string):Promise<string>;
@@ -271,6 +277,10 @@ export function SetPrioritySpeaker(arg1:boolean):Promise<string>;
 
 export function SetScreenShare(arg1:boolean):Promise<string>;
 
+export function SetScreenShareQuality(arg1:boolean,arg2:number):Promise<string>;
+
+export function SetServerConfig(arg1:netproto.ServerConfig):Promise<netproto.ServerConfig>;
+
 export function SetStatus(arg1:string,arg2:string):Promise<string>;
 
 export function SetVideoQuality(arg1:string):Promise<string>;
@@ -282,6 +292,8 @@ export function SubscribeChannels(arg1:Array<number>,arg2:boolean):Promise<strin
 export function Subscriptions():Promise<Array<number>>;
 
 export function SwitchIdentity(arg1:string):Promise<string>;
+
+export function SystemCPUPercent():Promise<number>;
 
 export function TokenAdd(arg1:number,arg2:number,arg3:string):Promise<netproto.Tokens>;
 

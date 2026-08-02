@@ -283,11 +283,18 @@ func (f *fakeChat) messageCount() int {
 	return len(f.order)
 }
 
-func (f *fakeChat) StoreChatMessage(_ context.Context, channelID int64, fromUniqueID, fromNickname, bodyEnc string, keyID uint32) (int64, error) {
+func (f *fakeChat) StoreChatMessage(_ context.Context, channelID int64, fromUniqueID, fromNickname, bodyEnc string, keyID uint32, replyToID int64, clientMsgID string) (int64, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.storeErr != nil {
-		return 0, f.storeErr
+		return 0, false, f.storeErr
+	}
+	if clientMsgID != "" {
+		for _, existing := range f.messages {
+			if existing.ChannelID == channelID && existing.FromUniqueID == fromUniqueID && existing.ClientMsgID == clientMsgID {
+				return existing.ID, false, nil
+			}
+		}
 	}
 	f.nextID++
 	m := &store.ChatMessage{
@@ -295,13 +302,16 @@ func (f *fakeChat) StoreChatMessage(_ context.Context, channelID int64, fromUniq
 		ChannelID:    channelID,
 		FromUniqueID: fromUniqueID,
 		FromNickname: fromNickname,
+		ReplyToID:    replyToID,
+		Version:      1,
+		ClientMsgID:  clientMsgID,
 		BodyEnc:      bodyEnc,
 		KeyID:        keyID,
 		SentAt:       time.Now(),
 	}
 	f.messages[f.nextID] = m
 	f.order = append(f.order, f.nextID)
-	return f.nextID, nil
+	return f.nextID, true, nil
 }
 
 func (f *fakeChat) ChatHistory(_ context.Context, channelID, beforeID int64, limit int) ([]store.ChatMessage, error) {
@@ -330,18 +340,22 @@ func (f *fakeChat) GetChatMessage(_ context.Context, id int64) (*store.ChatMessa
 	return f.messages[id], nil
 }
 
-func (f *fakeChat) EditChatMessage(_ context.Context, id int64, bodyEnc string, keyID uint32) error {
+func (f *fakeChat) EditChatMessage(_ context.Context, id int64, bodyEnc string, keyID uint32, expectedVersion uint64) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	m, ok := f.messages[id]
 	if !ok || m.DeletedAt != nil {
-		return fmt.Errorf("chat message not found or deleted")
+		return 0, fmt.Errorf("chat message not found or deleted")
+	}
+	if expectedVersion != 0 && m.Version != expectedVersion {
+		return 0, store.ErrChatEditConflict
 	}
 	m.BodyEnc = bodyEnc
 	m.KeyID = keyID
 	now := time.Now()
 	m.EditedAt = &now
-	return nil
+	m.Version++
+	return m.Version, nil
 }
 
 func (f *fakeChat) DeleteChatMessage(_ context.Context, id int64) error {

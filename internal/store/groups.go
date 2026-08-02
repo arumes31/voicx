@@ -169,6 +169,25 @@ func (s *Store) AssignChannelGroup(ctx context.Context, groupID, userID, channel
 	return nil
 }
 
+// ApplyChannelGroupAutoAssignment selects the highest-priority enabled rule
+// for a subscribed channel and atomically replaces the user's channel group.
+func (s *Store) ApplyChannelGroupAutoAssignment(ctx context.Context, userID, channelID int64) (int64, bool, error) {
+	const rule = `SELECT channel_group_id FROM channel_group_auto_rules
+	              WHERE channel_id = $1 AND enabled
+	              ORDER BY priority DESC, id LIMIT 1`
+	var groupID int64
+	if err := s.db.QueryRowContext(ctx, rule, channelID).Scan(&groupID); err != nil {
+		if err == sql.ErrNoRows {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("looking up channel-group auto rule: %w", err)
+	}
+	if err := s.AssignChannelGroup(ctx, groupID, userID, channelID); err != nil {
+		return 0, false, err
+	}
+	return groupID, true, nil
+}
+
 // UnassignChannelGroup removes a user from a channel group on a channel.
 func (s *Store) UnassignChannelGroup(ctx context.Context, userID, channelID int64) error {
 	const q = `DELETE FROM channel_group_members WHERE user_id = $1 AND channel_id = $2`
@@ -604,4 +623,36 @@ func (s *Store) AuditList(ctx context.Context, beforeID int64, limit int) ([]Aud
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// CompressPermissionAudit replaces permission mutation rows older than the
+// cutoff with daily action/target counts in one transaction. It returns the
+// number of detailed rows removed.
+func (s *Store) CompressPermissionAudit(ctx context.Context, cutoff time.Time) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("beginning audit compression: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	const aggregate = `INSERT INTO audit_log_daily (day, action, target, event_count)
+	                   SELECT created_at::date, action, target, COUNT(*)
+	                   FROM audit_log
+	                   WHERE created_at < $1 AND (action LIKE 'perm_%' OR action LIKE '%group%')
+	                   GROUP BY created_at::date, action, target
+	                   ON CONFLICT (day, action, target) DO UPDATE
+	                   SET event_count = audit_log_daily.event_count + EXCLUDED.event_count`
+	if _, err := tx.ExecContext(ctx, aggregate, cutoff); err != nil {
+		return 0, fmt.Errorf("aggregating audit log: %w", err)
+	}
+	const remove = `DELETE FROM audit_log
+	                WHERE created_at < $1 AND (action LIKE 'perm_%' OR action LIKE '%group%')`
+	res, err := tx.ExecContext(ctx, remove, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("removing compressed audit rows: %w", err)
+	}
+	count, _ := res.RowsAffected()
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("committing audit compression: %w", err)
+	}
+	return count, nil
 }

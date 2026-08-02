@@ -33,6 +33,8 @@ package filetransfer
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
@@ -422,7 +424,9 @@ func (s *Server) MoveFile(ctx context.Context, channelID int64, folder, name str
 		return err
 	}
 	if err := s.moveBlobFn(oldPath, newPath); err != nil {
-		rollbackErr := s.store.MoveFile(ctx, newChannelID, newFolder, newName, channelID, folder, name)
+		rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer rbCancel()
+		rollbackErr := s.store.MoveFile(rbCtx, newChannelID, newFolder, newName, channelID, folder, name)
 		if rollbackErr != nil {
 			return fmt.Errorf("moving file blob: %w (metadata rollback failed: %v)", err, rollbackErr)
 		}
@@ -542,7 +546,7 @@ func (s *Server) register(tr *transfer) (string, string, error) {
 	tr.Expires = time.Now().Add(tokenTTL)
 
 	s.mu.Lock()
-	s.transfers[token] = tr
+	s.transfers[tokenDigest(token)] = tr
 	s.mu.Unlock()
 	return id, token, nil
 }
@@ -551,19 +555,29 @@ func (s *Server) register(tr *transfer) (string, string, error) {
 // transfer or an error when the token is unknown or expired.
 func (s *Server) consume(token, transferID string) (*transfer, error) {
 	s.mu.Lock()
-	tr, ok := s.transfers[token]
+	digest := tokenDigest(token)
+	tr, ok := s.transfers[digest]
 	if ok {
-		delete(s.transfers, token)
+		delete(s.transfers, digest)
 	}
 	s.mu.Unlock()
 
-	if !ok || tr.ID != transferID {
+	if !ok || !constantTimeStringEqual(tr.ID, transferID) {
 		return nil, errors.New("invalid transfer token")
 	}
 	if time.Now().After(tr.Expires) {
 		return nil, errors.New("transfer token expired")
 	}
 	return tr, nil
+}
+
+func tokenDigest(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return string(sum[:])
+}
+
+func constantTimeStringEqual(a, b string) bool {
+	return len(a) == len(b) && subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
 // pendingCount returns the number of unconsumed tokens (for tests and

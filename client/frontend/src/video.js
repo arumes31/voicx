@@ -2,6 +2,8 @@
 // quality selector (63), share dialog (69-72), camera on/off + stop-share
 // confirm (85), and the low-bandwidth mode (88). Everything here works against
 // the shared namespace (window.__voicx) populated by main.js.
+import { GridCompositor } from "./grid-compositor.js";
+
 const V = () => window.__voicx;
 
 // (70/73) Track-identity contract with the router: a publisher's media arrives
@@ -42,7 +44,11 @@ let focusedID = null; // track id of the focused tile
 let qualityPref = "auto"; // auto | high | mid | low
 let lastSentQuality = "";
 let idleOverride = false; // (342) window idle: force low without losing the pref
+let cpuPressure = false;
+let autoNetworkQuality = "high";
 let statsTimer = null;
+let compositeTimer = null;
+let compositeVideo = null;
 
 // ---------------------------------------------------------------------------
 // Grid (61)
@@ -71,6 +77,7 @@ export function videoTrackAdded(trackID, stream, publisher) {
                 <span class="vtile-kind hidden"></span>
                 <span class="vtile-badge hidden"></span>
             </div>
+            <button class="vtile-pip icon-btn" title="floating always-on-top video">▣</button>
             <button class="vtile-fullscreen icon-btn" title="fullscreen (Esc exits)">⛶</button>`;
         const video = el.querySelector("video");
         const nameEl = el.querySelector(".vtile-name");
@@ -92,6 +99,20 @@ export function videoTrackAdded(trackID, stream, publisher) {
             e.stopPropagation();
             if (document.fullscreenElement) document.exitFullscreen();
             else el.requestFullscreen?.().catch(() => {});
+        };
+        const pip = el.querySelector(".vtile-pip");
+        pip.disabled = !document.pictureInPictureEnabled;
+        pip.onclick = async (e) => {
+            e.stopPropagation();
+            try {
+                if (document.pictureInPictureElement === video) await document.exitPictureInPicture();
+                else {
+                    if (document.pictureInPictureElement) await document.exitPictureInPicture();
+                    await video.requestPictureInPicture();
+                }
+            } catch (err) {
+                V().sysMsg("floating video unavailable: " + (err.message || err));
+            }
         };
         el.onclick = () => toggleFocus(key);
         el.oncontextmenu = (e) => {
@@ -257,9 +278,11 @@ export function initVideo() {
 // effectiveQuality maps the preference to a concrete layer. Auto heuristic:
 // focused view -> high, grid view -> mid, low-bandwidth mode -> low.
 function effectiveQuality() {
-    if (lowBandwidth || idleOverride) return "low";
+    if (lowBandwidth || idleOverride || cpuPressure) return "low";
     if (qualityPref !== "auto") return qualityPref;
-    return focusedID ? "high" : "mid";
+    const viewQuality = focusedID ? "high" : "mid";
+    const rank = { low: 0, mid: 1, high: 2 };
+    return rank[autoNetworkQuality] < rank[viewQuality] ? autoNetworkQuality : viewQuality;
 }
 
 // setIdleQualityOverride is the idle-pause hook (342). It goes through the
@@ -304,7 +327,8 @@ function openTileMenu(x, y, t) {
         <a data-q="mid">${cur === "mid" ? "✓ " : ""}Mid</a>
         <a data-q="low">${cur === "low" ? "✓ " : ""}Low</a>
         <div class="ctx-divider"></div>
-        <a class="ctx-note">applies to all incoming video</a>` + (sa ? `
+        <a class="ctx-note">applies to all incoming video</a>
+        <a data-grid-pip="1">Float whole grid</a>` + (sa ? `
         <div class="ctx-divider"></div>
         <a data-sa="mute">${sa.muted ? "Unmute" : "Mute"} shared system audio</a>
         <div class="ctx-volume">
@@ -323,6 +347,7 @@ function openTileMenu(x, y, t) {
             qMenuEl = null;
         };
     }
+    qMenuEl.querySelector("[data-grid-pip]").onclick = () => openGridOverlay();
     if (sa) {
         qMenuEl.querySelector('a[data-sa="mute"]').onclick = () => {
             V().shareAudioCtl.setMuted(t.clientID, !sa.muted);
@@ -341,6 +366,57 @@ function openTileMenu(x, y, t) {
         document.addEventListener("click", close, { once: true });
         document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); }, { once: true });
     });
+}
+
+async function openGridOverlay() {
+    if (!document.pictureInPictureEnabled || tiles.size === 0) {
+        V().sysMsg("floating grid is unavailable");
+        return;
+    }
+    stopGridOverlay();
+    try {
+        const compositor = new GridCompositor();
+        const canvas = document.createElement("canvas");
+        canvas.width = 1280;
+        canvas.height = 720;
+        canvas.className = "grid-composite-canvas";
+        document.body.appendChild(canvas);
+        const output = document.createElement("video");
+        output.muted = true;
+        output.playsInline = true;
+        output.srcObject = canvas.captureStream(15);
+        output.className = "grid-composite-video";
+        document.body.appendChild(output);
+        await output.play();
+        const target = canvas.getContext("bitmaprenderer");
+        let drawing = false;
+        const draw = async () => {
+            if (drawing) return;
+            drawing = true;
+            try {
+                target.transferFromImageBitmap(await compositor.compose([...tiles.values()].map((tile) => tile.video)));
+            } finally { drawing = false; }
+        };
+        await draw();
+        compositeTimer = setInterval(draw, 1000 / 15);
+        compositeVideo = output;
+        output.onleavepictureinpicture = stopGridOverlay;
+        await output.requestPictureInPicture();
+    } catch (err) {
+        stopGridOverlay();
+        V().sysMsg("floating grid failed: " + (err.message || err));
+    }
+}
+
+function stopGridOverlay() {
+    if (compositeTimer) clearInterval(compositeTimer);
+    compositeTimer = null;
+    if (compositeVideo) {
+        compositeVideo.srcObject?.getTracks().forEach((track) => track.stop());
+        compositeVideo.remove();
+    }
+    compositeVideo = null;
+    document.querySelector(".grid-composite-canvas")?.remove();
 }
 
 // startStatsPoll refreshes the per-tile layer badge from getStats (63,
@@ -368,11 +444,31 @@ async function refreshBadges() {
     try {
         const stats = await state.pc.getStats();
         const byTrack = new Map(); // trackIdentifier -> {w, frames}
+        let availableIncomingBitrate = 0;
         stats.forEach((r) => {
             if (r.type === "inbound-rtp" && (r.kind === "video" || r.mediaType === "video")) {
                 byTrack.set(r.trackIdentifier, { w: r.frameWidth || 0, frames: r.framesDecoded || 0 });
             }
+            if (r.type === "candidate-pair" && (r.nominated || r.selected) && r.state === "succeeded") {
+                availableIncomingBitrate = Math.max(availableIncomingBitrate, r.availableIncomingBitrate || 0);
+            }
         });
+        if (availableIncomingBitrate > 0 && qualityPref === "auto") {
+            const next = availableIncomingBitrate < 700000 ? "low" : availableIncomingBitrate < 2500000 ? "mid" : "high";
+            if (next !== autoNetworkQuality) {
+                autoNetworkQuality = next;
+                pushQuality();
+            }
+        }
+        const cpu = await window.go.main.App.SystemCPUPercent();
+        const nextPressure = cpu >= 85;
+        if (nextPressure !== cpuPressure) {
+            cpuPressure = nextPressure;
+            V().sysMsg(nextPressure ? `CPU ${cpu.toFixed(0)}% — reducing video resolution` : "CPU recovered — restoring video resolution");
+            lastSentQuality = "";
+            pushQuality();
+            applySendCaps();
+        }
         for (const t of tiles.values()) {
             const s = (t.track && byTrack.get(t.track.id)) || null;
             // (61) a camera switched off mid-call keeps its receiver track
@@ -469,11 +565,13 @@ function applySendCaps() {
     const p = sender.getParameters();
     if (!p.encodings?.length) return;
     p.encodings.forEach((e, i) => {
-        if (lowBandwidth) {
+        if (lowBandwidth || cpuPressure) {
             e.active = i === 0;
-            e.maxBitrate = LOW_BW_BITRATE;
+            e.maxBitrate = lowBandwidth ? LOW_BW_BITRATE : 500000;
+            e.scaleResolutionDownBy = Math.max(Number(e.scaleResolutionDownBy) || 1, 2);
         } else {
             e.active = true;
+            e.scaleResolutionDownBy = 1;
             // a share sets a preset ceiling on the same sender; restore it
             // (undefined = codec default) so stopping the share uncaps again.
             e.maxBitrate = sharePresetBitrate || undefined;
@@ -711,7 +809,12 @@ async function startShare({ surface, preset, withAudio }) {
     }
 
     state.screenSharing = true;
-    await window.go.main.App.SetScreenShare(true);
+    const shareErr = await window.go.main.App.SetScreenShareQuality(true, p.height);
+    if (shareErr) {
+        V().sysMsg("screen share permission failed: " + shareErr);
+        await doStopShare();
+        return;
+    }
     document.getElementById("voice-screen").classList.add("active");
 }
 

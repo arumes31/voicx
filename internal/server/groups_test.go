@@ -194,6 +194,10 @@ func (f *fakeGroups) AssignChannelGroup(_ context.Context, groupID, userID, chan
 	return nil
 }
 
+func (f *fakeGroups) ApplyChannelGroupAutoAssignment(_ context.Context, _, _ int64) (int64, bool, error) {
+	return 0, false, nil
+}
+
 func (f *fakeGroups) UnassignChannelGroup(_ context.Context, userID, channelID int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

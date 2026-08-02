@@ -9,9 +9,16 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
+
+	"github.com/lib/pq"
 )
+
+// ErrChatEditConflict means the message changed after the caller rendered it.
+var ErrChatEditConflict = errors.New("chat message version conflict")
 
 // ChatMessage is one stored channel/global chat message. BodyEnc is
 // base64(nonce[24] || secretbox(plain, scopeKey[KeyID])); it is empty (with
@@ -22,6 +29,9 @@ type ChatMessage struct {
 	ChannelID    int64 // 0 = global
 	FromUniqueID string
 	FromNickname string
+	ReplyToID    int64
+	Version      uint64
+	ClientMsgID  string
 	BodyEnc      string
 	KeyID        uint32
 	SentAt       time.Time
@@ -39,21 +49,32 @@ type LegacyChatRow struct {
 // StoreChatMessage inserts a channel/global message and returns its ID.
 // channelID 0 is the global scope. bodyEnc is the sender's ciphertext stored
 // verbatim; keyID names the generation it was sealed under.
-func (s *Store) StoreChatMessage(ctx context.Context, channelID int64, fromUniqueID, fromNickname, bodyEnc string, keyID uint32) (int64, error) {
+func (s *Store) StoreChatMessage(ctx context.Context, channelID int64, fromUniqueID, fromNickname, bodyEnc string, keyID uint32, replyToID int64, clientMsgID string) (int64, bool, error) {
 	scope := int16(1)
 	if channelID == 0 {
 		scope = 0
 	}
-	const q = `INSERT INTO chat_messages (scope, channel_id, from_unique_id, from_nickname, body_enc, key_id)
-	          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, sent_at`
-	var (
-		id     int64
-		sentAt time.Time
-	)
-	if err := s.db.QueryRowContext(ctx, q, scope, channelID, fromUniqueID, fromNickname, bodyEnc, keyID).Scan(&id, &sentAt); err != nil {
-		return 0, fmt.Errorf("storing chat message: %w", err)
+	const q = `INSERT INTO chat_messages
+	          (scope, channel_id, from_unique_id, from_nickname, body_enc, key_id, reply_to_id, client_msg_id)
+	          VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, 0), NULLIF($8, ''))
+	          ON CONFLICT (channel_id, from_unique_id, client_msg_id)
+	          WHERE client_msg_id IS NOT NULL AND client_msg_id <> ''
+	          DO NOTHING RETURNING id`
+	var id int64
+	err := s.db.QueryRowContext(ctx, q, scope, channelID, fromUniqueID, fromNickname, bodyEnc, keyID, replyToID, clientMsgID).Scan(&id)
+	if err == nil {
+		return id, true, nil
 	}
-	return id, nil
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, false, fmt.Errorf("storing chat message: %w", err)
+	}
+	// A retry with the same UUID is an acknowledgement, not a second relay.
+	const existing = `SELECT id FROM chat_messages
+	                  WHERE channel_id = $1 AND from_unique_id = $2 AND client_msg_id = $3`
+	if err := s.db.QueryRowContext(ctx, existing, channelID, fromUniqueID, clientMsgID).Scan(&id); err != nil {
+		return 0, false, fmt.Errorf("loading idempotent chat message: %w", err)
+	}
+	return id, false, nil
 }
 
 // ChatHistory returns up to limit messages of a scope, newest first, with id
@@ -63,7 +84,8 @@ func (s *Store) ChatHistory(ctx context.Context, channelID, beforeID int64, limi
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	q := `SELECT id, from_unique_id, from_nickname, body_enc, key_id, sent_at, edited_at, deleted_at
+	q := `SELECT id, from_unique_id, from_nickname, reply_to_id, version,
+	             COALESCE(client_msg_id, ''), body_enc, key_id, sent_at, edited_at, deleted_at
 	      FROM chat_messages
 	      WHERE channel_id = $1`
 	args := []any{channelID}
@@ -83,9 +105,12 @@ func (s *Store) ChatHistory(ctx context.Context, channelID, beforeID int64, limi
 		var m ChatMessage
 		var keyID int64
 		m.ChannelID = channelID
-		if err := rows.Scan(&m.ID, &m.FromUniqueID, &m.FromNickname, &m.BodyEnc, &keyID, &m.SentAt, &m.EditedAt, &m.DeletedAt); err != nil {
+		var replyToID sql.NullInt64
+		if err := rows.Scan(&m.ID, &m.FromUniqueID, &m.FromNickname, &replyToID, &m.Version,
+			&m.ClientMsgID, &m.BodyEnc, &keyID, &m.SentAt, &m.EditedAt, &m.DeletedAt); err != nil {
 			return nil, fmt.Errorf("scanning chat message: %w", err)
 		}
+		m.ReplyToID = replyToID.Int64
 		m.KeyID = uint32(keyID)
 		out = append(out, m)
 	}
@@ -95,13 +120,16 @@ func (s *Store) ChatHistory(ctx context.Context, channelID, beforeID int64, limi
 // GetChatMessage returns one message (for edit/delete/react authorization
 // and rendering).
 func (s *Store) GetChatMessage(ctx context.Context, id int64) (*ChatMessage, error) {
-	const q = `SELECT channel_id, from_unique_id, from_nickname, body_enc, key_id, sent_at, edited_at, deleted_at
+	const q = `SELECT channel_id, from_unique_id, from_nickname, reply_to_id, version,
+	                 COALESCE(client_msg_id, ''), body_enc, key_id, sent_at, edited_at, deleted_at
 	          FROM chat_messages WHERE id = $1`
 	var m ChatMessage
 	var keyID int64
+	var replyToID sql.NullInt64
 	m.ID = id
 	err := s.db.QueryRowContext(ctx, q, id).Scan(
-		&m.ChannelID, &m.FromUniqueID, &m.FromNickname, &m.BodyEnc, &keyID, &m.SentAt, &m.EditedAt, &m.DeletedAt)
+		&m.ChannelID, &m.FromUniqueID, &m.FromNickname, &replyToID, &m.Version,
+		&m.ClientMsgID, &m.BodyEnc, &keyID, &m.SentAt, &m.EditedAt, &m.DeletedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -109,6 +137,7 @@ func (s *Store) GetChatMessage(ctx context.Context, id int64) (*ChatMessage, err
 		return nil, fmt.Errorf("querying chat message: %w", err)
 	}
 	m.KeyID = uint32(keyID)
+	m.ReplyToID = replyToID.Int64
 	return &m, nil
 }
 
@@ -116,17 +145,19 @@ func (s *Store) GetChatMessage(ctx context.Context, id int64) (*ChatMessage, err
 // the legacy column: chat_messages_no_plaintext is checked on every UPDATE, so
 // editing a not-yet-backfilled row that still holds plaintext would otherwise
 // fail at the database (91-135).
-func (s *Store) EditChatMessage(ctx context.Context, id int64, bodyEnc string, keyID uint32) error {
-	const q = `UPDATE chat_messages SET body_enc = $1, key_id = $2, body = '', edited_at = NOW()
-	          WHERE id = $3 AND deleted_at IS NULL`
-	res, err := s.db.ExecContext(ctx, q, bodyEnc, keyID, id)
-	if err != nil {
-		return fmt.Errorf("editing chat message: %w", err)
+func (s *Store) EditChatMessage(ctx context.Context, id int64, bodyEnc string, keyID uint32, expectedVersion uint64) (uint64, error) {
+	const q = `UPDATE chat_messages
+	          SET body_enc = $1, key_id = $2, body = '', edited_at = NOW(), version = version + 1
+	          WHERE id = $3 AND deleted_at IS NULL AND ($4 = 0 OR version = $4)
+	          RETURNING version`
+	var version uint64
+	if err := s.db.QueryRowContext(ctx, q, bodyEnc, keyID, id, expectedVersion).Scan(&version); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrChatEditConflict
+		}
+		return 0, fmt.Errorf("editing chat message: %w", err)
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("chat message not found or deleted")
-	}
-	return nil
+	return version, nil
 }
 
 // DeleteChatMessage tombstones a message: ciphertext and generation cleared,
@@ -206,28 +237,92 @@ func (s *Store) ChatPins(ctx context.Context, channelID int64) ([]PinnedMessage,
 // ToggleReaction adds the (message, user, emoji) reaction if absent, removes
 // it if present. It returns the full updated reaction map (emoji -> count)
 // and whether the reaction is now present for this user.
+type reactionCacheEntry struct {
+	counts atomic.Pointer[map[string]int]
+}
+
+func cloneReactionCounts(in map[string]int) map[string]int {
+	out := make(map[string]int, len(in))
+	for emoji, count := range in {
+		out[emoji] = count
+	}
+	return out
+}
+
+func (s *Store) cacheReactions(messageID int64, counts map[string]int) {
+	value, _ := s.reactionCache.LoadOrStore(messageID, &reactionCacheEntry{})
+	entry := value.(*reactionCacheEntry)
+	snapshot := cloneReactionCounts(counts)
+	entry.counts.Store(&snapshot)
+}
+
+func (s *Store) cachedReactions(messageID int64) (map[string]int, bool) {
+	value, ok := s.reactionCache.Load(messageID)
+	if !ok {
+		return nil, false
+	}
+	entry := value.(*reactionCacheEntry)
+	snapshot := entry.counts.Load()
+	if snapshot == nil {
+		return nil, false
+	}
+	return cloneReactionCounts(*snapshot), true
+}
+
 func (s *Store) ToggleReaction(ctx context.Context, messageID int64, uniqueID, emoji string) (map[string]int, bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("beginning reaction toggle: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	// Serialize toggles for this exact tuple across goroutines and replicas.
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+		fmt.Sprintf("%d\x00%s\x00%s", messageID, uniqueID, emoji)); err != nil {
+		return nil, false, fmt.Errorf("locking reaction: %w", err)
+	}
 	const del = `DELETE FROM chat_reactions WHERE message_id = $1 AND unique_id = $2 AND emoji = $3`
-	res, err := s.db.ExecContext(ctx, del, messageID, uniqueID, emoji)
+	res, err := tx.ExecContext(ctx, del, messageID, uniqueID, emoji)
 	if err != nil {
 		return nil, false, fmt.Errorf("removing reaction: %w", err)
 	}
 	added := false
 	if n, _ := res.RowsAffected(); n == 0 {
 		const ins = `INSERT INTO chat_reactions (message_id, unique_id, emoji) VALUES ($1, $2, $3)`
-		if _, err := s.db.ExecContext(ctx, ins, messageID, uniqueID, emoji); err != nil {
+		if _, err := tx.ExecContext(ctx, ins, messageID, uniqueID, emoji); err != nil {
 			return nil, false, fmt.Errorf("adding reaction: %w", err)
 		}
 		added = true
 	}
-	counts, err := s.Reactions(ctx, messageID)
-	return counts, added, err
+	counts, err := queryReactions(ctx, tx, messageID)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, fmt.Errorf("committing reaction toggle: %w", err)
+	}
+	s.cacheReactions(messageID, counts)
+	return counts, added, nil
 }
 
 // Reactions returns the reaction counts (emoji -> count) for a message.
 func (s *Store) Reactions(ctx context.Context, messageID int64) (map[string]int, error) {
+	if counts, ok := s.cachedReactions(messageID); ok {
+		return counts, nil
+	}
+	counts, err := queryReactions(ctx, s.db, messageID)
+	if err == nil {
+		s.cacheReactions(messageID, counts)
+	}
+	return counts, err
+}
+
+type reactionQuerier interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+func queryReactions(ctx context.Context, qx reactionQuerier, messageID int64) (map[string]int, error) {
 	const q = `SELECT emoji, COUNT(*) FROM chat_reactions WHERE message_id = $1 GROUP BY emoji`
-	rows, err := s.db.QueryContext(ctx, q, messageID)
+	rows, err := qx.QueryContext(ctx, q, messageID)
 	if err != nil {
 		return nil, fmt.Errorf("querying reactions: %w", err)
 	}
@@ -248,12 +343,39 @@ func (s *Store) Reactions(ctx context.Context, messageID int64) (map[string]int,
 // (history pages).
 func (s *Store) ReactionsFor(ctx context.Context, ids []int64) (map[int64]map[string]int, error) {
 	out := make(map[int64]map[string]int, len(ids))
+	missing := make([]int64, 0, len(ids))
 	for _, id := range ids {
-		r, err := s.Reactions(ctx, id)
-		if err != nil {
-			return nil, err
+		if counts, ok := s.cachedReactions(id); ok {
+			out[id] = counts
+		} else {
+			out[id] = map[string]int{}
+			missing = append(missing, id)
 		}
-		out[id] = r
+	}
+	if len(missing) == 0 {
+		return out, nil
+	}
+	const q = `SELECT message_id, emoji, COUNT(*) FROM chat_reactions
+	          WHERE message_id = ANY($1) GROUP BY message_id, emoji`
+	rows, err := s.db.QueryContext(ctx, q, pq.Array(missing))
+	if err != nil {
+		return nil, fmt.Errorf("querying reactions page: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var emoji string
+		var count int
+		if err := rows.Scan(&id, &emoji, &count); err != nil {
+			return nil, fmt.Errorf("scanning reaction page: %w", err)
+		}
+		out[id][emoji] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for _, id := range missing {
+		s.cacheReactions(id, out[id])
 	}
 	return out, nil
 }

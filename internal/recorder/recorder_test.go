@@ -318,3 +318,25 @@ func TestTapWritesRTPOverUDP(t *testing.T) {
 		t.Fatalf("received packet = %+v, want SSRC 9001 seq 42", got)
 	}
 }
+
+func TestBufferedTapDropsWhenRingIsFull(t *testing.T) {
+	listener, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	b, err := NewBufferedTap(listener.LocalAddr().(*net.UDPAddr).Port, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkt := &rtp.Packet{Header: rtp.Header{Version: 2}, Payload: []byte("larger than one byte")}
+	if err := b.WriteRTP(pkt); err != nil {
+		t.Fatal(err)
+	}
+	if got := b.Dropped(); got != 1 {
+		t.Fatalf("Dropped = %d, want 1", got)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+}

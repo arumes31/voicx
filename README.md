@@ -94,7 +94,7 @@ front of it if remote bot access is required.
 | `tls_cert_file` | `VOICX_TLS_CERT_FILE` | `""` | Custom cert (empty = self-signed) |
 | `tls_key_file` | `VOICX_TLS_KEY_FILE` | `""` | Custom key (empty = self-signed) |
 | `chat_allow_plaintext` | `VOICX_CHAT_ALLOW_PLAINTEXT` | `false` | Allow unencrypted chat (dev escape hatch) |
-| `chat_max_length` | `VOICX_CHAT_MAX_LENGTH` | `2000` | Max message length (chars, post-decrypt) |
+| `chat_max_length` | `VOICX_CHAT_MAX_LENGTH` | `4096` | Max message length (UTF-8 bytes, post-decrypt) |
 | `chat_rate_msgs` | `VOICX_CHAT_RATE_MSGS` | `5` | Per-user chat token bucket size |
 | `chat_rate_window_seconds` | `VOICX_CHAT_RATE_WINDOW_SECONDS` | `3` | Per-user chat bucket window (s) |
 | `chat_word_filter` | `VOICX_CHAT_WORD_FILTER` | `""` | Comma-separated banned substrings |
@@ -108,6 +108,9 @@ front of it if remote bot access is required.
 | `db_max_open_conns` | `VOICX_DB_MAX_OPEN_CONNS` | `25` | Postgres pool size |
 | `db_max_idle_conns` | `VOICX_DB_MAX_IDLE_CONNS` | `5` | Postgres idle pool size |
 | `db_conn_max_lifetime` | `VOICX_DB_CONN_MAX_LIFETIME` | `30m` | Postgres connection lifetime |
+| `pii_key_file` | `VOICX_PII_KEY_FILE` | `./data/keys/pii.key` | First-start AES-256-GCM key for protected PII columns; keep outside PostgreSQL |
+| `client_timeout_seconds` | `VOICX_CLIENT_TIMEOUT_SECONDS` | `90` | Disconnect inactive control clients after this many seconds |
+| `default_opus_bitrate` | `VOICX_DEFAULT_OPUS_BITRATE` | `32000` | Default bitrate for newly created channels |
 | `webrtc.ice_servers` | `VOICX_WEBRTC_ICE_SERVERS` | `stun:stun.l.google.com:19302` | STUN/TURN URLs |
 | `webrtc.enable_av1` | `VOICX_WEBRTC_ENABLE_AV1` | `false` | Register the AV1 video codec |
 | `udp_rate_limit_pps` | `VOICX_UDP_RATE_LIMIT_PPS` | `200` | Per-IP UDP packet rate (pkt/s, 0=disabled) |
@@ -148,6 +151,8 @@ make compose-down  # stop & remove
 ```
 
 The compose stack configures the server purely through `VOICX_*` environment variables; no config file is mounted.
+
+Pool tuning is deliberately not capped: raise `db_max_open_conns` as the database is scaled up. Use the exported `voicx_db_pool_*` metrics to watch in-use connections and wait time, and run `DATABASE_URL=... make profile-db` to capture `EXPLAIN (ANALYZE, BUFFERS)` plans for the hot chat and permission queries before and after a change.
 
 ## Local e2e
 
@@ -198,7 +203,7 @@ Override the disruption with `-chaos-stop-cmd` / `-chaos-start-cmd` (or `CHAOS_S
 
 ## Load testing
 
-`cmd/loadtest` is a headless client simulator (TCP auth, channel join, chat, ping, optional UDP pings):
+`cmd/loadtest` is a headless client simulator (TCP auth, channel join, chat, ping, optional UDP pings, and real Pion Opus publishers):
 
 ```bash
 go run ./cmd/loadtest -addr 127.0.0.1:10011 -clients 50 -duration 30s -ramp 5s \
@@ -206,6 +211,8 @@ go run ./cmd/loadtest -addr 127.0.0.1:10011 -clients 50 -duration 30s -ramp 5s \
 ```
 
 All simulated clients share one account (voicx allows multiple connections per unique ID). Registration is not exposed over the protocol — create the test user directly (e.g. a one-off snippet calling `auth.RegisterUser`, or via psql). The report prints connect/auth counts, failures, an auth-latency histogram, and message counts.
+
+`make webrtc-load LOADTEST_ARGS='-anonymous -tls-insecure -channel 1'` runs the 100-publisher SFU profile. `make chaos-webrtc` forces the same media through TURN/TCP and Toxiproxy, adding latency, jitter, and periodic transport-loss bursts; it requires an explicit `TURN_SECRET` and `LOADTEST_ARGS`. `make query-load` drives persistent ServerQuery sessions at a target 5,000 requests/sec. `make canary` runs key-rotation, skipped-key, signature-tamper, and plaintext-leakage canaries.
 
 ## CI/CD
 
@@ -215,8 +222,8 @@ All simulated clients share one account (voicx allows multiple connections per u
 
 - **Encryption at a glance**: the TCP control channel is TLS by default (`tls_enabled`; self-signed ECDSA P-256 cert auto-generated into `tls_dir` on first start, 10y validity, SANs localhost + server name; SHA-256 fingerprint logged at startup, sent in the auth response, and shown in ServerQuery `serverinfo`). The Wails client pins the fingerprint TOFU-style in `known_servers.json` — a later mismatch hard-fails with a warning dialog until the user explicitly trusts the new fingerprint. Voice/video media is encrypted by WebRTC's DTLS-SRTP (mandated by the spec, not optional). **Still plaintext this wave**: ServerQuery (`:10012`, backlog 225) and file transfer (`:30033`, token-authorized) — keep them on trusted networks.
 - **Chat payload encryption (wave 4b) — exact trust model**:
-  - **Direct messages: true E2EE.** Clients generate an X25519 pair (stored in `identity.json` next to the Ed25519 signing key) and publish the public key to a server directory (`users.e2e_public_key`, migration 006; guests: state only). DM bodies are sealed with nacl/box (Curve25519 + XSalsa20-Poly1305) for the recipient's key. **The server relays and spools ciphertext it cannot read** — offline DMs are stored encrypted, a real privacy win. Caveat: static keys, so **no forward secrecy**; a stolen `identity.json` decrypts all past DMs to that user.
-  - **Channel + global messages: encrypted with server-held symmetric keys** (nacl/secretbox, XSalsa20-Poly1305). The server generates the keys in memory (lost on restart) and distributes them **sealed** (box.SealAnonymous) to each member's X25519 key — the distribution channel is E2E even though the server is a key holder. The server CAN read these scopes; that's deliberate: wave 5 needs server-side history, search, and moderation.
+  - **Direct messages: true E2EE.** The live compatibility envelope remains X25519 + XSalsa20-Poly1305 while `internal/e2ee` supplies the versioned X3DH, signed/one-time prekey, AES-256-GCM per-message HKDF chain, Double Ratchet and 2,000 skipped-key machinery for negotiated sessions. **The server relays and spools ciphertext it cannot read.** Session diagnostics state which envelope a peer actually negotiated; capability must not be mistaken for an active ratchet.
+  - **Channel + global messages: encrypted with server-held symmetric keys** (nacl/secretbox, XSalsa20-Poly1305). Scope generations are persisted wrapped under the external chat master key and distributed **sealed** to each member's X25519 key. The server CAN read these scopes; that's deliberate: history, search, and moderation require it. `internal/e2ee.SenderKey` provides the O(N) sender-key construction for private group-session negotiation.
   - **Rotation**: a channel's key rotates (bumped `key_id`) when a member leaves, and is redistributed to remaining members — ex-members can't read *new* messages. They keep access to history from their membership period (documented limitation). The global key does not rotate (it would re-key every client on every disconnect).
   - **Plaintext chat is rejected** by default (`chat_allow_plaintext: false`, dev escape hatch). The server validates scope `key_id` and ciphertext size but never inspects DM bodies.
 - The container image runs as a non-root user (uid 10001); the compose service additionally sets `no-new-privileges`, drops all capabilities, mounts the root filesystem read-only, and keeps writable data (uploads, avatars, icons, recordings, TLS keys) on a named volume at `/data`.

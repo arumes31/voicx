@@ -20,18 +20,33 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/crypto/nacl/box"
 	"golang.org/x/crypto/nacl/secretbox"
 
+	securee2ee "voicx/internal/e2ee"
 	"voicx/internal/netproto"
 )
+
+type E2EEDiagnostics struct {
+	Cipher           string `json:"cipher"`
+	PeerUniqueID     string `json:"peer_unique_id,omitempty"`
+	SafetyNumber     string `json:"safety_number,omitempty"`
+	PeerKeyAvailable bool   `json:"peer_key_available"`
+	CachedPeers      int    `json:"cached_peers"`
+	ScopeKeys        int    `json:"scope_keys"`
+	RefusedKeys      int    `json:"refused_keys"`
+	PendingKeyPulls  int    `json:"pending_key_pulls"`
+}
 
 // Placeholders for text the client cannot show. The three states are
 // deliberately distinct: conflating a transient truncation with a permanent
@@ -61,12 +76,62 @@ const (
 	scopeKeyRetry = 2 * time.Second
 )
 
-// newClientMsgID returns a client-generated message reference for DM
-// receipts (124): 8 random bytes, hex-encoded.
+// newClientMsgID returns an RFC 4122 UUIDv4 used for idempotent sends and DM
+// receipts. A failed entropy read is astronomically unlikely; returning an
+// empty id keeps the server's legacy non-idempotent compatibility path.
 func newClientMsgID() string {
-	var b [8]byte
-	_, _ = rand.Read(b[:])
-	return fmt.Sprintf("%x", b[:])
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return ""
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+func (a *App) E2EEDiagnostics(peerUniqueID string) (E2EEDiagnostics, error) {
+	m := a.cmLoad()
+	if m == nil {
+		return E2EEDiagnostics{}, errors.New("not connected")
+	}
+	d := E2EEDiagnostics{Cipher: "X25519 + XSalsa20-Poly1305; Double Ratchet/X3DH capable", PeerUniqueID: peerUniqueID}
+	m.pubKeys.mu.Lock()
+	d.CachedPeers = len(m.pubKeys.keys)
+	m.pubKeys.mu.Unlock()
+	m.scopeKeys.mu.Lock()
+	for _, generations := range m.scopeKeys.keys {
+		d.ScopeKeys += len(generations)
+	}
+	for _, generations := range m.scopeKeys.refused {
+		d.RefusedKeys += len(generations)
+	}
+	d.PendingKeyPulls = len(m.scopeKeys.inFlight)
+	m.scopeKeys.mu.Unlock()
+	if peerUniqueID == "" {
+		return d, nil
+	}
+	peer, ok := m.peerPubKey(peerUniqueID)
+	if !ok {
+		return d, nil
+	}
+	id, err := m.identity()
+	if err != nil {
+		return d, err
+	}
+	own, _, err := id.x25519()
+	if err != nil {
+		return d, err
+	}
+	parts := [][]byte{own[:], peer[:]}
+	sort.Slice(parts, func(i, j int) bool { return strings.Compare(string(parts[i]), string(parts[j])) < 0 })
+	digest := sha256.Sum256(append(append([]byte("voicx:safety:"), parts[0]...), parts[1]...))
+	groups := make([]string, 0, 12)
+	for i := 0; i < 24; i += 2 {
+		groups = append(groups, fmt.Sprintf("%05d", uint32(digest[i])<<8|uint32(digest[i+1])))
+	}
+	d.SafetyNumber = strings.Join(groups, " ")
+	d.PeerKeyAvailable = true
+	return d, nil
 }
 
 // --- key material ------------------------------------------------------------
@@ -293,15 +358,33 @@ func openScope(blobB64 string, key [32]byte) (string, error) {
 	return string(plain), nil
 }
 
-// sealFile encrypts attachment bytes with a per-file key as
-// nonce[24] || secretbox — raw bytes, because this blob is what crosses the
-// file-transfer port and lands on the server's disk (12).
+var attachmentGCMHeader = []byte("VCXGCM1\n")
+
+const attachmentChunkSize = 64 * 1024
+
+// sealFile encrypts each attachment chunk with a distinct HKDF-SHA256-derived
+// AES-256-GCM key before any bytes reach the TCP transfer port. The record
+// framing permits bounded-memory streaming while openFile retains the legacy
+// secretbox decoder for attachments created by older clients.
 func sealFile(data []byte, key [32]byte) ([]byte, error) {
-	var nonce [24]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		return nil, err
+	var out bytes.Buffer
+	out.Write(attachmentGCMHeader)
+	for offset, index := 0, uint64(0); offset < len(data); index++ {
+		end := offset + attachmentChunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		blob, err := securee2ee.EncryptFileChunk(key[:], "attachment", index, data[offset:end])
+		if err != nil {
+			return nil, err
+		}
+		if err := binary.Write(&out, binary.BigEndian, uint32(len(blob))); err != nil {
+			return nil, err
+		}
+		out.Write(blob)
+		offset = end
 	}
-	return secretbox.Seal(nonce[:], data, &nonce, &key), nil
+	return out.Bytes(), nil
 }
 
 // dmHistoryKeyLabel domain-separates the local DM log key from every other use
@@ -324,6 +407,26 @@ func dmHistoryKey(id *identity) ([32]byte, error) {
 
 // openFile decrypts an attachment blob produced by sealFile.
 func openFile(blob []byte, key [32]byte) ([]byte, error) {
+	if bytes.HasPrefix(blob, attachmentGCMHeader) {
+		reader := bytes.NewReader(blob[len(attachmentGCMHeader):])
+		var out bytes.Buffer
+		for index := uint64(0); reader.Len() > 0; index++ {
+			var size uint32
+			if err := binary.Read(reader, binary.BigEndian, &size); err != nil || size == 0 || size > attachmentChunkSize+64 || uint64(size) > uint64(reader.Len()) {
+				return nil, errors.New("invalid attachment chunk framing")
+			}
+			chunk := make([]byte, int(size))
+			if _, err := reader.Read(chunk); err != nil {
+				return nil, errors.New("invalid attachment chunk")
+			}
+			plain, err := securee2ee.DecryptFileChunk(key[:], "attachment", index, chunk)
+			if err != nil {
+				return nil, errors.New("attachment decryption failed (wrong key or tampered)")
+			}
+			out.Write(plain)
+		}
+		return out.Bytes(), nil
+	}
 	if len(blob) < 24 {
 		return nil, errors.New("invalid attachment ciphertext")
 	}
@@ -525,7 +628,7 @@ func (m *connManager) encryptChat(scope, target, text string) (netproto.ChatSend
 		if err != nil {
 			return netproto.ChatSend{}, err
 		}
-		return netproto.ChatSend{ChannelID: target, Text: blob, Enc: true, KeyID: keyID}, nil
+		return netproto.ChatSend{ChannelID: target, Text: blob, Enc: true, KeyID: keyID, ClientMsgID: newClientMsgID()}, nil
 
 	default: // global
 		keyID, key, ok := m.scopeKeys.current(0)
@@ -536,7 +639,7 @@ func (m *connManager) encryptChat(scope, target, text string) (netproto.ChatSend
 		if err != nil {
 			return netproto.ChatSend{}, err
 		}
-		return netproto.ChatSend{Text: blob, Enc: true, KeyID: keyID}, nil
+		return netproto.ChatSend{Text: blob, Enc: true, KeyID: keyID, ClientMsgID: newClientMsgID()}, nil
 	}
 }
 

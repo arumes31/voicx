@@ -38,6 +38,7 @@ const (
 	errCodePermissionDenied = 4 // caller lacks the required permission
 	errCodeUnavailable      = 5 // backend dependency unavailable
 	errCodeNotFound         = 6 // referenced entity not found
+	errCodeConflict         = 7 // optimistic concurrency precondition failed
 )
 
 // Client represents a single connected control-channel client.
@@ -135,6 +136,12 @@ func (c *Client) noteReceived(payloadBytes int) {
 	c.bytesIn += int64(payloadBytes)
 }
 
+func (c *Client) lastActivity() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lastActive
+}
+
 // noteSent records outbound payload bytes for the Client Info stats.
 func (c *Client) noteSent(payloadBytes int) {
 	c.mu.Lock()
@@ -229,9 +236,10 @@ func (c *Client) takeChallenge(uniqueID string) ([]byte, string, bool) {
 
 // TCPServer accepts and serves control-channel connections.
 type TCPServer struct {
-	cfg    *config.Config
-	logger *zap.Logger
-	deps   *Deps
+	cfg      *config.Config
+	logger   *zap.Logger
+	deps     *Deps
+	configMu sync.RWMutex
 
 	listener net.Listener
 
@@ -262,6 +270,7 @@ type TCPServer struct {
 	chatRate    *chatRateLimiter
 	chatSpam    *spamTracker
 	chatSlow    *slowTracker
+	typingRate  *typingTracker
 	chatFilters *chatFilterCache
 
 	permWriteMu sync.Mutex
@@ -298,6 +307,7 @@ func New(cfg *config.Config, logger *zap.Logger, deps *Deps) *TCPServer {
 		chatRate:   newChatRateLimiter(cfg.ChatRateMsgs, time.Duration(cfg.ChatRateWindowSeconds)*time.Second),
 		chatSpam:   newSpamTracker(),
 		chatSlow:   newSlowTracker(),
+		typingRate: newTypingTracker(),
 
 		chatFilters: &chatFilterCache{},
 	}
@@ -610,6 +620,14 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 		return s.handleEmojiDelete(ctx, client, f)
 	case netproto.MsgEmojiRename:
 		return s.handleEmojiRename(ctx, client, f)
+	case netproto.MsgServerConfigQuery:
+		return s.handleServerConfigQuery(ctx, client, f)
+	case netproto.MsgServerConfigSet:
+		return s.handleServerConfigSet(ctx, client, f)
+	case netproto.MsgPreKeyPublish:
+		return s.handlePreKeyPublish(ctx, client, f)
+	case netproto.MsgPreKeyQuery:
+		return s.handlePreKeyQuery(ctx, client, f)
 	case netproto.MsgClientInfoQuery:
 		return s.handleClientInfoQuery(ctx, client, f)
 	case netproto.MsgGroupList:
@@ -698,6 +716,14 @@ func (s *TCPServer) pingLoop(client *Client, stop chan struct{}) {
 		case <-s.stopCh:
 			return
 		case <-ticker.C:
+			s.configMu.RLock()
+			timeout := s.cfg.ClientTimeoutSeconds
+			s.configMu.RUnlock()
+			last := client.lastActivity()
+			if timeout > 0 && !last.IsZero() && time.Since(last) > time.Duration(timeout)*time.Second {
+				_ = client.Conn.Close()
+				return
+			}
 			client.notePingSent()
 			if err := s.writeMessage(client, netproto.MsgPing, netproto.Ping{}); err != nil {
 				return

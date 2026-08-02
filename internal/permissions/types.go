@@ -66,9 +66,12 @@ const (
 	PermissionKeyClientWhisperPower       PermissionKey = "i_client_whisper_power"
 	PermissionKeyClientNeededWhisperPower PermissionKey = "i_client_needed_whisper_power"
 	PermissionKeyClientVideoPublish       PermissionKey = "b_client_video_publish"
-	PermissionKeyClientPrioritySpeaker    PermissionKey = "b_client_priority_speaker"
-	PermissionKeyClientIgnoreAntiflood    PermissionKey = "b_client_ignore_antiflood"
-	PermissionKeyClientRequestTalker      PermissionKey = "b_client_request_talker"
+	// ScreenShare1080p gates shares above 720p. It is intentionally
+	// allow-on-unset for backwards compatibility; an explicit deny caps 720p.
+	PermissionKeyClientScreenShare1080p PermissionKey = "b_client_issue_screenshare_1080p"
+	PermissionKeyClientPrioritySpeaker  PermissionKey = "b_client_priority_speaker"
+	PermissionKeyClientIgnoreAntiflood  PermissionKey = "b_client_ignore_antiflood"
+	PermissionKeyClientRequestTalker    PermissionKey = "b_client_request_talker"
 
 	// --- File transfer ---
 	PermissionKeyFTFileUploadPower         PermissionKey = "i_ft_file_upload_power"
@@ -81,7 +84,8 @@ const (
 	PermissionKeyFTUploadQuotaMB PermissionKey = "i_ft_quota_mb_upload_per_client"
 	// PermissionKeyFTFileDelete allows deleting/renaming other users' files
 	// (263); uploaders may always manage their own files.
-	PermissionKeyFTFileDelete PermissionKey = "b_ft_delete"
+	PermissionKeyFTFileDelete       PermissionKey = "b_ft_delete"
+	PermissionKeyClientAvatarUpload PermissionKey = "b_client_avatar_upload"
 
 	// --- Poke ---
 	PermissionKeyClientPokePower       PermissionKey = "i_client_poke_power"
@@ -93,8 +97,9 @@ const (
 	PermissionKeyClientRemoteAddressView PermissionKey = "b_client_remoteaddress_view"
 
 	// --- Permission management ---
-	PermissionKeyPermissionModifyPower  PermissionKey = "b_permission_modify_power"
-	PermissionKeyPermissionModifyPowerI PermissionKey = "i_permission_modify_power"
+	PermissionKeyPermissionModifyPower       PermissionKey = "b_permission_modify_power"
+	PermissionKeyPermissionModifyPowerI      PermissionKey = "i_permission_modify_power"
+	PermissionKeyPermissionModifyPowerIgnore PermissionKey = "b_permission_modify_power_ignore"
 
 	// --- Virtual server ---
 	PermissionKeyVirtualserverSelect             PermissionKey = "b_virtualserver_select"

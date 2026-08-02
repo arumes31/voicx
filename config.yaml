@@ -27,13 +27,21 @@ file_root: "./data/files"     # on-disk layout: <channel_id>/<name>
 file_max_kbps: 0              # per-connection bandwidth cap in KiB/s; 0 = unlimited
 file_channel_quota_mb: 0      # per-channel total file quota in MiB; 0 = unlimited
 file_max_size_mb: 100         # per-transfer size cap in MiB; 0 = unlimited
+file_quiet_hours_start: 0      # local hour 0..23; equal start/end disables
+file_quiet_hours_end: 0
 
 database_url: "postgres://voicx:voicx@localhost:5432/voicx?sslmode=disable"
+pii_key_file: "./data/keys/pii.key"  # generated once, outside PostgreSQL
 redis_addr: "localhost:6379"
 redis_password: ""
 redis_enabled: true   # false = skip Redis entirely (server runs without it)
 
 max_clients: 1024
+client_timeout_seconds: 90
+default_opus_bitrate: 32000
+default_opus_fec: true
+default_opus_dtx: false
+default_opus_stereo: false
 
 # Database connection pool tuning.
 db_max_open_conns: 25
@@ -63,7 +71,7 @@ chat_allow_plaintext: false
 # post-decrypt. rate = per-user token bucket. word/link filters apply to
 # channel/global scopes only (DMs are E2EE, exempt). whitelist non-empty =
 # ONLY those domains may be linked.
-chat_max_length: 2000
+chat_max_length: 4096
 chat_rate_msgs: 5
 chat_rate_window_seconds: 3
 chat_word_filter: ""

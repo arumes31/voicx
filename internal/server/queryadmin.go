@@ -60,13 +60,15 @@ func (s *TCPServer) PermOverview(ctx context.Context, uniqueID string, channelID
 	return out, nil
 }
 
-// EffectiveMaxClients returns the connection cap: the configured max_clients,
-// tightened by the serveredit override when one is set (217).
+// EffectiveMaxClients returns the current connection cap. Runtime server UI
+// changes are folded into cfg under configMu and persisted for restart.
 func (s *TCPServer) EffectiveMaxClients(ctx context.Context) int {
+	s.configMu.RLock()
 	max := s.cfg.MaxClients
-	if v := s.serverSetting(ctx, "max_clients_override"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && (max <= 0 || n < max) {
-			max = n
+	s.configMu.RUnlock()
+	if value := s.serverSetting(ctx, "max_clients_override"); value != "" {
+		if override, err := strconv.Atoi(value); err == nil && override >= 0 {
+			return override
 		}
 	}
 	return max

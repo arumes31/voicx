@@ -29,12 +29,9 @@ func runApp() {
 	// hotkey/connection failures must be diagnosable from a file.
 	if dir, err := os.UserConfigDir(); err == nil {
 		logDir := filepath.Join(dir, "voicx")
-		if err := os.MkdirAll(logDir, 0o750); err == nil {
-			if f, err := os.OpenFile(filepath.Join(logDir, "client.log"),
-				os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
-				log.SetOutput(f)
-				defer f.Close()
-			}
+		if writer, err := newDailyLogWriter(logDir, "client.log"); err == nil {
+			log.SetOutput(writer)
+			defer writer.Close()
 		}
 	}
 

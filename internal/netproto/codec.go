@@ -155,10 +155,16 @@ const (
 	MsgEmojiDelete     MessageType = 119 // client -> server: delete a custom emoji
 	MsgEmojiRename     MessageType = 120 // client -> server: rename a custom emoji
 
-	MsgServerRules       MessageType = 121 // server -> client: rules text awaiting acceptance
-	MsgServerRulesAccept MessageType = 122 // client -> server: accept the rules by hash
-	MsgChannelSubscribe  MessageType = 123 // client -> server: (un)subscribe to channels
-	MsgSubscriptionState MessageType = 124 // server -> client: the authoritative subscription set
+	MsgServerRules          MessageType = 121 // server -> client: rules text awaiting acceptance
+	MsgServerRulesAccept    MessageType = 122 // client -> server: accept the rules by hash
+	MsgChannelSubscribe     MessageType = 123 // client -> server: (un)subscribe to channels
+	MsgSubscriptionState    MessageType = 124 // server -> client: the authoritative subscription set
+	MsgServerConfigQuery    MessageType = 125 // admin -> server: get runtime voice/client settings
+	MsgServerConfigSet      MessageType = 126 // admin -> server: update runtime voice/client settings
+	MsgServerConfigResponse MessageType = 127 // server -> admin: effective settings
+	MsgPreKeyPublish        MessageType = 128 // client -> server: publish X3DH bundle and one-time keys
+	MsgPreKeyQuery          MessageType = 129 // client -> server: consume target's X3DH bundle
+	MsgPreKeyBundle         MessageType = 130 // server -> client: signed bundle plus optional one-time key
 )
 
 // String returns a human-readable name for the message type.
@@ -182,6 +188,18 @@ func (m MessageType) String() string {
 		return "Ping"
 	case MsgPong:
 		return "Pong"
+	case MsgServerConfigQuery:
+		return "ServerConfigQuery"
+	case MsgServerConfigSet:
+		return "ServerConfigSet"
+	case MsgServerConfigResponse:
+		return "ServerConfigResponse"
+	case MsgPreKeyPublish:
+		return "PreKeyPublish"
+	case MsgPreKeyQuery:
+		return "PreKeyQuery"
+	case MsgPreKeyBundle:
+		return "PreKeyBundle"
 	case MsgJoinChannel:
 		return "JoinChannel"
 	case MsgDeleteChannel:
@@ -586,6 +604,9 @@ type ChatSend struct {
 	Text       string `json:"text"`
 	Enc        bool   `json:"enc,omitempty"`
 	KeyID      uint32 `json:"key_id,omitempty"`
+	// ReplyToID references a stored message in the same channel/global scope.
+	// It is zero for a normal message and is never used for direct messages.
+	ReplyToID int64 `json:"reply_to_id,omitempty"`
 	// ClientMsgID is a client-generated reference echoed in the broadcast so
 	// DM delivery/read receipts (wave 5a) can reference the message without
 	// a database id (DMs are true E2EE and not stored server-side).
@@ -611,6 +632,8 @@ type ChatBroadcast struct {
 	// 0 for DMs). Mentions lists mentioned users' unique IDs. ClientMsgID
 	// echoes the sender's reference for receipts.
 	ID          int64    `json:"id,omitempty"`
+	ReplyToID   int64    `json:"reply_to_id,omitempty"`
+	Version     uint64   `json:"version,omitempty"`
 	Mentions    []string `json:"mentions,omitempty"`
 	ClientMsgID string   `json:"client_msg_id,omitempty"`
 }
@@ -953,6 +976,46 @@ type ServerInfoResponse struct {
 	MOTD           string `json:"motd,omitempty"`
 }
 
+type ServerConfigQuery struct{}
+
+type ServerConfig struct {
+	MaxClients           int  `json:"max_clients"`
+	ClientTimeoutSeconds int  `json:"client_timeout_seconds"`
+	OpusBitrate          int  `json:"opus_bitrate"`
+	OpusFEC              bool `json:"opus_fec"`
+	OpusDTX              bool `json:"opus_dtx"`
+	OpusStereo           bool `json:"opus_stereo"`
+}
+
+type OneTimePreKey struct {
+	KeyID     uint32 `json:"key_id"`
+	PublicKey []byte `json:"public_key"`
+}
+
+type PreKeyPublish struct {
+	IdentityDH     []byte          `json:"identity_dh"`
+	SigningPublic  []byte          `json:"signing_public"`
+	SignedPreKeyID uint32          `json:"signed_prekey_id"`
+	SignedPreKey   []byte          `json:"signed_prekey"`
+	Signature      []byte          `json:"signature"`
+	OneTimePreKeys []OneTimePreKey `json:"one_time_prekeys,omitempty"`
+}
+
+type PreKeyQuery struct {
+	UniqueID string `json:"unique_id"`
+}
+
+type PreKeyBundle struct {
+	UniqueID       string `json:"unique_id"`
+	IdentityDH     []byte `json:"identity_dh"`
+	SigningPublic  []byte `json:"signing_public"`
+	SignedPreKeyID uint32 `json:"signed_prekey_id"`
+	SignedPreKey   []byte `json:"signed_prekey"`
+	Signature      []byte `json:"signature"`
+	OneTimeKeyID   uint32 `json:"one_time_key_id,omitempty"`
+	OneTimePreKey  []byte `json:"one_time_prekey,omitempty"`
+}
+
 // AvatarSet uploads the client's avatar image (base64). Accepted image
 // types: PNG, JPEG, GIF, WebP; max 256 KiB after decoding.
 type AvatarSet struct {
@@ -995,7 +1058,8 @@ type Complaint struct {
 // ScreenShare declares whether the client's video track is a screen share
 // (relayed to channel members as a screenshare_changed event).
 type ScreenShare struct {
-	Active bool `json:"active"`
+	Active    bool `json:"active"`
+	MaxHeight int  `json:"max_height,omitempty"`
 }
 
 // KeyPublish publishes the client's X25519 public key (base64, 32 bytes) to
@@ -1044,6 +1108,8 @@ type ChatHistoryEntry struct {
 	ID           int64  `json:"id"`
 	FromUniqueID string `json:"from_unique_id"`
 	FromNickname string `json:"from_nickname"`
+	ReplyToID    int64  `json:"reply_to_id,omitempty"`
+	Version      uint64 `json:"version"`
 
 	// BodyEnc is the stored ciphertext:
 	// base64(nonce[24] || secretbox(plain, scopeKey[KeyID])).
@@ -1089,10 +1155,11 @@ type ChatHistoryResponse struct {
 // ChatEdit edits the caller's own message. NewText is encrypted like a
 // normal message (the server decrypts before storing).
 type ChatEdit struct {
-	MessageID int64  `json:"message_id"`
-	NewText   string `json:"new_text"`
-	Enc       bool   `json:"enc,omitempty"`
-	KeyID     uint32 `json:"key_id,omitempty"`
+	MessageID       int64  `json:"message_id"`
+	NewText         string `json:"new_text"`
+	Enc             bool   `json:"enc,omitempty"`
+	KeyID           uint32 `json:"key_id,omitempty"`
+	ExpectedVersion uint64 `json:"expected_version,omitempty"`
 }
 
 // ChatDelete deletes a message (own, or any with b_chat_delete_any).
@@ -1570,17 +1637,27 @@ type PermissionsQuery struct{}
 
 // PermissionEntry describes one resolved permission.
 type PermissionEntry struct {
-	Key    string `json:"key"`
-	Value  int    `json:"value"`
-	Grant  int    `json:"grant"`
-	Skip   bool   `json:"skip,omitempty"`
-	Negate bool   `json:"negate,omitempty"`
+	Key        string `json:"key"`
+	Value      int    `json:"value"`
+	Grant      int    `json:"grant"`
+	Skip       bool   `json:"skip,omitempty"`
+	Negate     bool   `json:"negate,omitempty"`
+	SourceTier string `json:"source_tier,omitempty"`
+	Inherited  bool   `json:"inherited,omitempty"`
+}
+
+type PermissionConflict struct {
+	Key          string `json:"key"`
+	WinningTier  string `json:"winning_tier"`
+	ShadowedTier string `json:"shadowed_tier"`
+	Message      string `json:"message"`
 }
 
 // PermissionsResponse carries the caller's resolved permission set (one
 // entry per key present in any tier, with the winning tier's value).
 type PermissionsResponse struct {
-	Entries []PermissionEntry `json:"entries"`
+	Entries   []PermissionEntry    `json:"entries"`
+	Conflicts []PermissionConflict `json:"conflicts,omitempty"`
 }
 
 // ClientInfoQuery requests the connection info of an online client.

@@ -112,7 +112,7 @@ func openChatEntry(m *connManager, scope int64, e *netproto.ChatHistoryEntry, re
 // ChatEditMessage edits one of the caller's own messages. The new body is
 // sealed with the channel's current scope key (the server decrypts it for
 // storage and re-seals for the broadcast).
-func (a *App) ChatEditMessage(channelID, messageID int64, newText string) string {
+func (a *App) ChatEditMessage(channelID, messageID int64, newText string, expectedVersion uint64) string {
 	keyID, key, ok := a.cmLoad().scopeKeys.current(channelID)
 	if !ok {
 		return "no chat key for this channel yet"
@@ -122,7 +122,7 @@ func (a *App) ChatEditMessage(channelID, messageID int64, newText string) string
 		return err.Error()
 	}
 	if err := a.cmLoad().write(netproto.MsgChatEdit, netproto.ChatEdit{
-		MessageID: messageID, NewText: blob, Enc: true, KeyID: keyID,
+		MessageID: messageID, NewText: blob, Enc: true, KeyID: keyID, ExpectedVersion: expectedVersion,
 	}); err != nil {
 		return err.Error()
 	}
@@ -844,7 +844,7 @@ func (a *App) ftTarget(init netproto.FileTransferInitResponse) (ftEndpoint, erro
 	if fingerprint == "" {
 		fingerprint = control // server did not state it; same certificate anyway
 	}
-	if control != "" && !strings.EqualFold(fingerprint, control) {
+	if control != "" && !secureEqualFold(fingerprint, control) {
 		return ftEndpoint{}, errors.New("file transfer certificate does not match the server — refusing the transfer")
 	}
 	return ftEndpoint{addr: addr, fingerprint: fingerprint, tls: true}, nil
@@ -1030,7 +1030,7 @@ func pinFingerprint(want string) func([][]byte, [][]*x509.Certificate) error {
 			return errors.New("file transfer server presented no certificate")
 		}
 		got := tlscert.FingerprintDER(rawCerts[0])
-		if !strings.EqualFold(got, want) {
+		if !secureEqualFold(got, want) {
 			return fmt.Errorf("file transfer certificate mismatch (%s, expected %s)", got, want)
 		}
 		return nil

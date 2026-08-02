@@ -84,6 +84,7 @@ services:
 
       # --- Database (points at the postgres service) ---
       VOICX_DATABASE_URL: "postgres://${POSTGRES_USER:-voicx}:${POSTGRES_PASSWORD:-voicx}@postgres:5432/${POSTGRES_DB:-voicx}?sslmode=disable"
+      VOICX_PII_KEY_FILE: "/data/keys/pii.key"
 
       # --- Redis (points at the redis service) ---
       VOICX_REDIS_ADDR: "redis:6379"
@@ -139,6 +140,30 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+
+  # Nightly compressed dumps. Backups use a volume separate from pgdata and
+  # are retained for seven days; set BACKUP_REMOTE for optional object upload.
+  postgres-backup:
+    image: postgres:16-alpine
+    profiles: ["backup"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - voicx-net
+    environment:
+      DATABASE_URL: "postgres://${POSTGRES_USER:-voicx}:${POSTGRES_PASSWORD:-voicx}@postgres:5432/${POSTGRES_DB:-voicx}?sslmode=disable"
+      POSTGRES_DB: ${POSTGRES_DB:-voicx}
+      BACKUP_DIR: /backups/postgres
+      BACKUP_RETENTION_DAYS: 7
+      BACKUP_REMOTE: ${BACKUP_REMOTE:-}
+    volumes:
+      - pgbackups:/backups
+      - ./scripts/postgres-backup.sh:/usr/local/bin/postgres-backup.sh:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "if [ -n \"$$BACKUP_REMOTE\" ]; then apk add --no-cache rclone; fi; while true; do sleep $$(($$(date -d tomorrow +%s) - $$(date +%s) + 8100)); /bin/sh /usr/local/bin/postgres-backup.sh; done"
 
   # ---------------------------------------------------------------------------
   # redis — cache / pub-sub / session store
@@ -197,6 +222,11 @@ services:
     restart: unless-stopped
     networks:
       - voicx-net
+    environment:
+      TURN_SECRET: ${TURN_SECRET:-}
+    volumes:
+      - ./scripts/coturn-entrypoint.sh:/usr/local/bin/voicx-coturn-entrypoint.sh:ro
+    entrypoint: [ "/bin/sh", "/usr/local/bin/voicx-coturn-entrypoint.sh" ]
     ports:
       - "3478:3478"
       - "3478:3478/udp"
@@ -223,7 +253,6 @@ services:
       - "--no-dtls"
       - "--realm=${TURN_REALM:-voicx}"
       - "--use-auth-secret"
-      - "--static-auth-secret=${TURN_SECRET:?TURN_SECRET must be set for the turn profile}"
       # Empty when TURN_EXTERNAL_IP is unset; coturn ignores the empty argument.
       - "${TURN_EXTERNAL_IP:+--external-ip=$TURN_EXTERNAL_IP}"
       - "--min-port=49152"
@@ -233,6 +262,21 @@ services:
       # --log=stdout is ambiguous in coturn 4.16 and aborts startup with exit
       # 255 before any listener opens (445).
       - "--log-file=stdout"
+
+  # Toxiproxy is used only by scripts/chaos-webrtc.sh. WebRTC is forced
+  # through the TURN/TCP proxy because Toxiproxy intentionally supports TCP,
+  # not UDP; this still exercises the SFU media path under latency, jitter and
+  # periodic transport outages rather than merely perturbing signaling.
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    container_name: voicx-toxiproxy
+    profiles: [ "chaos-network" ]
+    restart: "no"
+    networks:
+      - voicx-net
+    ports:
+      - "8474:8474"
+      - "8666:8666"
 
 # ---------------------------------------------------------------------------
 # Networks
@@ -248,6 +292,8 @@ networks:
 volumes:
   pgdata:
     name: voicx-pgdata
+  pgbackups:
+    name: voicx-pgbackups
   redisdata:
     name: voicx-redisdata
   voicxdata:

@@ -33,12 +33,7 @@ func (a *App) LogChat(line string) {
 	if err != nil {
 		return
 	}
-	f, err := os.OpenFile(filepath.Join(dir, "chat.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	fmt.Fprintf(f, "[%s] %s\n", time.Now().Format("2006-01-02 15:04:05"), line)
+	appendDailyLog(dir, "chat.log", fmt.Sprintf("[%s] %s\n", time.Now().Format("2006-01-02 15:04:05"), line))
 }
 
 // OpenLogFolder reveals the config folder in the OS file manager

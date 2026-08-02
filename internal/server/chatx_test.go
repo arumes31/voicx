@@ -224,7 +224,7 @@ func TestKeyBundleTruncationIsNotRefusal(t *testing.T) {
 		if err != nil {
 			t.Fatalf("rotate %d: %v", i, err)
 		}
-		if _, err := env.chat.StoreChatMessage(ctx, 1, "user-uid", "user", "ct", gen); err != nil {
+		if _, _, err := env.chat.StoreChatMessage(ctx, 1, "user-uid", "user", "ct", gen, 0, ""); err != nil {
 			t.Fatalf("store: %v", err)
 		}
 	}
@@ -693,8 +693,7 @@ func TestWordAndLinkFilters(t *testing.T) {
 }
 
 // TestChatMaxLength pins the 119 cap on BOTH paths that enforce it. The limit
-// counts plaintext RUNES post-decrypt, so a multi-byte body at the limit must
-// be accepted rather than rejected for its byte length.
+// counts plaintext UTF-8 bytes post-decrypt, including multi-byte runes.
 func TestChatMaxLength(t *testing.T) {
 	const limit = 32
 	env := startTestEnvFull(t, nil, func(c *config.Config) { c.ChatMaxLength = limit })
@@ -704,7 +703,7 @@ func TestChatMaxLength(t *testing.T) {
 	defer bob.Close()
 
 	// Exactly at the limit, in two-byte runes: accepted.
-	atLimit := strings.Repeat("é", limit)
+	atLimit := strings.Repeat("é", limit/2)
 	sendEncChat(t, bob, key, keyID, "1", atLimit)
 	data := readEventOfType(t, alice, eventChat)
 	var chat netproto.ChatBroadcast
@@ -713,10 +712,10 @@ func TestChatMaxLength(t *testing.T) {
 	}
 	msgID := chat.ID
 
-	// One rune over on the send path: rejected, and never stored.
+	// One byte over on the send path: rejected, and never stored.
 	before := env.chat.messageCount()
 	sendEncChat(t, bob, key, keyID, "1", strings.Repeat("a", limit+1))
-	expectChatError(t, bob, "message too long (max 32 characters)")
+	expectChatError(t, bob, "message too long (max 32 bytes)")
 	if got := env.chat.messageCount(); got != before {
 		t.Fatalf("over-length message was stored: count %d -> %d", before, got)
 	}
@@ -725,7 +724,7 @@ func TestChatMaxLength(t *testing.T) {
 	send(t, bob, netproto.MsgChatEdit, netproto.ChatEdit{
 		MessageID: msgID, NewText: sealScopeTest(t, key, strings.Repeat("b", limit+1)), Enc: true, KeyID: keyID,
 	})
-	expectChatError(t, bob, "message too long (max 32 characters)")
+	expectChatError(t, bob, "message too long (max 32 bytes)")
 	env.chat.mu.Lock()
 	stored := env.chat.messages[msgID]
 	env.chat.mu.Unlock()

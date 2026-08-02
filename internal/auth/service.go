@@ -37,6 +37,11 @@ func New(s *store.Store, logger *zap.Logger) *AuthService {
 	return &AuthService{store: s, logger: logger}
 }
 
+// RecordLastIP encrypts the address at column level before persistence.
+func (a *AuthService) RecordLastIP(ctx context.Context, userID int64, ip string) error {
+	return a.store.SetUserPII(ctx, userID, "", ip)
+}
+
 // RegisterUser generates a new Ed25519 identity key pair, derives the unique
 // ID, hashes the password with Argon2id, and inserts a new row into the users
 // table. It returns the unique ID of the newly created user. If a user with the

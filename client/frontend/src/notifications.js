@@ -13,6 +13,7 @@ export const MATRIX_EVENTS = [
     ["mention", "mention"],
     ["keyword", "keyword highlight"],
     ["dm", "direct message"],
+    ["channel_message", "channel message"],
     ["whisper", "voice whisper"],
     ["poke", "poke"],
     ["join_leave", "join/leave (your channel)"],

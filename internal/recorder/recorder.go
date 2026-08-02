@@ -49,6 +49,11 @@ var ErrNotRecording = errors.New("recorder: channel is not being recorded")
 // after receiving the quit command before killing the process.
 const stopGracePeriod = 5 * time.Second
 
+// videoRingBytes absorbs short disk/ffmpeg stalls without back-pressuring the
+// SFU read loop. Once full, new recorder packets are dropped; live voice/video
+// forwarding remains the higher-priority workload.
+const videoRingBytes = 16 * 1024 * 1024
+
 // Config holds the recorder settings (populated from the "recording" config
 // section).
 type Config struct {
@@ -135,7 +140,7 @@ type Session struct {
 	// AudioTap and VideoTap are the router-facing track writers feeding the
 	// ffmpeg process.
 	AudioTap *Tap
-	VideoTap *Tap
+	VideoTap *BufferedTap
 
 	router TapRouter
 	tapID  string
@@ -224,7 +229,7 @@ func (r *Recorder) Start(ctx context.Context, channelID int64, router TapRouter)
 		_ = cmd.Kill()
 		return nil, fmt.Errorf("audio tap: %w", err)
 	}
-	videoTap, err := NewTap(videoPort)
+	videoTap, err := NewBufferedTap(videoPort, videoRingBytes)
 	if err != nil {
 		_ = audioTap.Close()
 		_ = cmd.Kill()
@@ -368,6 +373,93 @@ func freeUDPPort() (int, error) {
 type Tap struct {
 	conn *net.UDPConn
 	addr *net.UDPAddr
+}
+
+// BufferedTap is a bounded asynchronous RTP writer used by the video recorder.
+// It owns packet copies because router packets are only valid during WriteRTP.
+type BufferedTap struct {
+	tap      *Tap
+	maxBytes int
+	queue    chan []byte
+	done     chan struct{}
+
+	mu      sync.Mutex
+	queued  int
+	dropped uint64
+	closed  bool
+}
+
+// NewBufferedTap creates a UDP tap with a bounded in-memory write ring.
+func NewBufferedTap(port, maxBytes int) (*BufferedTap, error) {
+	if maxBytes <= 0 {
+		return nil, fmt.Errorf("recorder buffer size must be positive")
+	}
+	tap, err := NewTap(port)
+	if err != nil {
+		return nil, err
+	}
+	capacity := max(1, maxBytes/1200)
+	b := &BufferedTap{
+		tap: tap, maxBytes: maxBytes,
+		queue: make(chan []byte, capacity), done: make(chan struct{}),
+	}
+	go b.writeLoop()
+	return b, nil
+}
+
+// WriteRTP copies and queues a packet without waiting for the UDP consumer.
+func (b *BufferedTap) WriteRTP(pkt *rtp.Packet) error {
+	raw, err := pkt.Marshal()
+	if err != nil {
+		return err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return net.ErrClosed
+	}
+	if b.queued+len(raw) > b.maxBytes {
+		b.dropped++
+		return nil
+	}
+	select {
+	case b.queue <- raw:
+		b.queued += len(raw)
+	default:
+		b.dropped++
+	}
+	return nil
+}
+
+func (b *BufferedTap) writeLoop() {
+	defer close(b.done)
+	for raw := range b.queue {
+		_, _ = b.tap.conn.WriteToUDP(raw, b.tap.addr)
+		b.mu.Lock()
+		b.queued -= len(raw)
+		b.mu.Unlock()
+	}
+}
+
+// Dropped returns the number of packets discarded after the ring filled.
+func (b *BufferedTap) Dropped() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.dropped
+}
+
+// Close flushes queued packets, stops the writer, and releases its socket.
+func (b *BufferedTap) Close() error {
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return nil
+	}
+	b.closed = true
+	close(b.queue)
+	b.mu.Unlock()
+	<-b.done
+	return b.tap.Close()
 }
 
 // NewTap creates a Tap sending to 127.0.0.1:port.

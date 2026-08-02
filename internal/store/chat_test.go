@@ -74,7 +74,7 @@ func TestChatMessageRowsHoldNoPlaintext(t *testing.T) {
 		_, _ = s.DB().ExecContext(ctx, `DELETE FROM chat_messages WHERE channel_id = $1`, scope)
 	})
 
-	id, err := s.StoreChatMessage(ctx, scope, "u1", "nick", sealTest(t, key, canary), 3)
+	id, _, err := s.StoreChatMessage(ctx, scope, "u1", "nick", sealTest(t, key, canary), 3, 0, "")
 	if err != nil {
 		t.Fatalf("StoreChatMessage: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestChatMessageRowsHoldNoPlaintext(t *testing.T) {
 	// An edit re-seals under a possibly newer generation and never writes back
 	// into the legacy column.
 	edited := sealTest(t, key, canary+"-edited")
-	if err := s.EditChatMessage(ctx, id, edited, 4); err != nil {
+	if _, err := s.EditChatMessage(ctx, id, edited, 4, 0); err != nil {
 		t.Fatalf("EditChatMessage: %v", err)
 	}
 	body, bodyEnc, keyID = read()
@@ -160,7 +160,7 @@ func TestEditRejectedOnLegacyPlaintextRow(t *testing.T) {
 	}
 
 	key := testScopeKey(21)
-	if err := s.EditChatMessage(ctx, id, sealTest(t, key, "edited"), 1); err != nil {
+	if _, err := s.EditChatMessage(ctx, id, sealTest(t, key, "edited"), 1, 0); err != nil {
 		t.Fatalf("editing a not-yet-backfilled row: %v", err)
 	}
 	var body, bodyEnc string
@@ -188,7 +188,7 @@ func TestPlaintextWriteRejectedByConstraint(t *testing.T) {
 		_, _ = s.DB().ExecContext(ctx, `DELETE FROM chat_messages WHERE channel_id = $1`, scope)
 	})
 
-	id, err := s.StoreChatMessage(ctx, scope, "u1", "nick", sealTest(t, key, "hello"), 1)
+	id, _, err := s.StoreChatMessage(ctx, scope, "u1", "nick", sealTest(t, key, "hello"), 1, 0, "")
 	if err != nil {
 		t.Fatalf("StoreChatMessage: %v", err)
 	}

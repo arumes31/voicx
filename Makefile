@@ -24,7 +24,7 @@ VERSION_FLAGS = -ldflags="-s -w \
 	-X voicx/internal/version.Dirty=$(VOICX_DIRTY) \
 	-X voicx/internal/version.UpdateRepo=$(VOICX_UPDATE_REPO)"
 
-.PHONY: all build run migrate proto tidy test cover fmt vet docker-build docker-run docker-stop compose-up compose-down compose-logs chaos clean help client-build
+.PHONY: all build run migrate proto tidy test cover fmt vet docker-build docker-run docker-stop compose-up compose-down compose-logs chaos chaos-webrtc profile-db query-load webrtc-load canary clean help client-build
 
 all: build
 
@@ -102,6 +102,26 @@ compose-logs:
 ## chaos: run the database chaos drill against the running compose stack (467)
 chaos:
 	./scripts/chaos-db.sh
+
+## chaos-webrtc: run the 100-client Opus profile through a toxic TURN/TCP relay (917)
+chaos-webrtc:
+	bash ./scripts/chaos-webrtc.sh
+
+## profile-db: EXPLAIN ANALYZE the hot chat and permission queries (701)
+profile-db:
+	psql "$(DATABASE_URL)" -v ON_ERROR_STOP=1 -f scripts/profile-hot-queries.sql
+
+## query-load: drive the ServerQuery listener at 5,000 requests/sec (934)
+query-load:
+	$(GO) run ./cmd/queryload -rate 5000
+
+## webrtc-load: simulate 100 authenticated Opus publishers against the SFU (916)
+webrtc-load:
+	$(GO) run ./cmd/loadtest -clients 100 -webrtc $(LOADTEST_ARGS)
+
+## canary: run encryption rotation and plaintext-leakage canaries (920)
+canary:
+	$(GO) test ./internal/server ./internal/e2ee -run 'Canary|Plaintext|Ratchet|X3DH|SkippedKey|SignedPreKey' -count=1
 
 ## clean: remove local build artifacts
 clean:

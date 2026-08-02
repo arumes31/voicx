@@ -95,7 +95,7 @@ type HotkeyProfile struct {
 // default flips from the zero value, and add the repair to migrateSettings:
 // loading merges the file ONTO the defaults, so a field an older client always
 // wrote wins over the new default unless it is explicitly repaired.
-const settingsVersion = 3
+const settingsVersion = 4
 
 // Settings holds all user preferences.
 type Settings struct {
@@ -157,10 +157,11 @@ type Settings struct {
 	LogServerChat  bool `json:"log_server_chat"`
 
 	// Notifications.
-	NotifyJoinLeave  bool `json:"notify_join_leave"`
-	NotifyConnection bool `json:"notify_connection"`
-	PlaySounds       bool `json:"play_sounds"`
-	WhisperSound     bool `json:"whisper_sound"`
+	NotifyJoinLeave       bool   `json:"notify_join_leave"`
+	NotifyConnection      bool   `json:"notify_connection"`
+	PlaySounds            bool   `json:"play_sounds"`
+	WhisperSound          bool   `json:"whisper_sound"`
+	ChatNotificationLevel string `json:"chat_notification_level"` // direct | channel_mentions | role_mentions | all
 
 	// Whisper lists (re-applied on connect and via the Whisper settings page).
 	WhisperClients  []string `json:"whisper_clients"`
@@ -190,7 +191,8 @@ type Settings struct {
 	LowBandwidth bool `json:"low_bandwidth"` // (88) low-bandwidth mode
 
 	// Security (wave 4a).
-	AllowPlaintext bool `json:"allow_plaintext"` // allow plaintext control connections (dev servers)
+	AllowPlaintext bool              `json:"allow_plaintext"`         // allow plaintext control connections (dev servers)
+	E2EEVerified   map[string]string `json:"e2ee_verified,omitempty"` // uniqueID -> verified safety number
 
 	// Chat display (wave 5b).
 	ChatTimestamps        string           `json:"chat_timestamps"`        // "absolute" | "relative" | "off"
@@ -230,27 +232,28 @@ type Settings struct {
 // DefaultSettings returns the defaults used when no settings file exists.
 func DefaultSettings() Settings {
 	return Settings{
-		SettingsVersion:    settingsVersion,
-		PlaySounds:         true,
-		ActivationMode:     "ptt",
-		VADThreshold:       50,
-		EchoCancellation:   true,
-		NoiseSuppression:   true,
-		Volume:             100,
-		HotkeyPTT:          "Space",
-		HotkeyMute:         "Ctrl+M",
-		HotkeyQuickConnect: "Ctrl+Shift+C",
-		HotkeyZen:          "Ctrl+Shift+Z",
-		IdleVideoPause:     true,
-		Theme:              "dark",
-		UIFont:             "outfit",
-		UIFontSize:         14,
-		WindowOpacity:      100,
-		ChatMaxLines:       200,
-		NotifyJoinLeave:    true,
-		NotifyConnection:   true,
-		WhisperSound:       true,
-		UpdatesAutoCheck:   true,
+		SettingsVersion:       settingsVersion,
+		PlaySounds:            true,
+		ActivationMode:        "ptt",
+		VADThreshold:          50,
+		EchoCancellation:      true,
+		NoiseSuppression:      true,
+		Volume:                100,
+		HotkeyPTT:             "Space",
+		HotkeyMute:            "Ctrl+M",
+		HotkeyQuickConnect:    "Ctrl+Shift+C",
+		HotkeyZen:             "Ctrl+Shift+Z",
+		IdleVideoPause:        true,
+		Theme:                 "dark",
+		UIFont:                "outfit",
+		UIFontSize:            14,
+		WindowOpacity:         100,
+		ChatMaxLines:          200,
+		NotifyJoinLeave:       true,
+		NotifyConnection:      true,
+		WhisperSound:          true,
+		ChatNotificationLevel: "all",
+		UpdatesAutoCheck:      true,
 
 		PTTReleaseDelayMs: 0,
 		WarnMutedTalking:  true,
@@ -345,6 +348,9 @@ func migrateSettings(s Settings) Settings {
 		// Files written before the opacity option carry no value, and 0 would
 		// clamp the window to the 20% floor at the next start (292).
 		s.WindowOpacity = 100
+	}
+	if s.SettingsVersion < 4 && s.ChatNotificationLevel == "" {
+		s.ChatNotificationLevel = "all"
 	}
 	s.SettingsVersion = settingsVersion
 	return s
@@ -452,6 +458,11 @@ func (a *App) SaveSettings(s Settings) string {
 	}
 	if s.Volume < 0 || s.Volume > 200 {
 		return "volume must be 0..200"
+	}
+	switch s.ChatNotificationLevel {
+	case "direct", "channel_mentions", "role_mentions", "all":
+	default:
+		return "invalid chat notification level"
 	}
 	a.settingsMu.Lock()
 	a.settings = mergeGoOwned(a.settings, s)

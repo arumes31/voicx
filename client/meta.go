@@ -46,8 +46,10 @@ func (a *App) ExportLogs() string {
 	}
 	defer out.Close()
 	zw := zip.NewWriter(out)
-	for _, name := range []string{"client.log", "chat.log", "crash.log"} {
-		raw, err := os.ReadFile(filepath.Join(dir, name))
+	entries, _ := filepath.Glob(filepath.Join(dir, "*.log"))
+	for _, path := range entries {
+		name := filepath.Base(path)
+		raw, err := os.ReadFile(path)
 		if err != nil {
 			continue // a missing log is fine
 		}

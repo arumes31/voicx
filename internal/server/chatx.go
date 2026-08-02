@@ -77,11 +77,18 @@ func newChatRateLimiter(max int, window time.Duration) *chatRateLimiter {
 
 // allow consumes one token; false means the user is over the rate limit.
 func (l *chatRateLimiter) allow(uid string, now time.Time) bool {
+	return l.allowLimit(uid, now, l.max)
+}
+
+func (l *chatRateLimiter) allowLimit(uid string, now time.Time, limit int) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if limit <= 0 {
+		limit = l.max
+	}
 	b, ok := l.buckets[uid]
 	if !ok || now.After(b.reset) {
-		b = &chatBucket{tokens: l.max, reset: now.Add(l.window)}
+		b = &chatBucket{tokens: limit, reset: now.Add(l.window)}
 		l.buckets[uid] = b
 	}
 	if b.tokens <= 0 {
@@ -89,6 +96,24 @@ func (l *chatRateLimiter) allow(uid string, now time.Time) bool {
 	}
 	b.tokens--
 	return true
+}
+
+func (s *TCPServer) chatActionLimit(ctx context.Context, client *Client) int {
+	limit := s.chatRate.max
+	pc, err := s.permCheckerFor(ctx, client)
+	if err != nil {
+		return limit
+	}
+	switch power := pc.power(permissions.PermissionKeyClientTalkPower); {
+	case power >= 75:
+		return limit * 8
+	case power >= 50:
+		return limit * 4
+	case power >= 25:
+		return limit * 2
+	default:
+		return limit
+	}
 }
 
 // spamEntry is one recently seen message body for spam detection. Only the
@@ -169,6 +194,30 @@ type slowTracker struct {
 	last map[string]map[int64]time.Time
 }
 
+type typingTracker struct {
+	mu   sync.Mutex
+	last map[string]time.Time
+}
+
+func newTypingTracker() *typingTracker { return &typingTracker{last: map[string]time.Time{}} }
+
+func (t *typingTracker) allow(key string, now time.Time) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if previous := t.last[key]; !previous.IsZero() && now.Sub(previous) < 2*time.Second {
+		return false
+	}
+	t.last[key] = now
+	if len(t.last) > 10_000 {
+		for candidate, seen := range t.last {
+			if now.Sub(seen) > 10*time.Second {
+				delete(t.last, candidate)
+			}
+		}
+	}
+	return true
+}
+
 func newSlowTracker() *slowTracker {
 	return &slowTracker{last: map[string]map[int64]time.Time{}}
 }
@@ -202,12 +251,6 @@ func (t *slowTracker) check(uid string, channelID int64, seconds int, now time.T
 func (s *TCPServer) routeScopedChat(ctx context.Context, client *Client, msg netproto.ChatSend, channelID int64) error {
 	uid := client.UniqueID
 
-	// (115) per-user rate limit (all scopes).
-	if s.chatRate != nil && !s.chatRate.allow(uid, time.Now()) {
-		s.metricsSink().IncChatMessage("rejected")
-		return s.sendError(client, errCodeMalformed, "chat rate limit exceeded — slow down")
-	}
-
 	// (114) slow mode (channel scope; b_chat_slowmode_bypass or admins skip).
 	if channelID != 0 && s.cfg != nil {
 		if ch, ok := s.deps.State.GetChannel(channelID); ok && ch.SlowModeSeconds > 0 {
@@ -237,10 +280,10 @@ func (s *TCPServer) routeScopedChat(ctx context.Context, client *Client, msg net
 		plain = p
 	}
 
-	// (119) max length (plaintext characters post-decrypt).
-	if s.cfg != nil && s.cfg.ChatMaxLength > 0 && utf8.RuneCountInString(plain) > s.cfg.ChatMaxLength {
+	// (640) cap UTF-8 bytes, not runes, so wire/storage cost is predictable.
+	if s.cfg != nil && s.cfg.ChatMaxLength > 0 && len([]byte(plain)) > s.cfg.ChatMaxLength {
 		s.metricsSink().IncChatMessage("rejected")
-		return s.sendError(client, errCodeMalformed, fmt.Sprintf("message too long (max %d characters)", s.cfg.ChatMaxLength))
+		return s.sendError(client, errCodeMalformed, fmt.Sprintf("message too long (max %d bytes)", s.cfg.ChatMaxLength))
 	}
 
 	// Attachment tokens carry a fresh random key per upload; the filters and
@@ -283,7 +326,16 @@ func (s *TCPServer) routeScopedChat(ctx context.Context, client *Client, msg net
 
 	var messageID int64
 	if s.deps.Chat != nil {
-		id, err := s.deps.Chat.StoreChatMessage(ctx, channelID, uid, client.Username, bodyEnc, keyID)
+		if msg.ReplyToID != 0 {
+			parent, err := s.deps.Chat.GetChatMessage(ctx, msg.ReplyToID)
+			if err != nil {
+				return s.sendError(client, errCodeUnavailable, "reply target lookup failed")
+			}
+			if parent == nil || parent.ChannelID != channelID {
+				return s.sendError(client, errCodeMalformed, "reply target is not in this chat")
+			}
+		}
+		id, inserted, err := s.deps.Chat.StoreChatMessage(ctx, channelID, uid, client.Username, bodyEnc, keyID, msg.ReplyToID, msg.ClientMsgID)
 		if err != nil {
 			// Relaying anyway would turn a constraint violation into
 			// invisible, indefinite history loss; fail the send instead.
@@ -292,6 +344,9 @@ func (s *TCPServer) routeScopedChat(ctx context.Context, client *Client, msg net
 			return s.sendError(client, errCodeUnavailable, "message not stored — not delivered")
 		}
 		messageID = id
+		if !inserted {
+			return nil
+		}
 	}
 
 	// Relay the ciphertext (clients decrypt with the scope key). The relay is
@@ -310,6 +365,8 @@ func (s *TCPServer) routeScopedChat(ctx context.Context, client *Client, msg net
 		Enc:          true,
 		KeyID:        keyID,
 		ID:           messageID,
+		ReplyToID:    msg.ReplyToID,
+		Version:      1,
 		Mentions:     mentions,
 		ClientMsgID:  msg.ClientMsgID,
 	}
@@ -750,6 +807,11 @@ func (s *TCPServer) handleChatHistory(ctx context.Context, client *Client, f *ne
 	if !s.scopeReadable(ctx, client, msg.ChannelID) {
 		return s.sendError(client, errCodePermissionDenied, "not a member of this channel")
 	}
+	// Anonymous users may still join and inspect public channel membership,
+	// but one request cannot bulk-export more than a normal page of history.
+	if client.UserID == 0 && (msg.Limit <= 0 || msg.Limit > 50) {
+		msg.Limit = 50
+	}
 	memberPub := s.publishedKey(client)
 	if memberPub == "" {
 		return s.sendError(client, errCodePermissionDenied, "publish an encryption key before reading history")
@@ -787,6 +849,8 @@ func chatHistoryEntry(m store.ChatMessage, reactions map[string]int) netproto.Ch
 		ID:           m.ID,
 		FromUniqueID: m.FromUniqueID,
 		FromNickname: m.FromNickname,
+		ReplyToID:    m.ReplyToID,
+		Version:      m.Version,
 		BodyEnc:      m.BodyEnc,
 		KeyID:        m.KeyID,
 		SentAt:       m.SentAt.Unix(),
@@ -856,8 +920,8 @@ func (s *TCPServer) handleChatEdit(ctx context.Context, client *Client, f *netpr
 	// (119) same cap as the send path. The nil guard leads: this function
 	// already treats s.cfg as possibly nil above, so testing ChatMaxLength
 	// first would panic on exactly the path that guard exists for.
-	if s.cfg != nil && s.cfg.ChatMaxLength > 0 && utf8.RuneCountInString(plain) > s.cfg.ChatMaxLength {
-		return s.sendError(client, errCodeMalformed, fmt.Sprintf("message too long (max %d characters)", s.cfg.ChatMaxLength))
+	if s.cfg != nil && s.cfg.ChatMaxLength > 0 && len([]byte(plain)) > s.cfg.ChatMaxLength {
+		return s.sendError(client, errCodeMalformed, fmt.Sprintf("message too long (max %d bytes)", s.cfg.ChatMaxLength))
 	}
 	if err := s.moderateBody(ctx, stripAttachmentRefs(plain)); err != nil {
 		return s.sendError(client, errCodeMalformed, err.Error())
@@ -874,7 +938,11 @@ func (s *TCPServer) handleChatEdit(ctx context.Context, client *Client, f *netpr
 		bodyEnc, keyID = ct, id
 	}
 
-	if err := s.deps.Chat.EditChatMessage(ctx, msg.MessageID, bodyEnc, keyID); err != nil {
+	version, err := s.deps.Chat.EditChatMessage(ctx, msg.MessageID, bodyEnc, keyID, msg.ExpectedVersion)
+	if errors.Is(err, store.ErrChatEditConflict) {
+		return s.sendError(client, errCodeConflict, "message changed on another client; reload before editing")
+	}
+	if err != nil {
 		return s.sendError(client, errCodeNotFound, "edit failed: "+err.Error())
 	}
 
@@ -887,6 +955,7 @@ func (s *TCPServer) handleChatEdit(ctx context.Context, client *Client, f *netpr
 		"enc":        true,
 		"key_id":     keyID,
 		"edited_by":  client.UniqueID,
+		"version":    version,
 	})
 	return nil
 }
@@ -1104,6 +1173,15 @@ func (s *TCPServer) handleTyping(ctx context.Context, client *Client, f *netprot
 	}
 	if s.deps == nil || s.deps.Broadcast == nil {
 		return s.sendError(client, errCodeUnavailable, "broadcast backend unavailable")
+	}
+	typingScope := "global"
+	if msg.ToUniqueID != "" {
+		typingScope = "dm:" + msg.ToUniqueID
+	} else if msg.ChannelID != 0 {
+		typingScope = fmt.Sprintf("channel:%d", msg.ChannelID)
+	}
+	if s.typingRate != nil && !s.typingRate.allow(client.UniqueID+"\x00"+typingScope, time.Now()) {
+		return nil
 	}
 	data := typingEvent{
 		ClientID:  client.ID,

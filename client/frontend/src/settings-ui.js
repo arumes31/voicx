@@ -14,6 +14,7 @@ const PAGES = [
     { id: "downloads", icon: "⬇", label: "settings.downloads" },
     { id: "chat", icon: "💬", label: "settings.chat" },
     { id: "security", icon: "🔑", label: "settings.security" },
+    { id: "server", icon: "🖥", label: "settings.server" },
     { id: "notifications", icon: "🔔", label: "settings.notifications" },
 ];
 
@@ -213,6 +214,69 @@ function pageApplication() {
     css.value = s.user_css || "";
     css.onchange = () => { s.user_css = css.value; };
     el.appendChild(row("User CSS", css));
+    return el;
+}
+
+function pageServer() {
+    const el = document.createElement("div");
+    const status = hint("Loading effective server configuration…");
+    el.appendChild(status);
+    if (!V().state.isAdmin) {
+        status.textContent = "Server configuration is available to administrators only.";
+        return el;
+    }
+
+    const form = document.createElement("div");
+    form.hidden = true;
+    el.appendChild(form);
+    const values = {};
+    const addNumber = (label, key, min, max) => {
+        const input = numberInput(0, min, max, (v) => { values[key] = v; });
+        form.appendChild(row(label, input));
+        values[key] = 0;
+        return input;
+    };
+    const maxClients = addNumber("Maximum clients (0 = unlimited)", "max_clients", 0, 100000);
+    const timeout = addNumber("Connection timeout (seconds)", "client_timeout_seconds", 30, 86400);
+    const bitrate = addNumber("Default Opus bitrate (bit/s)", "opus_bitrate", 6000, 510000);
+    const fec = checkbox(false, (v) => { values.opus_fec = v; });
+    const dtx = checkbox(false, (v) => { values.opus_dtx = v; });
+    const stereo = checkbox(false, (v) => { values.opus_stereo = v; });
+    form.appendChild(row("Default Opus in-band FEC", fec));
+    form.appendChild(row("Default Opus DTX", dtx));
+    form.appendChild(row("Default Opus stereo", stereo));
+    form.appendChild(hint("Codec defaults apply to newly created channels. Existing channels keep their explicit settings."));
+    const apply = document.createElement("button");
+    apply.textContent = "Apply server configuration";
+    apply.onclick = async () => {
+        apply.disabled = true;
+        try {
+            const result = await window.go.main.App.SetServerConfig(values);
+            Object.assign(values, result);
+            status.textContent = "Server configuration saved and active.";
+            V().toast("server configuration updated");
+        } catch (err) {
+            status.textContent = "Could not save server configuration: " + err;
+            V().toast(status.textContent, "warn");
+        } finally {
+            apply.disabled = false;
+        }
+    };
+    form.appendChild(row("Runtime settings", apply));
+
+    window.go.main.App.GetServerConfig().then((cfg) => {
+        Object.assign(values, cfg);
+        maxClients.value = cfg.max_clients;
+        timeout.value = cfg.client_timeout_seconds;
+        bitrate.value = cfg.opus_bitrate;
+        fec.checked = !!cfg.opus_fec;
+        dtx.checked = !!cfg.opus_dtx;
+        stereo.checked = !!cfg.opus_stereo;
+        status.textContent = "Changes take effect immediately and are restored after restart.";
+        form.hidden = false;
+    }).catch((err) => {
+        status.textContent = "Could not load server configuration: " + err;
+    });
     return el;
 }
 
@@ -960,6 +1024,23 @@ function pageSecurity() {
 function pageNotifications() {
     const s = settings();
     const el = document.createElement("div");
+    const chatLevel = document.createElement("select");
+    chatLevel.className = "dlg-input";
+    for (const [value, label] of [
+        ["direct", "Direct messages only"],
+        ["channel_mentions", "DMs + channel mentions"],
+        ["role_mentions", "DMs + role mentions"],
+        ["all", "All messages"],
+    ]) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = label;
+        chatLevel.appendChild(option);
+    }
+    chatLevel.value = s.chat_notification_level || "all";
+    chatLevel.onchange = () => { s.chat_notification_level = chatLevel.value; };
+    el.appendChild(row("Chat notification category", chatLevel));
+    el.appendChild(hint("Per-channel mute and notification matrix outputs still apply after this category filter."));
     // (385) notification matrix: rows = events, columns = outputs. The rows
     // are the dispatcher's own event list, so every event it can fire has
     // reachable toggles here and the two cannot drift apart.
@@ -1081,6 +1162,7 @@ const PAGE_BUILDERS = {
     downloads: pageDownloads,
     chat: pageChat,
     security: pageSecurity,
+    server: pageServer,
     notifications: pageNotifications,
 };
 

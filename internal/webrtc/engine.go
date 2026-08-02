@@ -1,10 +1,16 @@
 package webrtc
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/pion/interceptor"
+	"github.com/pion/interceptor/pkg/cc"
+	"github.com/pion/interceptor/pkg/gcc"
 	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v3"
 	"go.uber.org/zap"
@@ -23,7 +29,9 @@ type Engine struct {
 	iceServers []webrtc.ICEServer
 
 	// enableAV1 controls whether the AV1 video codec is registered.
-	enableAV1 bool
+	enableAV1   bool
+	certificate webrtc.Certificate
+	fingerprint string
 
 	mu     sync.RWMutex
 	peers  map[string]*PeerConnectionWrapper
@@ -48,8 +56,19 @@ func New(logger *zap.Logger, iceServers []string, enableAV1 bool) (*Engine, erro
 	// Use lite ICE candidate gathering by default; full ICE is configured via
 	// the ICE servers. Keep defaults conservative for a server-side SFU.
 	settingEngine.SetSCTPMaxReceiveBufferSize(16 * 1024 * 1024)
+	settingEngine.SetInterfaceFilter(usableICEInterface)
 
 	interceptorRegistry := &interceptor.Registry{}
+	congestionController, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
+		return gcc.NewSendSideBWE(gcc.SendSideBWEInitialBitrate(1_500_000))
+	})
+	if err != nil {
+		return nil, fmt.Errorf("webrtc: creating GCC interceptor: %w", err)
+	}
+	interceptorRegistry.Add(congestionController)
+	if err := webrtc.ConfigureTWCCHeaderExtensionSender(mediaEngine, interceptorRegistry); err != nil {
+		return nil, fmt.Errorf("webrtc: configuring TWCC egress: %w", err)
+	}
 	if err := webrtc.RegisterDefaultInterceptors(mediaEngine, interceptorRegistry); err != nil {
 		return nil, fmt.Errorf("webrtc: registering default interceptors: %w", err)
 	}
@@ -70,18 +89,36 @@ func New(logger *zap.Logger, iceServers []string, enableAV1 bool) (*Engine, erro
 	if len(parsedICE) == 0 {
 		parsedICE = []webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}}
 	}
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("webrtc: generating DTLS key: %w", err)
+	}
+	certificate, err := webrtc.GenerateCertificate(privateKey)
+	if err != nil {
+		return nil, fmt.Errorf("webrtc: generating DTLS certificate: %w", err)
+	}
+	fingerprints, err := certificate.GetFingerprints()
+	if err != nil {
+		return nil, fmt.Errorf("webrtc: fingerprinting DTLS certificate: %w", err)
+	}
+	if len(fingerprints) == 0 {
+		return nil, fmt.Errorf("webrtc: DTLS certificate has no fingerprint")
+	}
 
 	e := &Engine{
-		logger:     logger,
-		api:        api,
-		iceServers: parsedICE,
-		enableAV1:  enableAV1,
-		peers:      make(map[string]*PeerConnectionWrapper),
+		logger:      logger,
+		api:         api,
+		iceServers:  parsedICE,
+		enableAV1:   enableAV1,
+		certificate: *certificate,
+		fingerprint: fingerprints[0].Value,
+		peers:       make(map[string]*PeerConnectionWrapper),
 	}
 
 	e.logger.Info("webrtc engine ready",
 		zap.Int("ice_servers", len(parsedICE)),
 		zap.Bool("av1_enabled", enableAV1),
+		zap.String("dtls_fingerprint", e.fingerprint),
 	)
 	return e, nil
 }
@@ -104,7 +141,8 @@ func (e *Engine) NewPeerConnection(clientID string) (*PeerConnectionWrapper, err
 	}
 
 	pc, err := e.api.NewPeerConnection(webrtc.Configuration{
-		ICEServers: e.iceServers,
+		ICEServers:   e.iceServers,
+		Certificates: []webrtc.Certificate{e.certificate},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("webrtc: creating peer connection for %q: %w", clientID, err)
@@ -114,6 +152,25 @@ func (e *Engine) NewPeerConnection(clientID string) (*PeerConnectionWrapper, err
 	e.peers[clientID] = wrapper
 	e.logger.Info("webrtc peer connection created", zap.String("client_id", clientID))
 	return wrapper, nil
+}
+
+// DTLSFingerprint returns the ephemeral ECDSA P-256 identity shared by peer
+// connections during this process run. A fresh identity is generated on the
+// next server start, limiting media-key lifetime without changing the stable
+// control-channel TLS certificate pinned by clients.
+func (e *Engine) DTLSFingerprint() string { return e.fingerprint }
+
+// usableICEInterface removes host-only bridge adapters while keeping physical,
+// loopback, VPN, and unknown interfaces eligible. A VPN may be the only route
+// to a private deployment, so it is intentionally not filtered by name.
+func usableICEInterface(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	for _, prefix := range []string{"docker", "veth", "virbr", "vboxnet", "vmnet", "br-"} {
+		if strings.HasPrefix(n, prefix) {
+			return false
+		}
+	}
+	return true
 }
 
 // PeerConnection returns the registered wrapper for clientID, or nil if none.

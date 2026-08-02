@@ -39,13 +39,19 @@ type Config struct {
 	// backups and big uploads run at full speed when nobody is listening.
 	// Both are 0-23; equal values disable the window. A start after the end
 	// wraps past midnight (22 -> 6).
-	FileQuietHoursStart int    `mapstructure:"file_quiet_hours_start"`
-	FileQuietHoursEnd   int    `mapstructure:"file_quiet_hours_end"`
-	DatabaseURL         string `mapstructure:"database_url"`
-	RedisAddr           string `mapstructure:"redis_addr"`
-	RedisPassword       string `mapstructure:"redis_password"`
-	RedisEnabled        bool   `mapstructure:"redis_enabled"`
-	MaxClients          int    `mapstructure:"max_clients"`
+	FileQuietHoursStart  int    `mapstructure:"file_quiet_hours_start"`
+	FileQuietHoursEnd    int    `mapstructure:"file_quiet_hours_end"`
+	DatabaseURL          string `mapstructure:"database_url"`
+	PIIKeyFile           string `mapstructure:"pii_key_file"`
+	RedisAddr            string `mapstructure:"redis_addr"`
+	RedisPassword        string `mapstructure:"redis_password"`
+	RedisEnabled         bool   `mapstructure:"redis_enabled"`
+	MaxClients           int    `mapstructure:"max_clients"`
+	ClientTimeoutSeconds int    `mapstructure:"client_timeout_seconds"`
+	DefaultOpusBitrate   int    `mapstructure:"default_opus_bitrate"`
+	DefaultOpusFEC       bool   `mapstructure:"default_opus_fec"`
+	DefaultOpusDTX       bool   `mapstructure:"default_opus_dtx"`
+	DefaultOpusStereo    bool   `mapstructure:"default_opus_stereo"`
 	// EchoChannelName is the name of the loopback test channel: the server
 	// ensures it exists at startup, and publishers in it hear their own audio
 	// routed back (the echo channel is the only channel with self-fan-out).
@@ -100,7 +106,7 @@ type Config struct {
 	// permissions; registered users get Member at first login.
 	DefaultGroupsEnabled bool `mapstructure:"default_groups_enabled"`
 
-	// Chat moderation/limits (wave 5a). MaxLength is in plaintext characters
+	// Chat moderation/limits (wave 5a). MaxLength is in UTF-8 bytes
 	// post-decrypt. RateMsgs/RateWindowSeconds is a per-user token bucket.
 	//
 	// WordFilter/LinkBlacklist/LinkWhitelist are comma-separated and
@@ -229,13 +235,19 @@ func Load() (*Config, error) {
 	v.SetDefault("tls_key_file", "")
 	v.SetDefault("chat_allow_plaintext", false)
 	v.SetDefault("chat_master_key_file", "./data/keys/chat_master.key")
+	v.SetDefault("pii_key_file", "./data/keys/pii.key")
 	v.SetDefault("chat_legacy_history", "encrypt")
 	v.SetDefault("chat_key_rotate_min_seconds", 60)
 	v.SetDefault("chat_search_max_messages", 2000)
 	v.SetDefault("file_tls_enabled", true)
 	v.SetDefault("server_info_motd", false)
 	v.SetDefault("default_groups_enabled", true)
-	v.SetDefault("chat_max_length", 2000)
+	v.SetDefault("chat_max_length", 4096)
+	v.SetDefault("client_timeout_seconds", 90)
+	v.SetDefault("default_opus_bitrate", 32000)
+	v.SetDefault("default_opus_fec", true)
+	v.SetDefault("default_opus_dtx", false)
+	v.SetDefault("default_opus_stereo", false)
 	v.SetDefault("chat_rate_msgs", 5)
 	v.SetDefault("chat_rate_window_seconds", 3)
 	v.SetDefault("chat_word_filter", "")

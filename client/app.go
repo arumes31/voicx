@@ -38,6 +38,11 @@ type App struct {
 	hkMu    sync.Mutex
 	hotkeys map[string]*hotkeyReg
 
+	// opacityMu serialises OS-level setWindowOpacity calls so the background
+	// watcher and SetWindowOpacity cannot interleave and leave persisted vs.
+	// visible opacity divergent (292).
+	opacityMu sync.Mutex
+
 	// readMu guards settings.LastReadChannels: server pushes from the read
 	// loop race the frontend's own mark-read calls (121).
 	readMu sync.Mutex
@@ -95,8 +100,13 @@ func (a *App) windowWatch() {
 		opacity := a.settings.WindowOpacity
 		minimizeToTray := a.settings.MinimizeToTray
 		a.settingsMu.Unlock()
-		if !applied && setWindowOpacity(opacity) == nil {
-			applied = true
+		if !applied {
+			a.opacityMu.Lock()
+			err := setWindowOpacity(opacity)
+			a.opacityMu.Unlock()
+			if err == nil {
+				applied = true
+			}
 		}
 		min := wailsRuntime.WindowIsMinimised(a.ctx)
 		if min && !wasMin && minimizeToTray {
@@ -123,9 +133,15 @@ func (a *App) SetWindowOpacity(pct int) string {
 	}
 	a.settingsMu.Lock()
 	a.settings.WindowOpacity = pct
-	_ = a.saveLocked()
+	if err := a.saveLocked(); err != nil {
+		a.settingsMu.Unlock()
+		return err.Error()
+	}
 	a.settingsMu.Unlock()
-	if err := setWindowOpacity(pct); err != nil {
+	a.opacityMu.Lock()
+	err := setWindowOpacity(pct)
+	a.opacityMu.Unlock()
+	if err != nil {
 		return err.Error()
 	}
 	return ""
@@ -308,12 +324,24 @@ func (a *App) ChannelEdit(channelID int64, topic string, maxClients int, opusBit
 // encrypted in the backend (4b): DMs are true E2EE (nacl/box), channel and
 // global use the server-distributed scope keys (secretbox).
 func (a *App) SendChat(scope, target, text string) string {
+	return a.sendChat(scope, target, text, 0)
+}
+
+// SendChatReply sends a channel/global reply with an explicit parent id.
+func (a *App) SendChatReply(scope, target, text string, replyToID int64) string {
+	return a.sendChat(scope, target, text, replyToID)
+}
+
+func (a *App) sendChat(scope, target, text string, replyToID int64) string {
 	if text == "" {
 		return "empty message"
 	}
 	msg, err := a.cmLoad().encryptChat(scope, target, text)
 	if err != nil {
 		return "encryption failed: " + err.Error()
+	}
+	if scope != "direct" {
+		msg.ReplyToID = replyToID
 	}
 	if err := a.cmLoad().write(netproto.MsgChatSend, msg); err != nil {
 		return err.Error()
@@ -382,6 +410,12 @@ func (a *App) SendICECandidate(candidate, sdpMid string, sdpMLineIndex uint16) {
 
 // SetScreenShare declares screen-share state to the channel.
 func (a *App) SetScreenShare(active bool) string {
+	return a.SetScreenShareQuality(active, 0)
+}
+
+// SetScreenShareQuality declares state plus the requested capture height so
+// the server can apply the granular 1080p permission.
+func (a *App) SetScreenShareQuality(active bool, maxHeight int) string {
 	// the voice teardown declares "not sharing" while disconnecting, and a
 	// tab switch stores a nil manager: write takes its mutex before looking
 	// at the connection, so a nil manager panics rather than erroring.
@@ -389,7 +423,7 @@ func (a *App) SetScreenShare(active bool) string {
 	if m == nil {
 		return "not connected"
 	}
-	if err := m.write(netproto.MsgScreenShare, netproto.ScreenShare{Active: active}); err != nil {
+	if err := m.write(netproto.MsgScreenShare, netproto.ScreenShare{Active: active, MaxHeight: maxHeight}); err != nil {
 		return err.Error()
 	}
 	return ""

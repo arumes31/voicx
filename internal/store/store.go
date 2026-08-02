@@ -6,6 +6,7 @@ import (
 	"embed"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/lib/pq"
@@ -18,8 +19,24 @@ var migrationsFS embed.FS
 // Store wraps a *sql.DB connection pool and a logger, providing access to the
 // voicx PostgreSQL database.
 type Store struct {
-	db     *sql.DB
-	logger *zap.Logger
+	db            *sql.DB
+	logger        *zap.Logger
+	reactionCache sync.Map // message id -> *reactionCacheEntry
+	pii           *PIICipher
+}
+
+// SetPIICipher installs the process-local field cipher used by PII methods.
+func (s *Store) SetPIICipher(cipher *PIICipher) { s.pii = cipher }
+
+// SchemaVersion returns the newest applied migration filename. An empty
+// string means the migration ledger exists but has no applied files yet.
+func (s *Store) SchemaVersion(ctx context.Context) (string, error) {
+	const q = `SELECT COALESCE(MAX(filename), '') FROM schema_migrations`
+	var version string
+	if err := s.db.QueryRowContext(ctx, q).Scan(&version); err != nil {
+		return "", fmt.Errorf("reading schema version: %w", err)
+	}
+	return version, nil
 }
 
 // New opens the database at databaseURL using the lib/pq driver, configures the

@@ -71,6 +71,13 @@ type SpoolStore interface {
 	MarkMessagesDelivered(ctx context.Context, ids []int64) error
 }
 
+// PreKeyStore persists X3DH signed and one-time prekeys. Consumption is
+// transactional so one-time keys are never handed to two initiators.
+type PreKeyStore interface {
+	PublishPreKeyBundle(ctx context.Context, userID int64, bundle store.PreKeyBundle, oneTime []store.PreKey) error
+	ConsumePreKeyBundle(ctx context.Context, userID int64) (*store.PreKeyBundle, error)
+}
+
 // VoiceBackend is the subset of webrtc.Voice the TCP server needs for the
 // voice pipeline: WebRTC signaling, channel routing membership, and whisper
 // configuration. It uses plain types only, so fakes need no Pion.
@@ -154,6 +161,7 @@ type GroupStore interface {
 	AssignServerGroup(ctx context.Context, groupID, userID int64, expiresIn time.Duration) error
 	UnassignServerGroup(ctx context.Context, groupID, userID int64) error
 	AssignChannelGroup(ctx context.Context, groupID, userID, channelID int64) error
+	ApplyChannelGroupAutoAssignment(ctx context.Context, userID, channelID int64) (groupID int64, applied bool, err error)
 	UnassignChannelGroup(ctx context.Context, userID, channelID int64) error
 	UserGroupIDs(ctx context.Context, userID int64) ([]int64, error)
 	FindGroupByName(ctx context.Context, groupType, name string) (*store.Group, error)
@@ -208,10 +216,10 @@ type ComplaintBackend interface {
 // legacy plaintext backfill. Bodies cross this interface as ciphertext plus
 // the scope generation that sealed them (91). It is satisfied by *store.Store.
 type ChatStore interface {
-	StoreChatMessage(ctx context.Context, channelID int64, fromUniqueID, fromNickname, bodyEnc string, keyID uint32) (int64, error)
+	StoreChatMessage(ctx context.Context, channelID int64, fromUniqueID, fromNickname, bodyEnc string, keyID uint32, replyToID int64, clientMsgID string) (int64, bool, error)
 	ChatHistory(ctx context.Context, channelID, beforeID int64, limit int) ([]store.ChatMessage, error)
 	GetChatMessage(ctx context.Context, id int64) (*store.ChatMessage, error)
-	EditChatMessage(ctx context.Context, id int64, bodyEnc string, keyID uint32) error
+	EditChatMessage(ctx context.Context, id int64, bodyEnc string, keyID uint32, expectedVersion uint64) (uint64, error)
 	DeleteChatMessage(ctx context.Context, id int64) error
 	PinChatMessage(ctx context.Context, channelID, messageID int64, pinnedBy string) error
 	UnpinChatMessage(ctx context.Context, channelID, messageID int64) error
@@ -256,6 +264,7 @@ type Deps struct {
 	Resolver     *permissions.Resolver
 	Bans         BanStore
 	Spool        SpoolStore
+	PreKeys      PreKeyStore
 	Voice        VoiceBackend
 	Recorder     RecordingBackend
 	FileTransfer FileTransferBackend

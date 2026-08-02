@@ -385,6 +385,18 @@ type authIdentity struct {
 // (registered users only), and announce the join.
 func (s *TCPServer) finishAuth(ctx context.Context, client *Client, id authIdentity) error {
 	client.setIdentity(id.uniqueID, id.nickname, id.userID, id.admin)
+	if !id.guest {
+		if recorder, ok := s.deps.Auth.(interface {
+			RecordLastIP(context.Context, int64, string) error
+		}); ok {
+			host, _, err := net.SplitHostPort(client.Conn.RemoteAddr().String())
+			if err == nil {
+				if err := recorder.RecordLastIP(ctx, id.userID, host); err != nil {
+					s.logger.Warn("recording encrypted login IP failed", zap.Error(err))
+				}
+			}
+		}
+	}
 
 	// Default groups (143/144): a registered user with no server-group
 	// memberships joins the Member group on first login. Guests virtually
@@ -713,6 +725,18 @@ func (s *TCPServer) handleCreateChannel(ctx context.Context, client *Client, f *
 		return s.sendError(client, errCodePermissionDenied, "cannot set needed join power above your own join power")
 	}
 
+	s.configMu.RLock()
+	defaultBitrate := s.cfg.DefaultOpusBitrate
+	defaultFEC := s.cfg.DefaultOpusFEC
+	defaultDTX := s.cfg.DefaultOpusDTX
+	defaultStereo := s.cfg.DefaultOpusStereo
+	s.configMu.RUnlock()
+	if msg.OpusBitrate == 0 {
+		msg.OpusBitrate = defaultBitrate
+		msg.OpusFEC = defaultFEC
+		msg.OpusDTX = defaultDTX
+		msg.OpusStereo = defaultStereo
+	}
 	channelID, err := s.deps.Channels.CreateChannel(ctx, channels.ChannelSpec{
 		Name:            msg.Name,
 		Topic:           msg.Topic,
@@ -1074,6 +1098,10 @@ func (s *TCPServer) handleChatSend(ctx context.Context, client *Client, f *netpr
 	}
 
 	isDM := msg.ToUniqueID != "" || msg.ToClientID != ""
+	if s.chatRate != nil && !s.chatRate.allowLimit(client.UniqueID, time.Now(), s.chatActionLimit(ctx, client)) {
+		s.metricsSink().IncChatMessage("rejected")
+		return s.sendError(client, errCodeMalformed, "chat rate limit exceeded — slow down")
+	}
 
 	// Channel/global scopes run the moderation pipeline (wave 5a): rate
 	// limit, slow mode, decrypt, filters, spam, mentions, store, relay.

@@ -182,6 +182,7 @@ type Router struct {
 	// the same publisher have independent RID/SSRC spaces.
 	videoSources map[string]map[string]map[string]uint32
 	layerPrefs   map[string]string         // subscriberID -> preferred RID ("f"/"h"/"q")
+	keyframeLast map[uint32]time.Time      // media SSRC -> last forwarded PLI/FIR
 	whispers     map[string]*whisperConfig // clientID -> whisper settings
 	// whisperPairs tracks publisher tracks created solely to serve an active
 	// whisper (publisherID -> subscriberID), so they can be torn down when
@@ -245,6 +246,7 @@ func NewRouter(logger *zap.Logger) *Router {
 		rtcpWriters:  make(map[string]RTCPWriter),
 		videoSources: make(map[string]map[string]map[string]uint32),
 		layerPrefs:   make(map[string]string),
+		keyframeLast: make(map[uint32]time.Time),
 		whispers:     make(map[string]*whisperConfig),
 		whisperPairs: make(map[string]map[string]bool),
 		trackSlots:   make(map[string]map[string]string),
@@ -1648,7 +1650,7 @@ func (r *Router) RequestKeyframe(publisherID, slot, rid string) {
 	}
 	r.mu.RUnlock()
 
-	if w == nil {
+	if w == nil || ssrc == 0 || !r.allowKeyframeRequest(ssrc, time.Now()) {
 		return
 	}
 	if err := w.WriteRTCP([]rtcp.Packet{
@@ -1701,7 +1703,7 @@ func (r *Router) relayKeyframeRequest(mediaSSRC uint32) {
 	w := r.rtcpWriters[owner]
 	r.mu.RUnlock()
 
-	if owner == "" || w == nil {
+	if owner == "" || w == nil || !r.allowKeyframeRequest(mediaSSRC, time.Now()) {
 		return
 	}
 	if err := w.WriteRTCP([]rtcp.Packet{
@@ -1712,6 +1714,21 @@ func (r *Router) relayKeyframeRequest(mediaSSRC uint32) {
 			zap.Error(err),
 		)
 	}
+}
+
+// keyframeRequestWindow coalesces simultaneous subscriber PLIs/FIRs. One
+// upstream keyframe repairs every subscriber on a source; forwarding the
+// entire burst only causes avoidable publisher encoder spikes.
+const keyframeRequestWindow = time.Second
+
+func (r *Router) allowKeyframeRequest(ssrc uint32, now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if last := r.keyframeLast[ssrc]; !last.IsZero() && now.Sub(last) < keyframeRequestWindow {
+		return false
+	}
+	r.keyframeLast[ssrc] = now
+	return true
 }
 
 // allowVideo evaluates the video-publish gate for clientID, defaulting to

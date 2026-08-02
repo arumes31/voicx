@@ -666,7 +666,7 @@ func (s *TCPServer) permTarget(ctx context.Context, tier, uniqueID string, group
 // only set value/grant <= their own grant for that key. Admins and holders
 // of a sufficient grant pass.
 func (s *TCPServer) grantCapOk(pc *permChecker, key string, value, grant int) bool {
-	if pc.admin {
+	if pc.admin || pc.granted(permissions.PermissionKeyPermissionModifyPowerIgnore) {
 		return true
 	}
 	own, tier, err := pc.resolver.Resolve(pc.tp, permissions.PermissionKey(key))
@@ -968,8 +968,9 @@ func (s *TCPServer) doPermCopyLocked(ctx context.Context, pc *permChecker, fromT
 // that hands out b_permission_manage without a grant produces an operator who
 // can open the editor and write nothing (142).
 type permTemplateEntry struct {
-	Value int
-	Grant int
+	Value  int
+	Grant  int
+	Negate bool
 }
 
 // permTemplates are the four built-in permission bundles (fixed in code).
@@ -981,7 +982,10 @@ type permTemplateEntry struct {
 var permTemplates = map[string]map[string]permTemplateEntry{
 	// guest: nothing. Every privileged action is denied-on-unset already, and
 	// everything else is open, which is exactly the guest experience.
-	"guest": {},
+	"guest": {
+		"i_ft_file_upload_power": {Negate: true},
+		"b_client_avatar_upload": {Negate: true},
+	},
 	// member: the two things a registered user is expected to do that the
 	// deny-on-unset default otherwise blocks.
 	"member": {
@@ -1034,6 +1038,7 @@ var permTemplates = map[string]map[string]permTemplateEntry{
 		"b_virtualserver_recording":        {Value: 1, Grant: 1},
 		"b_emoji_manage":                   {Value: 1, Grant: 1},
 		"b_permission_manage":              {Value: 1, Grant: 1},
+		"b_permission_modify_power_ignore": {Value: 1, Grant: 1},
 		"b_server_group_manage":            {Value: 1, Grant: 1},
 		"b_channel_group_manage":           {Value: 1, Grant: 1},
 		"b_audit_view":                     {Value: 1, Grant: 1},
@@ -1083,7 +1088,7 @@ func (s *TCPServer) handlePermTemplateApply(ctx context.Context, client *Client,
 		}
 	}
 	for key, e := range tmpl {
-		if err := s.deps.Groups.SetPermission(ctx, tier, target, key, e.Value, e.Grant, false, false); err != nil {
+		if err := s.deps.Groups.SetPermission(ctx, tier, target, key, e.Value, e.Grant, false, e.Negate); err != nil {
 			return s.sendError(client, errCodeUnavailable, "template apply failed: "+err.Error())
 		}
 	}

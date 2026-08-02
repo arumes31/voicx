@@ -18,13 +18,18 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"os"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/pion/rtp"
+	"github.com/pion/webrtc/v3"
 
 	"voicx/internal/netproto"
 	"voicx/internal/tlscert"
@@ -43,6 +48,8 @@ type options struct {
 	udp         bool
 	anonymous   bool
 	tlsInsecure bool
+	webrtc      bool
+	relayOnly   bool
 }
 
 // stats accumulates load-test results.
@@ -54,6 +61,9 @@ type stats struct {
 	chatSent     atomic.Int64
 	chatRecv     atomic.Int64
 	pongs        atomic.Int64
+	webrtcOK     atomic.Int64
+	webrtcFail   atomic.Int64
+	rtpSent      atomic.Int64
 
 	// authLatencyBuckets: <10ms, <50ms, <100ms, <500ms, <1s, >=1s.
 	authLatency [6]atomic.Int64
@@ -87,6 +97,9 @@ func (s *stats) print(opts options) {
 	fmt.Printf("auth:     ok=%d fail=%d\n", s.authOK.Load(), s.authFail.Load())
 	fmt.Printf("chat:     sent=%d received=%d\n", s.chatSent.Load(), s.chatRecv.Load())
 	fmt.Printf("pongs:    %d\n", s.pongs.Load())
+	if opts.webrtc {
+		fmt.Printf("webrtc:  ok=%d fail=%d opus_rtp_sent=%d\n", s.webrtcOK.Load(), s.webrtcFail.Load(), s.rtpSent.Load())
+	}
 	fmt.Printf("auth latency (ms): <10=%d <50=%d <100=%d <500=%d <1000=%d >=1000=%d\n",
 		s.authLatency[0].Load(), s.authLatency[1].Load(), s.authLatency[2].Load(),
 		s.authLatency[3].Load(), s.authLatency[4].Load(), s.authLatency[5].Load())
@@ -105,6 +118,8 @@ func main() {
 	flag.BoolVar(&opts.udp, "udp", false, "also send UDP pings to exercise the UDP path")
 	flag.BoolVar(&opts.anonymous, "anonymous", false, "connect as anonymous guests (loadtest-N nicknames; -unique-id/-password not needed)")
 	flag.BoolVar(&opts.tlsInsecure, "tls-insecure", false, "dial with TLS but skip certificate verification (self-signed certs), logging the fingerprint once")
+	flag.BoolVar(&opts.webrtc, "webrtc", false, "publish a continuous Opus RTP stream from every simulated client")
+	flag.BoolVar(&opts.relayOnly, "ice-relay-only", false, "require TURN relay candidates (for the Toxiproxy chaos profile)")
 	flag.Parse()
 
 	if !opts.anonymous && (opts.uniqueID == "" || opts.password == "") {
@@ -114,6 +129,9 @@ func main() {
 	if opts.clients < 1 {
 		fmt.Fprintln(os.Stderr, "loadtest: -clients must be >= 1")
 		os.Exit(2)
+	}
+	if opts.webrtc && opts.clients < 100 {
+		fmt.Fprintln(os.Stderr, "loadtest: -webrtc is intended for the 100-client SFU profile; continuing with the requested smaller count")
 	}
 
 	var st stats
@@ -218,6 +236,17 @@ func simulateClient(ctx context.Context, opts options, st *stats, index int) {
 		_ = writeMsg(conn, netproto.MsgJoinChannel, netproto.JoinChannel{ChannelID: opts.channel})
 	}
 
+	var pc *webrtc.PeerConnection
+	if opts.webrtc {
+		pc, err = startOpusPublisher(conn, resp.ICEServers, opts.relayOnly, ctx, st)
+		if err != nil {
+			st.webrtcFail.Add(1)
+			return
+		}
+		st.webrtcOK.Add(1)
+		defer pc.Close()
+	}
+
 	// UDP pings (optional): one packet per second.
 	var udpDone chan struct{}
 	if opts.udp {
@@ -243,6 +272,15 @@ func simulateClient(ctx context.Context, opts options, st *stats, index int) {
 			case netproto.MsgPing:
 				// Answer server-initiated keepalive pings.
 				_ = writeMsg(conn, netproto.MsgPong, netproto.Pong{})
+			case netproto.MsgICECandidate:
+				if pc != nil {
+					var candidate netproto.ICECandidate
+					if netproto.Decode(f, &candidate) == nil {
+						mid := candidate.SDPMid
+						line := uint16(candidate.SDPMLineIndex)
+						_ = pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: candidate.Candidate, SDPMid: &mid, SDPMLineIndex: &line})
+					}
+				}
 			}
 		}
 	}()
@@ -267,6 +305,132 @@ func simulateClient(ctx context.Context, opts options, st *stats, index int) {
 			if err := writeMsg(conn, netproto.MsgPing, netproto.Ping{}); err != nil {
 				return
 			}
+		}
+	}
+}
+
+// startOpusPublisher creates a real Pion peer and writes a valid Opus silence
+// packet every 20ms. Waiting for local ICE gathering avoids a separate client
+// trickle writer and makes the 100-client runner deterministic on localhost.
+func startOpusPublisher(conn net.Conn, supplied []netproto.ICEServer, relayOnly bool, ctx context.Context, st *stats) (*webrtc.PeerConnection, error) {
+	configuration := webrtc.Configuration{}
+	if relayOnly {
+		configuration.ICETransportPolicy = webrtc.ICETransportPolicyRelay
+	}
+	for _, server := range supplied {
+		configuration.ICEServers = append(configuration.ICEServers, webrtc.ICEServer{
+			URLs: server.URLs, Username: server.Username, Credential: server.Credential,
+		})
+	}
+	pc, err := webrtc.NewPeerConnection(configuration)
+	if err != nil {
+		return nil, err
+	}
+	track, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{
+		MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2,
+	}, "load-opus", "voicx-load")
+	if err != nil {
+		_ = pc.Close()
+		return nil, err
+	}
+	if _, err := pc.AddTrack(track); err != nil {
+		_ = pc.Close()
+		return nil, err
+	}
+	offer, err := pc.CreateOffer(nil)
+	if err != nil {
+		_ = pc.Close()
+		return nil, err
+	}
+	gathered := webrtc.GatheringCompletePromise(pc)
+	if err := pc.SetLocalDescription(offer); err != nil {
+		_ = pc.Close()
+		return nil, err
+	}
+	select {
+	case <-ctx.Done():
+		_ = pc.Close()
+		return nil, ctx.Err()
+	case <-time.After(10 * time.Second):
+		_ = pc.Close()
+		return nil, errors.New("ICE gathering timed out")
+	case <-gathered:
+	}
+	local := pc.LocalDescription()
+	if local == nil {
+		_ = pc.Close()
+		return nil, errors.New("local SDP unavailable")
+	}
+	if err := writeMsg(conn, netproto.MsgWebRTCOffer, netproto.WebRTCOffer{
+		SDP: local.SDP, Tracks: []netproto.TrackSlot{{TrackID: track.ID(), Slot: "mic"}},
+	}); err != nil {
+		_ = pc.Close()
+		return nil, err
+	}
+	answer, earlyCandidates, err := readWebRTCAnswer(conn, 10*time.Second)
+	if err != nil {
+		_ = pc.Close()
+		return nil, err
+	}
+	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answer.SDP}); err != nil {
+		_ = pc.Close()
+		return nil, err
+	}
+	for _, candidate := range earlyCandidates {
+		mid := candidate.SDPMid
+		line := candidate.SDPMLineIndex
+		if err := pc.AddICECandidate(webrtc.ICECandidateInit{Candidate: candidate.Candidate, SDPMid: &mid, SDPMLineIndex: &line}); err != nil {
+			_ = pc.Close()
+			return nil, err
+		}
+	}
+	go func() {
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		sequence := uint16(rand.Uint32())
+		timestamp := rand.Uint32()
+		ssrc := rand.Uint32()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				packet := &rtp.Packet{Header: rtp.Header{Version: 2, SequenceNumber: sequence, Timestamp: timestamp, SSRC: ssrc}, Payload: []byte{0xF8, 0xFF, 0xFE}}
+				if err := track.WriteRTP(packet); err != nil {
+					return
+				}
+				st.rtpSent.Add(1)
+				sequence++
+				timestamp += 960
+			}
+		}
+	}()
+	return pc, nil
+}
+
+func readWebRTCAnswer(conn net.Conn, timeout time.Duration) (netproto.WebRTCAnswer, []netproto.ICECandidate, error) {
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	defer conn.SetReadDeadline(time.Time{})
+	var candidates []netproto.ICECandidate
+	for {
+		f, err := netproto.ReadFrame(conn)
+		if err != nil {
+			return netproto.WebRTCAnswer{}, nil, err
+		}
+		switch netproto.MessageType(f.Type) {
+		case netproto.MsgICECandidate:
+			var candidate netproto.ICECandidate
+			if err := netproto.Decode(f, &candidate); err == nil {
+				candidates = append(candidates, candidate)
+			}
+		case netproto.MsgWebRTCAnswer:
+			var answer netproto.WebRTCAnswer
+			if err := netproto.Decode(f, &answer); err != nil {
+				return netproto.WebRTCAnswer{}, nil, err
+			}
+			return answer, candidates, nil
+		case netproto.MsgPing:
+			_ = writeMsg(conn, netproto.MsgPong, netproto.Pong{})
 		}
 	}
 }

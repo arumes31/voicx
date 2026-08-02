@@ -21,13 +21,13 @@ const PERMISSION_KEYS = [
     "i_client_move_power", "i_client_needed_move_power",
     "b_client_use_channel_command", "i_client_talk_power", "i_client_needed_talk_power",
     "i_client_whisper_power", "i_client_needed_whisper_power",
-    "b_client_video_publish", "b_client_priority_speaker", "b_client_ignore_antiflood",
+    "b_client_video_publish", "b_client_issue_screenshare_1080p", "b_client_priority_speaker", "b_client_ignore_antiflood",
     "b_client_request_talker", "b_client_is_bot",
     "i_ft_file_upload_power", "i_ft_needed_file_upload_power",
     "i_ft_file_download_power", "i_ft_needed_file_download_power",
-    "i_ft_quota_mb_upload_per_client", "b_ft_delete",
+    "i_ft_quota_mb_upload_per_client", "b_ft_delete", "b_client_avatar_upload",
     "i_client_poke_power", "i_client_needed_poke_power", "b_client_poke",
-    "b_client_remoteaddress_view", "i_permission_modify_power",
+    "b_client_remoteaddress_view", "i_permission_modify_power", "b_permission_modify_power_ignore",
     "b_virtualserver_info_view", "b_virtualserver_connectioninfo_view", "b_virtualserver_recording",
     "b_virtualserver_token_list", "b_virtualserver_token_add", "b_virtualserver_token_use",
     "b_virtualserver_token_delete",
@@ -219,6 +219,7 @@ function openPermissionManager() {
             <div class="pm-right">
                 <div class="pm-right-head">
                     <input class="pm-filter dlg-input" placeholder="filter permissions… (154)" />
+                    <button class="pm-matrix icon-btn" title="Compare this client's effective permissions across sub-channels (726)">▦</button>
                     <button class="pm-export icon-btn" title="Export this target's permissions as JSON (148)">⬇</button>
                     <button class="pm-export-csv icon-btn" title="Export this target's permissions as CSV (148)">CSV</button>
                 </div>
@@ -231,6 +232,7 @@ function openPermissionManager() {
     pm.q = q;
     q(".pm-close").onclick = () => closePermissionManager();
     q(".pm-filter").oninput = (e) => { pm.filter = e.target.value.trim().toLowerCase(); renderGrid(); };
+    q(".pm-matrix").onclick = () => openChannelPermissionMatrix();
     q(".pm-export").onclick = () => exportPerms("json");
     q(".pm-export-csv").onclick = () => exportPerms("csv");
     dlg.querySelectorAll(".pm-tabs button").forEach((b) => {
@@ -252,6 +254,72 @@ function closePermissionManager() {
     if (!pm) return;
     pm.overlay.remove();
     pm = null;
+}
+
+// openChannelPermissionMatrix compares a selected client's effective values
+// across several channel contexts. Each cell comes from the server's trace
+// resolver, so inherited tiers and overrides match enforcement exactly.
+async function openChannelPermissionMatrix() {
+    const uid = pm?.target?.uniqueID || "";
+    if (!uid) return V().toast("select a client target first", "warn");
+    const channels = [...(V().state.channels || [])].sort((a, b) =>
+        (a.ParentID - b.ParentID) || (a.OrderIndex - b.OrderIndex) || (a.ChannelID - b.ChannelID));
+    if (channels.length < 2) return V().toast("at least two channels are required for comparison", "warn");
+    const { overlay, q } = modal("pm-matrix-dialog", `
+        <h3>Cross-channel permission matrix</h3>
+        <div class="dlg-text pm-matrix-who"></div>
+        <div class="pm-matrix-channels"></div>
+        <label class="dlg-label">Permission keys (comma-separated)</label>
+        <textarea class="dlg-input pm-matrix-keys" rows="3"></textarea>
+        <div class="pm-matrix-result"></div>
+        <div class="dlg-buttons"><button class="dlg-cancel">Close</button><button class="dlg-ok">Compare</button></div>`);
+    q(".pm-matrix-who").textContent = pm.target.label + " — values include inherited permissions";
+    const chooser = q(".pm-matrix-channels");
+    const current = V().state.myChannelID || 0;
+    const defaults = new Set(channels.filter((ch) => ch.ChannelID === current || ch.ParentID === current).slice(0, 8).map((ch) => ch.ChannelID));
+    if (defaults.size < 2) for (const ch of channels.slice(0, 2)) defaults.add(ch.ChannelID);
+    for (const ch of channels) {
+        const label = document.createElement("label");
+        label.className = "pm-matrix-choice";
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.value = ch.ChannelID;
+        input.checked = defaults.has(ch.ChannelID);
+        label.append(input, document.createTextNode(" " + ch.Name + " (" + ch.ChannelID + ")"));
+        chooser.appendChild(label);
+    }
+    const common = ["i_channel_join_power", "i_client_talk_power", "i_client_whisper_power",
+        "b_client_use_channel_command", "b_client_video_publish", "b_client_issue_screenshare_1080p",
+        "i_ft_file_upload_power", "i_ft_file_download_power", "b_channel_modify", "b_channel_delete"];
+    q(".pm-matrix-keys").value = [...new Set([...pm.entries.keys(), ...common])].slice(0, 20).join(", ");
+    q(".dlg-cancel").onclick = () => overlay.remove();
+    q(".dlg-ok").onclick = async () => {
+        const selected = [...chooser.querySelectorAll("input:checked")].map((x) => Number(x.value)).slice(0, 12);
+        const keys = q(".pm-matrix-keys").value.split(",").map((x) => x.trim()).filter((x) => PERMISSION_KEYS.includes(x)).slice(0, 30);
+        if (selected.length < 2 || keys.length === 0) return V().toast("choose at least two channels and one known permission", "warn");
+        const result = q(".pm-matrix-result");
+        result.innerHTML = `<div class="empty-state">resolving ${selected.length * keys.length} cells…</div>`;
+        const values = new Map();
+        await Promise.all(selected.flatMap((channelID) => keys.map(async (key) => {
+            try {
+                const trace = await App().PermTrace(uid, key, channelID);
+                values.set(channelID + ":" + key, { value: trace.effective, tier: trace.effective_tier || "unset" });
+            } catch {
+                values.set(channelID + ":" + key, { value: "?", tier: "error" });
+            }
+        })));
+        let html = `<table class="perm-grid trace-grid"><thead><tr><th>permission</th>`;
+        for (const id of selected) html += `<th>${esc(channels.find((ch) => ch.ChannelID === id)?.Name || id)}</th>`;
+        html += "</tr></thead><tbody>";
+        for (const key of keys) {
+            html += `<tr><td class="mono">${esc(key)}</td>`;
+            const rowValues = selected.map((id) => values.get(id + ":" + key));
+            const differs = new Set(rowValues.map((v) => String(v?.value))).size > 1;
+            for (const v of rowValues) html += `<td class="${differs ? "winning" : ""}" title="source: ${esc(v?.tier)}"><b>${esc(v?.value)}</b><br><span class="pm-dim">${esc(v?.tier)}</span></td>`;
+            html += "</tr>";
+        }
+        result.innerHTML = html + "</tbody></table>";
+    };
 }
 
 // targetTier maps the tab to the write-path tier.
@@ -382,7 +450,7 @@ function renderGrid() {
             <td class="mono">${key}</td>
             <td>${e ? `<span class="pill-val">${e.value}</span>` : '<span class="pm-dim">—</span>'}</td>
             <td>${e && e.grant ? `<span class="pill-val grant">${e.grant}</span>` : '<span class="pm-dim">—</span>'}</td>
-            <td>${e ? [e.skip ? "skip" : "", e.negate ? "negate" : ""].filter(Boolean).join(",") : ""}</td>`;
+            <td title="${e?.negate ? "negate is an explicit denial and wins over positive lower tiers" : e?.skip ? "skip locks this value against lower-tier overrides" : ""}">${e ? [e.skip ? "skip" : "", e.negate ? "negate" : ""].filter(Boolean).join(",") : ""}</td>`;
         tr.onclick = () => { pm.editKey = pm.editKey === key ? "" : key; renderGrid(); };
         tbody.appendChild(tr);
         if (pm.editKey === key) tbody.appendChild(editorRow(key, e));
@@ -403,9 +471,9 @@ function editorRow(key, e) {
             <label>value <input type="number" class="dlg-input pe-value" value="${e ? e.value : 0}" /></label>
             <label title="grant value: a non-admin may only set values ≤ their own grant for this key (TS3-lite)">grant
                 <input type="number" class="dlg-input pe-grant" value="${e ? e.grant : 0}" /></label>
-            <label title="skip: prevents LOWER tiers from overriding this entry (multi-group merge)">
+            <label title="skip: locks this entry against lower-tier overrides; use only when inheritance must stop here">
                 <input type="checkbox" class="pe-skip" ${e && e.skip ? "checked" : ""} /> skip</label>
-            <label title="negate: explicitly DENIES this permission, overriding any positive lower-tier value">
+            <label title="negate: an explicit denial; it forces effective value 0 and overrides positive lower tiers">
                 <input type="checkbox" class="pe-negate" ${e && e.negate ? "checked" : ""} /> negate</label>
             <button class="dlg-ok pe-set">Set</button>
             <button class="dlg-cancel pe-unset" ${e ? "" : "disabled"}>Unset</button>
