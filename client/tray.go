@@ -2,10 +2,9 @@
 // getlantern/systray — the one new client dependency this wave, justified
 // because Wails v2 has no tray API.
 //
-// Threading: systray.Run must own the calling goroutine's message loop; on
-// macOS that must be the process main thread, on Windows any single
-// dedicated goroutine works. main() therefore runs systray on the main
-// thread and wails.Run in a goroutine — the order that is safe on both.
+// Threading is selected by the platform-specific desktop runner. On macOS
+// systray must own the process main thread; on Windows it runs on a dedicated,
+// locked OS thread so Wails/WebView2 can own the initial COM thread.
 package main
 
 import (
@@ -37,11 +36,16 @@ type tray struct {
 	miDeafen   *systray.MenuItem
 }
 
-// initTray starts the tray on the calling goroutine (blocks until quit).
-// onReady wires the menu after the app started.
-func initTray(a *App) {
+// initTray starts the tray on the calling goroutine and blocks until quit.
+// When ready is non-nil it is closed after the tray menu is fully wired.
+func initTray(a *App, ready chan<- struct{}) {
 	trayCtl = &tray{app: a, visible: true}
-	systray.Run(trayCtl.onReady, func() { log.Printf("tray exit") })
+	systray.Run(func() {
+		trayCtl.onReady()
+		if ready != nil {
+			close(ready)
+		}
+	}, func() { log.Printf("tray exit") })
 }
 
 // onReady builds the tray menu (called on the systray thread).

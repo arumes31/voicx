@@ -34,7 +34,7 @@ type Server struct {
 	backend Backend
 	logger  *zap.Logger
 
-	// Addr is the listen address (e.g. ":10012").
+	// Addr is the listen address (e.g. ":12335").
 	Addr string
 	// MaxConns caps concurrent query connections. Defaults to 10.
 	MaxConns int

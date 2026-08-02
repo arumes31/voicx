@@ -866,7 +866,7 @@ func startTestEnvLogger(t *testing.T, perms *permissions.TieredPermissions, muta
 	addr := freePort(t)
 	cfg := &config.Config{
 		TCPAddr:            addr,
-		HealthAddr:         ":9090",
+		HealthAddr:         ":12337",
 		FileRoot:           t.TempDir(),
 		TLSEnabled:         true,
 		TLSDir:             t.TempDir(),

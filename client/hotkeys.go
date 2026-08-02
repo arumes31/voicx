@@ -1,13 +1,13 @@
-// hotkeys.go registers global hotkeys for push-to-talk and mute toggle.
-// Bindings come from settings (defaults: Space, Ctrl+M) and can be changed
-// at runtime via SetHotkeys. Registration failures are retried once, then
-// surfaced to the frontend as hotkey_status events (and to the client log
-// file).
+// hotkeys.go registers configurable shortcuts. PTT is unbound by default and
+// uses a passive, non-consuming input monitor on platforms that support it.
+// Other actions use that monitor too, so configured shortcuts do not prevent
+// the foreground application from receiving the same keys.
 package main
 
 import (
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"golang.design/x/hotkey"
@@ -16,8 +16,8 @@ import (
 )
 
 // allowHotkeyRegistration gates the real OS-level registration. Tests clear
-// it (see main_test.go): a `go test` run would otherwise grab Space, Ctrl+M
-// and friends system-wide for the lifetime of the test binary.
+// it (see main_test.go): a `go test` run would otherwise grab configured
+// shortcuts system-wide for the lifetime of the test binary.
 var allowHotkeyRegistration = true
 
 // hotkeyStatus is emitted as a hotkey_status event so the UI can show
@@ -30,8 +30,20 @@ type hotkeyStatus struct {
 
 // hotkeyReg tracks a live registration so it can be torn down on rebinding.
 type hotkeyReg struct {
-	hk     *hotkey.Hotkey
-	cancel chan struct{}
+	hk       *hotkey.Hotkey
+	cancel   chan struct{}
+	stopOnce sync.Once
+}
+
+func (r *hotkeyReg) stop() {
+	r.stopOnce.Do(func() {
+		if r.hk != nil {
+			_ = r.hk.Unregister()
+		}
+		if r.cancel != nil {
+			close(r.cancel)
+		}
+	})
 }
 
 // registerHotkeys installs the configured global hotkeys (called at startup).
@@ -104,8 +116,7 @@ func (a *App) ApplyHotkeyProfile(name string) {
 func (a *App) applyHotkey(action, spec string) {
 	a.hkMu.Lock()
 	if reg, ok := a.hotkeys[action]; ok {
-		_ = reg.hk.Unregister()
-		close(reg.cancel)
+		reg.stop()
 		delete(a.hotkeys, action)
 	}
 	a.hkMu.Unlock()
@@ -122,8 +133,59 @@ func (a *App) applyHotkey(action, spec string) {
 	if !allowHotkeyRegistration {
 		return
 	}
+	if passiveHotkeyAvailable() {
+		go guardCrash("hotkey "+action, func() { a.passiveHotkeyLoop(action, mods, key) })
+		return
+	}
 	// recover is per-goroutine: hotkey callbacks need their own guard (331).
 	go guardCrash("hotkey "+action, func() { a.hotkeyLoop(action, mods, key) })
+}
+
+// passiveHotkeyLoop observes a configured chord without registering it as an
+// exclusive OS hotkey, so normal typing and application shortcuts continue to
+// receive the same key events.
+func (a *App) passiveHotkeyLoop(action string, mods []hotkey.Modifier, key hotkey.Key) {
+	cancel := make(chan struct{})
+	reg := &hotkeyReg{cancel: cancel}
+	a.hkMu.Lock()
+	if _, exists := a.hotkeys[action]; exists {
+		a.hkMu.Unlock()
+		return
+	}
+	a.hotkeys[action] = reg
+	a.hkMu.Unlock()
+
+	defer func() {
+		a.hkMu.Lock()
+		if current, ok := a.hotkeys[action]; ok && current == reg {
+			delete(a.hotkeys, action)
+			reg.stop()
+		}
+		a.hkMu.Unlock()
+	}()
+
+	log.Printf("hotkey %s registered (passive)", action)
+	a.emitHotkeyStatus(hotkeyStatus{Action: action, Registered: true})
+	err := monitorPassiveHotkey(mods, key, cancel,
+		func() {
+			if action == "ptt" {
+				log.Printf("hotkey ptt_down fired")
+				a.emitHotkey("ptt_down")
+				return
+			}
+			log.Printf("hotkey %s fired", action)
+			a.emitHotkey(action)
+		},
+		func() {
+			if action == "ptt" {
+				log.Printf("hotkey ptt_up fired")
+				a.emitHotkey("ptt_up")
+			}
+		})
+	if err != nil {
+		log.Printf("hotkey %s disabled: %v", action, err)
+		a.emitHotkeyStatus(hotkeyStatus{Action: action, Error: err.Error()})
+	}
 }
 
 // hotkeyLoop registers one hotkey (retrying once on failure) and forwards
@@ -153,12 +215,7 @@ func (a *App) hotkeyLoop(action string, mods []hotkey.Modifier, key hotkey.Key) 
 		if r := recover(); r != nil {
 			a.hkMu.Lock()
 			if cur, ok := a.hotkeys[action]; ok && cur == reg {
-				_ = hk.Unregister()
-				select {
-				case <-cancel:
-				default:
-					close(cancel)
-				}
+				reg.stop()
 				delete(a.hotkeys, action)
 			}
 			a.hkMu.Unlock()
@@ -208,13 +265,13 @@ func registerHotkey(action string, mods []hotkey.Modifier, key hotkey.Key) (*hot
 // SetHotkeys rebinds the global hotkeys at runtime. It returns "" on success
 // or an error describing the unsupported spec.
 func (a *App) SetHotkeys(pttSpec, muteSpec, whisperReplySpec string) string {
-	if _, _, err := parseHotkeySpec(pttSpec); err != nil {
+	if err := validateHotkeySpec(pttSpec); err != nil {
 		return "ptt: " + err.Error()
 	}
-	if _, _, err := parseHotkeySpec(muteSpec); err != nil {
+	if err := validateHotkeySpec(muteSpec); err != nil {
 		return "mute: " + err.Error()
 	}
-	if _, _, err := parseHotkeySpec(whisperReplySpec); err != nil {
+	if err := validateHotkeySpec(whisperReplySpec); err != nil {
 		return "whisper reply: " + err.Error()
 	}
 	a.settings.HotkeyPTT = pttSpec
@@ -240,10 +297,8 @@ func (a *App) SetHotkey(action, spec string) string {
 	if !valid {
 		return "unknown action " + action
 	}
-	if spec != "" {
-		if _, _, err := parseHotkeySpec(spec); err != nil {
-			return err.Error()
-		}
+	if err := validateHotkeySpec(spec); err != nil {
+		return err.Error()
 	}
 	switch action {
 	case "ptt":

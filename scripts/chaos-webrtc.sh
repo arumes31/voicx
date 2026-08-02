@@ -16,17 +16,17 @@ if [ -z "${LOADTEST_ARGS:-}" ]; then
 fi
 
 export TURN_SECRET
-export VOICX_TURN_URIS="turn:127.0.0.1:8666?transport=tcp"
+export VOICX_TURN_URIS="turn:127.0.0.1:12366?transport=tcp"
 docker compose --profile turn --profile chaos-network up -d --build voicx coturn toxiproxy
 
-api=http://127.0.0.1:8474
+api=http://127.0.0.1:12365
 for _ in $(seq 1 60); do
 	if curl -fsS "$api/version" >/dev/null; then break; fi
 	sleep 1
 done
 
 curl -fsS -X POST "$api/proxies" -H 'Content-Type: application/json' \
-	-d '{"name":"turn_tcp","listen":"0.0.0.0:8666","upstream":"coturn:3478"}' >/dev/null || true
+	-d '{"name":"turn_tcp","listen":"0.0.0.0:12366","upstream":"coturn:12340"}' >/dev/null || true
 curl -fsS -X POST "$api/proxies/turn_tcp/toxics" -H 'Content-Type: application/json' \
 	-d '{"name":"wan_latency","type":"latency","stream":"downstream","toxicity":1,"attributes":{"latency":90,"jitter":45}}' >/dev/null
 

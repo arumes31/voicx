@@ -208,12 +208,12 @@ func TestSubscribedTypesRejectsAllUnknownFilter(t *testing.T) {
 }
 
 func TestGRPCAddressMustBeLoopback(t *testing.T) {
-	for _, addr := range []string{"127.0.0.1:50051", "localhost:50051", "[::1]:50051"} {
+	for _, addr := range []string{"127.0.0.1:12338", "localhost:12338", "[::1]:12338"} {
 		if err := validateLoopbackAddr(addr); err != nil {
 			t.Errorf("validateLoopbackAddr(%q) = %v", addr, err)
 		}
 	}
-	for _, addr := range []string{":50051", "0.0.0.0:50051", "192.0.2.1:50051"} {
+	for _, addr := range []string{":12338", "0.0.0.0:12338", "192.0.2.1:12338"} {
 		if err := validateLoopbackAddr(addr); err == nil {
 			t.Errorf("validateLoopbackAddr(%q) accepted public bind", addr)
 		}

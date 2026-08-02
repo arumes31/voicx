@@ -579,7 +579,7 @@ function pagePlayback() {
     return el;
 }
 
-// hkErrors tracks the last registration error per action (301 conflict
+// hkErrors tracks the last activation error per action (301 conflict
 // detection), fed by hotkey_status events.
 const hkErrors = new Map();
 
@@ -702,13 +702,13 @@ function pageHotkeys() {
     renderRows();
 
     const reset = document.createElement("button");
-    reset.textContent = "Reset to defaults (Space / Ctrl+M)";
+    reset.textContent = "Reset to defaults (PTT unbound / Ctrl+M)";
     reset.onclick = () => {
-        s.hotkey_ptt = "Space"; s.hotkey_mute = "Ctrl+M";
+        s.hotkey_ptt = ""; s.hotkey_mute = "Ctrl+M";
         renderPage("hotkeys");
     };
     el.appendChild(reset);
-    el.appendChild(hint("Hotkeys are re-registered when you Apply or OK. Profiles apply on connect via the bookmark's profile field (300)."));
+    el.appendChild(hint("Hotkeys are applied when you Apply or OK. On Windows they do not reserve or consume the configured keys. Profiles apply on connect via the bookmark's profile field (300)."));
     return el;
 }
 

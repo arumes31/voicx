@@ -64,15 +64,15 @@ services:
       - voicx-net
     ports:
       # TeamSpeak-style voice transport (UDP)
-      - "9987:9987/udp"
+      - "12334:12334/udp"
       # ServerQuery / raw TCP control
-      - "10011:10011"
+      - "12333:12333"
       # ServerQuery (admin/bot text protocol)
-      - "10012:10012"
+      - "12335:12335"
       # File transfer
-      - "30033:30033"
+      - "12336:12336"
       # Health/readiness/metrics HTTP endpoint
-      - "9090:9090"
+      - "12337:12337"
     volumes:
       # Writable data (uploaded files, avatars, icons, recordings) so the
       # root filesystem can stay read-only.
@@ -91,12 +91,14 @@ services:
       VOICX_REDIS_PASSWORD: ${REDIS_PASSWORD:-}
 
       # --- Listen addresses (kept in sync with the published ports) ---
-      VOICX_TCP_ADDR: ":10011"
-      VOICX_UDP_ADDR: ":9987"
+      VOICX_TCP_ADDR: ":12333"
+      VOICX_UDP_ADDR: ":12334"
       # gRPC carries Basic credentials over plaintext and is loopback-only.
-      VOICX_GRPC_ADDR: "127.0.0.1:50051"
-      VOICX_HEALTH_ADDR: ":9090"
-      VOICX_QUERY_ADDR: ":10012"
+      VOICX_GRPC_ADDR: "127.0.0.1:12338"
+      VOICX_HEALTH_ADDR: ":12337"
+      VOICX_QUERY_ADDR: ":12335"
+      VOICX_QUERY_SSH_ADDR: ":12339"
+      VOICX_FILE_ADDR: ":12336"
 
       # --- Writable data on the named volume (read_only root fs) ---
       VOICX_FILE_ROOT: "/data/files"
@@ -107,10 +109,10 @@ services:
       # --- TURN (optional; must match the coturn service, profile "turn") ---
       VOICX_TURN_SECRET: ${TURN_SECRET:-}
       VOICX_TURN_REALM: ${TURN_REALM:-voicx}
-      # Comma-separated client URIs, e.g. turn:localhost:3478?transport=udp
+      # Comma-separated client URIs, e.g. turn:localhost:12340?transport=udp
       VOICX_TURN_URIS: ${VOICX_TURN_URIS:-}
     healthcheck:
-      test: [ "CMD-SHELL", "wget -qO- http://127.0.0.1:9090/healthz || exit 1" ]
+      test: [ "CMD-SHELL", "wget -qO- http://127.0.0.1:12337/healthz || exit 1" ]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -204,7 +206,7 @@ services:
   # the auth response. TURN_SECRET must match VOICX_TURN_SECRET on the voicx
   # service; set BOTH in .env or neither side works (445). Also set on voicx
   # (comma-separated):
-  #   VOICX_TURN_URIS=turn:<host>:3478?transport=udp,turn:<host>:3478?transport=tcp
+  #   VOICX_TURN_URIS=turn:<host>:12340?transport=udp,turn:<host>:12340?transport=tcp
   #
   # TURN_EXTERNAL_IP is REQUIRED for any client outside this host (445): on the
   # bridge network coturn discovers only its 172.x container address and would
@@ -228,35 +230,35 @@ services:
       - ./scripts/coturn-entrypoint.sh:/usr/local/bin/voicx-coturn-entrypoint.sh:ro
     entrypoint: [ "/bin/sh", "/usr/local/bin/voicx-coturn-entrypoint.sh" ]
     ports:
-      - "3478:3478"
-      - "3478:3478/udp"
+      - "12340:12340"
+      - "12340:12340/udp"
       # Relay ports (must be reachable by clients; widen in production).
-      - "49152-49252:49152-49252/udp"
+      - "12342-12366:12342-12366/udp"
       # TLS/DTLS listener; only publish it together with the cert block below.
-      # - "5349:5349"
-      # - "5349:5349/udp"
+      # - "12341:12341"
+      # - "12341:12341/udp"
     # volumes:
     #   # TLS material for turns:/DTLS (see the cert flags below).
     #   - ./data/turn-certs:/etc/coturn/certs:ro
     command:
-      - "--listening-port=3478"
+      - "--listening-port=12340"
       # turns: needs a real certificate for the TURN hostname, which this repo
       # cannot ship. TLS/DTLS is therefore OFF rather than advertised-but-broken
       # (445). To enable: put fullchain.pem/privkey.pem in ./data/turn-certs,
-      # uncomment the volume and the 5349 ports above, drop the two --no-*
+      # uncomment the volume and the 12341 ports above, drop the two --no-*
       # lines, and add
-      #   --tls-listening-port=5349
+      #   --tls-listening-port=12341
       #   --cert=/etc/coturn/certs/fullchain.pem
       #   --pkey=/etc/coturn/certs/privkey.pem
-      # then append turns:<host>:5349?transport=tcp to VOICX_TURN_URIS.
+      # then append turns:<host>:12341?transport=tcp to VOICX_TURN_URIS.
       - "--no-tls"
       - "--no-dtls"
       - "--realm=${TURN_REALM:-voicx}"
       - "--use-auth-secret"
       # Empty when TURN_EXTERNAL_IP is unset; coturn ignores the empty argument.
       - "${TURN_EXTERNAL_IP:+--external-ip=$TURN_EXTERNAL_IP}"
-      - "--min-port=49152"
-      - "--max-port=49252"
+      - "--min-port=12342"
+      - "--max-port=12366"
       - "--no-multicast-peers"
       - "--no-cli"
       # --log=stdout is ambiguous in coturn 4.16 and aborts startup with exit
@@ -275,8 +277,8 @@ services:
     networks:
       - voicx-net
     ports:
-      - "8474:8474"
-      - "8666:8666"
+      - "12365:8474"
+      - "12366:12366"
 
 # ---------------------------------------------------------------------------
 # Networks

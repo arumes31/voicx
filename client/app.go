@@ -149,6 +149,12 @@ func (a *App) SetWindowOpacity(pct int) string {
 
 // shutdown is called when the app closes.
 func (a *App) shutdown(_ context.Context) {
+	a.hkMu.Lock()
+	for action, reg := range a.hotkeys {
+		reg.stop()
+		delete(a.hotkeys, action)
+	}
+	a.hkMu.Unlock()
 	for _, ts := range a.tabsRegistry() {
 		ts.cm.disconnect()
 	}

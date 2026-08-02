@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/getlantern/systray"
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
@@ -37,46 +36,42 @@ func runApp() {
 
 	// Create an instance of the app structure
 	app := NewApp()
+	runDesktop(app)
+}
 
-	// recover is per-goroutine, so every goroutine the client starts carries
-	// its own guard (331) — main's covers only main's stack.
-	go guardCrash("wails", func() {
-		// Create application with options
-		err := wails.Run(&options.App{
-			Title:  "voicx-client",
-			Width:  1024,
-			Height: 768,
-			AssetServer: &assetserver.Options{
-				Assets: assets,
-			},
-			BackgroundColour: &options.RGBA{R: 27, G: 38, B: 54, A: 1},
-			OnStartup:        app.startup,
-			OnShutdown:       app.shutdown,
-			// (287) close-to-tray: the close button hides the window instead
-			// of quitting when the setting is on.
-			OnBeforeClose: func(ctx context.Context) bool {
-				if app.settings.CloseToTray {
-					wailsRuntime.WindowHide(ctx)
-					if trayCtl != nil {
-						trayCtl.mu.Lock()
-						trayCtl.visible = false
-						trayCtl.mu.Unlock()
-						trayCtl.miShowHide.SetTitle("Show voicx")
-					}
-					return true
+// runWails owns the native application loop on the calling OS thread.
+func runWails(app *App) {
+	err := wails.Run(&options.App{
+		Title:  "voicx-client",
+		Width:  1024,
+		Height: 768,
+		AssetServer: &assetserver.Options{
+			Assets: assets,
+		},
+		BackgroundColour: &options.RGBA{R: 27, G: 38, B: 54, A: 1},
+		OnStartup:        app.startup,
+		OnShutdown:       app.shutdown,
+		// (287) close-to-tray: the close button hides the window instead
+		// of quitting when the setting is on.
+		OnBeforeClose: func(ctx context.Context) bool {
+			if app.settings.CloseToTray {
+				wailsRuntime.WindowHide(ctx)
+				if trayCtl != nil {
+					trayCtl.mu.Lock()
+					trayCtl.visible = false
+					trayCtl.mu.Unlock()
+					trayCtl.miShowHide.SetTitle("Show voicx")
 				}
-				return false
-			},
-			Bind: []interface{}{
-				app,
-			},
-		})
-		if err != nil {
-			log.Printf("wails run error: %v", err)
-			println("Error:", err.Error())
-		}
-		systray.Quit()
+				return true
+			}
+			return false
+		},
+		Bind: []interface{}{
+			app,
+		},
 	})
-
-	initTray(app)
+	if err != nil {
+		log.Printf("wails run error: %v", err)
+		println("Error:", err.Error())
+	}
 }

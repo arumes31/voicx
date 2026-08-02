@@ -6,8 +6,8 @@
 //
 // Usage:
 //
-//	loadtest -addr 127.0.0.1:10011 -clients 50 -duration 30s -ramp 5s \
-//	    -unique-id <uid> -password <pw> [-channel 1] [-udp -udp-addr 127.0.0.1:9987]
+//	loadtest -addr 127.0.0.1:12333 -clients 50 -duration 30s -ramp 5s \
+//	    -unique-id <uid> -password <pw> [-channel 1] [-udp -udp-addr 127.0.0.1:12334]
 //
 // Authentication uses a single shared account for all simulated clients
 // (voicx allows multiple connections per unique ID). Create a test user
@@ -31,6 +31,7 @@ import (
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v3"
 
+	"voicx/internal/config"
 	"voicx/internal/netproto"
 	"voicx/internal/tlscert"
 )
@@ -107,8 +108,8 @@ func (s *stats) print(opts options) {
 
 func main() {
 	var opts options
-	flag.StringVar(&opts.addr, "addr", "127.0.0.1:10011", "control channel address")
-	flag.StringVar(&opts.udpAddr, "udp-addr", "127.0.0.1:9987", "UDP media address (with -udp)")
+	flag.StringVar(&opts.addr, "addr", "127.0.0.1"+config.DefaultTCPAddr, "control channel address")
+	flag.StringVar(&opts.udpAddr, "udp-addr", "127.0.0.1"+config.DefaultUDPAddr, "UDP media address (with -udp)")
 	flag.IntVar(&opts.clients, "clients", 10, "number of simulated clients")
 	flag.DurationVar(&opts.duration, "duration", 30*time.Second, "load duration")
 	flag.DurationVar(&opts.ramp, "ramp", 5*time.Second, "ramp-up period over which clients start")

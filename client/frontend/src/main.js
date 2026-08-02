@@ -2164,7 +2164,7 @@ window.runtime.EventsOn("hotkey_status", (st) => {
     if (st.registered) {
         el.textContent = "⌨ " + st.action;
         el.classList.remove("err");
-        el.title = st.action + " hotkey registered";
+        el.title = st.action + " hotkey active";
     } else {
         el.textContent = "⌨ off";
         el.classList.add("err");

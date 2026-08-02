@@ -14,7 +14,7 @@ func TestSettingsRoundTrip(t *testing.T) {
 
 	// Missing file: defaults.
 	s := loadSettingsAt(path)
-	if s.HotkeyPTT != "Space" || s.HotkeyMute != "Ctrl+M" || s.Volume != 100 ||
+	if s.HotkeyPTT != "" || s.HotkeyMute != "Ctrl+M" || s.Volume != 100 ||
 		s.ActivationMode != "ptt" || s.ChatMaxLines != 200 {
 		t.Fatalf("defaults = %+v", s)
 	}
@@ -22,7 +22,7 @@ func TestSettingsRoundTrip(t *testing.T) {
 	s.ChatMaxLines = 42
 	s.Volume = 150
 	s.HotkeyPTT = "F5"
-	s.Bookmarks = []Bookmark{{Name: "local", Addr: "127.0.0.1:10011", Nickname: "alice"}}
+	s.Bookmarks = []Bookmark{{Name: "local", Addr: "127.0.0.1:12333", Nickname: "alice"}}
 	s.WhisperClients = []string{"uid-1"}
 
 	if err := saveSettingsAt(path, s); err != nil {
@@ -40,7 +40,7 @@ func TestSettingsRoundTrip(t *testing.T) {
 	if loaded.ChatMaxLines != 42 || loaded.Volume != 150 || loaded.HotkeyPTT != "F5" {
 		t.Fatalf("reloaded = %+v", loaded)
 	}
-	if len(loaded.Bookmarks) != 1 || loaded.Bookmarks[0].Addr != "127.0.0.1:10011" {
+	if len(loaded.Bookmarks) != 1 || loaded.Bookmarks[0].Addr != "127.0.0.1:12333" {
 		t.Fatalf("bookmarks = %+v", loaded.Bookmarks)
 	}
 	if len(loaded.WhisperClients) != 1 || loaded.WhisperClients[0] != "uid-1" {
@@ -60,14 +60,14 @@ func TestSaveSettingsKeepsGoOwnedFields(t *testing.T) {
 	// What the frontend cached before the connect happened.
 	stale := a.GetSettings()
 
-	a.RecordRecent("127.0.0.1:10011", "alice")
+	a.RecordRecent("127.0.0.1:12333", "alice")
 	a.settings.LastSeenVersion = "9.9"
 
 	stale.Volume = 120
 	if err := a.SaveSettings(stale); err != "" {
 		t.Fatalf("save: %s", err)
 	}
-	if len(a.settings.Recents) != 1 || a.settings.Recents[0].Addr != "127.0.0.1:10011" {
+	if len(a.settings.Recents) != 1 || a.settings.Recents[0].Addr != "127.0.0.1:12333" {
 		t.Fatalf("recents clobbered by frontend save: %+v", a.settings.Recents)
 	}
 	if a.settings.LastSeenVersion != "9.9" {
@@ -82,6 +82,27 @@ func TestSaveSettingsKeepsGoOwnedFields(t *testing.T) {
 	}
 }
 
+func TestSaveSettingsAllowsUnboundHotkeys(t *testing.T) {
+	a := &App{
+		settings:     DefaultSettings(),
+		hotkeys:      map[string]*hotkeyReg{},
+		settingsPath: filepath.Join(t.TempDir(), "settings.json"),
+	}
+	s := DefaultSettings()
+	s.HotkeyPTT = ""
+	s.HotkeyMute = ""
+	s.WhisperReplyHotkey = ""
+
+	if err := a.SaveSettings(s); err != "" {
+		t.Fatalf("save unbound hotkeys: %s", err)
+	}
+	loaded := loadSettingsAt(a.settingsPath)
+	if loaded.HotkeyPTT != "" || loaded.HotkeyMute != "" || loaded.WhisperReplyHotkey != "" {
+		t.Fatalf("unbound hotkeys did not persist: ptt=%q mute=%q whisper=%q",
+			loaded.HotkeyPTT, loaded.HotkeyMute, loaded.WhisperReplyHotkey)
+	}
+}
+
 // TestSettingsCorruptFile verifies a corrupt file falls back to defaults.
 func TestSettingsCorruptFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "settings.json")
@@ -89,7 +110,7 @@ func TestSettingsCorruptFile(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 	s := loadSettingsAt(path)
-	if s.HotkeyPTT != "Space" {
+	if s.HotkeyPTT != "" {
 		t.Fatalf("corrupt file did not fall back to defaults: %+v", s)
 	}
 }
@@ -105,7 +126,7 @@ func TestSettingsMergeMissingFields(t *testing.T) {
 	if s.Volume != 175 {
 		t.Fatalf("volume = %d, want 175", s.Volume)
 	}
-	if s.HotkeyPTT != "Space" || s.ChatMaxLines != 200 {
+	if s.HotkeyPTT != "" || s.ChatMaxLines != 200 {
 		t.Fatalf("missing fields not defaulted: %+v", s)
 	}
 }
@@ -288,6 +309,21 @@ func TestMigrateSettingsRestoresPlaySounds(t *testing.T) {
 	cur.PlaySounds = false
 	if migrateSettings(cur).PlaySounds {
 		t.Error("migration overrode a deliberate opt-out")
+	}
+}
+
+func TestMigrateSettingsUnbindsLegacyDefaultPTT(t *testing.T) {
+	old := DefaultSettings()
+	old.SettingsVersion = 4
+	old.HotkeyPTT = "Space"
+	if got := migrateSettings(old).HotkeyPTT; got != "" {
+		t.Fatalf("legacy PTT hotkey = %q, want unbound", got)
+	}
+
+	current := DefaultSettings()
+	current.HotkeyPTT = "F8"
+	if got := migrateSettings(current).HotkeyPTT; got != "F8" {
+		t.Fatalf("current PTT hotkey = %q, want F8", got)
 	}
 }
 

@@ -138,7 +138,7 @@ func quotaFor(used int64, limitMB int64) Quota {
 // Config holds the file-transfer server settings (populated from the
 // "file_*" config keys).
 type Config struct {
-	// Addr is the listen address (e.g. ":30033").
+	// Addr is the listen address (e.g. ":12336").
 	Addr string
 	// RootDir is where uploaded files are stored, laid out per channel.
 	RootDir string

@@ -11,7 +11,7 @@ func TestTOFUFirstSeenThenMatch(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "known_servers.json")
 	ks := loadKnownServersAt(path)
 
-	addr := "example.com:10011"
+	addr := "example.com:12333"
 	fp := "aa:bb:cc"
 	if got := ks.verify(addr, fp); got != trustUnknown {
 		t.Fatalf("verify (first seen) = %v, want trustUnknown", got)
@@ -52,7 +52,7 @@ func TestTOFUPersistence(t *testing.T) {
 func TestTOFUMismatch(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "known_servers.json")
 	ks := loadKnownServersAt(path)
-	addr := "example.com:10011"
+	addr := "example.com:12333"
 	if err := ks.trust(addr, "old-fp"); err != nil {
 		t.Fatalf("trust: %v", err)
 	}

@@ -9,8 +9,8 @@ import (
 // TestMain disarms the settings-path fallback for the whole package. An App
 // built without settingsPath (a plain &App{}) otherwise writes through to the
 // developer's own <UserConfigDir>/voicx/settings.json. Hotkey registration is
-// disarmed with it: SaveSettings/SetHotkey otherwise grab Space, Ctrl+M and
-// friends system-wide for the whole test run.
+// disarmed with it: SaveSettings/SetHotkey otherwise grab configured shortcuts
+// system-wide for the whole test run.
 func TestMain(m *testing.M) {
 	allowDefaultSettingsPath = false
 	allowHotkeyRegistration = false

@@ -15,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"voicx/internal/config"
 )
 
 type options struct {
@@ -25,7 +27,7 @@ type options struct {
 
 func main() {
 	var o options
-	flag.StringVar(&o.addr, "addr", "127.0.0.1:10012", "ServerQuery address")
+	flag.StringVar(&o.addr, "addr", "127.0.0.1"+config.DefaultQueryAddr, "ServerQuery address")
 	flag.StringVar(&o.user, "user", os.Getenv("VOICX_QUERY_USER"), "admin unique ID (or VOICX_QUERY_USER)")
 	flag.StringVar(&o.password, "password", os.Getenv("VOICX_QUERY_PASSWORD"), "admin password (or VOICX_QUERY_PASSWORD)")
 	flag.StringVar(&o.command, "command", "clientlist", "query command to execute")

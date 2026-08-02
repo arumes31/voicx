@@ -33,7 +33,7 @@ type SSHServer struct {
 	base   *Server
 	logger *zap.Logger
 
-	// Addr is the listen address (e.g. ":10022").
+	// Addr is the listen address (e.g. ":12339").
 	Addr string
 	// HostKeyPath is where the persistent ed25519 host key lives; it is
 	// generated on first start. A regenerated key makes every client warn

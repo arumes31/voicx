@@ -1,9 +1,9 @@
 // conn_live_test.go is a headless integration test for the client backend
 // against a LIVE voicx server. It is skipped unless VOICX_LIVE_ADDR is set:
 //
-//	VOICX_LIVE_ADDR=127.0.0.1:10011 go test -run Live -v ./... -count=1
+//	VOICX_LIVE_ADDR=127.0.0.1:12333 go test -run Live -v ./... -count=1
 //
-// Optional: VOICX_LIVE_QUERY_ADDR (default: same host, port 10012) and
+// Optional: VOICX_LIVE_QUERY_ADDR (default: same host, port 12335) and
 // VOICX_LIVE_ADMIN_UID / VOICX_LIVE_ADMIN_PASS for channel creation.
 package main
 
@@ -56,7 +56,7 @@ func liveQueryAddr(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("splitting addr: %v", err)
 	}
-	return net.JoinHostPort(host, "10012")
+	return net.JoinHostPort(host, "12335")
 }
 
 // eventRecorder is an eventSink that records everything for assertions.

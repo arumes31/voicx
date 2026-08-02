@@ -91,14 +91,19 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.ServerName != "voicx" {
 		t.Errorf("ServerName = %q, want %q", cfg.ServerName, "voicx")
 	}
-	if cfg.TCPAddr != ":10011" {
-		t.Errorf("TCPAddr = %q, want %q", cfg.TCPAddr, ":10011")
+	if cfg.TCPAddr != DefaultTCPAddr {
+		t.Errorf("TCPAddr = %q, want %q", cfg.TCPAddr, DefaultTCPAddr)
 	}
-	if cfg.UDPAddr != ":9987" {
-		t.Errorf("UDPAddr = %q, want %q", cfg.UDPAddr, ":9987")
+	if cfg.UDPAddr != DefaultUDPAddr {
+		t.Errorf("UDPAddr = %q, want %q", cfg.UDPAddr, DefaultUDPAddr)
 	}
-	if cfg.GRPCAddr != "127.0.0.1:50051" {
-		t.Errorf("GRPCAddr = %q, want %q", cfg.GRPCAddr, "127.0.0.1:50051")
+	if cfg.GRPCAddr != DefaultGRPCAddr {
+		t.Errorf("GRPCAddr = %q, want %q", cfg.GRPCAddr, DefaultGRPCAddr)
+	}
+	if cfg.HealthAddr != DefaultHealthAddr || cfg.QueryAddr != DefaultQueryAddr ||
+		cfg.QuerySSHAddr != DefaultQuerySSHAddr || cfg.FileAddr != DefaultFileAddr {
+		t.Errorf("remaining listener defaults = health %q, query %q, query SSH %q, file %q",
+			cfg.HealthAddr, cfg.QueryAddr, cfg.QuerySSHAddr, cfg.FileAddr)
 	}
 	if cfg.MaxClients != 1024 {
 		t.Errorf("MaxClients = %d, want 1024", cfg.MaxClients)
@@ -206,9 +211,9 @@ func TestSummary(t *testing.T) {
 		ServerName:  "voicx",
 		LogLevel:    "info",
 		DevMode:     true,
-		TCPAddr:     ":10011",
-		UDPAddr:     ":9987",
-		GRPCAddr:    ":50051",
+		TCPAddr:     DefaultTCPAddr,
+		UDPAddr:     DefaultUDPAddr,
+		GRPCAddr:    DefaultGRPCAddr,
 		DatabaseURL: "postgres://localhost",
 		RedisAddr:   "localhost:6379",
 		MaxClients:  1024,

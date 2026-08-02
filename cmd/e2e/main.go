@@ -5,7 +5,7 @@
 //
 // Usage:
 //
-//	e2e -addr 127.0.0.1:10011 -alice-uid <uid> -alice-pass <pw> \
+//	e2e -addr 127.0.0.1:12333 -alice-uid <uid> -alice-pass <pw> \
 //	    -bob-uid <uid> -bob-pass <pw> -admin-uid <uid> -admin-pass <pw>
 //
 // The *-uid flags take the unique IDs printed by cmd/adduser. All endpoints
@@ -36,6 +36,7 @@ import (
 	"golang.org/x/crypto/nacl/box"
 	"golang.org/x/crypto/nacl/secretbox"
 
+	"voicx/internal/config"
 	"voicx/internal/netproto"
 	"voicx/internal/tlscert"
 )
@@ -314,11 +315,11 @@ func e2eOpenDM(blobB64 string, senderPub, recipientPriv [32]byte) (string, error
 
 func main() {
 	var o options
-	flag.StringVar(&o.addr, "addr", "127.0.0.1:10011", "control channel address")
-	flag.StringVar(&o.queryAddr, "query-addr", "127.0.0.1:10012", "ServerQuery address")
-	flag.StringVar(&o.healthURL, "health-url", "http://127.0.0.1:9090", "health endpoint base URL")
-	flag.StringVar(&o.udpAddr, "udp-addr", "127.0.0.1:9987", "UDP media address")
-	flag.StringVar(&o.fileAddr, "file-addr", "127.0.0.1:30033", "file-transfer address (fallback; the port from the init response wins)")
+	flag.StringVar(&o.addr, "addr", "127.0.0.1"+config.DefaultTCPAddr, "control channel address")
+	flag.StringVar(&o.queryAddr, "query-addr", "127.0.0.1"+config.DefaultQueryAddr, "ServerQuery address")
+	flag.StringVar(&o.healthURL, "health-url", "http://127.0.0.1"+config.DefaultHealthAddr, "health endpoint base URL")
+	flag.StringVar(&o.udpAddr, "udp-addr", "127.0.0.1"+config.DefaultUDPAddr, "UDP media address")
+	flag.StringVar(&o.fileAddr, "file-addr", "127.0.0.1"+config.DefaultFileAddr, "file-transfer address (fallback; the port from the init response wins)")
 	flag.StringVar(&o.aliceUID, "alice-uid", "", "alice's unique ID")
 	flag.StringVar(&o.alicePass, "alice-pass", "", "alice's password")
 	flag.StringVar(&o.aliceNickname, "alice-nick", "alice", "alice's account nickname (nickname-login check)")

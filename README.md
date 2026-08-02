@@ -4,15 +4,15 @@ A TeamSpeak-like voice/video server written in Go. TCP/JSON control protocol, Pi
 
 ## Architecture
 
-- **TCP control channel** (`:10011`) — length-prefixed binary frames carrying JSON messages (`internal/netproto`) over **TLS by default** (self-signed cert in `tls_dir`, TOFU fingerprint pinning on clients). Handles authentication, channel management, chat, kick/ban/move, and keepalive. Handlers are wired to the backends via `server.Deps` with a permission middleware (`internal/server`).
-- **UDP keepalive channel** (`:9987`) — datagram listener with a bounded worker pool answering ping/pong connectivity probes (`internal/server/udp.go`). All media runs over WebRTC (DTLS-SRTP); the raw-UDP surface is deliberately limited to keepalive.
+- **TCP control channel** (`:12333`) — length-prefixed binary frames carrying JSON messages (`internal/netproto`) over **TLS by default** (self-signed cert in `tls_dir`, TOFU fingerprint pinning on clients). Handles authentication, channel management, chat, kick/ban/move, and keepalive. Handlers are wired to the backends via `server.Deps` with a permission middleware (`internal/server`).
+- **UDP keepalive channel** (`:12334`) — datagram listener with a bounded worker pool answering ping/pong connectivity probes (`internal/server/udp.go`). All media runs over WebRTC (DTLS-SRTP); the raw-UDP surface is deliberately limited to keepalive.
 - **WebRTC engine** (`internal/webrtc`) — Pion-based SFU engine (constructed at startup; wiring into the media path is a later phase).
 - **PostgreSQL** — users, channels, groups, permissions, bans, tokens, offline messages (`internal/store`, migrations in `internal/store/migrations/`).
 - **Permissions** (`internal/permissions`) — TeamSpeak 3 model: five evaluation tiers (server group → client → channel client → channel → channel group), power-vs-needed-power comparisons, skip/negate flags, DB-backed loader with a 5s cache.
 - **State** (`internal/state`) — goroutine-safe in-memory tracking of clients, channels, membership, and speaking state.
 - **Broadcast** (`internal/broadcast`) — per-client outbound channels, non-blocking sends, channel-tree snapshots, JSON event envelopes.
 - **Redis** (`internal/redisx`) — optional; reserved for pub/sub fan-out and rate limiting (later phases). The server degrades gracefully when Redis is unreachable.
-- **Health** (`internal/health`) — HTTP `/healthz` (liveness) and `/readyz` (Postgres ping) on `:9090`.
+- **Health** (`internal/health`) — HTTP `/healthz` (liveness) and `/readyz` (Postgres ping) on `:12337`.
 
 ## Implemented features
 
@@ -30,8 +30,8 @@ A TeamSpeak-like voice/video server written in Go. TCP/JSON control protocol, Pi
 - Video SFU: channel fan-out with per-publisher tracks, simulcast layer selection per subscriber (`high`/`mid`/`low` → RID `f`/`h`/`q` with fallback), PLI/FIR keyframe relay to publishers and on subscriber join, video-publish permission gate.
 - Server-side recording: optional ffmpeg-subprocess recorder for channel audio/video (`internal/recorder`), start/stop via control message, hardware-encoder-ready argument configuration.
 - Presence status: online/away/busy/invisible + status message (`MsgSetStatus`, `status_changed` broadcasts); invisible is admin-only to set and hides the user from non-admin snapshots and join/leave events (visible to admins and the user themself).
-- ServerQuery: TS3-style line-based admin protocol on `:10012` (`internal/query`) for headless administration and bots — admin-only login, client/channel listing, move/kick/ban, text injection, channel create/delete/info/edit (incl. Opus quality); connection cap, idle timeout, and login brute-force lockout built in.
-- File transfer: token-authorized uploads/downloads on `:30033` (`internal/filetransfer`) — single-use short-lived tokens issued over the control channel, SHA-256 integrity, per-channel quotas, per-connection bandwidth caps, per-transfer size caps, on-disk storage per channel with a `files` metadata table. Wave 7 adds: virtual folders (migration 010), rename/move and delete (`MsgFileRename`/`MsgFileDelete`, uploader or `b_ft_delete`), file versioning (N=3 rotation to `<name>.vN` on overwrite, `MsgFileVersions`), SHA-256 dedup (hard-link to the identical blob), quota state in the list response, expiring download links (`MsgFileLink` → `/dl/<token>` on the health port, 15 min), and a server icon (`MsgServerIconSet`/`MsgServerIconGet`, admin-only).
+- ServerQuery: TS3-style line-based admin protocol on `:12335` (`internal/query`) for headless administration and bots — admin-only login, client/channel listing, move/kick/ban, text injection, channel create/delete/info/edit (incl. Opus quality); connection cap, idle timeout, and login brute-force lockout built in.
+- File transfer: token-authorized uploads/downloads on `:12336` (`internal/filetransfer`) — single-use short-lived tokens issued over the control channel, SHA-256 integrity, per-channel quotas, per-connection bandwidth caps, per-transfer size caps, on-disk storage per channel with a `files` metadata table. Wave 7 adds: virtual folders (migration 010), rename/move and delete (`MsgFileRename`/`MsgFileDelete`, uploader or `b_ft_delete`), file versioning (N=3 rotation to `<name>.vN` on overwrite, `MsgFileVersions`), SHA-256 dedup (hard-link to the identical blob), quota state in the list response, expiring download links (`MsgFileLink` → `/dl/<token>` on the health port, 15 min), and a server icon (`MsgServerIconSet`/`MsgServerIconGet`, admin-only).
 - Server password: optional global password (`server_password`, hashed at startup), enforced at authenticate time.
 - Avatars & channel icons: base64 upload with type/size validation (png/jpeg/gif/webp, 256 KiB), stored under the file root; `avatar_changed`/`channel_icon_changed` events; `has_icon` in channel snapshots.
 - Complaints: file complaints against users (max 5 open per reporter); manage via ServerQuery (`complaintlist`/`complaintdel`/`complaintdelall`).
@@ -46,14 +46,21 @@ A TeamSpeak-like voice/video server written in Go. TCP/JSON control protocol, Pi
 
 ## Ports
 
-| Port  | Protocol | Purpose                                    |
-|-------|----------|--------------------------------------------|
-| 9987  | UDP      | Keepalive (ping/pong probes)               |
-| 10011 | TCP+TLS  | Control channel (query, JSON frames)       |
-| 10012 | TCP      | ServerQuery (admin/bot text protocol)      |
-| 30033 | TCP      | File transfer (token-authorized)           |
-| 9090  | TCP/HTTP | Health (`/healthz`), readiness (`/readyz`), metrics (`/metrics`) |
-| 50051 | TCP      | Reserved for the gRPC API (future)         |
+All product-owned listeners use the firewall-friendly `12333-12366` range.
+Postgres, Redis, and public STUN endpoints keep their upstream ports.
+
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| 12333 | TCP+TLS | Control channel (binary JSON frames) |
+| 12334 | UDP | Keepalive (ping/pong probes) |
+| 12335 | TCP | ServerQuery (admin/bot text protocol) |
+| 12336 | TCP | File transfer (token-authorized) |
+| 12337 | TCP/HTTP | Health, readiness, metrics, download links |
+| 12338 | TCP | gRPC API (loopback-only by default) |
+| 12339 | TCP+SSH | ServerQuery over SSH (disabled by default) |
+| 12340 | TCP/UDP | Bundled TURN listener |
+| 12341 | TCP/UDP | Optional TURN TLS/DTLS listener |
+| 12342-12366 | UDP | Bundled TURN relay pool |
 
 ## Configuration
 
@@ -69,12 +76,13 @@ Loaded with viper. Precedence (highest first):
 | `server_password` | `VOICX_SERVER_PASSWORD` | `""` | Global server password (empty = open; hashed at startup) |
 | `log_level` | `VOICX_LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error` |
 | `dev_mode` | `VOICX_DEV_MODE` | `true` | Development (console) vs production (JSON) logger |
-| `tcp_addr` | `VOICX_TCP_ADDR` | `:10011` | Control listener address |
-| `udp_addr` | `VOICX_UDP_ADDR` | `:9987` | UDP keepalive listener address |
-| `grpc_addr` | `VOICX_GRPC_ADDR` | `127.0.0.1:50051` | plaintext gRPC address (loopback-only) |
-| `health_addr` | `VOICX_HEALTH_ADDR` | `:9090` | Health HTTP listener address |
-| `query_addr` | `VOICX_QUERY_ADDR` | `:10012` | ServerQuery listener address |
-| `file_addr` | `VOICX_FILE_ADDR` | `:30033` | File-transfer listener address |
+| `tcp_addr` | `VOICX_TCP_ADDR` | `:12333` | Control listener address |
+| `udp_addr` | `VOICX_UDP_ADDR` | `:12334` | UDP keepalive listener address |
+| `grpc_addr` | `VOICX_GRPC_ADDR` | `127.0.0.1:12338` | plaintext gRPC address (loopback-only) |
+| `health_addr` | `VOICX_HEALTH_ADDR` | `:12337` | Health HTTP listener address |
+| `query_addr` | `VOICX_QUERY_ADDR` | `:12335` | ServerQuery listener address |
+| `query_ssh_addr` | `VOICX_QUERY_SSH_ADDR` | `:12339` | ServerQuery-over-SSH listener address |
+| `file_addr` | `VOICX_FILE_ADDR` | `:12336` | File-transfer listener address |
 
 The gRPC administration API carries Basic credentials and therefore refuses
 non-loopback bind addresses. Put a TLS-terminating proxy on the same host in
@@ -206,8 +214,8 @@ Override the disruption with `-chaos-stop-cmd` / `-chaos-start-cmd` (or `CHAOS_S
 `cmd/loadtest` is a headless client simulator (TCP auth, channel join, chat, ping, optional UDP pings, and real Pion Opus publishers):
 
 ```bash
-go run ./cmd/loadtest -addr 127.0.0.1:10011 -clients 50 -duration 30s -ramp 5s \
-    -unique-id <uid> -password <pw> [-channel 1] [-udp -udp-addr 127.0.0.1:9987]
+go run ./cmd/loadtest -addr 127.0.0.1:12333 -clients 50 -duration 30s -ramp 5s \
+    -unique-id <uid> -password <pw> [-channel 1] [-udp -udp-addr 127.0.0.1:12334]
 ```
 
 All simulated clients share one account (voicx allows multiple connections per unique ID). Registration is not exposed over the protocol — create the test user directly (e.g. a one-off snippet calling `auth.RegisterUser`, or via psql). The report prints connect/auth counts, failures, an auth-latency histogram, and message counts.
@@ -220,7 +228,7 @@ All simulated clients share one account (voicx allows multiple connections per u
 
 ## Security notes
 
-- **Encryption at a glance**: the TCP control channel is TLS by default (`tls_enabled`; self-signed ECDSA P-256 cert auto-generated into `tls_dir` on first start, 10y validity, SANs localhost + server name; SHA-256 fingerprint logged at startup, sent in the auth response, and shown in ServerQuery `serverinfo`). The Wails client pins the fingerprint TOFU-style in `known_servers.json` — a later mismatch hard-fails with a warning dialog until the user explicitly trusts the new fingerprint. Voice/video media is encrypted by WebRTC's DTLS-SRTP (mandated by the spec, not optional). **Still plaintext this wave**: ServerQuery (`:10012`, backlog 225) and file transfer (`:30033`, token-authorized) — keep them on trusted networks.
+- **Encryption at a glance**: the TCP control channel is TLS by default (`tls_enabled`; self-signed ECDSA P-256 cert auto-generated into `tls_dir` on first start, 10y validity, SANs localhost + server name; SHA-256 fingerprint logged at startup, sent in the auth response, and shown in ServerQuery `serverinfo`). The Wails client pins the fingerprint TOFU-style in `known_servers.json` — a later mismatch hard-fails with a warning dialog until the user explicitly trusts the new fingerprint. Voice/video media is encrypted by WebRTC's DTLS-SRTP (mandated by the spec, not optional). **Still plaintext this wave**: ServerQuery (`:12335`, backlog 225) and file transfer (`:12336`, token-authorized) — keep them on trusted networks.
 - **Chat payload encryption (wave 4b) — exact trust model**:
   - **Direct messages: true E2EE.** The live compatibility envelope remains X25519 + XSalsa20-Poly1305 while `internal/e2ee` supplies the versioned X3DH, signed/one-time prekey, AES-256-GCM per-message HKDF chain, Double Ratchet and 2,000 skipped-key machinery for negotiated sessions. **The server relays and spools ciphertext it cannot read.** Session diagnostics state which envelope a peer actually negotiated; capability must not be mistaken for an active ratchet.
   - **Channel + global messages: encrypted with server-held symmetric keys** (nacl/secretbox, XSalsa20-Poly1305). Scope generations are persisted wrapped under the external chat master key and distributed **sealed** to each member's X25519 key. The server CAN read these scopes; that's deliberate: history, search, and moderation require it. `internal/e2ee.SenderKey` provides the O(N) sender-key construction for private group-session negotiation.
@@ -258,12 +266,12 @@ TURN is only needed for clients behind restrictive NATs (symmetric NAT, UDP-bloc
 
 1. Put **all four** variables in `.env` — `TURN_SECRET`/`TURN_REALM` configure the coturn container, `VOICX_TURN_SECRET`/`VOICX_TURN_REALM` configure the server, and they must match. Setting only one pair leaves coturn on its placeholder secret while the server has TURN disabled, and the mismatch is silent (445).
 2. Set `TURN_EXTERNAL_IP` to the public IP clients reach the host on. **This is required for every client outside the host**: coturn runs on the `voicx-net` bridge, so without `--external-ip` it discovers only its `172.x` container address and advertises relay candidates nobody can reach — the ports being published does not help, because the address in the candidate is wrong. Leave it empty only for host-local testing.
-3. Start coturn: `docker compose --profile turn up -d` (publishes 3478 tcp/udp and the relay range 49152-49252/udp).
-4. Point the server at it: `VOICX_TURN_URIS=turn:<host>:3478?transport=udp,turn:<host>:3478?transport=tcp`.
+3. Start coturn: `docker compose --profile turn up -d` (publishes 12340 tcp/udp and the relay range 12342-12366/udp).
+4. Point the server at it: `VOICX_TURN_URIS=turn:<host>:12340?transport=udp,turn:<host>:12340?transport=tcp`.
 
 The server then mints time-limited credentials per client (`internal/turn`, coturn REST API: `username = <expiry>:<uid>`, `credential = base64(HMAC-SHA1(secret, username))`, TTL `turn.credentials_ttl`, default 24h) and delivers them together with the STUN defaults in the auth response; clients merge them into their `RTCPeerConnection` automatically.
 
-**`turns:` (TLS/DTLS) is off by default** and the compose file no longer advertises port 5349, because a working `turns:` needs a real certificate for the TURN hostname that this repo cannot ship — advertising the port without one gives clients an endpoint that always fails. To enable it: obtain a certificate for the TURN hostname (e.g. certbot), place `fullchain.pem`/`privkey.pem` in `./data/turn-certs`, uncomment the cert volume and the 5349 port mappings in the coturn service, replace `--no-tls`/`--no-dtls` with `--tls-listening-port=5349 --cert=/etc/coturn/certs/fullchain.pem --pkey=/etc/coturn/certs/privkey.pem`, and append `turns:<host>:5349?transport=tcp` to `VOICX_TURN_URIS`.
+**`turns:` (TLS/DTLS) is off by default** and the compose file does not advertise port 12341, because a working `turns:` needs a real certificate for the TURN hostname that this repo cannot ship — advertising the port without one gives clients an endpoint that always fails. To enable it: obtain a certificate for the TURN hostname (e.g. certbot), place `fullchain.pem`/`privkey.pem` in `./data/turn-certs`, uncomment the cert volume and the 12341 port mappings in the coturn service, replace `--no-tls`/`--no-dtls` with `--tls-listening-port=12341 --cert=/etc/coturn/certs/fullchain.pem --pkey=/etc/coturn/certs/privkey.pem`, and append `turns:<host>:12341?transport=tcp` to `VOICX_TURN_URIS`.
 
 **Known gap (445):** TURN credentials are minted once during authentication and never refreshed for a live session. A session that outlives `turn.credentials_ttl` (default 24h) presents expired credentials on a later ICE restart, and relayed media fails to re-establish until the client reconnects. Shortening the TTL makes this *more* likely, not less.
 
@@ -319,7 +327,7 @@ default, update checks report "no update source" and stay quiet.
 
 Done: control protocol end-to-end (auth, channels, permissions, chat, moderation), persistence, health endpoints, voice SFU (audio + simulcast video), recording hooks.
 
-Later phases: SVC layer-dropping for VP9/AV1 (currently pass-through), per-codec video output tracks with renegotiation (currently a single VP8 output; publishers should send VP8), gRPC API (`:50051`, see `proto/`), file-transfer subdirectories, Redis pub/sub fan-out and rate limiting, ServerQuery compatibility layer.
+Later phases: SVC layer-dropping for VP9/AV1 (currently pass-through), per-codec video output tracks with renegotiation (currently a single VP8 output; publishers should send VP8), file-transfer subdirectories, Redis pub/sub fan-out and rate limiting, ServerQuery compatibility layer.
 
 ## Layout
 

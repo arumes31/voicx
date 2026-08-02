@@ -81,13 +81,13 @@ func TestCodecRoundTrip(t *testing.T) {
 
 	t.Run("AuthResponseWithICEServers", func(t *testing.T) {
 		in := AuthResponse{OK: true, ClientID: "c-1", ICEServers: []ICEServer{
-			{URLs: []string{"stun:stun.example.com:3478"}},
-			{URLs: []string{"turn:turn.example.com:3478"}, Username: "123:uid", Credential: "cred"},
+			{URLs: []string{"stun:stun.example.com:12340"}},
+			{URLs: []string{"turn:turn.example.com:12340"}, Username: "123:uid", Credential: "cred"},
 		}}
 		var out AuthResponse
 		roundTrip(t, MsgAuthResponse, in, &out)
 		if len(out.ICEServers) != 2 ||
-			out.ICEServers[0].URLs[0] != "stun:stun.example.com:3478" ||
+			out.ICEServers[0].URLs[0] != "stun:stun.example.com:12340" ||
 			out.ICEServers[1].Username != "123:uid" || out.ICEServers[1].Credential != "cred" {
 			t.Errorf("got %+v, want %+v", out, in)
 		}
@@ -198,7 +198,7 @@ func TestCodecRoundTrip(t *testing.T) {
 	})
 
 	t.Run("ICECandidate", func(t *testing.T) {
-		in := ICECandidate{Candidate: "candidate:1 1 udp 2130706431 127.0.0.1 9987 typ host", SDPMid: "0", SDPMLineIndex: 0}
+		in := ICECandidate{Candidate: "candidate:1 1 udp 2130706431 127.0.0.1 12334 typ host", SDPMid: "0", SDPMLineIndex: 0}
 		var out ICECandidate
 		roundTrip(t, MsgICECandidate, in, &out)
 		if out != in {
@@ -252,7 +252,7 @@ func TestCodecRoundTrip(t *testing.T) {
 	})
 
 	t.Run("FileTransferInitResponse", func(t *testing.T) {
-		in := FileTransferInitResponse{TransferID: "tid", Token: "tok", Port: 30033}
+		in := FileTransferInitResponse{TransferID: "tid", Token: "tok", Port: 12336}
 		var out FileTransferInitResponse
 		roundTrip(t, MsgFileTransferInitResponse, in, &out)
 		if out != in {

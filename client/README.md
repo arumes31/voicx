@@ -510,7 +510,7 @@ wails dev
 wails build        # output: build/bin/voicx-client.exe
 ```
 
-Connect from the login dialog: server address (`127.0.0.1:10011`), your
+Connect from the login dialog: server address (`127.0.0.1:12333`), your
 unique ID, account password, and the server password if the server has one
 set.
 
@@ -546,18 +546,17 @@ The login dialog asks for:
 
 ## Hotkeys & troubleshooting
 
-- **Space** — push-to-talk (works in the background; while the chat input is
-  focused in the voicx window, Space types instead). Also hold the big mic
-  button in the voice bar for mouse PTT. Rebindable in Settings → Hotkeys
-  (any key spec like `F5`, `Ctrl+M`, `Ctrl+Shift+F5`).
+- **Push-to-talk is unbound by default.** Configure it in Settings → Hotkeys,
+  or hold the big mic button in the voice bar. On Windows, configured hotkeys
+  are observed passively, so the foreground application still receives the
+  same keys.
 - **Ctrl+M** — mute toggle (also rebindable).
 
 The big mic button glows and the **● TALKING** banner appears while
-push-to-talk is active. The keyboard icon in the voice bar shows global
-hotkey status (`⌨ ptt` = registered, `⌨ off` = failed). If a hotkey shows
-off: check `<UserConfigDir>/voicx/client.log` — the usual cause is a second
-client instance already holding the global hotkey. Debug lines like
-`hotkey ptt_down fired` are logged there for every captured event.
+push-to-talk is active. The keyboard icon in the voice bar shows hotkey
+status (`⌨ ptt` = active, `⌨ off` = failed). If a hotkey shows off, check
+`<UserConfigDir>/voicx/client.log`. Debug lines like `hotkey ptt_down fired`
+are logged there for every observed event.
 
 ## Auto-update
 
@@ -594,12 +593,12 @@ server — no Wails runtime needed (the backend's events go through an
 ```bash
 # server must be running (e.g. docker compose up)
 cd client
-VOICX_LIVE_ADDR=127.0.0.1:10011 go test -run Live -v ./... -count=1
-VOICX_LIVE_ADDR=127.0.0.1:10011 go test -race -run Live ./... -count=1
+VOICX_LIVE_ADDR=127.0.0.1:12333 go test -run Live -v ./... -count=1
+VOICX_LIVE_ADDR=127.0.0.1:12333 go test -race -run Live ./... -count=1
 ```
 
 Optional env: `VOICX_LIVE_QUERY_ADDR` (ServerQuery port, default
-`<host>:10012`). The test creates a throwaway permanent channel via
+`<host>:12335`). The test creates a throwaway permanent channel via
 ServerQuery (admin account) so channel-dependent assertions are real. Note
 `GetPermissions` returns an empty set on a fresh server — registered users
 have no granted permissions until seeded; the test asserts the

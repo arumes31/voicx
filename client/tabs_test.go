@@ -143,34 +143,34 @@ func TestRecordRecent(t *testing.T) {
 func TestLookupBookmark(t *testing.T) {
 	a := newTabApp(t)
 	a.settings.Bookmarks = []Bookmark{
-		{Name: "work", Addr: "srv:10011", Nickname: "alice", NicknameOverride: "alice-work", Profile: "work"},
-		{Name: "home", Addr: "srv:10011", Nickname: "alice"},
-		{Name: "work", Addr: "other:10011", Nickname: "carol"},
+		{Name: "work", Addr: "srv:12333", Nickname: "alice", NicknameOverride: "alice-work", Profile: "work"},
+		{Name: "home", Addr: "srv:12333", Nickname: "alice"},
+		{Name: "work", Addr: "other:12333", Nickname: "carol"},
 	}
 
-	if b := a.lookupBookmark("home", "srv:10011", "alice-work"); b == nil || b.Name != "home" {
+	if b := a.lookupBookmark("home", "srv:12333", "alice-work"); b == nil || b.Name != "home" {
 		t.Fatalf("explicit name lookup = %+v", b)
 	}
 	// A duplicated name resolves per address, not first-wins.
-	if b := a.lookupBookmark("work", "other:10011", "carol"); b == nil || b.Nickname != "carol" {
+	if b := a.lookupBookmark("work", "other:12333", "carol"); b == nil || b.Nickname != "carol" {
 		t.Fatalf("duplicate name lookup = %+v", b)
 	}
 	// The override is what was sent as the login nickname.
-	if b := a.lookupBookmark("", "srv:10011", "alice-work"); b == nil || b.Name != "work" {
+	if b := a.lookupBookmark("", "srv:12333", "alice-work"); b == nil || b.Name != "work" {
 		t.Fatalf("override lookup = %+v", b)
 	}
 	// Two bookmarks answer to "alice" on that server: guessing would apply
 	// the wrong profile/avatar override, so neither is returned.
-	if b := a.lookupBookmark("", "srv:10011", "alice"); b != nil {
+	if b := a.lookupBookmark("", "srv:12333", "alice"); b != nil {
 		t.Fatalf("ambiguous nickname matched %+v", b)
 	}
-	if b := a.lookupBookmark("", "nowhere:10011", "alice"); b != nil {
+	if b := a.lookupBookmark("", "nowhere:12333", "alice"); b != nil {
 		t.Fatalf("unknown server matched %+v", b)
 	}
-	if b := a.lookupBookmark("gone", "srv:10011", "alice"); b != nil {
+	if b := a.lookupBookmark("gone", "srv:12333", "alice"); b != nil {
 		t.Fatalf("unknown bookmark name matched %+v", b)
 	}
-	if b := a.lookupBookmark("work", "nowhere:10011", "alice-work"); b != nil {
+	if b := a.lookupBookmark("work", "nowhere:12333", "alice-work"); b != nil {
 		t.Fatalf("name matched a foreign address: %+v", b)
 	}
 }
@@ -199,14 +199,14 @@ func TestLookupBookmarkNicknameCollision(t *testing.T) {
 func TestLookupBookmarkDuplicateName(t *testing.T) {
 	a := newTabApp(t)
 	a.settings.Bookmarks = []Bookmark{
-		{Name: "work", Addr: "srv:10011", Nickname: "alice", Profile: "alice", AvatarOverrideB64: "aaa"},
-		{Name: "work", Addr: "srv:10011", Nickname: "bob", Profile: "bob", AvatarOverrideB64: "bbb"},
+		{Name: "work", Addr: "srv:12333", Nickname: "alice", Profile: "alice", AvatarOverrideB64: "aaa"},
+		{Name: "work", Addr: "srv:12333", Nickname: "bob", Profile: "bob", AvatarOverrideB64: "bbb"},
 	}
 
-	if b := a.lookupBookmark("work", "srv:10011", "bob"); b != nil {
+	if b := a.lookupBookmark("work", "srv:12333", "bob"); b != nil {
 		t.Fatalf("ambiguous name matched %+v", b)
 	}
-	if b := a.lookupBookmark("work", "srv:10011", "alice"); b != nil {
+	if b := a.lookupBookmark("work", "srv:12333", "alice"); b != nil {
 		t.Fatalf("ambiguous name matched %+v", b)
 	}
 }

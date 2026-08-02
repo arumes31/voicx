@@ -144,7 +144,7 @@ func (f *fakeFileTransfer) CreateLink(_ context.Context, channelID int64, folder
 	return "deadbeef", time.Now().Add(15 * time.Minute), nil
 }
 
-func (f *fakeFileTransfer) Port() int { return 30033 }
+func (f *fakeFileTransfer) Port() int { return 12336 }
 
 // fingerprint is the data port's certificate fingerprint ("" = TLS off).
 func (f *fakeFileTransfer) Fingerprint() string {
@@ -176,7 +176,7 @@ func TestFileTransferInitUpload(t *testing.T) {
 	if err := netproto.Decode(f, &resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if resp.TransferID != "tid-1" || resp.Token != "tok-1" || resp.Port != 30033 {
+	if resp.TransferID != "tid-1" || resp.Token != "tok-1" || resp.Port != 12336 {
 		t.Fatalf("response = %+v", resp)
 	}
 

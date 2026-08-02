@@ -213,14 +213,14 @@ func TestWebRTCOfferAnswer(t *testing.T) {
 	if cb == nil {
 		t.Fatal("no candidate callback captured by fake voice")
 	}
-	cb("candidate:1 udp 127.0.0.1 9987 typ host", "0", 0)
+	cb("candidate:1 udp 127.0.0.1 12334 typ host", "0", 0)
 
 	f = readOfType(t, conn, netproto.MsgICECandidate)
 	var ice netproto.ICECandidate
 	if err := netproto.Decode(f, &ice); err != nil {
 		t.Fatalf("decode ice candidate: %v", err)
 	}
-	if ice.Candidate != "candidate:1 udp 127.0.0.1 9987 typ host" {
+	if ice.Candidate != "candidate:1 udp 127.0.0.1 12334 typ host" {
 		t.Fatalf("candidate = %q", ice.Candidate)
 	}
 }

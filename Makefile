@@ -81,7 +81,7 @@ docker-build:
 
 ## docker-run: run the voicx:dev image with default ports published
 docker-run:
-	$(DOCKER) run --rm -p 9987:9987/udp -p 10011:10011 -p 30033:30033 -p 50051:50051 -p 9090:9090 $(IMAGE)
+	$(DOCKER) run --rm -p 12333:12333 -p 12334:12334/udp -p 12335:12335 -p 12336:12336 -p 12337:12337 $(IMAGE)
 
 ## docker-stop: stop and remove any running voicx containers
 docker-stop:

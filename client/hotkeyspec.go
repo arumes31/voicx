@@ -88,3 +88,14 @@ func parseHotkeySpec(spec string) ([]hotkey.Modifier, hotkey.Key, error) {
 	}
 	return nil, 0, fmt.Errorf("unsupported key %q", parts[len(parts)-1])
 }
+
+// validateHotkeySpec accepts an empty spec as an explicit unbind. Parsing
+// itself remains strict so callers that require a binding still get a useful
+// error for an empty value.
+func validateHotkeySpec(spec string) error {
+	if strings.TrimSpace(spec) == "" {
+		return nil
+	}
+	_, _, err := parseHotkeySpec(spec)
+	return err
+}

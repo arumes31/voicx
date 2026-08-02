@@ -174,7 +174,7 @@ type TURNConfig struct {
 	// Realm is the TURN realm (informational; must match the coturn realm).
 	Realm string `mapstructure:"realm"`
 	// URIs are the TURN server URIs given to clients, e.g.
-	// ["turn:turn.example.com:3478?transport=udp", "turn:...?transport=tcp"].
+	// ["turn:turn.example.com:12340?transport=udp", "turn:...?transport=tcp"].
 	URIs []string `mapstructure:"uris"`
 	// CredentialsTTL is how long minted credentials stay valid.
 	CredentialsTTL time.Duration `mapstructure:"credentials_ttl"`
@@ -203,15 +203,15 @@ func Load() (*Config, error) {
 	v.SetDefault("server_password", "")
 	v.SetDefault("log_level", "info")
 	v.SetDefault("dev_mode", true)
-	v.SetDefault("tcp_addr", ":10011")
-	v.SetDefault("udp_addr", ":9987")
-	v.SetDefault("grpc_addr", "127.0.0.1:50051")
-	v.SetDefault("health_addr", ":9090")
-	v.SetDefault("query_addr", ":10012")
+	v.SetDefault("tcp_addr", DefaultTCPAddr)
+	v.SetDefault("udp_addr", DefaultUDPAddr)
+	v.SetDefault("grpc_addr", DefaultGRPCAddr)
+	v.SetDefault("health_addr", DefaultHealthAddr)
+	v.SetDefault("query_addr", DefaultQueryAddr)
 	v.SetDefault("query_ssh_enabled", false)
-	v.SetDefault("query_ssh_addr", ":10022")
+	v.SetDefault("query_ssh_addr", DefaultQuerySSHAddr)
 	v.SetDefault("query_ssh_host_key", "./data/keys/query_ssh_host.key")
-	v.SetDefault("file_addr", ":30033")
+	v.SetDefault("file_addr", DefaultFileAddr)
 	v.SetDefault("file_root", "./data/files")
 	v.SetDefault("file_max_kbps", 0)
 	v.SetDefault("file_channel_quota_mb", 0)

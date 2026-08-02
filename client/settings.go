@@ -92,10 +92,10 @@ type HotkeyProfile struct {
 }
 
 // settingsVersion is the generation of the settings file. Bump it whenever a
-// default flips from the zero value, and add the repair to migrateSettings:
+// serialized default changes, and add the repair to migrateSettings:
 // loading merges the file ONTO the defaults, so a field an older client always
 // wrote wins over the new default unless it is explicitly repaired.
-const settingsVersion = 4
+const settingsVersion = 5
 
 // Settings holds all user preferences.
 type Settings struct {
@@ -239,7 +239,7 @@ func DefaultSettings() Settings {
 		EchoCancellation:      true,
 		NoiseSuppression:      true,
 		Volume:                100,
-		HotkeyPTT:             "Space",
+		HotkeyPTT:             "",
 		HotkeyMute:            "Ctrl+M",
 		HotkeyQuickConnect:    "Ctrl+Shift+C",
 		HotkeyZen:             "Ctrl+Shift+Z",
@@ -331,8 +331,8 @@ func loadSettingsAt(path string) Settings {
 }
 
 // migrateSettings repairs a file written by an older client. A field the older
-// client always serialised takes precedence over its new default, so any
-// default that flips from the zero value has to be restored explicitly here.
+// client always serialised takes precedence over its new default, so changed
+// defaults have to be repaired explicitly here when appropriate.
 func migrateSettings(s Settings) Settings {
 	if s.SettingsVersion < 1 {
 		// Every client before the master sound gate wrote play_sounds:false,
@@ -351,6 +351,12 @@ func migrateSettings(s Settings) Settings {
 	}
 	if s.SettingsVersion < 4 && s.ChatNotificationLevel == "" {
 		s.ChatNotificationLevel = "all"
+	}
+	if s.SettingsVersion < 5 && strings.EqualFold(strings.TrimSpace(s.HotkeyPTT), "Space") {
+		// Space used to be the implicit PTT default. RegisterHotKey consumes a
+		// registered key system-wide on Windows, so old untouched defaults made
+		// spaces unavailable in every application while voicx was running.
+		s.HotkeyPTT = ""
 	}
 	s.SettingsVersion = settingsVersion
 	return s
@@ -444,13 +450,13 @@ func mergeGoOwned(cur, incoming Settings) Settings {
 // whole object (Go-owned fields are kept, see mergeGoOwned); hotkey specs
 // are validated and re-applied.
 func (a *App) SaveSettings(s Settings) string {
-	if _, _, err := parseHotkeySpec(s.HotkeyPTT); err != nil {
+	if err := validateHotkeySpec(s.HotkeyPTT); err != nil {
 		return "ptt hotkey: " + err.Error()
 	}
-	if _, _, err := parseHotkeySpec(s.HotkeyMute); err != nil {
+	if err := validateHotkeySpec(s.HotkeyMute); err != nil {
 		return "mute hotkey: " + err.Error()
 	}
-	if _, _, err := parseHotkeySpec(s.WhisperReplyHotkey); err != nil {
+	if err := validateHotkeySpec(s.WhisperReplyHotkey); err != nil {
 		return "whisper reply hotkey: " + err.Error()
 	}
 	if s.ChatMaxLines < 1 {

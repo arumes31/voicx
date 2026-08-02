@@ -74,8 +74,8 @@ test("switches the capture device and persists it", async ({ page }) => {
 test("switches active server tabs without retaining stale identity", async ({ page }) => {
     await page.evaluate(() => {
         window.__tabs = [
-            { id: "tab-a", addr: "a.example:10011", nickname: "alice", active: true, connected: true, unread: 0, mentions: 0 },
-            { id: "tab-b", addr: "b.example:10011", nickname: "bob", active: false, connected: true, unread: 2, mentions: 1 },
+            { id: "tab-a", addr: "a.example:12333", nickname: "alice", active: true, connected: true, unread: 0, mentions: 0 },
+            { id: "tab-b", addr: "b.example:12333", nickname: "bob", active: false, connected: true, unread: 2, mentions: 1 },
         ];
         for (const cb of window.__events.tab_update || []) cb(structuredClone(window.__tabs));
         for (const cb of window.__events.tab_reset || []) cb("tab-a");
