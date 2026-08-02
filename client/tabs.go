@@ -1,13 +1,13 @@
 // tabs.go implements multi-server tabs (281). Architecture (the low-churn
 // option): the App keeps one connManager per tab; the active tab's manager
 // is what all existing bindings talk to (a.cm), so the bound API stays
-// unchanged. Events from the ACTIVE tab go to the frontend under their
-// plain names (snapshot/event/channellist/...), so the frontend keeps its
-// single-state model. Events from BACKGROUND tabs are journaled in Go
-// (bounded, state-carrying frames only) and replayed as plain events when
-// their tab becomes active — after a "tab_reset" marker that tells the
-// frontend to clear its chat/tree state first. Background chat events only
-// bump the tab's unread/mention badges (emitted as "tab_update").
+// unchanged. State-carrying events from every tab are journaled in Go, while
+// events from the ACTIVE tab also go to the frontend under their plain names
+// (snapshot/event/channellist/...), so the frontend keeps its single-state
+// model. The bounded journal is replayed as plain events when a tab becomes
+// active — after a "tab_reset" marker that tells the frontend to clear its
+// chat/tree state first. Background chat events also bump the tab's
+// unread/mention badges (emitted as "tab_update").
 package main
 
 import (
@@ -67,17 +67,40 @@ func (s tabSink) Emit(name string, payload any) {
 	s.app.relayTabEvent(s.tabID, name, payload)
 }
 
-// relayTabEvent forwards active-tab events to the frontend and journals
-// background-tab events, updating badges.
+// relayTabEvent forwards active-tab events to the frontend and journals every
+// tab's state-carrying events. Active events must be journaled too: they are
+// the state that has to be replayed after switching away and back.
 func (a *App) relayTabEvent(tabID, name string, payload any) {
 	a.tabsMu.Lock()
 	active := a.activeID == tabID
 	ts := a.tabs[tabID]
+	mention := false
 	if name == "disconnected" && ts != nil {
 		ts.info.Connected = false
 	}
+	if ts != nil {
+		text, _ := payload.(string)
+		switch name {
+		case "snapshot":
+			ts.journal = ts.journal[:0]
+			ts.journal = append(ts.journal, journalEntry{name, text})
+		case "channellist", "subscriptions", "server_rules", "event":
+			ts.journal = append(ts.journal, journalEntry{name, text})
+			if len(ts.journal) > journalCap {
+				ts.journal = ts.journal[len(ts.journal)-journalCap:]
+			}
+			if !active && name == "event" {
+				mention = a.countBadge(ts, text)
+			}
+		}
+	}
 	a.tabsMu.Unlock()
 
+	if mention {
+		// (290) mention in a background tab: flash the taskbar + badge.
+		a.FlashWindow()
+		trayAddMention()
+	}
 	if active || ts == nil {
 		a.emitPlain(name, payload)
 		if name == "disconnected" {
@@ -85,26 +108,8 @@ func (a *App) relayTabEvent(tabID, name string, payload any) {
 		}
 		return
 	}
-
-	// Background tab: journal state-carrying frames for replay.
-	text, _ := payload.(string)
-	switch name {
-	case "snapshot":
-		ts.journal = ts.journal[:0]
-		ts.journal = append(ts.journal, journalEntry{name, text})
-	case "channellist", "subscriptions", "server_rules", "event":
-		ts.journal = append(ts.journal, journalEntry{name, text})
-		if len(ts.journal) > journalCap {
-			ts.journal = ts.journal[len(ts.journal)-journalCap:]
-		}
-		if name == "event" {
-			a.countBadge(ts, text)
-		}
-	case "disconnected":
-		ts.info.Connected = false
-		a.emitTabsUpdate()
-		return
-	default:
+	if name != "snapshot" && name != "channellist" && name != "subscriptions" &&
+		name != "server_rules" && name != "event" && name != "disconnected" {
 		// ice/offer/avatar/servererror from background tabs: drop (voice is
 		// active-tab only this wave).
 		return
@@ -113,29 +118,30 @@ func (a *App) relayTabEvent(tabID, name string, payload any) {
 }
 
 // countBadge increments unread/mention counters for background chat events.
-func (a *App) countBadge(ts *tabState, eventJSON string) {
+func (a *App) countBadge(ts *tabState, eventJSON string) bool {
 	var env struct {
 		Type string          `json:"type"`
 		Data json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal([]byte(eventJSON), &env); err != nil || env.Type != "chat" {
-		return
+		return false
 	}
 	var chat struct {
 		From string `json:"from"`
 		Text string `json:"text"`
 	}
 	if err := json.Unmarshal(env.Data, &chat); err != nil {
-		return
+		return false
 	}
 	ts.info.Unread++
+	ts.cm.mu.Lock()
 	nick := ts.cm.nickname
+	ts.cm.mu.Unlock()
 	if nick != "" && strings.Contains(chat.Text, "@"+nick) {
 		ts.info.Mentions++
-		// (290) mention in a background tab: flash the taskbar + badge.
-		a.FlashWindow()
-		trayAddMention()
+		return true
 	}
+	return false
 }
 
 // emitPlain forwards an event to the Wails runtime under its plain name.
@@ -195,10 +201,12 @@ func (a *App) activate(tabID string) {
 	a.tabsMu.Lock()
 	ts := a.tabs[tabID]
 	a.activeID = tabID
+	var journal []journalEntry
 	if ts != nil {
 		a.cmStore(ts.cm)
 		ts.info.Unread = 0
 		ts.info.Mentions = 0
+		journal = append(journal, ts.journal...)
 	} else {
 		a.cmStore(nil)
 	}
@@ -209,7 +217,7 @@ func (a *App) activate(tabID string) {
 	trayClearMentions()
 	a.emitPlain("tab_reset", tabID)
 	if ts != nil {
-		for _, e := range ts.journal {
+		for _, e := range journal {
 			a.emitPlain(e.name, e.payload)
 		}
 	}

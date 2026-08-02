@@ -9,7 +9,7 @@ import { initMenu } from "./menu.js";
 import { initSettingsUI } from "./settings-ui.js";
 import { initClientInfo } from "./clientinfo.js";
 import { initUpdater } from "./updater.js";
-import { playEvent, beep, testAll } from "./sounds.js";
+import { playEvent, playChannelJoin, beep, testAll } from "./sounds.js";
 import {
     startMicMeter, stopMicMeter, pttRelease, makeLimiter,
     getUserVolume, isUserMuted, setUserMuted, registerUserChain, unregisterUserChain,
@@ -320,8 +320,8 @@ window.runtime.EventsOn("disconnected", () => {
     activeWhisperers.clear();
     state.whisperArmed = false;
     state.whisperPrev = null;
-    teardownVoice();
-    resetVoiceUI();
+    state.myChannelID = 0;
+    resetVoiceSession();
     stopQualitySampler();
     state.selectedClientID = "";
     state.isGuest = true;
@@ -496,6 +496,10 @@ window.runtime.EventsOn("snapshot", (json) => {
         if (prioByID.has(c.client_id)) c.priority_speaker = true;
         if (shareByID.has(c.client_id)) c.sharing = true;
     }
+    // Snapshot replay can beat the async ClientID lookup during a tab switch
+    // or reconnect. Reconcile here when the identity is already known; the
+    // identity completion path calls the same helper for the opposite order.
+    syncOwnChannel();
     // (317) blocked users are locally muted on sight; (318) contact nickname
     // history updates from presence; (383) buddy alerts; (389) channel watch.
     applyBlockAndContacts();
@@ -506,6 +510,27 @@ window.runtime.EventsOn("snapshot", (json) => {
     window.__voicxNotify?.checkChannelWatch();
     renderTree();
 });
+
+// syncOwnChannel makes channel ownership independent of whether the snapshot
+// / user_moved event or the active-tab ClientID lookup finishes first.
+function syncOwnChannel() {
+    if (!state.myClientID) return;
+    const me = state.clients.find((c) => c.client_id === state.myClientID);
+    if (!me) return;
+    const channelID = Number(me.channel_id) || 0;
+    if (state.myChannelID === channelID) {
+        ensureVoiceForChannel();
+        return;
+    }
+    state.myChannelID = channelID;
+    if (channelID > 0) playChannelJoin();
+    expandMyBranch();
+    applyChannelAudio();
+    chatUI.onMyChannelChanged();
+    window.__voicxFiles?.onChannelChanged?.();
+    renderTree();
+    ensureVoiceForChannel();
+}
 
 // applyBlockAndContacts mutes blocked users locally and records contact
 // nickname history from the fresh snapshot (317/318). Settings persist is
@@ -629,12 +654,15 @@ window.runtime.EventsOn("event", (json) => {
             const c = state.clients.find((c) => c.client_id === d.client_id);
             if (c) c.channel_id = d.channel_id;
             if (d.client_id === state.myClientID) {
+                const previousChannelID = state.myChannelID;
                 state.myChannelID = d.channel_id;
+                if (d.channel_id > 0 && d.channel_id !== previousChannelID) playChannelJoin();
                 expandMyBranch(); // (302)
                 applyChannelAudio();
                 chatUI.onMyChannelChanged(); // (103/111) load history + header for the new channel
                 window.__voicxFiles?.onChannelChanged?.(); // (256) file browser follows the channel
                 recordRecentChannel(d.channel_id); // (320) recent channels
+                ensureVoiceForChannel();
             } else if (d.channel_id === state.myChannelID && state.myChannelID !== 0 && c) {
                 window.__voicxNotify?.notify("join_leave", (c.nickname || "someone") + " joined your channel",
                     { channelID: state.myChannelID, className: "joins", kind: "info" });
@@ -1448,20 +1476,53 @@ $("chat-text").addEventListener("keydown", (e) => { if (e.key === "Enter") sendC
 // Voice
 // ---------------------------------------------------------------------------
 
-$("voice-join").onclick = async () => {
+let voiceSessionEpoch = 0;
+let voiceStartPromise = null;
+
+// Channel presence owns voice presence. There is deliberately no separate
+// join/leave voice control: a confirmed local channel move establishes the
+// session, while disconnecting or changing server tabs tears it down.
+function ensureVoiceForChannel() {
+    if (state.myChannelID <= 0) {
+        if (state.pc || state.localStream || voiceStartPromise) resetVoiceSession();
+        return Promise.resolve(false);
+    }
     if (state.pc) {
-        teardownVoice();
-        resetVoiceUI();
-        return;
+        setVoiceStatus("voice on");
+        return Promise.resolve(true);
     }
-    try {
-        await startVoice();
-    } catch (e) {
-        sysMsg("voice failed: " + e);
-        teardownVoice();
-        resetVoiceUI();
-    }
-};
+    if (voiceStartPromise) return voiceStartPromise;
+
+    const epoch = voiceSessionEpoch;
+    setVoiceStatus("voice connecting…");
+    voiceStartPromise = (async () => {
+        try {
+            return await startVoice(epoch);
+        } catch (e) {
+            // A tab switch intentionally invalidates the in-flight start; its
+            // replacement session is scheduled in finally without a warning.
+            if (epoch !== voiceSessionEpoch) return false;
+            sysMsg("voice failed: " + e);
+            toast("Voice could not start automatically", "warn", "conn");
+            teardownVoice();
+            resetVoiceUI();
+            setVoiceStatus("voice unavailable");
+            return false;
+        } finally {
+            voiceStartPromise = null;
+            if (epoch !== voiceSessionEpoch && state.myChannelID > 0 && !state.pc) {
+                queueMicrotask(() => ensureVoiceForChannel());
+            }
+        }
+    })();
+    return voiceStartPromise;
+}
+
+function resetVoiceSession() {
+    voiceSessionEpoch++;
+    teardownVoice();
+    resetVoiceUI();
+}
 
 // (25) Capture follows the joined channel's audio profile: a music channel is
 // captured stereo with the browser's speech DSP off, everything else uses the
@@ -1476,7 +1537,7 @@ function videoConstraints() {
     return { width: 640, height: 360, frameRate: { ideal: fps } };
 }
 
-async function startVoice() {
+async function startVoice(expectedEpoch = voiceSessionEpoch) {
     // Capture degrades in steps — mic+camera, then mic only, then camera only.
     // Either device may be absent, and a machine without a webcam must still
     // get a full audio session; micErr stays null while the mic works.
@@ -1503,6 +1564,11 @@ async function startVoice() {
             }
         }
     }
+    if (expectedEpoch !== voiceSessionEpoch || state.myChannelID <= 0) {
+        state.localStream?.getTracks().forEach((track) => track.stop());
+        state.localStream = null;
+        return false;
+    }
     setMicState(micErr === null ? "ok" : micErr.name === "NotAllowedError" ? "denied" : "none");
     // (25) record which profile this capture was taken with, so a later move
     // only re-captures when the profile actually changes.
@@ -1526,6 +1592,11 @@ async function startVoice() {
     try {
         iceServers = await window.go.main.App.GetICEServers();
     } catch { /* fall back to client defaults */ }
+    if (expectedEpoch !== voiceSessionEpoch || state.myChannelID <= 0) {
+        state.localStream?.getTracks().forEach((track) => track.stop());
+        state.localStream = null;
+        return false;
+    }
     const pc = iceServers && iceServers.length
         ? new RTCPeerConnection({ iceServers })
         : new RTCPeerConnection();
@@ -1593,14 +1664,19 @@ async function startVoice() {
     const answerSDP = await window.go.main.App.WebRTCOffer(offer.sdp, trackSlots());
     await pc.setRemoteDescription({ type: "answer", sdp: answerSDP });
 
+    if (expectedEpoch !== voiceSessionEpoch || state.pc !== pc || state.myChannelID <= 0) {
+        pc.close();
+        return false;
+    }
+
     applyChannelAudio();
     // (88) re-apply the persisted low-bandwidth mode to the fresh session.
     if (state.settings?.low_bandwidth) setLowBandwidth(true, false);
     startVoiceMonitor();
     startMicMeter(state.localStream);
     applyVoiceState();
-    $("voice-join").classList.add("active");
     setVoiceStatus("voice on");
+    return true;
 }
 
 // (24) applyChannelAudio applies the current channel's Opus settings to the
@@ -1696,7 +1772,7 @@ function resetICERestart() {
 function scheduleICERestart() {
     if (!state.pc) return;
     if (iceFailures >= ICE_BACKOFF_MS.length) {
-        toast("Voice connection unstable — rejoin voice if it does not recover", "warn", "conn");
+        toast("Voice connection unstable — reconnect if it does not recover", "warn", "conn");
         return;
     }
     const delay = ICE_BACKOFF_MS[iceFailures++];
@@ -1774,7 +1850,6 @@ function renderVoiceStatus() {
 }
 
 function resetVoiceUI() {
-    $("voice-join").classList.remove("active");
     setVoiceStatus("voice off");
     state.pttActive = false;
     $("ptt-btn").classList.remove("live");
@@ -2362,7 +2437,8 @@ window.__voicx = {
     startVADMonitor: startVoiceMonitor, stopVADMonitor: stopVoiceMonitor,
     connectFromLogin, renderTree, setDetailsOpen, setDirectTargetVisible,
     clientName, initials, fetchAvatar,
-    applyAppearance, toggleCompact, recentChannels,
+    applyAppearance, toggleCompact, recentChannels, syncOwnChannel,
+    ensureVoiceForChannel, resetVoiceSession,
     // (70) shared system audio controls for the screen tile's context menu.
     shareAudioCtl: {
         get: (clientID) => {

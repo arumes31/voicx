@@ -312,7 +312,7 @@ The files UI (`frontend/src/files-ui.js`, bindings in `files.go`) adds a
 - **Multi-server tabs (281)**: TS3-style server tab bar above the panes.
   Architecture (documented in `tabs.go`): the backend keeps one connManager
   per tab; all bindings operate on the *active* tab, so the bound API is
-  unchanged. Events from background tabs are journaled in Go and replayed on
+  unchanged. State events from every tab are journaled in Go and replayed on
   activation (after a `tab_reset` that clears chat/tree state), keeping the
   frontend single-state. Tabs show addr + nickname, unread/mention badges,
   and a close button; "+" opens the connect dialog for a new tab. Voice is

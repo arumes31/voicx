@@ -106,6 +106,10 @@ async function refreshTabIdentity(tabID) {
     try { myClientID = await App().ClientID(); } catch { /* disconnected */ }
     if (activeTabID !== activatedTabID) return;
     state.myClientID = myClientID;
+    // The tab's replayed snapshot (and even an immediate join event) may have
+    // arrived while ClientID was pending. Resolve our channel from that state
+    // now so the move cannot be mistaken for another user's.
+    V().syncOwnChannel();
     let isAdmin = false;
     try { isAdmin = await App().IsAdmin(); } catch { /* disconnected */ }
     if (activeTabID !== activatedTabID) return;
@@ -141,11 +145,9 @@ async function refreshTabIdentity(tabID) {
 function onTabReset(tabID) {
     const { state, $ } = V();
     activeTabID = tabID || "";
-    // Voice is active-tab only this wave: tear it down on every switch.
-    if (state.pc) {
-        try { state.pc.close(); } catch { /* already closed */ }
-        state.pc = null;
-    }
+    // Voice is active-tab only: fully tear down capture and WebRTC before the
+    // replayed channel state automatically starts the new tab's session.
+    V().resetVoiceSession();
     state.channels = [];
     state.clients = [];
     window.__voicxNotify?.resetBuddyWatch(); // (383) buddy alerts re-arm per connect

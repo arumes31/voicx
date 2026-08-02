@@ -1,6 +1,8 @@
 // sounds.js — sound pack system: synthesized per-event sounds via WebAudio
-// oscillators (no asset files), with pack selection, per-event enable, a
-// master volume slider and the master play_sounds gate.
+// plus dedicated media cues, with pack selection, per-event enable, a master
+// volume slider and the master play_sounds gate.
+import channelJoinURL from "./assets/channel_join.mp3?url";
+
 const V = () => window.__voicx;
 
 // Sound events: every row of the notification matrix plus the local
@@ -53,18 +55,42 @@ function soundsEnabled() {
     return V().state.settings?.play_sounds !== false;
 }
 
+function eventEnabled(name, force = false) {
+    const s = V().state.settings;
+    if (!s) return false;
+    if (!force && !soundsEnabled()) return false;
+    if (s.event_sounds && s.event_sounds[name] === false) return false;
+    // (347/348) DND silences sounds (mentions still badge silently).
+    if (window.__voicxPolish?.dndActive?.()) return false;
+    return true;
+}
+
 // playEvent plays the sound for an event if enabled in settings.
 export function playEvent(name, force = false) {
     const s = V().state.settings;
-    if (!s) return;
-    if (!force && !soundsEnabled()) return;
-    if (s.event_sounds && s.event_sounds[name] === false) return;
-    // (347/348) DND silences sounds (mentions still badge silently).
-    if (window.__voicxPolish?.dndActive?.()) return;
+    if (!eventEnabled(name, force)) return;
     const pack = PACKS[s.sound_pack] || PACKS.soft;
     const preset = pack[name];
     if (!preset) return;
     play(preset[0], preset[1], preset[2], (s.sound_volume ?? 100) / 100, force);
+}
+
+// playChannelJoin plays the bundled cue only for this client's own channel
+// transition. It shares the Join event's settings policy without replacing
+// the synthesized join notification used for other users.
+const activeMedia = new Set();
+
+export function playChannelJoin(force = false) {
+    if (!eventEnabled("join", force)) return;
+    try {
+        const audio = new Audio(channelJoinURL);
+        audio.volume = Math.min(1, Math.max(0, (V().state.settings?.sound_volume ?? 100) / 100));
+        activeMedia.add(audio);
+        const release = () => activeMedia.delete(audio);
+        audio.addEventListener("ended", release, { once: true });
+        audio.addEventListener("error", release, { once: true });
+        audio.play().catch(release);
+    } catch { /* media playback unavailable */ }
 }
 
 // play sounds an oscillator note.

@@ -821,7 +821,7 @@ export function initFilesUI() {
             <span class="fb-crumb"></span>
             <span class="fb-spacer"></span>
             <button class="icon-btn fb-refresh" title="Refresh">⟳</button>
-            <button class="icon-btn fb-upload" title="Upload files">⬆</button>
+            <button class="icon-btn fb-upload" title="Upload files"><span aria-hidden="true">⬆</span><span>Upload</span></button>
             <button class="icon-btn fb-mkdir" title="New folder (virtual — persists only while it contains files)">📁+</button>
             <button class="icon-btn fb-emoji" title="Custom emoji manager (272)">😀</button>
             <button class="icon-btn fb-banner" title="Set the server banner (admin, 270)">🖼</button>

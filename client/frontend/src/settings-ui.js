@@ -439,7 +439,7 @@ function pageCapture() {
     el.appendChild(row("Echo cancellation", checkbox(s.echo_cancellation !== false, (v) => { s.echo_cancellation = v; })));
     el.appendChild(row("Noise suppression", checkbox(s.noise_suppression !== false, (v) => { s.noise_suppression = v; })));
 
-    // (78) Camera frame rate (applies on the next Join Voice).
+    // (78) Camera frame rate applies when the automatic voice session next starts.
     const fpsSelect = document.createElement("select");
     for (const fps of [15, 30, 60]) {
         const o = document.createElement("option");
@@ -452,7 +452,7 @@ function pageCapture() {
     el.appendChild(row("Camera frame rate", fpsSelect));
 
     el.appendChild(row("PTT release delay (ms)", slider(s.ptt_release_delay_ms || 0, 0, 2000, (v) => { s.ptt_release_delay_ms = v; })));
-    el.appendChild(hint("Capture changes apply on the next Join Voice."));
+    el.appendChild(hint("Capture changes apply when voice next reconnects."));
     // (25) the music profile overrides these two, so say so where they live.
     el.appendChild(hint("Music channels (stereo, 96 kbit/s or more) capture in stereo with echo cancellation, "
         + "noise suppression and auto gain off; your settings above apply everywhere else."));
@@ -571,7 +571,7 @@ function pagePlayback() {
     el.appendChild(row("Per-user gain normalization (cap 4x)", checkbox(s.gain_normalize, (v) => { s.gain_normalize = v; })));
     // (53) each publisher is levelled on its own chain, so a loud speaker no
     // longer sets the gain for a quiet one.
-    el.appendChild(hint("Normalization levels every speaker separately. Limiter and normalizer apply on the next Join Voice."));
+    el.appendChild(hint("Normalization levels every speaker separately. Limiter and normalizer apply when voice next reconnects."));
     const testBtn = document.createElement("button");
     testBtn.textContent = "Play Test Sound";
     testBtn.onclick = () => V().beep(660, 0.25);

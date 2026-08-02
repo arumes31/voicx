@@ -45,9 +45,9 @@ type connManager struct {
 
 	// tabID identifies the owning server tab (281). Empty means the legacy
 	// single-connection manager (tests, headless tools): events go out under
-	// their plain names. Tabbed managers route through tabSink, which
-	// forwards active-tab events under their plain names and journals
-	// background-tab events for replay on tab switch.
+	// their plain names. Tabbed managers route through tabSink, which journals
+	// state events for replay and also forwards active-tab events under their
+	// plain names.
 	tabID string
 
 	mu       sync.Mutex
@@ -526,6 +526,13 @@ func (m *connManager) request(send, reply netproto.MessageType, msg any, timeout
 	}
 	select {
 	case f := <-ch:
+		if f.Type == uint16(netproto.MsgError) {
+			var e netproto.Error
+			if err := netproto.Decode(f, &e); err == nil {
+				return nil, fmt.Errorf("%s", e.Message)
+			}
+			return nil, fmt.Errorf("server error")
+		}
 		return f, nil
 	case <-time.After(timeout):
 		return nil, fmt.Errorf("timeout waiting for %s", reply)
@@ -619,6 +626,15 @@ func (m *connManager) dispatch(f *netproto.Frame) {
 			m.emit("perms_invalid", pi.Reason)
 		}
 	case netproto.MsgError:
+		m.mu.Lock()
+		for _, waiter := range m.pending {
+			select {
+			case waiter <- f:
+			default:
+			}
+		}
+		m.mu.Unlock()
+
 		var e netproto.Error
 		if err := netproto.Decode(f, &e); err == nil {
 			// Capability probes (121 read state) are sent speculatively, so an

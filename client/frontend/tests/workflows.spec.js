@@ -34,7 +34,10 @@ test.beforeEach(async ({ page }) => {
                     if (method === "GetSettings") return structuredClone(initialSettings);
                     if (method === "SaveSettings") { window.__savedSettings = structuredClone(args[0]); return ""; }
                     if (method === "ListTabs") return structuredClone(window.__tabs);
-                    if (method === "ClientID") return window.__activeClient || "client-a";
+                    if (method === "ClientID") {
+                        if (window.__clientIDGate) await window.__clientIDGate;
+                        return window.__activeClient || "client-a";
+                    }
                     if (method === "IsAdmin") return true;
                     if (method === "IsGuest") return false;
                     if (method === "IdentityUID") return "playwright-identity";
@@ -87,6 +90,101 @@ test("switches active server tabs without retaining stale identity", async ({ pa
     await page.locator('.srv-tab[data-tab-id="tab-b"]').click();
     await expect(page.locator('.srv-tab[data-tab-id="tab-b"]')).toHaveClass(/active/);
     await expect.poll(() => page.evaluate(() => window.__voicx.state.myClientID)).toBe("client-b");
+});
+
+test("recognises an immediate channel join while switched-tab identity is loading", async ({ page }) => {
+    await page.evaluate(() => {
+        window.__tabs = [
+            { id: "tab-a", addr: "a.example:12333", nickname: "alice", active: true, connected: true, unread: 0, mentions: 0 },
+            { id: "tab-b", addr: "b.example:12333", nickname: "bob", active: false, connected: true, unread: 0, mentions: 0 },
+        ];
+        window.__activeClient = "client-a";
+        window.__voicx.state.myClientID = "client-a";
+        let release;
+        window.__clientIDGate = new Promise((resolve) => { release = resolve; });
+        window.__releaseClientID = release;
+        for (const cb of window.__events.tab_update || []) cb(structuredClone(window.__tabs));
+    });
+
+    await page.locator('.srv-tab[data-tab-id="tab-b"]').click();
+    await page.evaluate(() => {
+        const snapshot = JSON.stringify({
+            root_channels: [{
+                ChannelID: 42, ParentID: 0, Name: "Lobby",
+                clients: [{ client_id: "client-b", unique_id: "user-b", nickname: "Bob", channel_id: 0, is_speaking: false }],
+                children: [],
+            }],
+        });
+        const moved = JSON.stringify({ type: "user_moved", data: { client_id: "client-b", channel_id: 42 } });
+        for (const cb of window.__events.snapshot || []) cb(snapshot);
+        for (const cb of window.__events.event || []) cb(moved);
+        window.__releaseClientID();
+        window.__clientIDGate = null;
+    });
+
+    await expect.poll(() => page.evaluate(() => window.__voicx.state.myClientID)).toBe("client-b");
+    await expect.poll(() => page.evaluate(() => window.__voicx.state.myChannelID)).toBe(42);
+});
+
+test("starts voice and plays the local cue when joining or switching channels", async ({ page }) => {
+    await page.evaluate(() => {
+        window.__getUserMediaCalls = 0;
+        window.__playedMedia = [];
+        HTMLMediaElement.prototype.play = function play() {
+            window.__playedMedia.push(this.currentSrc || this.src);
+            return Promise.resolve();
+        };
+        navigator.mediaDevices.getUserMedia = async () => {
+            window.__getUserMediaCalls++;
+            throw new DOMException("test permission denial", "NotAllowedError");
+        };
+        window.__voicx.state.myClientID = "client-a";
+        window.__voicx.state.myChannelID = 0;
+        window.__voicx.state.clients = [{
+            client_id: "client-a", unique_id: "user-a", nickname: "Alice",
+            channel_id: 0, is_speaking: false,
+        }];
+        const moved = JSON.stringify({ type: "user_moved", data: { client_id: "client-a", channel_id: 42 } });
+        for (const cb of window.__events.event || []) cb(moved);
+    });
+
+    await expect(page.locator("#voice-join")).toHaveCount(0);
+    await expect.poll(() => page.evaluate(() => window.__getUserMediaCalls)).toBeGreaterThan(0);
+    await expect.poll(() => page.evaluate(
+        () => window.__playedMedia.some((src) => src.includes("channel_join")),
+    )).toBe(true);
+
+    const firstCueCount = await page.evaluate(() => window.__playedMedia.length);
+    await page.evaluate(() => {
+        const emitMove = (clientID, channelID) => {
+            const moved = JSON.stringify({ type: "user_moved", data: { client_id: clientID, channel_id: channelID } });
+            for (const cb of window.__events.event || []) cb(moved);
+        };
+        emitMove("someone-else", 42);
+        emitMove("client-a", 42);
+    });
+    await expect.poll(() => page.evaluate(() => window.__playedMedia.length)).toBe(firstCueCount);
+
+    await page.evaluate(() => {
+        const moved = JSON.stringify({ type: "user_moved", data: { client_id: "client-a", channel_id: 43 } });
+        for (const cb of window.__events.event || []) cb(moved);
+    });
+    await expect.poll(() => page.evaluate(() => window.__playedMedia.length)).toBe(firstCueCount + 1);
+});
+
+test("shows the files toolbar and opens the upload picker", async ({ page }) => {
+    await page.evaluate(() => {
+        document.getElementById("login-overlay").classList.add("hidden");
+        document.getElementById("app").classList.remove("hidden");
+        window.__voicx.state.myChannelID = 42;
+        window.__voicx.state.channels = [{ ChannelID: 42, Name: "Uploads" }];
+    });
+
+    await page.locator("#tab-files").click();
+    await expect(page.locator("#files-pane")).toBeVisible();
+    await expect(page.locator("#files-pane .fb-upload")).toBeVisible();
+    await page.locator("#files-pane .fb-upload").click();
+    await expect.poll(() => page.evaluate(() => window.__calls.PickUploadPaths || 0)).toBe(1);
 });
 
 test("keeps details contextual and opens it when a user is selected", async ({ page }) => {
@@ -180,4 +278,48 @@ test("nests connected members below channels and offers them as direct-message t
     await expect(page.locator("#chat-target-options .target-option")).toHaveCount(2);
     await page.locator("#chat-target-options .target-option", { hasText: "Carol" }).click();
     await expect(page.locator("#chat-target")).toHaveValue("user-c");
+});
+
+test("uses the reference control-room composition without losing responsive navigation", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.evaluate(() => {
+        document.getElementById("login-overlay").classList.add("hidden");
+        document.getElementById("app").classList.remove("hidden");
+        window.__tabs = [{
+            id: "tab-a", addr: "127.0.0.1:12333", nickname: "Test",
+            active: true, connected: true, unread: 0, mentions: 0,
+        }];
+        for (const cb of window.__events.tab_update || []) cb(structuredClone(window.__tabs));
+        window.__voicx.state.myClientID = "client-a";
+        window.__voicx.state.myChannelID = 1;
+        for (const cb of window.__events.snapshot || []) cb(JSON.stringify({
+            root_channels: [{
+                ChannelID: 1, ParentID: 0, Name: "Main Lounge",
+                clients: [
+                    { client_id: "client-a", unique_id: "user-a", nickname: "Daniel", channel_id: 1, is_speaking: false },
+                    { client_id: "client-b", unique_id: "user-b", nickname: "Benedikt", channel_id: 1, is_speaking: true },
+                ],
+                children: [{ ChannelID: 2, ParentID: 1, Name: "Alpha Squad", clients: [], children: [] }],
+            }],
+        }));
+    });
+
+    const desktop = await page.evaluate(() => ({
+        accent: getComputedStyle(document.documentElement).getPropertyValue("--accent").trim(),
+        appColumns: getComputedStyle(document.getElementById("app")).gridTemplateColumns,
+        railDirection: getComputedStyle(document.getElementById("server-tabs")).flexDirection,
+        texture: getComputedStyle(document.getElementById("center"), "::before").backgroundImage,
+    }));
+    expect(desktop.accent).toBe("#00f2ff");
+    expect(desktop.appColumns).toMatch(/^72px /);
+    expect(desktop.railDirection).toBe("column");
+    expect(desktop.texture).toContain("radial-gradient");
+    await expect(page.locator("#server-tabs .srv-tab.active")).toBeVisible();
+    await page.locator('.client[data-clid="client-a"]').click();
+
+    await page.setViewportSize({ width: 700, height: 800 });
+    await expect.poll(() => page.evaluate(
+        () => getComputedStyle(document.getElementById("server-tabs")).flexDirection,
+    )).toBe("row");
+    await expect(page.locator("#center")).toBeVisible();
 });

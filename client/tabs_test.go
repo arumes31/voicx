@@ -102,6 +102,23 @@ func TestTabJournalAndBadges(t *testing.T) {
 	}
 }
 
+// TestActiveTabJournalTracksSessionChanges covers the switch-away/switch-back
+// lifecycle. State events received while a tab is active must still be kept in
+// its replay journal; otherwise a successful channel join disappears as soon
+// as another server tab is selected.
+func TestActiveTabJournalTracksSessionChanges(t *testing.T) {
+	a := newTabApp(t)
+	id, ts := a.newTab()
+	a.activate(id)
+
+	a.relayTabEvent(id, "snapshot", `{"root_channels":[]}`)
+	a.relayTabEvent(id, "event", `{"type":"user_moved","data":{"client_id":"me","channel_id":42}}`)
+
+	if len(ts.journal) != 2 {
+		t.Fatalf("active tab journal = %d entries, want snapshot plus move", len(ts.journal))
+	}
+}
+
 // TestTabReplayUsesCachedFrames verifies activation replays the cached
 // snapshot/list frames through the connManager itself (281 replay source).
 func TestTabReplayUsesCachedFrames(t *testing.T) {
