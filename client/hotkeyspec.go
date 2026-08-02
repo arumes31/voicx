@@ -9,8 +9,6 @@ import (
 	"golang.design/x/hotkey"
 )
 
-
-
 // specKeys maps key names to hotkey keys (only keys the hotkey package
 // defines on Windows are listed).
 var specKeys = map[string]hotkey.Key{
