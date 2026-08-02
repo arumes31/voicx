@@ -26,6 +26,11 @@ func nextFrame(t *testing.T, frames <-chan *netproto.Frame, want netproto.Messag
 func TestAppOfflineContracts(t *testing.T) {
 	t.Parallel()
 
+	constructed := NewApp()
+	if constructed.tabs == nil || constructed.hotkeys == nil {
+		t.Fatal("NewApp did not initialize runtime registries")
+	}
+
 	a := &App{settingsPath: filepath.Join(t.TempDir(), "settings.json")}
 	if a.Connected() {
 		t.Fatal("zero App reports connected")

@@ -100,7 +100,7 @@ jobs:
 
           client_coverage="$RUNNER_TEMP/client-unit.out"
           (cd client && xvfb-run -a go test -race -count=1 -covermode=atomic -coverprofile="$client_coverage" ./...)
-          client_pct="$(go tool cover -func="$client_coverage" | awk '/^total:/ {gsub("%", "", $3); print $3}')"
+          client_pct="$(cd client && go tool cover -func="$client_coverage" | awk '/^total:/ {gsub("%", "", $3); print $3}')"
           awk -v got="$client_pct" 'BEGIN {
             minimum = 50
             if (got + 0 < minimum) {
