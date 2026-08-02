@@ -49,6 +49,18 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: client/frontend/package-lock.json
+
+      - name: build frontend assets
+        working-directory: client/frontend
+        run: |
+          npm ci
+          npm run build
+
       - name: gofmt check
         run: |
           fmt=$(gofmt -l .)
