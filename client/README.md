@@ -246,7 +246,7 @@ write and denials arrive as toasts (grant-cap errors included).
 - **Permission Manager** (Permissions menu): tabs for Server Groups / Clients /
   Channel / Channel Groups. The right side is the editable permission grid
   (136) — click a row for the inline editor (value + grant inputs, skip/negate
-  checkboxes with TS3 tooltips (152/153), Set/Unset). A filter box searches
+  checkboxes with tooltips, Set/Unset). A filter box searches
   keys (154); ⬇ exports the target's grid as JSON (148). Current values are
   read via the `PermList` request; after each write the grid re-queries.
 - **Trace** (137/155): on the Clients tab, each row's editor has a Trace
@@ -529,7 +529,7 @@ first-run admin token the server logs at WARN on an empty database.
 
 ## Identity & login
 
-TS3-style identity: on first run the client generates an Ed25519 key pair
+Cryptographic identity: on first run the client generates an Ed25519 key pair
 and persists it to `<UserConfigDir>/voicx/identity.json` (0600). The unique
 ID is derived from the public key — you never type one.
 
@@ -541,7 +541,7 @@ The login dialog asks for:
   account's canonical unique ID, and binds your identity key to the account
   so future logins work passwordless (challenge auth with the same key).
 - **Password** — optional. Empty = guest login with your own identity
-  (key-derived unique ID, TS3 guest semantics).
+  (key-derived unique ID, guest semantics).
 - **Server password** — only if the server has a global password set.
 
 ## Hotkeys & troubleshooting
