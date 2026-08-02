@@ -19,11 +19,11 @@ jobs:
       - name: golangci-lint (root)
         uses: golangci/golangci-lint-action@v6
         with:
-          version: v1.60.1
+          version: v1.64.0
           working-directory: .
 
       - name: golangci-lint (client)
         uses: golangci/golangci-lint-action@v6
         with:
-          version: v1.60.1
+          version: v1.64.0
           working-directory: client
