@@ -47,6 +47,7 @@ let newCount = 0;
 let replyTo = null; // message object being replied to (107)
 let pendingFiles = []; // {name, dataBase64, isImage, dataURL} staged for send (98/100)
 let lastDMTarget = ""; // last unique ID we sent a DM to (echo routing)
+let emojiPanel = null; // open emoji panel element (95)
 let pinsPanel = null; // open pins panel element (109)
 let searchQ = ""; // live search filter (110)
 let threadPanel = null; // open thread panel element (108)

@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1.6
 # =============================================================================
-# voicx - TeamSpeak-like voice/video server (Phase 1 base image)
+# voicx - voice/video server (Phase 1 base image)
 # =============================================================================
 # Multi-stage build:
-#   1. builder  - compiles a static Go binary from golang:1.25-alpine
+#   1. builder  - compiles a static Go binary from golang:1.26-alpine
 #   2. runtime  - minimal alpine:3.20 image running as a non-root user
 #
 # NOTE on CGO: Phase 1 keeps CGO_ENABLED=0 to produce a fully static binary
@@ -15,7 +15,7 @@
 # -----------------------------------------------------------------------------
 # Builder stage
 # -----------------------------------------------------------------------------
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 # Version metadata: .git is excluded from the build context (see
 # .dockerignore), so it is injected via --build-arg (from Makefile/compose).
