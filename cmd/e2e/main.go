@@ -945,7 +945,7 @@ func writeEncChannelChat(cl *client, channelID int64, text string) error {
 func readEncChannelChat(cl *client, channelID int64, wantText string) error {
 	deadline := time.Now().Add(readTimeout)
 	for time.Now().Before(deadline) {
-		env, err := readEvent(cl.conn, "chat", deadline.Sub(time.Now()))
+		env, err := readEvent(cl.conn, "chat", time.Until(deadline))
 		if err != nil {
 			return err
 		}
@@ -996,7 +996,7 @@ func checkChatDirect(c *checkCtx) error {
 	}
 	deadline := time.Now().Add(readTimeout)
 	for time.Now().Before(deadline) {
-		env, err := readEvent(c.alice.conn, "chat", deadline.Sub(time.Now()))
+		env, err := readEvent(c.alice.conn, "chat", time.Until(deadline))
 		if err != nil {
 			return err
 		}
@@ -1562,7 +1562,7 @@ func checkAnonymousAuth(c *checkCtx) error {
 	// Bob must see the guest's user_joined with the nickname.
 	deadline := time.Now().Add(readTimeout)
 	for time.Now().Before(deadline) {
-		env, err := readEvent(c.bob.conn, "user_joined", deadline.Sub(time.Now()))
+		env, err := readEvent(c.bob.conn, "user_joined", time.Until(deadline))
 		if err != nil {
 			return fmt.Errorf("bob user_joined: %w", err)
 		}
