@@ -558,6 +558,10 @@ func insertChannelRow(t *testing.T, s *store.Store, name string, parentID int64,
 func TestLoadIntoState(t *testing.T) {
 	mgr, s, sm := testEnv(t)
 
+	if _, err := s.DB().Exec("DELETE FROM channels"); err != nil {
+		t.Fatalf("failed to clean channels table: %v", err)
+	}
+
 	rootID := insertChannelRow(t, s, "LoadRoot", 0, ChannelTypePermanent, 10)
 	childID := insertChannelRow(t, s, "LoadChild", rootID, ChannelTypeSemiPermanent, 0)
 	tempID := insertChannelRow(t, s, "LoadTemp", 0, ChannelTypeTemporary, 0)
