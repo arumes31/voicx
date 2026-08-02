@@ -345,7 +345,10 @@ func (s *TCPServer) Start(ctx context.Context) error {
 		return fmt.Errorf("tcp listen on %s: %w", s.cfg.TCPAddr, err)
 	}
 	if s.cfg.TLSEnabled {
-		cert, fp := tls.Certificate{}, ""
+		var (
+			cert tls.Certificate
+			fp   string
+		)
 		if s.tlsCertSet {
 			cert, fp = *s.tlsCert, s.tlsFingerprint
 		} else {
