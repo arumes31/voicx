@@ -24,7 +24,7 @@ VERSION_FLAGS = -ldflags="-s -w \
 	-X voicx/internal/version.Dirty=$(VOICX_DIRTY) \
 	-X voicx/internal/version.UpdateRepo=$(VOICX_UPDATE_REPO)"
 
-.PHONY: all build run migrate tidy test cover fmt vet docker-build docker-run docker-stop compose-up compose-down compose-logs clean help client-build
+.PHONY: all build run migrate proto tidy test cover fmt vet docker-build docker-run docker-stop compose-up compose-down compose-logs chaos clean help client-build
 
 all: build
 
@@ -43,6 +43,10 @@ run:
 ## migrate: run database migrations (go run ./cmd/migrate)
 migrate:
 	$(GO) run ./cmd/migrate
+
+## proto: regenerate the gRPC stubs in ./v1 from proto/ (needs buf, 232)
+proto:
+	buf generate
 
 ## tidy: run go mod tidy
 tidy:
@@ -94,6 +98,10 @@ compose-down:
 ## compose-logs: tail logs from all compose services
 compose-logs:
 	$(DOCKER) compose logs -f --tail=100
+
+## chaos: run the database chaos drill against the running compose stack (467)
+chaos:
+	./scripts/chaos-db.sh
 
 ## clean: remove local build artifacts
 clean:

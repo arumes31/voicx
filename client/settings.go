@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -94,7 +95,7 @@ type HotkeyProfile struct {
 // default flips from the zero value, and add the repair to migrateSettings:
 // loading merges the file ONTO the defaults, so a field an older client always
 // wrote wins over the new default unless it is explicitly repaired.
-const settingsVersion = 1
+const settingsVersion = 3
 
 // Settings holds all user preferences.
 type Settings struct {
@@ -115,6 +116,7 @@ type Settings struct {
 	UserCSS        string `json:"user_css"`         // (296) scoped overrides
 	UIFont         string `json:"ui_font"`          // (297) "outfit" | "sora" | "jetbrains"
 	UIFontSize     int    `json:"ui_font_size"`     // (297) base px, default 14
+	WindowOpacity  int    `json:"window_opacity"`   // (292) 20..100 percent, default 100
 
 	// Accessibility & polish (wave 8c).
 	Language       string `json:"language"`         // (336) "system" | "en" | "de"
@@ -206,8 +208,16 @@ type Settings struct {
 	UserNotes       map[string]string  `json:"user_notes,omitempty"`      // (315) uniqueID -> local note
 	RecentChannels  map[string][]int64 `json:"recent_channels,omitempty"` // (320) server addr -> last 5 channel IDs
 	AutoAwayMinutes int                `json:"auto_away_minutes"`         // (308) 0 = off, default 15
+	AutoAwayMessage string             `json:"auto_away_message"`         // (390) status line other clients see while idle
 	OnboardingDone  bool               `json:"onboarding_done"`           // (329)
 	LastSeenVersion string             `json:"last_seen_version"`         // (330) what's-new tracking
+
+	// Identity (wave 9).
+	ActiveIdentity string `json:"active_identity,omitempty"` // (351) identity file stem in identities/
+	// (354) "" or "auto" = protect the private key with the OS key store when
+	// one is available, "off" = always plaintext. "" deliberately means auto
+	// so a settings file predating the option keeps the protected default.
+	IdentityKeyProtection string `json:"identity_key_protection,omitempty"`
 
 	// Notifications (wave 9).
 	NotifyMatrix   map[string]NotifyChannels  `json:"notify_matrix,omitempty"`  // (385) event -> outputs
@@ -235,6 +245,7 @@ func DefaultSettings() Settings {
 		Theme:              "dark",
 		UIFont:             "outfit",
 		UIFontSize:         14,
+		WindowOpacity:      100,
 		ChatMaxLines:       200,
 		NotifyJoinLeave:    true,
 		NotifyConnection:   true,
@@ -246,9 +257,13 @@ func DefaultSettings() Settings {
 		WarnEmptyChannel:  true,
 		SoundPack:         "soft",
 		SoundVolume:       100,
+		// (385) one entry per notification-matrix event plus the local
+		// mic/voice ones, so every matrix row has a togglable sound.
 		EventSounds: map[string]bool{
-			"join": true, "leave": true, "mention": true, "dm": true,
-			"whisper": true, "poke": true, "mic_on": true, "mic_off": true,
+			"join": true, "leave": true, "join_leave": true, "mention": true,
+			"keyword": true, "dm": true, "whisper": true, "poke": true,
+			"buddy_online": true, "kick": true, "announcement": true,
+			"channel_watch": true, "mic_on": true, "mic_off": true,
 		},
 		WhisperReplyHotkey: "Ctrl+R",
 		VoiceLimiter:       true,
@@ -260,7 +275,30 @@ func DefaultSettings() Settings {
 		SysJoinLeave:       true,
 		SysKick:            true,
 		AutoAwayMinutes:    15,
+		AutoAwayMessage:    defaultAutoAwayMessage,
 	}
+}
+
+// defaultAutoAwayMessage is the status line other clients see while the user
+// is idle (390). It is a non-zero default, so migrateSettings repairs it.
+const defaultAutoAwayMessage = "auto-away"
+
+// autoAwaySentinel is what the idle timer passes to SetStatus. It marks the
+// call as automatic so the configured away message can be substituted; a
+// status the user set by hand keeps the text they typed (390).
+const autoAwaySentinel = "auto-away"
+
+// autoAwayMessage returns the status text to publish when the idle timer
+// fires (390), clamped to the server's status-message limit.
+func (a *App) autoAwayMessage() string {
+	msg := strings.TrimSpace(a.settings.AutoAwayMessage)
+	if msg == "" {
+		msg = defaultAutoAwayMessage
+	}
+	if len(msg) > 200 {
+		msg = msg[:200]
+	}
+	return msg
 }
 
 // settingsPath returns the default settings file location.
@@ -296,6 +334,16 @@ func migrateSettings(s Settings) Settings {
 		// Every client before the master sound gate wrote play_sounds:false,
 		// which would now mute every notification sound (28).
 		s.PlaySounds = true
+	}
+	if s.SettingsVersion < 2 && s.AutoAwayMessage == "" {
+		// Files written before the custom away message always carried the
+		// empty string, which would publish a blank status line (390).
+		s.AutoAwayMessage = defaultAutoAwayMessage
+	}
+	if s.SettingsVersion < 3 && s.WindowOpacity == 0 {
+		// Files written before the opacity option carry no value, and 0 would
+		// clamp the window to the 20% floor at the next start (292).
+		s.WindowOpacity = 100
 	}
 	s.SettingsVersion = settingsVersion
 	return s
@@ -366,6 +414,10 @@ func (a *App) emitSettingsUpdate() {
 func mergeGoOwned(cur, incoming Settings) Settings {
 	incoming.Recents = cur.Recents
 	incoming.LastSeenVersion = cur.LastSeenVersion
+	// (351) the identity manager writes ActiveIdentity while the settings
+	// dialog is open, so a draft cloned before the switch would revert it and
+	// silently hand the next connect the previous account.
+	incoming.ActiveIdentity = cur.ActiveIdentity
 	// LastReadChannels is deliberately NOT listed: the frontend still owns it
 	// (121 has no server half yet). It has to move here the moment the Go side
 	// starts writing pointers, or one save discards them.

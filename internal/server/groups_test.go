@@ -18,6 +18,7 @@ import (
 	"voicx/internal/config"
 	"voicx/internal/netproto"
 	"voicx/internal/permissions"
+	"voicx/internal/state"
 	"voicx/internal/store"
 )
 
@@ -117,6 +118,25 @@ func (f *fakeGroups) RenameGroup(_ context.Context, groupType string, id int64, 
 		return fmt.Errorf("group not found")
 	}
 	g.Name = name
+	return nil
+}
+
+func (f *fakeGroups) SetGroupCosmetics(_ context.Context, groupID int64, color *string, hoist *bool, sortID *int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	g, ok := f.groups["server"][groupID]
+	if !ok {
+		return fmt.Errorf("group not found")
+	}
+	if color != nil {
+		g.Color = *color
+	}
+	if hoist != nil {
+		g.Hoist = *hoist
+	}
+	if sortID != nil {
+		g.SortID = *sortID
+	}
 	return nil
 }
 
@@ -835,9 +855,9 @@ func TestPermTemplateApplyGrantCap(t *testing.T) {
 // values still cannot overwrite an entry granted above its own level.
 func TestPermTemplateApplyOverwriteGrantCap(t *testing.T) {
 	perms := []*permissions.Permission{boolPerm(permissions.PermissionKeyPermissionManage, true)}
-	for key := range permTemplates["moderator"] {
+	for key, e := range permTemplates["moderator"] {
 		perms = append(perms, &permissions.Permission{
-			Key: permissions.PermissionKey(key), Type: permissions.PermissionTypeBoolean, Value: 1, Grant: 1,
+			Key: permissions.PermissionKey(key), Value: e.Value, Grant: e.Value,
 		})
 	}
 	tp := tieredWith(perms...)
@@ -1307,5 +1327,558 @@ func TestPermList(t *testing.T) {
 	e := resp.Entries[0]
 	if e.Key != "i_client_talk_power" || e.Value != 10 || e.Grant != 50 || !e.Skip || e.Negate {
 		t.Fatalf("entry = %+v", e)
+	}
+}
+
+// --- group cosmetics (178/179) -------------------------------------------------
+
+// srvClient returns the server-side registry entry for an authenticated
+// connection.
+func srvClient(t *testing.T, env *testEnv, uniqueID string) *Client {
+	t.Helper()
+	var c *Client
+	waitFor(t, "client "+uniqueID+" registered", func() bool {
+		var ok bool
+		c, ok = env.srv.clientByUniqueID(uniqueID)
+		return ok
+	})
+	return c
+}
+
+// callHandler invokes a handler for a connected client. GroupEdit (104) and
+// PermCopy (105) have no dispatch entry yet, so the tests drive the handlers
+// the way dispatch will.
+func callHandler(t *testing.T, env *testEnv, uniqueID string, mt netproto.MessageType, msg any,
+	h func(context.Context, *Client, *netproto.Frame) error) {
+	t.Helper()
+	c := srvClient(t, env, uniqueID)
+	f, err := netproto.Encode(mt, msg)
+	if err != nil {
+		t.Fatalf("encode %s: %v", mt, err)
+	}
+	if err := h(context.Background(), c, f); err != nil {
+		t.Fatalf("handler %s: %v", mt, err)
+	}
+}
+
+// groupFromList reads back one group from a GroupListResponse frame.
+func groupFromList(t *testing.T, conn net.Conn, groupID int64) netproto.GroupEntry {
+	t.Helper()
+	f := readOfType(t, conn, netproto.MsgGroupListResponse)
+	var list netproto.GroupListResponse
+	if err := netproto.Decode(f, &list); err != nil {
+		t.Fatalf("decode group list: %v", err)
+	}
+	for _, g := range list.Groups {
+		if g.ID == groupID {
+			return g
+		}
+	}
+	t.Fatalf("group %d missing from %+v", groupID, list.Groups)
+	return netproto.GroupEntry{}
+}
+
+// containsAction reports whether an audit action was recorded.
+func containsAction(actions []string, want string) bool {
+	for _, a := range actions {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestGroupEditCosmetics covers the colour/hoist/sort write path: a full edit
+// lands, a partial edit leaves the untouched fields alone, and the refreshed
+// list carries both cosmetics back.
+func TestGroupEditCosmetics(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	conn, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer conn.Close()
+	env.groups.seedGroup("server", 10, "Mods")
+
+	color, hoist, sortID := "#Ff8800", true, 3
+	callHandler(t, env, "admin-uid", netproto.MsgGroupEdit,
+		netproto.GroupEdit{GroupID: 10, Color: &color, Hoist: &hoist, SortID: &sortID}, env.srv.handleGroupEdit)
+	g := groupFromList(t, conn, 10)
+	if g.Color != "#Ff8800" || !g.Hoist || g.SortID != 3 {
+		t.Fatalf("group after edit = %+v", g)
+	}
+
+	// A nil field is unchanged: clearing the hoist keeps the colour.
+	off := false
+	callHandler(t, env, "admin-uid", netproto.MsgGroupEdit,
+		netproto.GroupEdit{GroupID: 10, Hoist: &off}, env.srv.handleGroupEdit)
+	g = groupFromList(t, conn, 10)
+	if g.Color != "#Ff8800" || g.Hoist || g.SortID != 3 {
+		t.Fatalf("group after partial edit = %+v", g)
+	}
+
+	// An empty colour clears back to the theme default.
+	empty := ""
+	callHandler(t, env, "admin-uid", netproto.MsgGroupEdit,
+		netproto.GroupEdit{GroupID: 10, Color: &empty}, env.srv.handleGroupEdit)
+	if g = groupFromList(t, conn, 10); g.Color != "" {
+		t.Fatalf("group after colour clear = %+v", g)
+	}
+
+	if !containsAction(env.groups.auditActions(), "group_edit") {
+		t.Fatalf("audit actions = %v, want group_edit", env.groups.auditActions())
+	}
+}
+
+// TestGroupEditRejectsBadColor verifies an invalid colour is refused rather
+// than stored: the client paints the string straight into CSS.
+func TestGroupEditRejectsBadColor(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	conn, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer conn.Close()
+	env.groups.seedGroup("server", 10, "Mods")
+
+	for _, bad := range []string{"red", "#fff", "#12345g", "#1234567", "javascript:x"} {
+		c := bad
+		callHandler(t, env, "admin-uid", netproto.MsgGroupEdit,
+			netproto.GroupEdit{GroupID: 10, Color: &c}, env.srv.handleGroupEdit)
+		if e := readError(t, conn); e.Code != errCodeMalformed {
+			t.Fatalf("color %q: error = %+v, want malformed", bad, e)
+		}
+	}
+	env.groups.mu.Lock()
+	stored := env.groups.groups["server"][10].Color
+	env.groups.mu.Unlock()
+	if stored != "" {
+		t.Fatalf("stored colour = %q, want unchanged", stored)
+	}
+
+	// An edit carrying no field at all is a malformed request, not a no-op.
+	callHandler(t, env, "admin-uid", netproto.MsgGroupEdit,
+		netproto.GroupEdit{GroupID: 10}, env.srv.handleGroupEdit)
+	if e := readError(t, conn); e.Code != errCodeMalformed {
+		t.Fatalf("empty edit: error = %+v, want malformed", e)
+	}
+}
+
+// TestGroupEditGate verifies the cosmetics write is gated like the other
+// server-group management handlers.
+func TestGroupEditGate(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+	env.groups.seedGroup("server", 10, "Mods")
+
+	color := "#123456"
+	callHandler(t, env, "user-uid", netproto.MsgGroupEdit,
+		netproto.GroupEdit{GroupID: 10, Color: &color}, env.srv.handleGroupEdit)
+	if e := readError(t, conn); e.Code != errCodePermissionDenied {
+		t.Fatalf("error = %+v, want permission denied", e)
+	}
+	env.groups.mu.Lock()
+	stored := env.groups.groups["server"][10].Color
+	env.groups.mu.Unlock()
+	if stored != "" {
+		t.Fatalf("denied edit stored %q", stored)
+	}
+}
+
+// --- permission copy (141) -----------------------------------------------------
+
+// destKeys returns the permission keys stored on a server group.
+func destKeys(t *testing.T, env *testEnv, groupID int64) []string {
+	t.Helper()
+	entries, err := env.groups.ListPermissions(context.Background(), store.PermTierServerGroup, store.PermTarget{GroupID: groupID})
+	if err != nil {
+		t.Fatalf("list permissions: %v", err)
+	}
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.Key)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// mustSet seeds a permission entry on a server group.
+func mustSet(t *testing.T, env *testEnv, target store.PermTarget, key string, value, grant int) {
+	t.Helper()
+	if err := env.groups.SetPermission(context.Background(), store.PermTierServerGroup, target, key, value, grant, false, false); err != nil {
+		t.Fatalf("seed %s: %v", key, err)
+	}
+}
+
+// TestPermCopyMergeAndReplace verifies a copy merges by default and, with
+// Replace, leaves the destination an exact copy of the source.
+func TestPermCopyMergeAndReplace(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	conn, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer conn.Close()
+	ctx := context.Background()
+
+	src := store.PermTarget{GroupID: 10}
+	dst := store.PermTarget{GroupID: 11}
+	mustSet(t, env, src, "b_channel_modify", 1, 20)
+	mustSet(t, env, dst, "b_audit_view", 1, 0)
+
+	callHandler(t, env, "admin-uid", netproto.MsgPermCopy,
+		netproto.PermCopy{FromKind: "servergroup", FromID: "10", ToKind: "servergroup", ToID: "11"},
+		env.srv.handlePermCopy)
+	if got := destKeys(t, env, 11); len(got) != 2 || got[0] != "b_audit_view" || got[1] != "b_channel_modify" {
+		t.Fatalf("merge copy left %v, want both keys", got)
+	}
+	// The entry travels whole, grant included.
+	entries, _ := env.groups.ListPermissions(ctx, store.PermTierServerGroup, dst)
+	for _, e := range entries {
+		if e.Key == "b_channel_modify" && e.Grant != 20 {
+			t.Fatalf("copied grant = %d, want 20", e.Grant)
+		}
+	}
+
+	callHandler(t, env, "admin-uid", netproto.MsgPermCopy,
+		netproto.PermCopy{FromKind: "servergroup", FromID: "10", ToKind: "servergroup", ToID: "11", Replace: true},
+		env.srv.handlePermCopy)
+	if got := destKeys(t, env, 11); len(got) != 1 || got[0] != "b_channel_modify" {
+		t.Fatalf("replace copy left %v, want the source keys only", got)
+	}
+	if !containsAction(env.groups.auditActions(), "perm_copy") {
+		t.Fatalf("audit actions = %v, want perm_copy", env.groups.auditActions())
+	}
+}
+
+// TestPermCopyGate verifies the copy needs b_permission_manage.
+func TestPermCopyGate(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+	mustSet(t, env, store.PermTarget{GroupID: 10}, "b_channel_modify", 1, 0)
+
+	callHandler(t, env, "user-uid", netproto.MsgPermCopy,
+		netproto.PermCopy{FromKind: "servergroup", FromID: "10", ToKind: "servergroup", ToID: "11"},
+		env.srv.handlePermCopy)
+	if e := readError(t, conn); e.Code != errCodePermissionDenied {
+		t.Fatalf("error = %+v, want permission denied", e)
+	}
+	if got := destKeys(t, env, 11); len(got) != 0 {
+		t.Fatalf("denied copy wrote %v", got)
+	}
+}
+
+// TestPermCopyGrantCap verifies a copy cannot deposit an entry the caller
+// could not have set directly.
+func TestPermCopyGrantCap(t *testing.T) {
+	tp := tieredWith(boolPerm(permissions.PermissionKeyPermissionManage, true))
+	env := startTestEnv(t, &tp)
+	defer env.stop()
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+	mustSet(t, env, store.PermTarget{GroupID: 10}, "b_channel_modify", 1, 0)
+
+	// The caller holds no grant for b_channel_modify, so it may not deposit it.
+	callHandler(t, env, "user-uid", netproto.MsgPermCopy,
+		netproto.PermCopy{FromKind: "servergroup", FromID: "10", ToKind: "servergroup", ToID: "11"},
+		env.srv.handlePermCopy)
+	if e := readError(t, conn); e.Code != errCodePermissionDenied {
+		t.Fatalf("error = %+v, want grant-cap denial", e)
+	}
+	if got := destKeys(t, env, 11); len(got) != 0 {
+		t.Fatalf("capped copy wrote %v", got)
+	}
+}
+
+// TestPermCopyReplaceCapsRemovals verifies Replace cannot be used to wipe a
+// destination entry that sits above the caller's own grant.
+func TestPermCopyReplaceCapsRemovals(t *testing.T) {
+	tp := tieredWith(
+		boolPerm(permissions.PermissionKeyPermissionManage, true),
+		&permissions.Permission{Key: "b_channel_modify", Value: 1, Grant: 1},
+	)
+	env := startTestEnv(t, &tp)
+	defer env.stop()
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+
+	mustSet(t, env, store.PermTarget{GroupID: 10}, "b_channel_modify", 1, 1)
+	// The destination holds an entry far above the caller's level.
+	mustSet(t, env, store.PermTarget{GroupID: 11}, "b_permission_manage", 1, 100)
+
+	callHandler(t, env, "user-uid", netproto.MsgPermCopy,
+		netproto.PermCopy{FromKind: "servergroup", FromID: "10", ToKind: "servergroup", ToID: "11", Replace: true},
+		env.srv.handlePermCopy)
+	if e := readError(t, conn); e.Code != errCodePermissionDenied {
+		t.Fatalf("error = %+v, want grant-cap denial", e)
+	}
+	if got := destKeys(t, env, 11); len(got) != 1 || got[0] != "b_permission_manage" {
+		t.Fatalf("capped replace changed the destination: %v", got)
+	}
+
+	// Without Replace the same copy is a merge and lands.
+	callHandler(t, env, "user-uid", netproto.MsgPermCopy,
+		netproto.PermCopy{FromKind: "servergroup", FromID: "10", ToKind: "servergroup", ToID: "11"},
+		env.srv.handlePermCopy)
+	if got := destKeys(t, env, 11); len(got) != 2 {
+		t.Fatalf("merge copy left %v, want both keys", got)
+	}
+}
+
+// TestPermCopyBadTargets verifies unusable addressing is refused.
+func TestPermCopyBadTargets(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	conn, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer conn.Close()
+
+	for _, msg := range []netproto.PermCopy{
+		{FromKind: "nonsense", FromID: "10", ToKind: "servergroup", ToID: "11"},
+		{FromKind: "servergroup", FromID: "abc", ToKind: "servergroup", ToID: "11"},
+		{FromKind: "client", FromID: "ghost-uid", ToKind: "servergroup", ToID: "11"},
+		{FromKind: "servergroup", FromID: "10", ToKind: "servergroup", ToID: "10"},
+	} {
+		callHandler(t, env, "admin-uid", netproto.MsgPermCopy, msg, env.srv.handlePermCopy)
+		if e := readError(t, conn); e.Code != errCodeMalformed {
+			t.Fatalf("copy %+v: error = %+v, want malformed", msg, e)
+		}
+	}
+}
+
+// TestPermCopyClientTiers verifies a client copy addresses the client tier,
+// and the channel-scoped one addresses channel_client.
+func TestPermCopyClientTiers(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	conn, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer conn.Close()
+	ctx := context.Background()
+	mustSet(t, env, store.PermTarget{GroupID: 10}, "b_channel_modify", 1, 0)
+
+	callHandler(t, env, "admin-uid", netproto.MsgPermCopy,
+		netproto.PermCopy{FromKind: "servergroup", FromID: "10", ToKind: "client", ToID: "user-uid"},
+		env.srv.handlePermCopy)
+	entries, _ := env.groups.ListPermissions(ctx, store.PermTierClient, store.PermTarget{UserID: 2})
+	if len(entries) != 1 || entries[0].Key != "b_channel_modify" {
+		t.Fatalf("client-tier copy = %+v", entries)
+	}
+
+	callHandler(t, env, "admin-uid", netproto.MsgPermCopy,
+		netproto.PermCopy{FromKind: "servergroup", FromID: "10", ToKind: "client", ToID: "user-uid", ChannelID: 7},
+		env.srv.handlePermCopy)
+	entries, _ = env.groups.ListPermissions(ctx, store.PermTierChannelClient, store.PermTarget{UserID: 2, ChannelID: 7})
+	if len(entries) != 1 || entries[0].Key != "b_channel_modify" {
+		t.Fatalf("channel_client-tier copy = %+v", entries)
+	}
+}
+
+// --- permission cache invalidation push (151) ----------------------------------
+
+// readPermsInvalid reads the next MsgPermsInvalid and returns its reason.
+func readPermsInvalid(t *testing.T, conn net.Conn) string {
+	t.Helper()
+	f := readOfType(t, conn, netproto.MsgPermsInvalid)
+	var msg netproto.PermsInvalid
+	if err := netproto.Decode(f, &msg); err != nil {
+		t.Fatalf("decode perms_invalid: %v", err)
+	}
+	return msg.Reason
+}
+
+// assertNoPermsInvalid pings and fails if a MsgPermsInvalid arrives before the
+// pong. Frames for one connection are written in order, so a push emitted by
+// the preceding handler would have to precede the pong.
+func assertNoPermsInvalid(t *testing.T, conn net.Conn) {
+	t.Helper()
+	send(t, conn, netproto.MsgPing, netproto.Ping{})
+	deadline := time.Now().Add(waitDeadline)
+	for time.Now().Before(deadline) {
+		f := readFrame(t, conn)
+		switch netproto.MessageType(f.Type) {
+		case netproto.MsgPermsInvalid:
+			t.Fatalf("client received an unexpected perms_invalid")
+		case netproto.MsgPong:
+			return
+		}
+	}
+	t.Fatalf("no pong before deadline")
+}
+
+// TestPermsInvalidReachesGroupMembersOnly verifies a server-group permission
+// write pushes to the group members and to nobody else.
+func TestPermsInvalidReachesGroupMembersOnly(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer adminConn.Close()
+	userConn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer userConn.Close()
+
+	env.groups.seedGroup("server", 10, "Mods")
+	if err := env.groups.AssignServerGroup(context.Background(), 10, 2, 0); err != nil {
+		t.Fatalf("seed membership: %v", err)
+	}
+
+	send(t, adminConn, netproto.MsgPermSet, netproto.PermSet{
+		Tier: "server_group", GroupID: 10, Key: "b_channel_modify", Value: 1,
+	})
+	if reason := readPermsInvalid(t, userConn); reason != "perm_set" {
+		t.Fatalf("reason = %q, want perm_set", reason)
+	}
+	// The caller is not a member, so it must not be told to refetch.
+	assertNoPermsInvalid(t, adminConn)
+}
+
+// TestPermsInvalidOnGroupAssign verifies membership changes push to the user
+// whose resolution moved.
+func TestPermsInvalidOnGroupAssign(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer adminConn.Close()
+	userConn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer userConn.Close()
+	env.groups.seedGroup("server", 10, "Mods")
+
+	send(t, adminConn, netproto.MsgGroupAssign, netproto.GroupAssign{
+		Type: "server", GroupID: 10, UniqueID: "user-uid",
+	})
+	if reason := readPermsInvalid(t, userConn); reason != "group_assign" {
+		t.Fatalf("reason = %q, want group_assign", reason)
+	}
+
+	send(t, adminConn, netproto.MsgGroupUnassign, netproto.GroupUnassign{
+		Type: "server", GroupID: 10, UniqueID: "user-uid",
+	})
+	if reason := readPermsInvalid(t, userConn); reason != "group_unassign" {
+		t.Fatalf("reason = %q, want group_unassign", reason)
+	}
+}
+
+// TestPermsInvalidOnGroupDelete verifies the audience is read before the
+// memberships are gone.
+func TestPermsInvalidOnGroupDelete(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer adminConn.Close()
+	userConn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer userConn.Close()
+
+	env.groups.seedGroup("server", 10, "Mods")
+	if err := env.groups.AssignServerGroup(context.Background(), 10, 2, 0); err != nil {
+		t.Fatalf("seed membership: %v", err)
+	}
+	send(t, adminConn, netproto.MsgGroupDelete, netproto.GroupDelete{Type: "server", GroupID: 10, Force: true})
+	if reason := readPermsInvalid(t, userConn); reason != "group_delete" {
+		t.Fatalf("reason = %q, want group_delete", reason)
+	}
+}
+
+// TestPermsInvalidOnGroupEdit verifies a cosmetics change reaches the members
+// whose nickname colour and hoisted section moved.
+func TestPermsInvalidOnGroupEdit(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer adminConn.Close()
+	userConn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer userConn.Close()
+
+	env.groups.seedGroup("server", 10, "Mods")
+	if err := env.groups.AssignServerGroup(context.Background(), 10, 2, 0); err != nil {
+		t.Fatalf("seed membership: %v", err)
+	}
+	color := "#00ff00"
+	callHandler(t, env, "admin-uid", netproto.MsgGroupEdit,
+		netproto.GroupEdit{GroupID: 10, Color: &color}, env.srv.handleGroupEdit)
+	if reason := readPermsInvalid(t, userConn); reason != "group_edit" {
+		t.Fatalf("reason = %q, want group_edit", reason)
+	}
+}
+
+// TestPermsInvalidOnChannelTier verifies a channel-tier write reaches exactly
+// the clients standing in that channel.
+func TestPermsInvalidOnChannelTier(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer adminConn.Close()
+	userConn, userID := dialAuthed(t, env.addr, "user-uid")
+	defer userConn.Close()
+
+	env.state.AddChannel(&state.Channel{ChannelID: 7, Name: "room"})
+	if err := env.state.JoinChannel(userID, 7); err != nil {
+		t.Fatalf("join channel: %v", err)
+	}
+	send(t, adminConn, netproto.MsgPermSet, netproto.PermSet{
+		Tier: "channel", ChannelID: 7, Key: "i_channel_needed_talk_power", Value: 10,
+	})
+	if reason := readPermsInvalid(t, userConn); reason != "perm_set" {
+		t.Fatalf("reason = %q, want perm_set", reason)
+	}
+	assertNoPermsInvalid(t, adminConn)
+}
+
+// --- templates (142) -----------------------------------------------------------
+
+// TestPermTemplatesSane verifies the bundles form a ladder and that the admin
+// bundle is delegable: an entry written with grant 0 can never be handed on.
+func TestPermTemplatesSane(t *testing.T) {
+	for key := range permTemplates["member"] {
+		if _, ok := permTemplates["moderator"][key]; !ok {
+			t.Fatalf("moderator is missing the member key %q", key)
+		}
+	}
+	for key, mod := range permTemplates["moderator"] {
+		adm, ok := permTemplates["admin"][key]
+		if !ok {
+			t.Fatalf("admin is missing the moderator key %q", key)
+		}
+		if adm.Value < mod.Value {
+			t.Fatalf("admin %s = %d ranks below moderator %d", key, adm.Value, mod.Value)
+		}
+	}
+	for key, e := range permTemplates["admin"] {
+		if e.Grant < e.Value {
+			t.Fatalf("admin %s has grant %d below its value %d: undelegable", key, e.Grant, e.Value)
+		}
+	}
+	// 117/118 stay admin-only unless moderators own the filter lists.
+	for _, tmpl := range []string{"moderator", "admin"} {
+		if _, ok := permTemplates[tmpl][string(permissions.PermissionKeyChatFilterManage)]; !ok {
+			t.Fatalf("%s bundle is missing %s", tmpl, permissions.PermissionKeyChatFilterManage)
+		}
+	}
+	// Bot-ness is an account property, not a role tier.
+	for tmpl := range permTemplates {
+		if _, ok := permTemplates[tmpl][string(permissions.PermissionKeyClientIsBot)]; ok {
+			t.Fatalf("%s bundle carries %s", tmpl, permissions.PermissionKeyClientIsBot)
+		}
+	}
+}
+
+// --- bot accounts (180) --------------------------------------------------------
+
+// TestClientIsBot verifies the flag resolves from the account permissions and
+// that server admins are not swept up by the admin bypass.
+func TestClientIsBot(t *testing.T) {
+	plain := startTestEnv(t, nil)
+	defer plain.stop()
+	adminConn, _ := dialAuthed(t, plain.addr, "admin-uid")
+	defer adminConn.Close()
+	if plain.srv.ClientIsBot(context.Background(), srvClient(t, plain, "admin-uid")) {
+		t.Fatalf("server admin resolved as a bot")
+	}
+
+	tp := tieredWith(&permissions.Permission{Key: permissions.PermissionKeyClientIsBot, Value: 1})
+	botEnv := startTestEnv(t, &tp)
+	defer botEnv.stop()
+	conn, _ := dialAuthed(t, botEnv.addr, "user-uid")
+	defer conn.Close()
+	if !botEnv.srv.ClientIsBot(context.Background(), srvClient(t, botEnv, "user-uid")) {
+		t.Fatalf("account holding b_client_is_bot did not resolve as a bot")
+	}
+	// Guests have no users row, so they can never carry the flag.
+	if botEnv.srv.ClientIsBot(context.Background(), &Client{ID: "guest"}) {
+		t.Fatalf("guest resolved as a bot")
 	}
 }

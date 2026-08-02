@@ -43,6 +43,8 @@ const (
 	eventDMDelivered  = "dm_delivered"
 	eventDMRead       = "dm_read"
 	eventEmojiAdded   = "emoji_added"
+	eventEmojiRemoved = "emoji_removed"
+	eventEmojiRenamed = "emoji_renamed"
 	eventAnnouncement = "announcement"
 )
 
@@ -126,6 +128,22 @@ func (t *spamTracker) record(uid string, sum [32]byte, now time.Time) bool {
 	}
 	t.recent[uid] = append(keep, spamEntry{sum: sum, at: now})
 	return same >= 2 // this is the 3rd identical message in 30s
+}
+
+// recentFor returns a copy of recent entries for a user under lock (for tests).
+func (t *spamTracker) recentFor(uid string) []spamEntry {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	entries, ok := t.recent[uid]
+	if !ok {
+		return nil
+	}
+	cp := make([]spamEntry, len(entries))
+	copy(cp, entries)
+	return cp
 }
 
 // bodyDigest is the spam tracker's key for a moderated body.
@@ -699,7 +717,7 @@ func (s *TCPServer) scopeKeyBundle(ctx context.Context, scope int64, memberPub s
 	for gen := range gens {
 		ordered = append(ordered, gen)
 	}
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] > ordered[j] })
 	for _, gen := range ordered {
 		if len(keys) >= maxKeysPerResponse {
 			truncated = true
@@ -712,6 +730,8 @@ func (s *TCPServer) scopeKeyBundle(ctx context.Context, scope int64, memberPub s
 		}
 		keys = append(keys, *ck)
 	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i].KeyID < keys[j].KeyID })
+	sort.Slice(refused, func(i, j int) bool { return refused[i] < refused[j] })
 	return keys, refused, truncated
 }
 
@@ -1202,6 +1222,97 @@ func (s *TCPServer) handleEmojiUpload(ctx context.Context, client *Client, f *ne
 		return s.sendError(client, errCodeUnavailable, "emoji write failed")
 	}
 	s.broadcastEvent(eventEmojiAdded, map[string]any{"name": msg.Name, "file_name": fileName, "by": client.UniqueID})
+	return nil
+}
+
+// emojiFile resolves a shortcode to its stored file name, whatever extension
+// it was uploaded with.
+func (s *TCPServer) emojiFile(name string) (string, bool) {
+	entries, err := os.ReadDir(s.emojiDir())
+	if err != nil {
+		return "", false
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		fn := e.Name()
+		if strings.TrimSuffix(fn, filepath.Ext(fn)) == name {
+			return fn, true
+		}
+	}
+	return "", false
+}
+
+// emojiManageAllowed applies the same gate as upload (272).
+func (s *TCPServer) emojiManageAllowed(ctx context.Context, client *Client) error {
+	pc, err := s.permCheckerFor(ctx, client)
+	if err != nil {
+		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+	}
+	if !pc.granted(permissions.PermissionKeyEmojiManage) {
+		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyEmojiManage))
+	}
+	return nil
+}
+
+// handleEmojiDelete removes a custom emoji and announces it (272).
+func (s *TCPServer) handleEmojiDelete(ctx context.Context, client *Client, f *netproto.Frame) error {
+	var msg netproto.EmojiDelete
+	if err := netproto.Decode(f, &msg); err != nil {
+		return s.sendError(client, errCodeMalformed, "malformed emoji_delete: "+err.Error())
+	}
+	if err := s.emojiManageAllowed(ctx, client); err != nil {
+		return err
+	}
+	if !emojiNameRe.MatchString(msg.Name) {
+		return s.sendError(client, errCodeMalformed, "invalid emoji name")
+	}
+	fileName, ok := s.emojiFile(msg.Name)
+	if !ok {
+		return s.sendError(client, errCodeNotFound, "emoji not found")
+	}
+	if err := os.Remove(filepath.Join(s.emojiDir(), fileName)); err != nil {
+		return s.sendError(client, errCodeUnavailable, "emoji delete failed")
+	}
+	s.audit(ctx, client.UniqueID, "emoji_delete", msg.Name, "")
+	s.broadcastEvent(eventEmojiRemoved, map[string]any{"name": msg.Name, "by": client.UniqueID})
+	return nil
+}
+
+// handleEmojiRename renames a custom emoji (272). Messages already sent keep
+// the old shortcode as literal text — a rename must not rewrite history — so
+// this only affects the picker and future messages.
+func (s *TCPServer) handleEmojiRename(ctx context.Context, client *Client, f *netproto.Frame) error {
+	var msg netproto.EmojiRename
+	if err := netproto.Decode(f, &msg); err != nil {
+		return s.sendError(client, errCodeMalformed, "malformed emoji_rename: "+err.Error())
+	}
+	if err := s.emojiManageAllowed(ctx, client); err != nil {
+		return err
+	}
+	if !emojiNameRe.MatchString(msg.Name) || !emojiNameRe.MatchString(msg.NewName) {
+		return s.sendError(client, errCodeMalformed, "invalid emoji name (1-32 of a-z 0-9 _ -)")
+	}
+	if msg.Name == msg.NewName {
+		return s.sendError(client, errCodeMalformed, "new name is the same")
+	}
+	fileName, ok := s.emojiFile(msg.Name)
+	if !ok {
+		return s.sendError(client, errCodeNotFound, "emoji not found")
+	}
+	if _, taken := s.emojiFile(msg.NewName); taken {
+		return s.sendError(client, errCodeMalformed, "an emoji with that name already exists")
+	}
+	ext := filepath.Ext(fileName)
+	dir := s.emojiDir()
+	if err := os.Rename(filepath.Join(dir, fileName), filepath.Join(dir, msg.NewName+ext)); err != nil {
+		return s.sendError(client, errCodeUnavailable, "emoji rename failed")
+	}
+	s.audit(ctx, client.UniqueID, "emoji_rename", msg.Name, "to "+msg.NewName)
+	s.broadcastEvent(eventEmojiRenamed, map[string]any{
+		"name": msg.Name, "new_name": msg.NewName, "file_name": msg.NewName + ext, "by": client.UniqueID,
+	})
 	return nil
 }
 

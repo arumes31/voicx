@@ -337,10 +337,9 @@ func (m *connManager) connectWith(addr string, authMsg netproto.Authenticate, si
 		m.emit("servererror", "e2e key publish failed: "+err.Error())
 	}
 
-	// (121) pull the account's last-read pointers. Fire-and-forget: the answer
-	// lands on the read loop below, so an old server costs one frame and no
-	// wait. The reconcile flag resets here, because a reconnect has to push
-	// again whatever this device read while it was gone.
+	// Publishing the E2EE key above triggers the server to answer with sealed
+	// scope keys on the read loop below. Account reconnect and state
+	// synchronization are driven by server broadcasts upon authentication.
 
 	// recover is per-goroutine: the read loop needs its own guard (331).
 	go guardCrash("readLoop", func() {
@@ -583,6 +582,13 @@ func (m *connManager) dispatch(f *netproto.Frame) {
 		m.emit("offer", string(f.Payload))
 	case netproto.MsgAvatarData:
 		m.emit("avatar", string(f.Payload))
+	case netproto.MsgPermsInvalid:
+		// (151) the server pushes this instead of the client re-resolving on a
+		// timer; the reason distinguishes a cosmetics change from a grant change.
+		var pi netproto.PermsInvalid
+		if err := netproto.Decode(f, &pi); err == nil {
+			m.emit("perms_invalid", pi.Reason)
+		}
 	case netproto.MsgError:
 		var e netproto.Error
 		if err := netproto.Decode(f, &e); err == nil {

@@ -155,6 +155,14 @@ func (s *TCPServer) SendServerText(targetMode int, target, msg string) error {
 		if err != nil {
 			return fmt.Errorf("invalid channel id %q", target)
 		}
+		if s.deps.State != nil {
+			if _, ok := s.deps.State.GetChannel(id); !ok {
+				return fmt.Errorf("channel %d does not exist", id)
+			}
+		}
+		if _, _, err := s.chatKeys.EnsureScope(ctx, id); err != nil {
+			return fmt.Errorf("ensuring scope %d: %w", id, err)
+		}
 		channelID, scope = id, id
 	}
 	keyID, sealed, err := s.chatKeys.seal(ctx, scope, msg)

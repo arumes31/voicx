@@ -96,6 +96,21 @@ func (t *tray) toggleWindow() {
 	}
 }
 
+// trayMarkHidden records that the window was hidden by something other than
+// the tray menu (288 minimize-to-tray), so the next menu click shows it again
+// instead of hiding an already-hidden window.
+func trayMarkHidden() {
+	if trayCtl == nil {
+		return
+	}
+	trayCtl.mu.Lock()
+	trayCtl.visible = false
+	trayCtl.mu.Unlock()
+	if trayCtl.miShowHide != nil {
+		trayCtl.miShowHide.SetTitle("Show voicx")
+	}
+}
+
 // updateTitle refreshes the tray title/tooltip (289 PTT state, 290 badge).
 func (t *tray) updateTitle() {
 	t.mu.Lock()
@@ -172,6 +187,19 @@ func trayClearMentions() {
 	trayCtl.mentions = 0
 	trayCtl.mu.Unlock()
 	trayCtl.updateTitle()
+}
+
+// TrayMention bumps the tray badge for a mention that arrived in the ACTIVE
+// tab (290). Background tabs are counted by the event relay, which never sees
+// the active tab's frames, so the frontend has to report those itself.
+func (a *App) TrayMention() {
+	trayAddMention()
+}
+
+// TrayClearMentions resets the tray badge (290), e.g. once the window is
+// focused again and the user has necessarily seen the messages.
+func (a *App) TrayClearMentions() {
+	trayClearMentions()
 }
 
 // trayIcon builds a minimal 16x16 32bpp ICO at runtime (signal-green square

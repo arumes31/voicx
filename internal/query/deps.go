@@ -53,6 +53,22 @@ type ChannelEditParams struct {
 	OpusDTX         *bool
 	OpusStereo      *bool
 	SlowModeSeconds *int
+	// Join power (160), sort index (163), parent (168) and the permission
+	// inheritance toggle (157), so ServerQuery can drive the same edits as the
+	// control channel.
+	NeededJoinPower    *int
+	OrderIndex         *int
+	ParentID           *int64
+	InheritPermissions *bool
+}
+
+// ServerEditParams carries serveredit arguments (217). Nil pointers leave the
+// setting untouched; a non-nil empty string (or MaxClients 0) clears the
+// stored override so the config.yaml value applies again.
+type ServerEditParams struct {
+	Name       *string
+	Welcome    *string
+	MaxClients *int
 }
 
 // Info describes the server (serverinfo row).
@@ -178,9 +194,9 @@ type Backend interface {
 	AuditLog(ctx context.Context, limit int) ([]AuditEntry, error)
 
 	// Wave 10a (217-223).
-	// ServerEdit updates the server name, welcome message (MOTD), and the
-	// max-clients override (0 = keep current). Empty name/welcome = keep.
-	ServerEdit(ctx context.Context, name, welcome string, maxClients int) error
+	// ServerEdit applies the non-nil fields of params; an empty string or a
+	// zero max-clients CLEARS the stored override back to the config default.
+	ServerEdit(ctx context.Context, params ServerEditParams) error
 	// Shutdown gracefully stops the server; restart=true documents that a
 	// supervisor (docker restart policy) brings it back.
 	Shutdown(ctx context.Context, restart bool) error
@@ -203,4 +219,12 @@ type Backend interface {
 	CustomInfo(ctx context.Context, uniqueID string) ([]CustomProp, error)
 	// LogView returns recent server log lines (223).
 	LogView(ctx context.Context, lines int, filter string) ([]string, error)
+	// ServerRules returns the operator-defined rules shown on first join, the
+	// content hash acceptances are keyed by, and how many users accepted the
+	// current wording (215).
+	ServerRules(ctx context.Context) (text, hash string, accepted int, err error)
+	// LogFollow streams log lines emitted from the call onward; cancel
+	// unregisters the follower (223). The channel is never closed by the
+	// producer, so a caller that stops reading must call cancel.
+	LogFollow() (lines <-chan string, cancel func())
 }

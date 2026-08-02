@@ -30,6 +30,8 @@ type ClientInfo struct {
 	// Status/StatusMessage carry the client's presence (307-309).
 	Status        string `json:"status,omitempty"`
 	StatusMessage string `json:"status_message,omitempty"`
+	// IsBot marks accounts holding b_client_is_bot (180).
+	IsBot bool `json:"is_bot,omitempty"`
 }
 
 // ChannelNode represents a single channel in the tree snapshot. It embeds the
@@ -66,6 +68,7 @@ func clientToInfo(c *state.Client) ClientInfo {
 		PrioritySpeaker: c.PrioritySpeaker,
 		Status:          c.Status,
 		StatusMessage:   c.StatusMessage,
+		IsBot:           c.IsBot,
 	}
 }
 
@@ -87,7 +90,9 @@ func BuildSnapshot(sm *state.Manager, forAdmin bool, viewerUniqueID string) *Tre
 		return snap
 	}
 
-	channels := sm.ChannelTree() // sorted by ParentID then OrderIndex
+	// Totally ordered (parent, order index, id) so siblings sharing an order
+	// index keep a fixed position instead of shuffling between snapshots (163).
+	channels := sm.ChannelTreeOrdered()
 	members := sm.ListClients()
 
 	// Index channels by ID for quick lookup while building the tree.

@@ -170,13 +170,24 @@ services:
   # Only needed for clients behind restrictive NATs (symmetric NAT, corporate
   # firewalls blocking UDP). LAN / direct-WAN deployments can skip it.
   #
-  # Start with:  docker compose --profile turn up -d
+  # Start with:  TURN_SECRET=<random> TURN_EXTERNAL_IP=<public ip> \
+  #                docker compose --profile turn up -d
   #
   # Uses coturn's REST API auth: voicx mints time-limited credentials from the
   # shared static auth secret (internal/turn) and delivers them to clients in
   # the auth response. TURN_SECRET must match VOICX_TURN_SECRET on the voicx
-  # service. Also set on voicx (comma-separated):
+  # service; set BOTH in .env or neither side works (445). Also set on voicx
+  # (comma-separated):
   #   VOICX_TURN_URIS=turn:<host>:3478?transport=udp,turn:<host>:3478?transport=tcp
+  #
+  # TURN_EXTERNAL_IP is REQUIRED for any client outside this host (445): on the
+  # bridge network coturn discovers only its 172.x container address and would
+  # advertise relay candidates no external client can reach, so relaying fails
+  # even though the ports below are published. --external-ip keeps the binding
+  # on 172.x but rewrites the ADVERTISED address to the public one. Leaving it
+  # unset drops the flag, which is only correct for host-local testing.
+  # (Alternative to --external-ip: network_mode: host, which also drops the
+  # 101-port relay publish — but it cannot coexist with the voicx-net bridge.)
   # ---------------------------------------------------------------------------
   coturn:
     image: coturn/coturn:latest
@@ -189,19 +200,38 @@ services:
       - "3478:3478"
       - "3478:3478/udp"
       # Relay ports (must be reachable by clients; widen in production).
-      - "5349:5349"
       - "49152-49252:49152-49252/udp"
+      # TLS/DTLS listener; only publish it together with the cert block below.
+      # - "5349:5349"
+      # - "5349:5349/udp"
+    # volumes:
+    #   # TLS material for turns:/DTLS (see the cert flags below).
+    #   - ./data/turn-certs:/etc/coturn/certs:ro
     command:
       - "--listening-port=3478"
-      - "--tls-listening-port=5349"
+      # turns: needs a real certificate for the TURN hostname, which this repo
+      # cannot ship. TLS/DTLS is therefore OFF rather than advertised-but-broken
+      # (445). To enable: put fullchain.pem/privkey.pem in ./data/turn-certs,
+      # uncomment the volume and the 5349 ports above, drop the two --no-*
+      # lines, and add
+      #   --tls-listening-port=5349
+      #   --cert=/etc/coturn/certs/fullchain.pem
+      #   --pkey=/etc/coturn/certs/privkey.pem
+      # then append turns:<host>:5349?transport=tcp to VOICX_TURN_URIS.
+      - "--no-tls"
+      - "--no-dtls"
       - "--realm=${TURN_REALM:-voicx}"
       - "--use-auth-secret"
       - "--static-auth-secret=${TURN_SECRET:-change-me-turn-secret}"
+      # Empty when TURN_EXTERNAL_IP is unset; coturn ignores the empty argument.
+      - "${TURN_EXTERNAL_IP:+--external-ip=$TURN_EXTERNAL_IP}"
       - "--min-port=49152"
       - "--max-port=49252"
       - "--no-multicast-peers"
       - "--no-cli"
-      - "--log=stdout"
+      # --log=stdout is ambiguous in coturn 4.16 and aborts startup with exit
+      # 255 before any listener opens (445).
+      - "--log-file=stdout"
 
 # ---------------------------------------------------------------------------
 # Networks

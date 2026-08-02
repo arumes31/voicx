@@ -26,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,6 +56,9 @@ type options struct {
 	serverPass    string
 	filePayload   int64
 	tlsInsecure   bool
+	chaos         bool
+	chaosStopCmd  string
+	chaosStartCmd string
 }
 
 // file-transfer frame types (mirror internal/filetransfer, unexported).
@@ -324,6 +328,9 @@ func main() {
 	flag.StringVar(&o.serverPass, "server-password", "", "global server password (if set)")
 	flag.Int64Var(&o.filePayload, "file-payload", 64*1024, "upload test payload size in bytes")
 	flag.BoolVar(&o.tlsInsecure, "tls-insecure", false, "dial the control channel with TLS but skip certificate verification (self-signed certs), logging the fingerprint")
+	flag.BoolVar(&o.chaos, "chaos", false, "additionally run the database chaos drill (467): stops PostgreSQL mid-traffic and verifies recovery (needs Docker; disruptive)")
+	flag.StringVar(&o.chaosStopCmd, "chaos-stop-cmd", "docker compose stop postgres", "command that takes the database down (split on whitespace, run without a shell)")
+	flag.StringVar(&o.chaosStartCmd, "chaos-start-cmd", "docker compose start postgres", "command that brings the database back up (split on whitespace, run without a shell)")
 	flag.Parse()
 	e2eTLSInsecure = o.tlsInsecure
 
@@ -374,6 +381,12 @@ func runChecks(o options) int {
 	}
 	if o.serverPass != "" {
 		checks = append(checks, check{"auth-anonymous-server-password", checkAnonymousServerPassword})
+	}
+	// Opt-in only, and last: the drill takes the database away from the whole
+	// server, so anything running after it would be testing a recovering
+	// backend rather than its own subject (467).
+	if o.chaos {
+		checks = append(checks, check{"chaos-postgres-restart", checkChaosPostgres})
 	}
 
 	passed := 0
@@ -1351,11 +1364,14 @@ func dialFileTransfer(addr string, init netproto.FileTransferInitResponse) (net.
 		&tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}) //nolint:gosec // e2e harness
 	if err == nil {
 		if init.TLSFingerprint != "" {
-			if pc := conn.ConnectionState().PeerCertificates; len(pc) > 0 {
-				if got := tlscert.FingerprintDER(pc[0].Raw); !strings.EqualFold(got, init.TLSFingerprint) {
-					_ = conn.Close()
-					return nil, fmt.Errorf("file transfer fingerprint = %s, want %s", got, init.TLSFingerprint)
-				}
+			pc := conn.ConnectionState().PeerCertificates
+			var got string
+			if len(pc) > 0 {
+				got = tlscert.FingerprintDER(pc[0].Raw)
+			}
+			if len(pc) == 0 || !strings.EqualFold(got, init.TLSFingerprint) {
+				_ = conn.Close()
+				return nil, fmt.Errorf("file transfer fingerprint = %s, want %s", got, init.TLSFingerprint)
 			}
 		}
 		return conn, nil
@@ -1981,5 +1997,457 @@ func checkQueryWave10a(c *checkCtx) error {
 	if !strings.HasPrefix(lines[0], "line=") {
 		return fmt.Errorf("logview row = %q", lines[0])
 	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Chaos: PostgreSQL restart under traffic (467)
+// ---------------------------------------------------------------------------
+
+const (
+	// chaosUnreadyWithin bounds how long /readyz may keep claiming readiness
+	// after the database is gone.
+	chaosUnreadyWithin = 10 * time.Second
+	// chaosReadyWithin bounds recovery: /readyz must serve 200 again this long
+	// after the database comes back.
+	chaosReadyWithin = 30 * time.Second
+	// chaosOutage is how long traffic runs against the dead database before
+	// the tallies are judged.
+	chaosOutage = 3 * time.Second
+	// chaosPingEvery paces the liveness traffic.
+	chaosPingEvery = 200 * time.Millisecond
+	// chaosChatEvery paces the DB-backed traffic. Chat is deliberately slower
+	// than the pings: the server's default limit is 5 messages per 3s, and a
+	// rate-limit rejection would be indistinguishable from a database failure.
+	chaosChatEvery = time.Second
+	// chaosPoll is the interval between health probes.
+	chaosPoll = 250 * time.Millisecond
+)
+
+// chaosSession drives one authenticated session from two goroutines: a reader
+// that never sets a deadline (a deadline firing mid-frame would desynchronize
+// the stream) and a writer that generates the traffic. WriteFrame emits the
+// header and the payload as separate writes, so every write goes through wmu
+// or the two goroutines would interleave a frame.
+type chaosSession struct {
+	cl  *client
+	wmu sync.Mutex
+
+	mu       sync.Mutex
+	pings    int
+	pongs    int
+	chats    int
+	errCodes map[uint16]int
+	readErr  error
+	stopped  bool
+}
+
+func newChaosSession(cl *client) *chaosSession {
+	return &chaosSession{cl: cl, errCodes: map[uint16]int{}}
+}
+
+// chaosTally is a snapshot of a session's counters.
+type chaosTally struct {
+	pings    int
+	pongs    int
+	chats    int
+	errCodes map[uint16]int
+	readErr  error
+}
+
+func (s *chaosSession) snapshot() chaosTally {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	codes := make(map[uint16]int, len(s.errCodes))
+	for k, v := range s.errCodes {
+		codes[k] = v
+	}
+	return chaosTally{pings: s.pings, pongs: s.pongs, chats: s.chats, errCodes: codes, readErr: s.readErr}
+}
+
+// send writes one frame under the write lock.
+func (s *chaosSession) send(mt netproto.MessageType, msg any) error {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	return writeMsg(s.cl.conn, mt, msg)
+}
+
+// stop closes the connection so the blocking reader returns, and marks the
+// session as shut down so that return is not reported as a dropped session.
+func (s *chaosSession) stop() {
+	s.mu.Lock()
+	s.stopped = true
+	s.mu.Unlock()
+	_ = s.cl.conn.Close()
+}
+
+// readLoop consumes frames until the connection ends, answering server
+// keepalives and tallying pongs and error frames.
+func (s *chaosSession) readLoop() {
+	for {
+		f, err := netproto.ReadFrame(s.cl.conn)
+		if err != nil {
+			s.mu.Lock()
+			if !s.stopped && s.readErr == nil {
+				s.readErr = err
+			}
+			s.mu.Unlock()
+			return
+		}
+		switch netproto.MessageType(f.Type) {
+		case netproto.MsgPong:
+			s.mu.Lock()
+			s.pongs++
+			s.mu.Unlock()
+		case netproto.MsgPing:
+			if err := s.send(netproto.MsgPong, netproto.Pong{}); err != nil {
+				return
+			}
+		case netproto.MsgChannelKey:
+			// The scope maps are also read by sendChat, so the capture takes
+			// the same lock.
+			s.mu.Lock()
+			captureChannelKey(s.cl.conn, f)
+			s.mu.Unlock()
+		case netproto.MsgError:
+			var e netproto.Error
+			if err := netproto.Decode(f, &e); err == nil {
+				s.mu.Lock()
+				s.errCodes[e.Code]++
+				s.mu.Unlock()
+			}
+		}
+	}
+}
+
+// sendChat seals text with the generation already captured for channelID and
+// sends it. It cannot reuse writeEncChannelChat: that helper READS from the
+// connection to await a key, and reads belong to readLoop here.
+func (s *chaosSession) sendChat(channelID int64, text string) error {
+	s.mu.Lock()
+	id := s.cl.scopeLatest[channelID]
+	key := s.cl.scopeKeys[channelID][id]
+	s.mu.Unlock()
+	blob, err := e2eSealScope(text, key)
+	if err != nil {
+		return err
+	}
+	return s.send(netproto.MsgChatSend, netproto.ChatSend{
+		ChannelID: strconv.FormatInt(channelID, 10), Text: blob, Enc: true, KeyID: id,
+	})
+}
+
+// writeLoop generates traffic until stop closes. Write failures end the loop;
+// the reader reports the session as dropped.
+func (s *chaosSession) writeLoop(channelID int64, stop <-chan struct{}) {
+	ping := time.NewTicker(chaosPingEvery)
+	defer ping.Stop()
+	chat := time.NewTicker(chaosChatEvery)
+	defer chat.Stop()
+
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ping.C:
+			if err := s.send(netproto.MsgPing, netproto.Ping{}); err != nil {
+				return
+			}
+			s.mu.Lock()
+			s.pings++
+			s.mu.Unlock()
+		case <-chat.C:
+			// Unique text every time: three identical messages in 30s trip the
+			// anti-spam filter, which would look like a backend failure.
+			if err := s.sendChat(channelID, "chaos-"+randHex(4)); err != nil {
+				return
+			}
+			s.mu.Lock()
+			s.chats++
+			s.mu.Unlock()
+		}
+	}
+}
+
+// runChaosCmd runs one chaos command. The command line is split on whitespace
+// and executed WITHOUT a shell, so the drill behaves identically on Windows
+// and Linux; quoting and shell operators are therefore not supported.
+func runChaosCmd(cmdline string) (string, error) {
+	fields := strings.Fields(cmdline)
+	if len(fields) == 0 {
+		return "", errors.New("empty command")
+	}
+	out, err := exec.Command(fields[0], fields[1:]...).CombinedOutput() //nolint:gosec // operator-supplied drill command
+	return strings.TrimSpace(string(out)), err
+}
+
+// awaitReadyz polls /readyz until want accepts the status, returning the last
+// status seen.
+func awaitReadyz(baseURL string, want func(int) bool, within time.Duration) (int, error) {
+	deadline := time.Now().Add(within)
+	last := 0
+	for {
+		code, _, err := httpGet(baseURL + "/readyz")
+		if err == nil {
+			last = code
+			if want(code) {
+				return code, nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return last, fmt.Errorf("last status %d after %s", last, within)
+		}
+		time.Sleep(chaosPoll)
+	}
+}
+
+// readAnyOf reads frames until one of the wanted types arrives, answering
+// server keepalives while it waits.
+func readAnyOf(conn net.Conn, timeout time.Duration, want ...netproto.MessageType) (*netproto.Frame, error) {
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	defer conn.SetReadDeadline(time.Time{})
+	for {
+		f, err := netproto.ReadFrame(conn)
+		if err != nil {
+			return nil, err
+		}
+		if netproto.MessageType(f.Type) == netproto.MsgPing {
+			_ = writeMsg(conn, netproto.MsgPong, netproto.Pong{})
+			continue
+		}
+		if netproto.MessageType(f.Type) == netproto.MsgChannelKey {
+			captureChannelKey(conn, f)
+		}
+		for _, w := range want {
+			if netproto.MessageType(f.Type) == w {
+				return f, nil
+			}
+		}
+	}
+}
+
+// chaosJoin puts a fresh session into the drill channel and waits for the
+// scope key, so chat can be sealed without further reads.
+func chaosJoin(cl *client, channelID int64) error {
+	if err := writeMsg(cl.conn, netproto.MsgJoinChannel, netproto.JoinChannel{ChannelID: channelID}); err != nil {
+		return err
+	}
+	if err := waitForMove(cl.conn, cl.clientID); err != nil {
+		return fmt.Errorf("membership: %w", err)
+	}
+	return awaitScopeKey(cl.conn, cl, channelID)
+}
+
+// chaosHistoryHas asks for the channel's recent history and reports whether it
+// contains text.
+func chaosHistoryHas(cl *client, channelID int64, text string) (bool, error) {
+	if err := writeMsg(cl.conn, netproto.MsgChatHistory, netproto.ChatHistory{
+		ChannelID: channelID, Limit: 20,
+	}); err != nil {
+		return false, err
+	}
+	f, err := readOfType(cl.conn, netproto.MsgChatHistoryResponse, readTimeout)
+	if err != nil {
+		return false, err
+	}
+	var resp netproto.ChatHistoryResponse
+	if err := netproto.Decode(f, &resp); err != nil {
+		return false, err
+	}
+	// Archival generations: they must not move the send generation.
+	installScopeKeys(cl, channelID, resp.Keys, false)
+	for _, m := range resp.Messages {
+		if m.Deleted {
+			continue
+		}
+		body, err := historyBody(cl, channelID, m)
+		if err != nil {
+			continue
+		}
+		if body == text {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// checkChaosPostgres is the database chaos drill (467): with two authenticated
+// sessions and continuous traffic in flight, the database is stopped and
+// restarted. It asserts that liveness and readiness diverge, that live TCP
+// sessions survive and keep being answered, that DB-backed requests fail as
+// error frames rather than by dropping the connection, and that the server
+// serves reads and writes again once the database returns.
+//
+// It is destructive and opt-in (-chaos), and always tries to restart the
+// database, including on failure.
+func checkChaosPostgres(c *checkCtx) error {
+	if c.channelID == 0 {
+		return errors.New("no channel id — channel-create-via-query must run first")
+	}
+
+	// Fresh sessions: the shared alice/bob connections are reused by other
+	// checks, and this one deliberately breaks their backend.
+	traffic, err := dialAuth(c.opts.addr, c.opts.bobUID, c.opts.bobPass, c.opts.serverPass)
+	if err != nil {
+		return fmt.Errorf("traffic session: %w", err)
+	}
+	defer traffic.conn.Close()
+	probe, err := dialAuth(c.opts.addr, c.opts.aliceUID, c.opts.alicePass, c.opts.serverPass)
+	if err != nil {
+		return fmt.Errorf("probe session: %w", err)
+	}
+	defer probe.conn.Close()
+	if err := chaosJoin(traffic, c.channelID); err != nil {
+		return fmt.Errorf("traffic session join: %w", err)
+	}
+	if err := chaosJoin(probe, c.channelID); err != nil {
+		return fmt.Errorf("probe session join: %w", err)
+	}
+
+	sess := newChaosSession(traffic)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); sess.readLoop() }()
+	go func() { defer wg.Done(); sess.writeLoop(c.channelID, stop) }()
+	defer func() {
+		close(stop)
+		sess.stop()
+		wg.Wait()
+	}()
+
+	// Let the traffic settle so a zero pong count later means something.
+	time.Sleep(time.Second)
+	if base := sess.snapshot(); base.pongs == 0 {
+		return fmt.Errorf("no pong before the outage (%d pings sent) — the drill cannot prove anything", base.pings)
+	}
+
+	// --- take the database down --------------------------------------------
+	fmt.Printf("e2e: chaos: stopping the database: %s\n", c.opts.chaosStopCmd)
+	if out, err := runChaosCmd(c.opts.chaosStopCmd); err != nil {
+		return fmt.Errorf("stop command %q failed: %w: %s", c.opts.chaosStopCmd, err, out)
+	}
+	restarted := false
+	defer func() {
+		if !restarted {
+			// Never leave the stack on a dead database, whatever went wrong.
+			if out, err := runChaosCmd(c.opts.chaosStartCmd); err != nil {
+				fmt.Printf("e2e: chaos: RESTART FAILED, the stack needs manual repair: %v: %s\n", err, out)
+			}
+		}
+	}()
+
+	// (i) readiness must drop while liveness holds.
+	code, err := awaitReadyz(c.opts.healthURL, func(code int) bool { return code != http.StatusOK }, chaosUnreadyWithin)
+	if err != nil {
+		return fmt.Errorf("readyz kept reporting ready with the database down: %w", err)
+	}
+	// The server answers 500 here; 503 is the more conventional code for the
+	// same condition, so both count as "not ready".
+	if code != http.StatusServiceUnavailable && code != http.StatusInternalServerError {
+		return fmt.Errorf("readyz status = %d with the database down, want 503 or 500", code)
+	}
+	hc, _, err := httpGet(c.opts.healthURL + "/healthz")
+	if err != nil {
+		return fmt.Errorf("healthz unreachable during the outage: %w", err)
+	}
+	if hc != http.StatusOK {
+		return fmt.Errorf("healthz status = %d during the outage, want 200 — liveness must not follow the database", hc)
+	}
+	fmt.Printf("e2e: chaos: readyz = %d, healthz = %d with the database down\n", code, hc)
+
+	// (ii) live sessions survive and keep being answered.
+	before := sess.snapshot()
+	time.Sleep(chaosOutage)
+	during := sess.snapshot()
+	if during.readErr != nil {
+		return fmt.Errorf("traffic session dropped during the outage: %w", during.readErr)
+	}
+	if during.pongs <= before.pongs {
+		return fmt.Errorf("no ping answered during the outage (%d pings, %d pongs) — the session is not being served",
+			during.pings, during.pongs)
+	}
+
+	// (iii) a DB-backed request must come back as an error frame on a live
+	// connection, not as a dropped connection, a panic, or a hang.
+	if err := writeMsg(probe.conn, netproto.MsgChatHistory, netproto.ChatHistory{
+		ChannelID: c.channelID, Limit: 10,
+	}); err != nil {
+		return fmt.Errorf("history request during the outage: %w", err)
+	}
+	f, err := readAnyOf(probe.conn, readTimeout, netproto.MsgError, netproto.MsgChatHistoryResponse)
+	if err != nil {
+		return fmt.Errorf("no answer to a DB-backed request during the outage (connection dropped or handler hung): %w", err)
+	}
+	if netproto.MessageType(f.Type) == netproto.MsgError {
+		var e netproto.Error
+		if err := netproto.Decode(f, &e); err != nil {
+			return fmt.Errorf("undecodable error frame: %w", err)
+		}
+		fmt.Printf("e2e: chaos: DB-backed request answered with error frame %d (%s)\n", e.Code, e.Message)
+	} else {
+		// Tolerated: a pooled connection can still serve a read. The session
+		// survived either way, which is what this step is about.
+		fmt.Printf("e2e: chaos: DB-backed request still succeeded (served from the pool)\n")
+	}
+
+	// --- bring the database back -------------------------------------------
+	fmt.Printf("e2e: chaos: starting the database: %s\n", c.opts.chaosStartCmd)
+	if out, err := runChaosCmd(c.opts.chaosStartCmd); err != nil {
+		return fmt.Errorf("start command %q failed: %w: %s", c.opts.chaosStartCmd, err, out)
+	}
+	restarted = true
+
+	// (iv) readiness, fresh authentication, and a persisted round trip.
+	if _, err := awaitReadyz(c.opts.healthURL, func(code int) bool { return code == http.StatusOK }, chaosReadyWithin); err != nil {
+		return fmt.Errorf("readyz did not recover: %w", err)
+	}
+	if tally := sess.snapshot(); tally.readErr != nil {
+		return fmt.Errorf("traffic session dropped during recovery: %w", tally.readErr)
+	}
+
+	fresh, err := dialAuth(c.opts.addr, c.opts.aliceUID, c.opts.alicePass, c.opts.serverPass)
+	if err != nil {
+		// /readyz retries once on "bad connection", so it can report ready
+		// while other pooled connections are still stale. Report the gap
+		// instead of failing on it.
+		fmt.Printf("e2e: chaos: first authentication after recovery failed (%v), retrying\n", err)
+		for i := 0; i < 3 && err != nil; i++ {
+			time.Sleep(2 * time.Second)
+			fresh, err = dialAuth(c.opts.addr, c.opts.aliceUID, c.opts.alicePass, c.opts.serverPass)
+		}
+		if err != nil {
+			return fmt.Errorf("authentication never recovered: %w", err)
+		}
+	}
+	defer fresh.conn.Close()
+	if err := chaosJoin(fresh, c.channelID); err != nil {
+		return fmt.Errorf("post-recovery join: %w", err)
+	}
+
+	text := "chaos-recovered-" + randHex(4)
+	if err := writeEncChannelChat(fresh, c.channelID, text); err != nil {
+		return fmt.Errorf("post-recovery send: %w", err)
+	}
+	// The write only counts if it reached storage, so read it back out of the
+	// database rather than off the relay.
+	deadline := time.Now().Add(readTimeout)
+	for {
+		found, err := chaosHistoryHas(fresh, c.channelID, text)
+		if err != nil {
+			return fmt.Errorf("post-recovery history query: %w", err)
+		}
+		if found {
+			break
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("post-recovery message %q never appeared in history — the write did not reach storage", text)
+		}
+		time.Sleep(chaosPoll)
+	}
+
+	final := sess.snapshot()
+	fmt.Printf("e2e: chaos: %d pings / %d pongs / %d chats, error frames by code: %v\n",
+		final.pings, final.pongs, final.chats, final.errCodes)
 	return nil
 }

@@ -37,6 +37,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -57,6 +58,10 @@ var tokenTTL = 60 * time.Second
 // ErrQuotaExceeded is returned by InitUpload when the channel's file quota
 // would be exceeded.
 var ErrQuotaExceeded = errors.New("filetransfer: channel quota exceeded")
+
+// ErrUploaderQuotaExceeded is returned by InitUpload when the uploader's own
+// quota would be exceeded (266).
+var ErrUploaderQuotaExceeded = errors.New("filetransfer: upload quota exceeded")
 
 // ErrTooLarge is returned by InitUpload when the declared size exceeds the
 // per-transfer maximum.
@@ -97,9 +102,35 @@ type FileStore interface {
 	ListFileFolders(ctx context.Context, channelID int64) ([]string, error)
 	ListFileVersions(ctx context.Context, channelID int64, folder, baseName string) ([]store.FileRecord, error)
 	RenameFile(ctx context.Context, channelID int64, folder, name, newFolder, newName string) error
+	MoveFile(ctx context.Context, channelID int64, folder, name string, newChannelID int64, newFolder, newName string) error
 	DeleteFile(ctx context.Context, channelID int64, folder, name string) error
 	FindFileBySHA(ctx context.Context, channelID int64, sha256, exclFolder, exclName string) (*store.FileRecord, error)
+	// ChannelFileUsage and UploaderFileUsage are the two axes of the quota
+	// model (265/266). Both report PHYSICAL bytes: dedup hard-links identical
+	// blobs, and a copy that costs no disk must not be charged for.
 	ChannelFileUsage(ctx context.Context, channelID int64) (int64, error)
+	UploaderFileUsage(ctx context.Context, uploader string) (int64, error)
+}
+
+// Quota is one axis of the file quota model (265 per channel, 266 per
+// uploader): bytes already used and the ceiling, where 0 means unlimited.
+// Both axes resolve through quotaFor so they cannot drift apart.
+type Quota struct {
+	Used  int64
+	Limit int64
+}
+
+// Exceeded reports whether storing size more bytes would cross the ceiling.
+func (q Quota) Exceeded(size int64) bool {
+	return q.Limit > 0 && q.Used+size > q.Limit
+}
+
+// quotaFor pairs a usage lookup with a MiB ceiling.
+func quotaFor(used int64, limitMB int64) Quota {
+	if limitMB <= 0 {
+		return Quota{Used: used}
+	}
+	return Quota{Used: used, Limit: limitMB << 20}
 }
 
 // Config holds the file-transfer server settings (populated from the
@@ -111,6 +142,13 @@ type Config struct {
 	RootDir string
 	// MaxKBps is the per-connection bandwidth cap in KiB/s. 0 = unlimited.
 	MaxKBps int
+	// QuietHoursStart/End lift MaxKBps during a local-time window (276):
+	// both 0-23, equal = disabled, and a start after the end wraps past
+	// midnight. The window is evaluated when a transfer starts, so a transfer
+	// that begins inside it keeps full speed to the end rather than being
+	// throttled mid-stream.
+	QuietHoursStart int
+	QuietHoursEnd   int
 	// ChannelQuotaMB is the per-channel total file size quota in MiB.
 	// 0 = unlimited.
 	ChannelQuotaMB int64
@@ -206,9 +244,11 @@ func (s *Server) Fingerprint() string {
 }
 
 // InitUpload issues a single-use upload token after validating the folder
-// and name, the per-transfer size cap, and the channel quota. uploader is
-// the initiating user's unique ID, recorded in the files table.
-func (s *Server) InitUpload(ctx context.Context, channelID int64, folder, name string, size int64, uploader string) (string, string, error) {
+// and name, the per-transfer size cap, and BOTH quota axes. uploader is the
+// initiating user's unique ID, recorded in the files table;
+// uploaderQuotaMB is that user's personal ceiling (266), resolved by the
+// caller from the client's permissions (0 = unlimited).
+func (s *Server) InitUpload(ctx context.Context, channelID int64, folder, name string, size int64, uploader string, uploaderQuotaMB int64) (string, string, error) {
 	name, err := sanitizeName(name)
 	if err != nil {
 		return "", "", err
@@ -225,12 +265,21 @@ func (s *Server) InitUpload(ctx context.Context, channelID int64, folder, name s
 	}
 
 	if s.cfg.ChannelQuotaMB > 0 {
-		usage, err := s.store.ChannelFileUsage(ctx, channelID)
+		q, err := s.ChannelQuotaState(ctx, channelID)
 		if err != nil {
 			return "", "", fmt.Errorf("checking channel quota: %w", err)
 		}
-		if usage+size > s.cfg.ChannelQuotaMB<<20 {
+		if q.Exceeded(size) {
 			return "", "", fmt.Errorf("%w: %d MiB", ErrQuotaExceeded, s.cfg.ChannelQuotaMB)
+		}
+	}
+	if uploaderQuotaMB > 0 {
+		q, err := s.UploaderQuotaState(ctx, uploader, uploaderQuotaMB)
+		if err != nil {
+			return "", "", fmt.Errorf("checking upload quota: %w", err)
+		}
+		if q.Exceeded(size) {
+			return "", "", fmt.Errorf("%w: %d MiB", ErrUploaderQuotaExceeded, uploaderQuotaMB)
 		}
 	}
 
@@ -319,8 +368,15 @@ func (s *Server) DeleteFile(ctx context.Context, channelID int64, folder, name s
 	return nil
 }
 
-// RenameFile moves/renames a file record and its blob (262).
+// RenameFile moves/renames a file record and its blob within one channel
+// (262).
 func (s *Server) RenameFile(ctx context.Context, channelID int64, folder, name, newFolder, newName string) error {
+	return s.MoveFile(ctx, channelID, folder, name, channelID, newFolder, newName)
+}
+
+// MoveFile relocates a file and its blob, possibly into another channel
+// (262). The caller is responsible for the permission check on BOTH channels.
+func (s *Server) MoveFile(ctx context.Context, channelID int64, folder, name string, newChannelID int64, newFolder, newName string) error {
 	name, err := sanitizeName(name)
 	if err != nil {
 		return err
@@ -337,30 +393,101 @@ func (s *Server) RenameFile(ctx context.Context, channelID int64, folder, name, 
 	if err != nil {
 		return err
 	}
-	if folder == newFolder && name == newName {
+	if newChannelID == 0 {
+		newChannelID = channelID
+	}
+	if channelID == newChannelID && folder == newFolder && name == newName {
 		return errors.New("nothing to rename")
 	}
-	if err := s.store.RenameFile(ctx, channelID, folder, name, newFolder, newName); err != nil {
+	// A move into an occupied name would silently orphan the blob already
+	// there, so refuse instead of overwriting.
+	if channelID != newChannelID || folder != newFolder || name != newName {
+		if _, err := s.store.GetFile(ctx, newChannelID, newFolder, newName); err == nil {
+			return fmt.Errorf("%s already exists in the target folder", newName)
+		}
+	}
+	if err := s.store.MoveFile(ctx, channelID, folder, name, newChannelID, newFolder, newName); err != nil {
 		return err
 	}
 	oldPath := s.filePath(channelID, folder, name)
-	newPath := s.filePath(channelID, newFolder, newName)
+	newPath := s.filePath(newChannelID, newFolder, newName)
 	if err := os.MkdirAll(filepath.Dir(newPath), 0o750); err != nil {
 		return fmt.Errorf("creating target folder: %w", err)
 	}
-	if err := os.Rename(oldPath, newPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := moveBlob(oldPath, newPath); err != nil {
 		return fmt.Errorf("moving file blob: %w", err)
 	}
 	return nil
 }
 
-// ChannelQuota returns the channel's used bytes and quota (0 = unlimited).
-func (s *Server) ChannelQuota(ctx context.Context, channelID int64) (int64, int64, error) {
+// moveBlob renames a blob, falling back to copy+unlink when the two paths sit
+// on different volumes (a cross-channel move can cross a mount point when the
+// storage root spans devices, and Rename fails with EXDEV there). A missing
+// source is not an error: the row is the record of truth.
+func moveBlob(oldPath, newPath string) error {
+	err := os.Rename(oldPath, newPath)
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	src, openErr := os.Open(oldPath)
+	if openErr != nil {
+		if errors.Is(openErr, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer src.Close()
+	dst, createErr := os.Create(newPath)
+	if createErr != nil {
+		return createErr
+	}
+	if _, copyErr := io.Copy(dst, src); copyErr != nil {
+		_ = dst.Close()
+		_ = os.Remove(newPath)
+		return copyErr
+	}
+	if closeErr := dst.Close(); closeErr != nil {
+		_ = os.Remove(newPath)
+		return closeErr
+	}
+	_ = src.Close()
+	// Only drop the source once the copy is safely closed.
+	_ = os.Remove(oldPath)
+	return nil
+}
+
+// ChannelQuotaState resolves the per-channel axis (265): physical usage
+// against the configured channel ceiling.
+func (s *Server) ChannelQuotaState(ctx context.Context, channelID int64) (Quota, error) {
 	used, err := s.store.ChannelFileUsage(ctx, channelID)
+	if err != nil {
+		return Quota{}, err
+	}
+	return quotaFor(used, s.cfg.ChannelQuotaMB), nil
+}
+
+// UploaderQuotaState resolves the per-uploader axis (266): what this user
+// already stores server-wide against the ceiling their permissions grant
+// them. limitMB <= 0 is unlimited, in which case the usage query is skipped.
+func (s *Server) UploaderQuotaState(ctx context.Context, uploader string, limitMB int64) (Quota, error) {
+	if limitMB <= 0 || uploader == "" {
+		return Quota{}, nil
+	}
+	used, err := s.store.UploaderFileUsage(ctx, uploader)
+	if err != nil {
+		return Quota{}, err
+	}
+	return quotaFor(used, limitMB), nil
+}
+
+// ChannelQuota returns the channel's used bytes and quota (0 = unlimited),
+// the shape the file-list response wants.
+func (s *Server) ChannelQuota(ctx context.Context, channelID int64) (int64, int64, error) {
+	q, err := s.ChannelQuotaState(ctx, channelID)
 	if err != nil {
 		return 0, 0, err
 	}
-	return used, s.cfg.ChannelQuotaMB << 20, nil
+	return q.Used, q.Limit, nil
 }
 
 // Links returns the download-link registry (mounted on the health server).
@@ -508,6 +635,13 @@ func (s *Server) Start(ctx context.Context) error {
 		})
 	}
 	s.listener = ln
+	if s.cfg.QuietHoursStart != s.cfg.QuietHoursEnd {
+		s.logger.Info("file transfer quiet hours active",
+			zap.Int("start_hour", s.cfg.QuietHoursStart),
+			zap.Int("end_hour", s.cfg.QuietHoursEnd),
+			zap.Int("max_kbps_outside", s.cfg.MaxKBps),
+		)
+	}
 	if s.cfg.TLSEnabled {
 		s.logger.Info("file transfer listener started",
 			zap.String("addr", s.cfg.Addr),

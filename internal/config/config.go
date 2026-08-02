@@ -14,29 +14,47 @@ import (
 //  2. config.yaml at the project root (if present)
 //  3. the defaults defined in Load().
 type Config struct {
-	ServerName         string `mapstructure:"server_name"`
-	ServerPassword     string `mapstructure:"server_password"`
-	LogLevel           string `mapstructure:"log_level"`
-	DevMode            bool   `mapstructure:"dev_mode"`
-	TCPAddr            string `mapstructure:"tcp_addr"`
-	UDPAddr            string `mapstructure:"udp_addr"`
-	GRPCAddr           string `mapstructure:"grpc_addr"`
-	HealthAddr         string `mapstructure:"health_addr"`
-	QueryAddr          string `mapstructure:"query_addr"`
+	ServerName     string `mapstructure:"server_name"`
+	ServerPassword string `mapstructure:"server_password"`
+	LogLevel       string `mapstructure:"log_level"`
+	DevMode        bool   `mapstructure:"dev_mode"`
+	TCPAddr        string `mapstructure:"tcp_addr"`
+	UDPAddr        string `mapstructure:"udp_addr"`
+	GRPCAddr       string `mapstructure:"grpc_addr"`
+	HealthAddr     string `mapstructure:"health_addr"`
+	QueryAddr      string `mapstructure:"query_addr"`
+	// ServerQuery over SSH (224): the same command set and the same
+	// credentials as QueryAddr, wrapped in an SSH transport. Off by default.
+	// QuerySSHHostKey is generated on first start and must persist, or every
+	// client reports a changed host identity after a restart.
+	QuerySSHEnabled    bool   `mapstructure:"query_ssh_enabled"`
+	QuerySSHAddr       string `mapstructure:"query_ssh_addr"`
+	QuerySSHHostKey    string `mapstructure:"query_ssh_host_key"`
 	FileAddr           string `mapstructure:"file_addr"`
 	FileRoot           string `mapstructure:"file_root"`
 	FileMaxKBps        int    `mapstructure:"file_max_kbps"`
 	FileChannelQuotaMB int64  `mapstructure:"file_channel_quota_mb"`
 	FileMaxSizeMB      int64  `mapstructure:"file_max_size_mb"`
-	DatabaseURL        string `mapstructure:"database_url"`
-	RedisAddr          string `mapstructure:"redis_addr"`
-	RedisPassword      string `mapstructure:"redis_password"`
-	RedisEnabled       bool   `mapstructure:"redis_enabled"`
-	MaxClients         int    `mapstructure:"max_clients"`
+	// Quiet hours lift file_max_kbps between these local hours (276), so
+	// backups and big uploads run at full speed when nobody is listening.
+	// Both are 0-23; equal values disable the window. A start after the end
+	// wraps past midnight (22 -> 6).
+	FileQuietHoursStart int    `mapstructure:"file_quiet_hours_start"`
+	FileQuietHoursEnd   int    `mapstructure:"file_quiet_hours_end"`
+	DatabaseURL         string `mapstructure:"database_url"`
+	RedisAddr           string `mapstructure:"redis_addr"`
+	RedisPassword       string `mapstructure:"redis_password"`
+	RedisEnabled        bool   `mapstructure:"redis_enabled"`
+	MaxClients          int    `mapstructure:"max_clients"`
 	// EchoChannelName is the name of the loopback test channel: the server
 	// ensures it exists at startup, and publishers in it hear their own audio
 	// routed back (the echo channel is the only channel with self-fan-out).
 	EchoChannelName string `mapstructure:"echo_channel_name"`
+
+	// ChannelTempLifetimeSeconds is the grace period an empty temporary
+	// channel survives before it is deleted (165). Zero or negative falls
+	// back to channels.DefaultCleanupDelay.
+	ChannelTempLifetimeSeconds int `mapstructure:"channel_temp_lifetime_seconds"`
 
 	// TLS protects the TCP control channel (wave 4a). Enabled by default;
 	// when CertFile/KeyFile are empty a self-signed ECDSA P-256 certificate
@@ -184,17 +202,24 @@ func Load() (*Config, error) {
 	v.SetDefault("grpc_addr", ":50051")
 	v.SetDefault("health_addr", ":9090")
 	v.SetDefault("query_addr", ":10012")
+	v.SetDefault("query_ssh_enabled", false)
+	v.SetDefault("query_ssh_addr", ":10022")
+	v.SetDefault("query_ssh_host_key", "./data/keys/query_ssh_host.key")
 	v.SetDefault("file_addr", ":30033")
 	v.SetDefault("file_root", "./data/files")
 	v.SetDefault("file_max_kbps", 0)
 	v.SetDefault("file_channel_quota_mb", 0)
 	v.SetDefault("file_max_size_mb", 100)
+	v.SetDefault("file_quiet_hours_start", 0)
+	v.SetDefault("file_quiet_hours_end", 0)
 	v.SetDefault("database_url", "postgres://voicx:voicx@localhost:5432/voicx?sslmode=disable")
 	v.SetDefault("redis_addr", "localhost:6379")
 	v.SetDefault("redis_password", "")
 	v.SetDefault("redis_enabled", true)
 	v.SetDefault("max_clients", 1024)
 	v.SetDefault("echo_channel_name", "Echo Test")
+	// 60s matches channels.DefaultCleanupDelay (165).
+	v.SetDefault("channel_temp_lifetime_seconds", 60)
 
 	// TLS defaults: on, self-signed cert under ./data/tls (the Docker image
 	// points tls_dir at the /data volume).

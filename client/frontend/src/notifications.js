@@ -29,14 +29,19 @@ const TOAST_CATEGORY = {
     join_leave: "social",
 };
 
-// matrixRow returns the effective outputs for an event (defaults: all on
+// defaultMatrixRow is the fallback output set for an event (defaults: all on
 // except native for chatty events). (32) whisper defaults to sound + flash +
-// native: an incoming voice whisper is addressed at you personally.
-function matrixRow(event) {
-    const m = V().state.settings?.notify_matrix?.[event];
-    if (m) return m;
+// native: an incoming voice whisper is addressed at you personally. (385) the
+// settings grid seeds unset rows from here, so the checkboxes a user sees are
+// the ones dispatch actually uses.
+export function defaultMatrixRow(event) {
     const direct = event === "mention" || event === "poke" || event === "dm" || event === "whisper";
     return { toast: true, sound: true, flash: event !== "join_leave" && event !== "buddy_online", native: direct };
+}
+
+// matrixRow returns the effective outputs for an event.
+function matrixRow(event) {
+    return V().state.settings?.notify_matrix?.[event] || defaultMatrixRow(event);
 }
 
 // channelKey builds the per-channel override key ("addr#channelID").
@@ -204,12 +209,69 @@ export function maybeAlphaNotice(force = false) {
     document.body.appendChild(overlay);
 }
 
+// ---------------------------------------------------------------------------
+// Identity backup reminder (353)
+// ---------------------------------------------------------------------------
+
+// backupNagSnoozed is deliberately session-scoped and NOT persisted: an
+// identity that was never exported dies with the machine, so "Later" only
+// silences the reminder until the next start — it comes back until an export
+// actually happened.
+let backupNagSnoozed = false;
+
+// maybeIdentityBackupNag prompts to export the active identity while it has
+// never been backed up (353).
+export async function maybeIdentityBackupNag(force = false) {
+    if (backupNagSnoozed && !force) return;
+    if (document.querySelector(".identity-backup-nag")) return;
+    let pending = false;
+    try {
+        pending = await App().IdentityBackupPending();
+    } catch {
+        return;
+    }
+    if (!pending) return;
+    const overlay = document.createElement("div");
+    overlay.className = "dlg-overlay identity-backup-nag";
+    overlay.innerHTML = `
+        <div class="dlg">
+            <h3>Back up your identity</h3>
+            <div class="dlg-text">
+                <p>Your identity key has never been exported. It <b>is</b> your account on every
+                server you have joined — if this machine dies, no one can restore it for you.</p>
+                <p>Export it once and keep the file somewhere safe.</p>
+            </div>
+            <div class="dlg-buttons">
+                <button class="dlg-ok">Export now…</button>
+                <button class="dlg-cancel">Later</button>
+            </div>
+        </div>`;
+    overlay.querySelector(".dlg-ok").onclick = async () => {
+        const err = await App().ExportIdentity("");
+        if (err) {
+            V().toast("export failed: " + err, "warn");
+            return;
+        }
+        overlay.remove();
+        if (await App().IdentityBackupPending()) V().toast("identity not exported yet", "warn");
+        else V().toast("identity exported — keep the file safe");
+    };
+    overlay.querySelector(".dlg-cancel").onclick = () => {
+        backupNagSnoozed = true;
+        overlay.remove();
+    };
+    document.body.appendChild(overlay);
+}
+
 export function initNotifications() {
     window.__voicxNotify = {
         notify, checkBuddyOnline, resetBuddyWatch, matchKeyword,
         checkChannelWatch, channelOverride, saveChannelOverride, maybeAlphaNotice,
+        maybeIdentityBackupNag,
     };
     const badge = document.getElementById("alpha-badge");
     if (badge) badge.onclick = () => maybeAlphaNotice(true);
     setTimeout(() => maybeAlphaNotice(false), 1200);
+    // (353) after the alpha notice so two modals never stack on first run.
+    setTimeout(() => maybeIdentityBackupNag(false), 3000);
 }

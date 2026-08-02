@@ -18,10 +18,38 @@ import (
 	"voicx/internal/store"
 )
 
+// permCheckerInChannel resolves the client's permissions as they apply in a
+// given channel rather than in the one they currently occupy (262): a move
+// has to be judged where the file lands, and channel-tier grants differ per
+// channel. Guests hold the same virtual set everywhere, so they need no
+// second lookup.
+func (s *TCPServer) permCheckerInChannel(ctx context.Context, client *Client, channelID int64) (*permChecker, error) {
+	if client.UserID == 0 {
+		return s.permCheckerFor(ctx, client)
+	}
+	if s.deps == nil || s.deps.Perms == nil || s.deps.Resolver == nil {
+		return nil, errPermsUnavailable
+	}
+	tp, err := s.deps.Perms.LoadForClient(ctx, client.UserID, channelID)
+	if err != nil {
+		return nil, fmt.Errorf("loading permissions: %w", err)
+	}
+	return &permChecker{resolver: s.deps.Resolver, tp: tp, admin: client.isAdmin()}, nil
+}
+
+// uploadQuotaMB resolves the caller's personal upload ceiling. Admins are
+// never capped.
+func (pc *permChecker) uploadQuotaMB() int64 {
+	if pc.admin {
+		return 0
+	}
+	return int64(pc.power(permissions.PermissionKeyFTUploadQuotaMB))
+}
+
 // handleFileTransferInit issues a single-use transfer token after a
 // permission check (upload/download power; unset = allowed, negated =
-// denied) and the file-transfer backend's own validation (size cap, quota,
-// name/folder sanitization).
+// denied) and the file-transfer backend's own validation (size cap, both
+// quota axes, name/folder sanitization).
 func (s *TCPServer) handleFileTransferInit(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.FileTransferInit
 	if err := netproto.Decode(f, &msg); err != nil {
@@ -42,7 +70,7 @@ func (s *TCPServer) handleFileTransferInit(ctx context.Context, client *Client, 
 		if !pc.ftUploadAllowed() {
 			return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyFTFileUploadPower))
 		}
-		transferID, token, err = s.deps.FileTransfer.InitUpload(ctx, msg.ChannelID, msg.Folder, msg.Name, msg.Size, client.UniqueID)
+		transferID, token, err = s.deps.FileTransfer.InitUpload(ctx, msg.ChannelID, msg.Folder, msg.Name, msg.Size, client.UniqueID, pc.uploadQuotaMB())
 	case "download":
 		if !pc.ftDownloadAllowed() {
 			return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyFTFileDownloadPower))
@@ -86,6 +114,9 @@ func fileEntries(files []store.FileRecord) []netproto.FileEntry {
 			SHA256:     rec.SHA256,
 			Uploader:   rec.Uploader,
 			UploadedAt: rec.UploadedAt,
+			// (91-135) sending the flag lets the browser stop inferring
+			// sealedness from the ".vcx" suffix.
+			Encrypted: rec.Encrypted,
 		})
 	}
 	return out
@@ -195,11 +226,34 @@ func (s *TCPServer) handleFileRename(ctx context.Context, client *Client, f *net
 	if err := s.fileManageAllowed(ctx, client, msg.ChannelID, msg.Folder, msg.Name); err != nil {
 		return s.sendError(client, errCodePermissionDenied, err.Error())
 	}
-	if err := s.deps.FileTransfer.RenameFile(ctx, msg.ChannelID, msg.Folder, msg.Name, msg.NewFolder, msg.NewName); err != nil {
+	target := msg.NewChannelID
+	if target == 0 {
+		target = msg.ChannelID
+	}
+	if target != msg.ChannelID {
+		// (262) a cross-channel move is an upload into the destination as much
+		// as a delete from the source, so it needs the upload right THERE:
+		// managing a file in one channel must not be a way to push it into a
+		// channel the mover cannot write to.
+		if s.deps.State != nil {
+			if _, ok := s.deps.State.GetChannel(target); !ok {
+				return s.sendError(client, errCodeNotFound, "target channel not found")
+			}
+		}
+		pc, err := s.permCheckerInChannel(ctx, client, target)
+		if err != nil {
+			return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		}
+		if !pc.ftUploadAllowed() {
+			return s.sendError(client, errCodePermissionDenied,
+				"insufficient permission in the target channel: "+string(permissions.PermissionKeyFTFileUploadPower))
+		}
+	}
+	if err := s.deps.FileTransfer.MoveFile(ctx, msg.ChannelID, msg.Folder, msg.Name, target, msg.NewFolder, msg.NewName); err != nil {
 		return s.sendError(client, errCodeNotFound, "rename failed: "+err.Error())
 	}
 	s.audit(ctx, client.UniqueID, "file_rename", fmt.Sprintf("%d:%s/%s", msg.ChannelID, msg.Folder, msg.Name),
-		fmt.Sprintf("to %s/%s", msg.NewFolder, msg.NewName))
+		fmt.Sprintf("to %d:%s/%s", target, msg.NewFolder, msg.NewName))
 	return nil
 }
 

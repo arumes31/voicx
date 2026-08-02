@@ -135,6 +135,25 @@ const (
 	MsgChatFilterGet      MessageType = 101 // client -> server: read the runtime chat moderation lists
 	MsgChatFilterSet      MessageType = 102 // client -> server: replace the runtime chat moderation lists
 	MsgChatFilterResponse MessageType = 103 // server -> client: the moderation lists in force
+
+	MsgGroupEdit      MessageType = 104 // client -> server: edit a group's cosmetics (color/hoist/sort)
+	MsgPermCopy       MessageType = 105 // client -> server: copy permissions between targets
+	MsgPermsInvalid   MessageType = 106 // server -> client: your resolved permissions changed, refetch
+	MsgComplaintList  MessageType = 107 // client -> server: list complaints
+	MsgComplaints     MessageType = 108 // server -> client: complaint list
+	MsgComplaintClear MessageType = 109 // client -> server: delete complaints against a target
+	MsgTokenList      MessageType = 110 // client -> server: list privilege tokens
+	MsgTokens         MessageType = 111 // server -> client: privilege token list
+	MsgTokenAdd       MessageType = 112 // client -> server: create a privilege token
+	MsgTokenDelete    MessageType = 113 // client -> server: revoke a privilege token
+
+	MsgChannelIconGet  MessageType = 114 // client -> server: fetch a channel icon
+	MsgChannelIconData MessageType = 115 // server -> client: channel icon payload
+	MsgServerBannerSet MessageType = 116 // client -> server: upload the server banner (admin)
+	MsgServerBannerGet MessageType = 117 // client -> server: fetch the server banner
+	MsgServerBannerDat MessageType = 118 // server -> client: server banner payload
+	MsgEmojiDelete     MessageType = 119 // client -> server: delete a custom emoji
+	MsgEmojiRename     MessageType = 120 // client -> server: rename a custom emoji
 )
 
 // String returns a human-readable name for the message type.
@@ -346,6 +365,40 @@ func (m MessageType) String() string {
 		return "ChatFilterSet"
 	case MsgChatFilterResponse:
 		return "ChatFilterResponse"
+	case MsgGroupEdit:
+		return "GroupEdit"
+	case MsgPermCopy:
+		return "PermCopy"
+	case MsgPermsInvalid:
+		return "PermsInvalid"
+	case MsgComplaintList:
+		return "ComplaintList"
+	case MsgComplaints:
+		return "Complaints"
+	case MsgComplaintClear:
+		return "ComplaintClear"
+	case MsgTokenList:
+		return "TokenList"
+	case MsgTokens:
+		return "Tokens"
+	case MsgTokenAdd:
+		return "TokenAdd"
+	case MsgTokenDelete:
+		return "TokenDelete"
+	case MsgChannelIconGet:
+		return "ChannelIconGet"
+	case MsgChannelIconData:
+		return "ChannelIconData"
+	case MsgServerBannerSet:
+		return "ServerBannerSet"
+	case MsgServerBannerGet:
+		return "ServerBannerGet"
+	case MsgServerBannerDat:
+		return "ServerBannerData"
+	case MsgEmojiDelete:
+		return "EmojiDelete"
+	case MsgEmojiRename:
+		return "EmojiRename"
 	default:
 		return fmt.Sprintf("Unknown(%d)", uint16(m))
 	}
@@ -474,6 +527,15 @@ type ChannelEdit struct {
 	OpusStereo      *bool   `json:"opus_stereo,omitempty"`
 	SlowModeSeconds *int    `json:"slow_mode_seconds,omitempty"`
 	Description     *string `json:"description,omitempty"`
+	// NeededJoinPower (160), OrderIndex (163 reordering) and ParentID (168
+	// re-parenting) were the shared gap that blocked all three items: the
+	// create dialog could set join power but nothing could ever edit it.
+	NeededJoinPower *int   `json:"needed_join_power,omitempty"`
+	OrderIndex      *int   `json:"order_index,omitempty"`
+	ParentID        *int64 `json:"parent_id,omitempty"`
+	// InheritPermissions toggles whether a sub-channel resolves its parent's
+	// channel permissions before its own (157).
+	InheritPermissions *bool `json:"inherit_permissions,omitempty"`
 }
 
 // PrioritySpeaker toggles the calling client's priority-speaker flag
@@ -699,6 +761,10 @@ type FileEntry struct {
 	SHA256     string    `json:"sha256"`
 	Uploader   string    `json:"uploader,omitempty"`
 	UploadedAt time.Time `json:"uploaded_at"`
+	// Encrypted marks a client-sealed chat attachment (91-135). The browser
+	// infers it from the ".vcx" suffix today, which only works because the
+	// client also chooses the name — this makes it explicit.
+	Encrypted bool `json:"encrypted,omitempty"`
 }
 
 // FileListResponse carries a channel's file listing plus the quota state
@@ -725,6 +791,48 @@ type FileRename struct {
 	Name      string `json:"name"`
 	NewName   string `json:"new_name"`
 	NewFolder string `json:"new_folder,omitempty"`
+	// NewChannelID moves the file to another channel (262). 0 keeps it where
+	// it is; a move is permission-checked against BOTH channels.
+	NewChannelID int64 `json:"new_channel_id,omitempty"`
+}
+
+// ChannelIconGet fetches a channel's icon (271). Without it the uploaded
+// image was write-only: nothing could ever read one back.
+type ChannelIconGet struct {
+	ChannelID int64 `json:"channel_id"`
+}
+
+// ChannelIconData carries a channel icon ("" data = no icon set).
+type ChannelIconData struct {
+	ChannelID   int64  `json:"channel_id"`
+	DataBase64  string `json:"data_base64"`
+	ContentType string `json:"content_type,omitempty"`
+}
+
+// ServerBannerSet uploads the server banner (270, admin only).
+type ServerBannerSet struct {
+	DataBase64 string `json:"data_base64"`
+}
+
+// ServerBannerGet requests the server banner.
+type ServerBannerGet struct{}
+
+// ServerBannerData carries the server banner ("" data = none set).
+type ServerBannerData struct {
+	DataBase64  string `json:"data_base64"`
+	ContentType string `json:"content_type,omitempty"`
+}
+
+// EmojiDelete removes a custom server emoji (272). Gated like upload.
+type EmojiDelete struct {
+	Name string `json:"name"`
+}
+
+// EmojiRename renames a custom server emoji (272). Messages already sent
+// keep the old shortcode, so a rename does not rewrite history.
+type EmojiRename struct {
+	Name    string `json:"name"`
+	NewName string `json:"new_name"`
 }
 
 // FileVersions lists the rotated old versions of a file (264).
@@ -1034,6 +1142,94 @@ type ChatFilterResponse struct {
 	// FromConfig reports that no runtime override is stored yet, so these are
 	// the config.yaml values. It is false for every response to a set.
 	FromConfig bool `json:"from_config,omitempty"`
+}
+
+// GroupEdit changes a group's cosmetic fields (178 role colours, 179 hoisting).
+// The columns have existed since migration 009 but nothing could ever set them.
+// A nil field is left unchanged, so a dialog may send only what it edited.
+type GroupEdit struct {
+	GroupID int64   `json:"group_id"`
+	Color   *string `json:"color,omitempty"`   // "#rrggbb"; "" clears back to the theme default
+	Hoist   *bool   `json:"hoist,omitempty"`   // display the group in its own tree section
+	SortID  *int    `json:"sort_id,omitempty"` // lower sorts first; picks the nickname colour
+}
+
+// PermCopy copies permission entries between targets (141). Kind is
+// "servergroup" | "channelgroup" | "client"; ChannelID scopes a channel-group
+// or per-channel client copy. Replace clears the destination's own entries
+// first, so the copy is exact rather than a merge.
+type PermCopy struct {
+	FromKind  string `json:"from_kind"`
+	FromID    string `json:"from_id"`
+	ToKind    string `json:"to_kind"`
+	ToID      string `json:"to_id"`
+	ChannelID int64  `json:"channel_id,omitempty"`
+	Replace   bool   `json:"replace,omitempty"`
+}
+
+// PermsInvalid tells a client its resolved permissions changed and the cached
+// set must be refetched (151). It replaces the client's 5 s poll, so it has to
+// reach every client whose resolution could have moved — not just the caller.
+type PermsInvalid struct {
+	Reason string `json:"reason,omitempty"`
+}
+
+// ComplaintList requests the complaint list (173). Gated by b_complain_list.
+type ComplaintList struct{}
+
+// ComplaintEntry is one filed complaint.
+type ComplaintEntry struct {
+	TargetUniqueID string `json:"target_unique_id"`
+	TargetNickname string `json:"target_nickname,omitempty"`
+	FromUniqueID   string `json:"from_unique_id"`
+	FromNickname   string `json:"from_nickname,omitempty"`
+	Reason         string `json:"reason"`
+	CreatedAt      int64  `json:"created_at"` // unix seconds
+}
+
+// Complaints is the complaint list.
+type Complaints struct {
+	Entries []ComplaintEntry `json:"entries"`
+}
+
+// ComplaintClear deletes complaints against a target (173). FromUniqueID
+// empty clears every complaint against the target.
+type ComplaintClear struct {
+	TargetUniqueID string `json:"target_unique_id"`
+	FromUniqueID   string `json:"from_unique_id,omitempty"`
+}
+
+// TokenList requests the privilege tokens (174). Gated by
+// b_virtualserver_token_list.
+type TokenList struct{}
+
+// TokenEntry is one privilege key.
+type TokenEntry struct {
+	Token       string `json:"token"`
+	GroupID     int64  `json:"group_id"`
+	GroupName   string `json:"group_name,omitempty"`
+	ChannelID   int64  `json:"channel_id,omitempty"`
+	Description string `json:"description,omitempty"`
+	CreatedAt   int64  `json:"created_at"` // unix seconds
+	UsedBy      string `json:"used_by,omitempty"`
+}
+
+// Tokens is the privilege token list.
+type Tokens struct {
+	Entries []TokenEntry `json:"entries"`
+}
+
+// TokenAdd creates a privilege token (174). The server generates the token
+// string and returns the refreshed list.
+type TokenAdd struct {
+	GroupID     int64  `json:"group_id"`
+	ChannelID   int64  `json:"channel_id,omitempty"`
+	Description string `json:"description,omitempty"`
+}
+
+// TokenDelete revokes a privilege token (174).
+type TokenDelete struct {
+	Token string `json:"token"`
 }
 
 // Typing is a typing indicator. Exactly one of ChannelID / ToUniqueID is

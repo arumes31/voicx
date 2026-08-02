@@ -13,9 +13,13 @@ tcp_addr: ":10011"    # TeamSpeak-like query / control TCP port
 udp_addr: ":9987"     # voice UDP port (Pion WebRTC/media in later phases)
 udp_rate_limit_pps: 200   # per-source-IP UDP rate limit (pkt/s); 0 = disabled
 udp_rate_burst: 400       # per-source-IP UDP burst allowance
-grpc_addr: ":50051"   # gRPC API port (reserved; no listener yet)
+grpc_addr: ":50051"   # gRPC API port (Events.Subscribe + Control RPCs, 232)
 health_addr: ":9090"  # health/readiness HTTP endpoint (/healthz, /readyz)
 query_addr: ":10012"  # ServerQuery (TS3-style admin/bot text protocol)
+# ServerQuery over SSH (224): same commands and credentials as query_addr.
+query_ssh_enabled: false
+query_ssh_addr: ":10022"
+query_ssh_host_key: "./data/keys/query_ssh_host.key"  # generated once; keep it, or clients see a changed host key
 
 # File transfer (token-authorized uploads/downloads on its own port).
 file_addr: ":30033"

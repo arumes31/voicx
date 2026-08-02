@@ -19,7 +19,7 @@ import (
 // uploadOne performs a complete upload of content under folder/name.
 func uploadOne(t *testing.T, addr string, s *Server, folder, name string, content []byte) {
 	t.Helper()
-	id, token, err := s.InitUpload(context.Background(), 7, folder, name, int64(len(content)), "uid-1")
+	id, token, err := s.InitUpload(context.Background(), 7, folder, name, int64(len(content)), "uid-1", 0)
 	if err != nil {
 		t.Fatalf("InitUpload %s/%s: %v", folder, name, err)
 	}

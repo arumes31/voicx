@@ -161,8 +161,11 @@ export namespace main {
 	    user_notes?: Record<string, string>;
 	    recent_channels?: Record<string, Array<number>>;
 	    auto_away_minutes: number;
+	    auto_away_message: string;
 	    onboarding_done: boolean;
 	    last_seen_version: string;
+	    active_identity?: string;
+	    identity_key_protection?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new Settings(source);
@@ -244,8 +247,11 @@ export namespace main {
 	        this.user_notes = source["user_notes"];
 	        this.recent_channels = source["recent_channels"];
 	        this.auto_away_minutes = source["auto_away_minutes"];
+	        this.auto_away_message = source["auto_away_message"];
 	        this.onboarding_done = source["onboarding_done"];
 	        this.last_seen_version = source["last_seen_version"];
+	        this.active_identity = source["active_identity"];
+	        this.identity_key_protection = source["identity_key_protection"];
 	    }
 	
 		convertValues(a: any, classs: any, asMap: boolean = false): any {
@@ -265,6 +271,52 @@ export namespace main {
 		    }
 		    return a;
 		}
+	}
+	export class IdentityEntry {
+	    id: string;
+	    name: string;
+	    unique_id: string;
+	    active: boolean;
+	    created_at?: string;
+	    exported_at?: string;
+	    security_level: number;
+	    protection: string;
+	    path: string;
+	    error?: string;
+
+	    static createFrom(source: any = {}) {
+	        return new IdentityEntry(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.unique_id = source["unique_id"];
+	        this.active = source["active"];
+	        this.created_at = source["created_at"];
+	        this.exported_at = source["exported_at"];
+	        this.security_level = source["security_level"];
+	        this.protection = source["protection"];
+	        this.path = source["path"];
+	        this.error = source["error"];
+	    }
+	}
+	export class IdentityLevelResult {
+	    level: number;
+	    counter: number;
+	    error?: string;
+
+	    static createFrom(source: any = {}) {
+	        return new IdentityLevelResult(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.level = source["level"];
+	        this.counter = source["counter"];
+	        this.error = source["error"];
+	    }
 	}
 	export class TabInfo {
 	    id: string;
@@ -397,6 +449,24 @@ export namespace netproto {
 	        this.unique_id = source["unique_id"];
 	        this.data_base64 = source["data_base64"];
 	        this.content_type = source["content_type"];
+	    }
+	}
+	export class ChatFilterResponse {
+	    word_filter: string;
+	    link_blacklist: string;
+	    link_whitelist: string;
+	    from_config?: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new ChatFilterResponse(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.word_filter = source["word_filter"];
+	        this.link_blacklist = source["link_blacklist"];
+	        this.link_whitelist = source["link_whitelist"];
+	        this.from_config = source["from_config"];
 	    }
 	}
 	export class BanEntry {

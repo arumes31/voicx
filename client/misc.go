@@ -3,7 +3,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -113,31 +112,41 @@ func (a *App) RegenerateIdentity() string {
 	return uid
 }
 
-// ExportIdentity copies the identity file to a user-chosen destination.
-func (a *App) ExportIdentity() string {
-	src, err := identityPath()
+// ExportIdentity writes a PORTABLE copy of one identity ("" = the active
+// one) to a user-chosen destination and stamps its backup marker (351/353).
+// The copy carries the private key in the clear so it still opens on a new
+// machine even when the stored file is OS-protected (354).
+func (a *App) ExportIdentity(id string) string {
+	if id == "" {
+		var err error
+		if id, _, err = a.resolveActive(); err != nil {
+			return err.Error()
+		}
+	}
+	src, err := identityPathFor(id)
+	if err != nil {
+		return err.Error()
+	}
+	loaded, err := loadOrCreateIdentityAt(src)
 	if err != nil {
 		return err.Error()
 	}
 	dest, err := wailsRuntime.SaveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
 		Title:           "Export identity",
-		DefaultFilename: "voicx-identity.json",
+		DefaultFilename: "voicx-identity-" + id + ".json",
 	})
 	if err != nil || dest == "" {
 		return "" // cancelled
 	}
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return err.Error()
-	}
-	if err := os.WriteFile(dest, data, 0o600); err != nil {
+	if err := exportIdentityTo(dest, src, loaded); err != nil {
 		return err.Error()
 	}
 	return ""
 }
 
-// ImportIdentity replaces the identity file with a user-chosen one (a backup
-// of the current file is kept alongside). A reconnect is required.
+// ImportIdentity adds a user-chosen identity file as a NEW identity and makes
+// it active (351). Importing never overwrites a stored key: the file it would
+// replace may be the only copy of an account the user still needs.
 func (a *App) ImportIdentity() string {
 	src, err := wailsRuntime.OpenFileDialog(a.ctx, wailsRuntime.OpenDialogOptions{
 		Title: "Import identity",
@@ -152,26 +161,14 @@ func (a *App) ImportIdentity() string {
 	if err != nil {
 		return err.Error()
 	}
-	// Validate before replacing anything.
-	var id identity
-	if err := json.Unmarshal(data, &id); err != nil || id.PublicKey == "" || id.PrivateKey == "" {
-		return "not a valid identity file"
-	}
-	dest, err := identityPath()
+	// Decode BEFORE anything is written: a protected file from another
+	// machine has to be rejected with a message, not stored unreadable (354).
+	loaded, err := decodeIdentity(data)
 	if err != nil {
 		return err.Error()
 	}
-	if _, err := os.Stat(dest); err == nil {
-		_ = os.Rename(dest, dest+".bak")
-	}
-	if err := os.WriteFile(dest, data, 0o600); err != nil {
-		return err.Error()
-	}
-	if _, err := loadOrCreateIdentityAt(dest); err != nil {
-		return err.Error()
-	}
-	if a.cmLoad() != nil {
-		a.cmLoad().id = nil // reload on next connect
+	if msg := a.adoptImportedIdentity(loaded, filepath.Base(src)); msg != "" {
+		return msg
 	}
 	log.Printf("identity imported from %s", src)
 	return ""

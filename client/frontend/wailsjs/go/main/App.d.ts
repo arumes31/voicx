@@ -17,15 +17,17 @@ export function CancelTransfer(arg1:string):Promise<void>;
 
 export function ChannelEdit(arg1:number,arg2:string,arg3:number,arg4:number,arg5:boolean,arg6:boolean,arg7:boolean,arg8:string,arg9:number):Promise<string>;
 
+export function ChannelEditTree(arg1:number,arg2:string,arg3:number,arg4:number,arg5:number,arg6:boolean):Promise<string>;
+
 export function ChannelIconSet(arg1:number,arg2:string,arg3:number):Promise<string>;
 
 export function ChatDeleteMessage(arg1:number):Promise<string>;
 
 export function ChatEditMessage(arg1:number,arg2:number,arg3:string):Promise<string>;
 
-export function ChatFilterGet():Promise<{word_filter:string,link_blacklist:string,link_whitelist:string,from_config?:boolean}>;
+export function ChatFilterGet():Promise<netproto.ChatFilterResponse>;
 
-export function ChatFilterSet(arg1:string,arg2:string,arg3:string):Promise<{word_filter:string,link_blacklist:string,link_whitelist:string,from_config?:boolean}>;
+export function ChatFilterSet(arg1:string,arg2:string,arg3:string):Promise<netproto.ChatFilterResponse>;
 
 export function ChatHistory(arg1:number,arg2:number,arg3:number):Promise<netproto.ChatHistoryResponse>;
 
@@ -49,6 +51,10 @@ export function ClientVersionShort():Promise<string>;
 
 export function CloseTab(arg1:string):Promise<void>;
 
+export function ComplaintClear(arg1:string,arg2:string):Promise<any>;
+
+export function ComplaintList():Promise<any>;
+
 export function Connect(arg1:string,arg2:string,arg3:string,arg4:string):Promise<string>;
 
 export function ConnectBookmarkTab(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string):Promise<string>;
@@ -67,7 +73,11 @@ export function ConnectionSecurity():Promise<string>;
 
 export function CreateChannel(arg1:string,arg2:string,arg3:number,arg4:number,arg5:number,arg6:string,arg7:number,arg8:number,arg9:boolean,arg10:boolean,arg11:boolean):Promise<string>;
 
+export function CreateIdentity(arg1:string):Promise<string>;
+
 export function DeleteChannel(arg1:number):Promise<string>;
+
+export function DeleteIdentity(arg1:string):Promise<string>;
 
 export function Disconnect():Promise<void>;
 
@@ -83,6 +93,8 @@ export function DMHistoryLoad(arg1:string):Promise<Array<main.DMEntry>>;
 
 export function DMHistoryPeers():Promise<Array<main.DMPeer>>;
 
+export function DownloadChatAttachment(arg1:number,arg2:string,arg3:string):Promise<string>;
+
 export function DMSearch(arg1:string,arg2:string,arg3:number):Promise<main.ChatSearchResult>;
 
 export function DownloadFile(arg1:number,arg2:string):Promise<string>;
@@ -97,7 +109,9 @@ export function EmojiList():Promise<netproto.EmojiListResponse>;
 
 export function ExportChat(arg1:string,arg2:string):Promise<string>;
 
-export function ExportIdentity():Promise<string>;
+export function ExportChatEncrypted(arg1:string,arg2:string):Promise<string>;
+
+export function ExportIdentity(arg1:string):Promise<string>;
 
 export function ExportLogs():Promise<string>;
 
@@ -131,6 +145,8 @@ export function GroupCreate(arg1:string,arg2:string,arg3:number):Promise<netprot
 
 export function GroupDelete(arg1:string,arg2:number,arg3:boolean):Promise<string>;
 
+export function GroupEdit(arg1:number,arg2:string,arg3:boolean,arg4:number):Promise<netproto.GroupListResponse>;
+
 export function GroupIconGet(arg1:number):Promise<netproto.GroupIconData>;
 
 export function GroupIconSet(arg1:number,arg2:string):Promise<string>;
@@ -143,9 +159,13 @@ export function GroupRename(arg1:string,arg2:number,arg3:string):Promise<string>
 
 export function GroupUnassign(arg1:string,arg2:number,arg3:string,arg4:number):Promise<string>;
 
+export function IdentityBackupPending():Promise<boolean>;
+
 export function IdentityInfo():Promise<main.identityInfo>;
 
 export function IdentityUID():Promise<string>;
+
+export function ImproveIdentityLevel(arg1:string,arg2:number,arg3:number):Promise<main.IdentityLevelResult>;
 
 export function ImportIdentity():Promise<string>;
 
@@ -156,6 +176,8 @@ export function JoinChannel(arg1:number):Promise<string>;
 export function KickClient(arg1:string,arg2:boolean,arg3:boolean,arg4:string,arg5:number):Promise<string>;
 
 export function LastCrash():Promise<string>;
+
+export function ListIdentities():Promise<Array<main.IdentityEntry>>;
 
 export function ListTabs():Promise<Array<main.TabInfo>>;
 
@@ -168,6 +190,8 @@ export function MoveClient(arg1:string,arg2:number):Promise<string>;
 export function Notify(arg1:string,arg2:string):Promise<string>;
 
 export function OpenLogFolder():Promise<string>;
+
+export function PermCopy(arg1:string,arg2:string,arg3:string,arg4:string,arg5:number,arg6:boolean):Promise<string>;
 
 export function PermList(arg1:string,arg2:number,arg3:string,arg4:number):Promise<netproto.PermListResponse>;
 
@@ -188,6 +212,10 @@ export function Poke(arg1:string,arg2:string):Promise<string>;
 export function RecordRecent(arg1:string,arg2:string):Promise<void>;
 
 export function RegenerateIdentity():Promise<string>;
+
+export function RenameIdentity(arg1:string,arg2:string):Promise<string>;
+
+export function SwitchIdentity(arg1:string):Promise<string>;
 
 export function SaveSettings(arg1:main.Settings):Promise<string>;
 
@@ -233,7 +261,17 @@ export function SetStatus(arg1:string,arg2:string):Promise<string>;
 
 export function SetVideoQuality(arg1:string):Promise<string>;
 
+export function TokenAdd(arg1:number,arg2:number,arg3:string):Promise<any>;
+
+export function TokenDelete(arg1:string):Promise<any>;
+
+export function TokenList():Promise<any>;
+
+export function TokenUse(arg1:string):Promise<string>;
+
 export function TrustServerFingerprint(arg1:string,arg2:string):Promise<string>;
+
+export function UploadChatAttachment(arg1:number,arg2:string,arg3:string):Promise<string>;
 
 export function UploadFile(arg1:number,arg2:string,arg3:string):Promise<string>;
 

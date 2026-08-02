@@ -26,14 +26,26 @@ type Token struct {
 	Key       string
 	Type      int // 0=server group, 1=channel group (unused for now)
 	GroupID   int64
+	ChannelID int64
 	Uses      int
 	MaxUses   int
 	CreatedAt time.Time
+	// Description is the operator's note shown in the token manager, UsedBy
+	// the unique ID of the last redeemer ("" while unredeemed) (174).
+	Description string
+	UsedBy      string
 }
 
 // CreateToken generates a random token key and inserts a token row.
 // groupID 0 means the token grants server admin on use.
 func (s *Store) CreateToken(ctx context.Context, tokenType int, groupID int64, maxUses int) (string, error) {
+	return s.CreateTokenWithMeta(ctx, tokenType, groupID, 0, "", maxUses)
+}
+
+// CreateTokenWithMeta is CreateToken with the channel scope and the
+// description the token manager displays (174). The key is always generated
+// here so a caller can never choose a guessable one.
+func (s *Store) CreateTokenWithMeta(ctx context.Context, tokenType int, groupID, channelID int64, description string, maxUses int) (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
 		return "", fmt.Errorf("generating token: %w", err)
@@ -43,13 +55,18 @@ func (s *Store) CreateToken(ctx context.Context, tokenType int, groupID int64, m
 		maxUses = 1
 	}
 
-	var gid any
+	// group_id and channel_id are nullable FKs: 0 means "not scoped", which
+	// must go in as NULL rather than a reference to a nonexistent row.
+	var gid, cid any
 	if groupID != 0 {
 		gid = groupID
 	}
-	const q = `INSERT INTO tokens (token_key, token_type, group_id, max_uses)
-	          VALUES ($1, $2, $3, $4)`
-	if _, err := s.db.ExecContext(ctx, q, key, tokenType, gid, maxUses); err != nil {
+	if channelID != 0 {
+		cid = channelID
+	}
+	const q = `INSERT INTO tokens (token_key, token_type, group_id, channel_id, description, max_uses)
+	          VALUES ($1, $2, $3, $4, $5, $6)`
+	if _, err := s.db.ExecContext(ctx, q, key, tokenType, gid, cid, description, maxUses); err != nil {
 		return "", fmt.Errorf("inserting token: %w", err)
 	}
 	return key, nil
@@ -57,7 +74,8 @@ func (s *Store) CreateToken(ctx context.Context, tokenType int, groupID int64, m
 
 // ListTokens returns all tokens, oldest first.
 func (s *Store) ListTokens(ctx context.Context) ([]Token, error) {
-	const q = `SELECT id, token_key, token_type, COALESCE(group_id, 0), uses, max_uses, created_at
+	const q = `SELECT id, token_key, token_type, COALESCE(group_id, 0), COALESCE(channel_id, 0),
+	                 uses, max_uses, created_at, description, used_by
 	          FROM tokens ORDER BY id`
 	rows, err := s.db.QueryContext(ctx, q)
 	if err != nil {
@@ -68,7 +86,8 @@ func (s *Store) ListTokens(ctx context.Context) ([]Token, error) {
 	var out []Token
 	for rows.Next() {
 		var t Token
-		if err := rows.Scan(&t.ID, &t.Key, &t.Type, &t.GroupID, &t.Uses, &t.MaxUses, &t.CreatedAt); err != nil {
+		if err := rows.Scan(&t.ID, &t.Key, &t.Type, &t.GroupID, &t.ChannelID,
+			&t.Uses, &t.MaxUses, &t.CreatedAt, &t.Description, &t.UsedBy); err != nil {
 			return nil, fmt.Errorf("scanning token: %w", err)
 		}
 		out = append(out, t)
@@ -119,7 +138,13 @@ func (s *Store) UseToken(ctx context.Context, key string, userID int64) (int64, 
 		return 0, ErrTokenExhausted
 	}
 
-	if _, err := tx.ExecContext(ctx, `UPDATE tokens SET uses = uses + 1 WHERE id = $1`, tokenID); err != nil {
+	// used_by records the redeemer for the token manager (174). It is resolved
+	// from the users row here rather than passed in, so the caller cannot
+	// claim a redemption under someone else's unique ID.
+	const upd = `UPDATE tokens SET uses = uses + 1,
+	                              used_by = COALESCE((SELECT unique_id FROM users WHERE id = $2), '')
+	            WHERE id = $1`
+	if _, err := tx.ExecContext(ctx, upd, tokenID, userID); err != nil {
 		return 0, fmt.Errorf("consuming token: %w", err)
 	}
 

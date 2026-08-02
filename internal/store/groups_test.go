@@ -326,3 +326,49 @@ func TestGroupMembersDB(t *testing.T) {
 		t.Fatalf("members = %+v", members)
 	}
 }
+
+// TestGroupCosmeticsDB covers the colour/hoist/sort setter (178/179): a nil
+// field must leave the stored column alone, so a dialog can send only what the
+// operator touched.
+func TestGroupCosmeticsDB(t *testing.T) {
+	s := testDBStore(t)
+	ctx := context.Background()
+	suffix := fmt.Sprint(time.Now().UnixNano())
+
+	gid, err := s.CreateGroup(ctx, "server", "cosmetics_"+suffix, 1)
+	if err != nil {
+		t.Fatalf("CreateGroup: %v", err)
+	}
+	t.Cleanup(func() { _ = s.DeleteGroup(ctx, "server", gid, true) })
+
+	color, hoist, sortID := "#a1b2c3", true, 7
+	if err := s.SetGroupCosmetics(ctx, gid, &color, &hoist, &sortID); err != nil {
+		t.Fatalf("SetGroupCosmetics: %v", err)
+	}
+	g, err := s.GetGroup(ctx, "server", gid)
+	if err != nil || g == nil {
+		t.Fatalf("GetGroup: %v %+v", err, g)
+	}
+	if g.Color != color || !g.Hoist || g.SortID != 7 {
+		t.Fatalf("group after full edit = %+v", g)
+	}
+
+	// Partial edit: only the hoist changes.
+	off := false
+	if err := s.SetGroupCosmetics(ctx, gid, nil, &off, nil); err != nil {
+		t.Fatalf("SetGroupCosmetics partial: %v", err)
+	}
+	if g, err = s.GetGroup(ctx, "server", gid); err != nil || g == nil {
+		t.Fatalf("GetGroup: %v %+v", err, g)
+	}
+	if g.Color != color || g.Hoist || g.SortID != 7 {
+		t.Fatalf("group after partial edit = %+v", g)
+	}
+
+	if err := s.SetGroupCosmetics(ctx, gid, nil, nil, nil); err == nil {
+		t.Fatalf("SetGroupCosmetics with no fields returned nil error")
+	}
+	if err := s.SetGroupCosmetics(ctx, 0, &color, nil, nil); err == nil {
+		t.Fatalf("SetGroupCosmetics on a missing group returned nil error")
+	}
+}

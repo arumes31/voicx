@@ -74,6 +74,25 @@ func (s *Store) DeleteComplaint(ctx context.Context, id int64) error {
 	return nil
 }
 
+// DeleteComplaintsAgainst removes the complaints filed against target. An
+// empty reporter clears every complaint against that target; otherwise only
+// the ones that reporter filed. It returns the number of rows removed so the
+// caller can distinguish "cleared" from "nothing matched" (173).
+func (s *Store) DeleteComplaintsAgainst(ctx context.Context, target, reporter string) (int64, error) {
+	q := `DELETE FROM complaints WHERE target = $1`
+	args := []any{target}
+	if reporter != "" {
+		q += ` AND reporter = $2`
+		args = append(args, reporter)
+	}
+	res, err := s.db.ExecContext(ctx, q, args...)
+	if err != nil {
+		return 0, fmt.Errorf("deleting complaints: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
 // DeleteAllComplaints removes all complaints.
 func (s *Store) DeleteAllComplaints(ctx context.Context) error {
 	const q = `DELETE FROM complaints`

@@ -402,7 +402,7 @@ func TestModerationPipelineOrderUnchanged(t *testing.T) {
 	if env.chat.messageCount() != 0 {
 		t.Fatalf("a filtered message reached the store")
 	}
-	if _, seen := env.srv.chatSpam.recent["user-uid"]; seen {
+	if len(env.srv.chatSpam.recentFor("user-uid")) > 0 {
 		t.Fatal("the spam tracker ran before the word filter")
 	}
 
@@ -418,7 +418,7 @@ func TestModerationPipelineOrderUnchanged(t *testing.T) {
 	if len(chat.Mentions) != 1 || chat.Mentions[0] != "admin-uid" {
 		t.Fatalf("mentions = %v, want [admin-uid] parsed from the decrypted body", chat.Mentions)
 	}
-	entries := env.srv.chatSpam.recent["user-uid"]
+	entries := env.srv.chatSpam.recentFor("user-uid")
 	if len(entries) != 1 || entries[0].sum != bodyDigest(stripAttachmentRefs(clean)) {
 		t.Fatalf("spam tracker recorded %d entries, want one digest of the stripped body", len(entries))
 	}

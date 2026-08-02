@@ -112,13 +112,19 @@ type RecordingBackend interface {
 // and minting download links. The file-transfer port itself trusts only the
 // token; permission checks happen here, at issue time.
 type FileTransferBackend interface {
-	InitUpload(ctx context.Context, channelID int64, folder, name string, size int64, uploader string) (transferID, token string, err error)
+	// InitUpload takes the caller's personal upload ceiling in MiB (266,
+	// 0 = unlimited); the channel ceiling (265) is server configuration and
+	// the backend already knows it.
+	InitUpload(ctx context.Context, channelID int64, folder, name string, size int64, uploader string, uploaderQuotaMB int64) (transferID, token string, err error)
 	InitDownload(ctx context.Context, channelID int64, folder, name string) (transferID, token string, err error)
 	ListFiles(ctx context.Context, channelID int64, folder string) ([]store.FileRecord, error)
 	ListFileFolders(ctx context.Context, channelID int64) ([]string, error)
 	ListFileVersions(ctx context.Context, channelID int64, folder, name string) ([]store.FileRecord, error)
 	DeleteFile(ctx context.Context, channelID int64, folder, name string) error
 	RenameFile(ctx context.Context, channelID int64, folder, name, newFolder, newName string) error
+	// MoveFile relocates a file, possibly into another channel (262). The
+	// caller checks permissions on the source AND the destination.
+	MoveFile(ctx context.Context, channelID int64, folder, name string, newChannelID int64, newFolder, newName string) error
 	ChannelQuota(ctx context.Context, channelID int64) (used, quota int64, err error)
 	CreateLink(ctx context.Context, channelID int64, folder, name string) (token string, expires time.Time, err error)
 	Port() int
@@ -128,9 +134,13 @@ type FileTransferBackend interface {
 	Fingerprint() string
 }
 
-// TokenBackend is the subset of the store needed to redeem privilege tokens.
+// TokenBackend is the subset of the store needed to redeem and administer
+// privilege tokens (174).
 type TokenBackend interface {
 	UseToken(ctx context.Context, key string, userID int64) (groupID int64, err error)
+	ListTokens(ctx context.Context) ([]store.Token, error)
+	CreateTokenWithMeta(ctx context.Context, tokenType int, groupID, channelID int64, description string, maxUses int) (string, error)
+	DeleteToken(ctx context.Context, key string) error
 }
 
 // GroupStore is the subset of the store needed for wave-6a group and
@@ -154,6 +164,9 @@ type GroupStore interface {
 	UserUniqueID(ctx context.Context, userID int64) (string, error)
 	// SetGroupIcon marks a server group's icon file name.
 	SetGroupIcon(ctx context.Context, groupID int64, icon string) error
+	// SetGroupCosmetics writes a server group's colour/hoist/sort (178/179);
+	// a nil field is left unchanged.
+	SetGroupCosmetics(ctx context.Context, groupID int64, color *string, hoist *bool, sortID *int) error
 	SetPermission(ctx context.Context, tier store.PermTier, target store.PermTarget, key string, value, grant int, skip, negate bool) error
 	UnsetPermission(ctx context.Context, tier store.PermTier, target store.PermTarget, key string) error
 	// ListPermissions is the editor read path (wave 6b).
@@ -172,9 +185,12 @@ type BanAdminStore interface {
 	DeleteBan(ctx context.Context, id int64) error
 }
 
-// ComplaintBackend is the subset of the store needed to file complaints.
+// ComplaintBackend is the subset of the store needed to file and review
+// complaints (173).
 type ComplaintBackend interface {
 	AddComplaint(ctx context.Context, reporter, target, reason string) error
+	ListComplaints(ctx context.Context) ([]store.Complaint, error)
+	DeleteComplaintsAgainst(ctx context.Context, target, reporter string) (int64, error)
 }
 
 // ChatStore is the subset of the store needed for server-side chat

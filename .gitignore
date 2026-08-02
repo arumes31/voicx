@@ -29,6 +29,10 @@ go.work.sum
 # Docs
 BACKLOG.md
 GOAL.md
+*DESIGN.md
+DESIGN.md
+DESIGN_*.md
+*DESIGN*.md
 
 # Graphify
 graphify-out/

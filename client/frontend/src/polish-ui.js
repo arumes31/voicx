@@ -173,6 +173,28 @@ function initIdleVideoPause() {
 // Screen reader (343)
 // ---------------------------------------------------------------------------
 
+// trapFocus keeps Tab inside a modal (298). Dialogs are appended to <body>
+// over the app rather than replacing it, so without a trap the second Tab
+// walks out of the dialog into the tree and chat behind it.
+function trapFocus(overlay) {
+    const focusables = () => [...overlay.querySelectorAll(
+        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')]
+        .filter((el) => !el.disabled && el.offsetParent !== null);
+    // Only claim focus when the dialog did not already place it itself.
+    if (!overlay.contains(document.activeElement)) focusables()[0]?.focus();
+    overlay.addEventListener("keydown", (e) => {
+        if (e.key !== "Tab") return;
+        const items = focusables();
+        if (items.length === 0) return;
+        e.preventDefault();
+        const idx = items.indexOf(document.activeElement);
+        const next = e.shiftKey
+            ? (idx <= 0 ? items.length - 1 : idx - 1)
+            : (idx < 0 || idx === items.length - 1 ? 0 : idx + 1);
+        items[next].focus();
+    });
+}
+
 function initA11y() {
     const tree = document.getElementById("channel-tree");
     tree.setAttribute("role", "tree");
@@ -190,6 +212,7 @@ function initA11y() {
                         dlg.setAttribute("role", "dialog");
                         dlg.setAttribute("aria-modal", "true");
                     }
+                    trapFocus(node); // (298)
                 }
             }
         }

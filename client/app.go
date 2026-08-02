@@ -70,6 +70,57 @@ func (a *App) startup(ctx context.Context) {
 	if a.settings.AlwaysOnTop {
 		wailsRuntime.WindowSetAlwaysOnTop(ctx, true)
 	}
+	// recover is per-goroutine (331).
+	go guardCrash("window-watch", a.windowWatch)
+}
+
+// windowWatch restores the persisted opacity once the native window exists
+// (292) and polls the minimised state (288). Wails v2 emits no minimize
+// event, but WindowIsMinimised is a live query, so acting on the rising edge
+// is what puts a minimised window in the tray instead of the taskbar.
+func (a *App) windowWatch() {
+	tick := time.NewTicker(400 * time.Millisecond)
+	defer tick.Stop()
+	applied := false
+	wasMin := false
+	for range tick.C {
+		if a.ctx == nil {
+			continue
+		}
+		// (292) the layered-window call needs an HWND, which only exists once
+		// the window is up; the first success ends the retry.
+		if !applied && setWindowOpacity(a.settings.WindowOpacity) == nil {
+			applied = true
+		}
+		min := wailsRuntime.WindowIsMinimised(a.ctx)
+		if min && !wasMin && a.settings.MinimizeToTray {
+			// unminimise before hiding: a window hidden while minimised comes
+			// back minimised when the tray shows it again.
+			wailsRuntime.WindowUnminimise(a.ctx)
+			wailsRuntime.WindowHide(a.ctx)
+			trayMarkHidden()
+			min = false
+		}
+		wasMin = min
+	}
+}
+
+// SetWindowOpacity sets the window transparency in percent (292) and persists
+// it. The value is clamped so the window can never be made invisible and
+// therefore unclickable.
+func (a *App) SetWindowOpacity(pct int) string {
+	if pct < 20 {
+		pct = 20
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	a.settings.WindowOpacity = pct
+	_ = a.save()
+	if err := setWindowOpacity(pct); err != nil {
+		return err.Error()
+	}
+	return ""
 }
 
 // shutdown is called when the app closes.
@@ -185,6 +236,11 @@ func (a *App) MOTD() string {
 // ClientID returns the server-assigned client ID of the current connection
 // ("" when not connected).
 func (a *App) ClientID() string {
+	// the tab-switch identity refresh (281) can reach this while no manager is
+	// stored, and clientIDSnapshot takes its mutex before reading.
+	if a.cmLoad() == nil {
+		return ""
+	}
 	return a.cmLoad().clientIDSnapshot()
 }
 
@@ -299,6 +355,12 @@ func (a *App) SendICECandidate(candidate, sdpMid string, sdpMLineIndex uint16) {
 
 // SetScreenShare declares screen-share state to the channel.
 func (a *App) SetScreenShare(active bool) string {
+	// the voice teardown declares "not sharing" while disconnecting, and a
+	// tab switch stores a nil manager: write takes its mutex before looking
+	// at the connection, so a nil manager panics rather than erroring.
+	if a.cmLoad() == nil {
+		return "not connected"
+	}
 	if err := a.cmLoad().write(netproto.MsgScreenShare, netproto.ScreenShare{Active: active}); err != nil {
 		return err.Error()
 	}
@@ -308,6 +370,9 @@ func (a *App) SetScreenShare(active bool) string {
 // SetVideoQuality requests a simulcast layer for the video this client
 // receives: "high", "mid", or "low" (server maps to RID f/h/q).
 func (a *App) SetVideoQuality(quality string) string {
+	if a.cmLoad() == nil {
+		return "not connected"
+	}
 	if err := a.cmLoad().write(netproto.MsgVideoQuality, netproto.VideoQuality{Quality: quality}); err != nil {
 		return err.Error()
 	}

@@ -6,10 +6,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"voicx/internal/auth"
 	"voicx/internal/netproto"
@@ -25,6 +27,8 @@ type fakeTokens struct {
 	used      []string
 	grants    map[string]int64 // token -> groupID (0 = admin grant)
 	exhausted map[string]bool
+	rows      []store.Token
+	nextID    int64
 }
 
 func (f *fakeTokens) UseToken(_ context.Context, key string, _ int64) (int64, error) {
@@ -41,30 +45,96 @@ func (f *fakeTokens) UseToken(_ context.Context, key string, _ int64) (int64, er
 	return g, nil
 }
 
+func (f *fakeTokens) ListTokens(context.Context) ([]store.Token, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]store.Token(nil), f.rows...), nil
+}
+
+func (f *fakeTokens) CreateTokenWithMeta(_ context.Context, tokenType int, groupID, channelID int64, description string, maxUses int) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextID++
+	key := fmt.Sprintf("generated-%d", f.nextID)
+	f.rows = append(f.rows, store.Token{
+		ID: f.nextID, Key: key, Type: tokenType, GroupID: groupID, ChannelID: channelID,
+		MaxUses: maxUses, CreatedAt: time.Unix(1700000000, 0), Description: description,
+	})
+	return key, nil
+}
+
+func (f *fakeTokens) DeleteToken(_ context.Context, key string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, t := range f.rows {
+		if t.Key == key {
+			f.rows = append(f.rows[:i], f.rows[i+1:]...)
+			return nil
+		}
+	}
+	return store.ErrTokenNotFound
+}
+
 // fakeComplaints implements ComplaintBackend, enforcing the open-complaint
 // limit per reporter like the store does.
 type fakeComplaints struct {
 	mu     sync.Mutex
-	byUser map[string][]string // reporter -> reasons
+	rows   []store.Complaint
+	nextID int64
 }
 
 func (f *fakeComplaints) AddComplaint(_ context.Context, reporter, target, reason string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.byUser == nil {
-		f.byUser = make(map[string][]string)
+	open := 0
+	for _, c := range f.rows {
+		if c.Reporter == reporter {
+			open++
+		}
 	}
-	if len(f.byUser[reporter]) >= store.MaxOpenComplaints {
+	if open >= store.MaxOpenComplaints {
 		return store.ErrComplaintLimit
 	}
-	f.byUser[reporter] = append(f.byUser[reporter], target+":"+reason)
+	f.nextID++
+	f.rows = append(f.rows, store.Complaint{
+		ID: f.nextID, Reporter: reporter, Target: target, Reason: reason,
+		CreatedAt: time.Unix(1700000000, 0),
+	})
 	return nil
+}
+
+func (f *fakeComplaints) ListComplaints(context.Context) ([]store.Complaint, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]store.Complaint(nil), f.rows...), nil
+}
+
+func (f *fakeComplaints) DeleteComplaintsAgainst(_ context.Context, target, reporter string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	kept := f.rows[:0:0]
+	var n int64
+	for _, c := range f.rows {
+		if c.Target == target && (reporter == "" || c.Reporter == reporter) {
+			n++
+			continue
+		}
+		kept = append(kept, c)
+	}
+	f.rows = kept
+	return n, nil
 }
 
 func (f *fakeComplaints) count(reporter string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return len(f.byUser[reporter])
+	n := 0
+	for _, c := range f.rows {
+		if c.Reporter == reporter {
+			n++
+		}
+	}
+	return n
 }
 
 // tinyPNG is the smallest byte sequence http.DetectContentType recognizes as
@@ -910,5 +980,305 @@ func TestEWMARTT(t *testing.T) {
 	want := prev*7/8 + 40/8
 	if got != want {
 		t.Fatalf("ewma = %d, want %d", got, want)
+	}
+}
+
+// --- complaint review (173) --------------------------------------------------
+
+// TestComplaintList verifies an admin sees every complaint with nicknames
+// resolved from the users table.
+func TestComplaintList(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+
+	userConn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer userConn.Close()
+	send(t, userConn, netproto.MsgComplaint, netproto.Complaint{TargetUniqueID: "admin-uid", Reason: "spam"})
+
+	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer adminConn.Close()
+	send(t, adminConn, netproto.MsgComplaintList, netproto.ComplaintList{})
+
+	f := readOfType(t, adminConn, netproto.MsgComplaints)
+	var resp netproto.Complaints
+	if err := netproto.Decode(f, &resp); err != nil {
+		t.Fatalf("decode complaints: %v", err)
+	}
+	if len(resp.Entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(resp.Entries))
+	}
+	e := resp.Entries[0]
+	if e.TargetUniqueID != "admin-uid" || e.FromUniqueID != "user-uid" || e.Reason != "spam" {
+		t.Fatalf("entry = %+v", e)
+	}
+	if e.TargetNickname != "admin" || e.FromNickname != "user" {
+		t.Fatalf("nicknames unresolved: %+v", e)
+	}
+	if e.CreatedAt == 0 {
+		t.Fatal("created_at not set")
+	}
+}
+
+// TestComplaintClear verifies clearing one reporter's complaint, then all of
+// them, and that each clear is audited and returns the refreshed list.
+func TestComplaintClear(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+
+	userConn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer userConn.Close()
+	send(t, userConn, netproto.MsgComplaint, netproto.Complaint{TargetUniqueID: "admin-uid", Reason: "spam"})
+
+	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer adminConn.Close()
+	send(t, adminConn, netproto.MsgComplaint, netproto.Complaint{TargetUniqueID: "user-uid", Reason: "flood"})
+
+	// Targeted clear: only the complaint from user-uid against admin-uid goes.
+	send(t, adminConn, netproto.MsgComplaintClear, netproto.ComplaintClear{
+		TargetUniqueID: "admin-uid", FromUniqueID: "user-uid",
+	})
+	f := readOfType(t, adminConn, netproto.MsgComplaints)
+	var resp netproto.Complaints
+	if err := netproto.Decode(f, &resp); err != nil {
+		t.Fatalf("decode complaints: %v", err)
+	}
+	if len(resp.Entries) != 1 || resp.Entries[0].TargetUniqueID != "user-uid" {
+		t.Fatalf("after targeted clear entries = %+v", resp.Entries)
+	}
+
+	// Blanket clear against the remaining target.
+	send(t, adminConn, netproto.MsgComplaintClear, netproto.ComplaintClear{TargetUniqueID: "user-uid"})
+	f = readOfType(t, adminConn, netproto.MsgComplaints)
+	if err := netproto.Decode(f, &resp); err != nil {
+		t.Fatalf("decode complaints: %v", err)
+	}
+	if len(resp.Entries) != 0 {
+		t.Fatalf("after blanket clear entries = %+v", resp.Entries)
+	}
+
+	// Clearing nothing is a not-found, not a silent success.
+	send(t, adminConn, netproto.MsgComplaintClear, netproto.ComplaintClear{TargetUniqueID: "user-uid"})
+	if e := readError(t, adminConn); e.Code != errCodeNotFound {
+		t.Fatalf("empty clear error = %d, want %d", e.Code, errCodeNotFound)
+	}
+
+	var clears int
+	for _, a := range env.groups.auditActions() {
+		if a == "complaint_clear" {
+			clears++
+		}
+	}
+	if clears != 2 {
+		t.Fatalf("audited clears = %d, want 2", clears)
+	}
+}
+
+// TestComplaintReviewDenied verifies a user without the ban gate can neither
+// read nor clear complaints.
+func TestComplaintReviewDenied(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+
+	send(t, conn, netproto.MsgComplaintList, netproto.ComplaintList{})
+	if e := readError(t, conn); e.Code != errCodePermissionDenied {
+		t.Fatalf("list error = %d, want %d", e.Code, errCodePermissionDenied)
+	}
+	send(t, conn, netproto.MsgComplaintClear, netproto.ComplaintClear{TargetUniqueID: "admin-uid"})
+	if e := readError(t, conn); e.Code != errCodePermissionDenied {
+		t.Fatalf("clear error = %d, want %d", e.Code, errCodePermissionDenied)
+	}
+}
+
+// TestComplaintReviewBanPermission verifies b_client_ban, not admin status,
+// is enough to review complaints.
+func TestComplaintReviewBanPermission(t *testing.T) {
+	tp := tieredWith(boolPerm(permissions.PermissionKeyClientBan, true))
+	env := startTestEnv(t, &tp)
+	defer env.stop()
+
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+	send(t, conn, netproto.MsgComplaintList, netproto.ComplaintList{})
+
+	f := readOfType(t, conn, netproto.MsgComplaints)
+	var resp netproto.Complaints
+	if err := netproto.Decode(f, &resp); err != nil {
+		t.Fatalf("decode complaints: %v", err)
+	}
+	if len(resp.Entries) != 0 {
+		t.Fatalf("entries = %+v", resp.Entries)
+	}
+}
+
+// --- token management (174) --------------------------------------------------
+
+// TestTokenManagement verifies the list/add/delete round-trip: the server
+// mints the key, resolves the group name, audits, and replies with the
+// refreshed list every time.
+func TestTokenManagement(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+
+	gid, err := env.groups.CreateGroup(context.Background(), "server", "Moderator", 0)
+	if err != nil {
+		t.Fatalf("CreateGroup: %v", err)
+	}
+
+	conn, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer conn.Close()
+
+	send(t, conn, netproto.MsgTokenList, netproto.TokenList{})
+	f := readOfType(t, conn, netproto.MsgTokens)
+	var resp netproto.Tokens
+	if err := netproto.Decode(f, &resp); err != nil {
+		t.Fatalf("decode tokens: %v", err)
+	}
+	if len(resp.Entries) != 0 {
+		t.Fatalf("initial entries = %+v", resp.Entries)
+	}
+
+	send(t, conn, netproto.MsgTokenAdd, netproto.TokenAdd{
+		GroupID: gid, ChannelID: 7, Description: "for the new mod",
+	})
+	f = readOfType(t, conn, netproto.MsgTokens)
+	if err := netproto.Decode(f, &resp); err != nil {
+		t.Fatalf("decode tokens: %v", err)
+	}
+	if len(resp.Entries) != 1 {
+		t.Fatalf("after add entries = %+v", resp.Entries)
+	}
+	e := resp.Entries[0]
+	if e.Token == "" {
+		t.Fatal("server did not generate a token key")
+	}
+	if e.GroupID != gid || e.GroupName != "Moderator" {
+		t.Fatalf("group not resolved: %+v", e)
+	}
+	if e.ChannelID != 7 || e.Description != "for the new mod" {
+		t.Fatalf("metadata lost: %+v", e)
+	}
+
+	send(t, conn, netproto.MsgTokenDelete, netproto.TokenDelete{Token: e.Token})
+	f = readOfType(t, conn, netproto.MsgTokens)
+	if err := netproto.Decode(f, &resp); err != nil {
+		t.Fatalf("decode tokens: %v", err)
+	}
+	if len(resp.Entries) != 0 {
+		t.Fatalf("after delete entries = %+v", resp.Entries)
+	}
+
+	send(t, conn, netproto.MsgTokenDelete, netproto.TokenDelete{Token: "nope"})
+	if ferr := readError(t, conn); ferr.Code != errCodeNotFound {
+		t.Fatalf("unknown token delete error = %d, want %d", ferr.Code, errCodeNotFound)
+	}
+
+	actions := env.groups.auditActions()
+	var add, del int
+	for _, a := range actions {
+		switch a {
+		case "token_add":
+			add++
+		case "token_delete":
+			del++
+		}
+	}
+	if add != 1 || del != 1 {
+		t.Fatalf("audit actions = %v", actions)
+	}
+}
+
+// TestTokenManagementDenied verifies each operation is gated by its own
+// b_virtualserver_token_* key.
+func TestTokenManagementDenied(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+
+	for _, tc := range []struct {
+		name string
+		mt   netproto.MessageType
+		msg  any
+	}{
+		{"list", netproto.MsgTokenList, netproto.TokenList{}},
+		{"add", netproto.MsgTokenAdd, netproto.TokenAdd{GroupID: 3}},
+		{"delete", netproto.MsgTokenDelete, netproto.TokenDelete{Token: "x"}},
+	} {
+		send(t, conn, tc.mt, tc.msg)
+		if e := readError(t, conn); e.Code != errCodePermissionDenied {
+			t.Fatalf("%s error = %d, want %d", tc.name, e.Code, errCodePermissionDenied)
+		}
+	}
+}
+
+// TestTokenAddGranted verifies b_virtualserver_token_add alone lets a
+// non-admin mint a group token, but not a group-less admin token.
+func TestTokenAddGranted(t *testing.T) {
+	tp := tieredWith(boolPerm(permissions.PermissionKeyVirtualserverTokenAdd, true))
+	env := startTestEnv(t, &tp)
+	defer env.stop()
+
+	gid, err := env.groups.CreateGroup(context.Background(), "server", "Moderator", 0)
+	if err != nil {
+		t.Fatalf("CreateGroup: %v", err)
+	}
+
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+
+	send(t, conn, netproto.MsgTokenAdd, netproto.TokenAdd{GroupID: gid})
+	f := readOfType(t, conn, netproto.MsgTokens)
+	var resp netproto.Tokens
+	if err := netproto.Decode(f, &resp); err != nil {
+		t.Fatalf("decode tokens: %v", err)
+	}
+	if len(resp.Entries) != 1 {
+		t.Fatalf("entries = %+v", resp.Entries)
+	}
+
+	// An admin-granting (group-less) token needs more than the add key.
+	send(t, conn, netproto.MsgTokenAdd, netproto.TokenAdd{})
+	if e := readError(t, conn); e.Code != errCodePermissionDenied {
+		t.Fatalf("admin token error = %d, want %d", e.Code, errCodePermissionDenied)
+	}
+
+	// A token for a group that does not exist is refused.
+	send(t, conn, netproto.MsgTokenAdd, netproto.TokenAdd{GroupID: 4242})
+	if e := readError(t, conn); e.Code != errCodeNotFound {
+		t.Fatalf("unknown group error = %d, want %d", e.Code, errCodeNotFound)
+	}
+}
+
+// TestTokenUseGuestRejected verifies a guest cannot redeem a token: the grant
+// has no users row to land on.
+func TestTokenUseGuestRejected(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	env.tokens.grants = map[string]int64{"tok-abc": 5}
+
+	conn := dialRetry(t, env.addr)
+	defer conn.Close()
+	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Anonymous: true, Nickname: "guest"})
+	f := readOfType(t, conn, netproto.MsgAuthResponse)
+	var ar netproto.AuthResponse
+	if err := netproto.Decode(f, &ar); err != nil {
+		t.Fatalf("decode auth: %v", err)
+	}
+	if !ar.OK {
+		t.Fatalf("guest auth failed: %s", ar.Reason)
+	}
+
+	send(t, conn, netproto.MsgTokenUse, netproto.TokenUse{Token: "tok-abc"})
+	if e := readError(t, conn); e.Code != errCodePermissionDenied {
+		t.Fatalf("guest redeem error = %d, want %d", e.Code, errCodePermissionDenied)
+	}
+	env.tokens.mu.Lock()
+	defer env.tokens.mu.Unlock()
+	if len(env.tokens.used) != 0 {
+		t.Fatalf("guest redemption reached the store: %v", env.tokens.used)
 	}
 }

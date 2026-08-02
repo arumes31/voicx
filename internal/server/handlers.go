@@ -65,6 +65,13 @@ type channelUpdatedEvent struct {
 	OpusStereo      bool   `json:"opus_stereo"`
 	SlowModeSeconds int    `json:"slow_mode_seconds"`
 	Description     string `json:"description"`
+	// Join power (160), sort index (163), parent (168) and the inheritance
+	// toggle (157) ride the same event so a client that edited any of them
+	// sees the result without refetching the tree.
+	NeededJoinPower    int   `json:"needed_join_power"`
+	OrderIndex         int   `json:"order_index"`
+	ParentID           int64 `json:"parent_id"`
+	InheritPermissions bool  `json:"inherit_permissions"`
 }
 
 // kickEvent is the payload of kicked events.
@@ -400,6 +407,8 @@ func (s *TCPServer) finishAuth(ctx context.Context, client *Client, id authIdent
 			Nickname:    id.nickname,
 			ConnectedAt: time.Now(),
 			Conn:        client.Conn,
+			// (180) resolved once at auth so the badge rides every snapshot.
+			IsBot: s.ClientIsBot(ctx, client),
 		})
 		// (133) the key must be live before the snapshot, so anything that
 		// reads it during this handshake sees it.
@@ -685,17 +694,31 @@ func (s *TCPServer) handleChannelEdit(ctx context.Context, client *Client, f *ne
 	if !pc.granted(permissions.PermissionKeyChannelModify) {
 		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyChannelModify))
 	}
+	// Same power cap as channel creation (160): an editor may not raise the
+	// needed join power above their own join power, or they could lock
+	// themselves and their peers out of a channel they still administer.
+	if msg.NeededJoinPower != nil && *msg.NeededJoinPower > 0 && !pc.admin &&
+		pc.power(permissions.PermissionKeyChannelJoinPower) < *msg.NeededJoinPower {
+		return s.sendError(client, errCodePermissionDenied, "cannot set needed join power above your own join power")
+	}
 
 	if err := s.deps.Channels.UpdateChannel(ctx, msg.ChannelID, channels.ChannelUpdate{
-		Topic:           msg.Topic,
-		MaxClients:      msg.MaxClients,
-		OpusBitrate:     msg.OpusBitrate,
-		OpusFEC:         msg.OpusFEC,
-		OpusDTX:         msg.OpusDTX,
-		OpusStereo:      msg.OpusStereo,
-		SlowModeSeconds: msg.SlowModeSeconds,
-		Description:     msg.Description,
+		Topic:              msg.Topic,
+		MaxClients:         msg.MaxClients,
+		OpusBitrate:        msg.OpusBitrate,
+		OpusFEC:            msg.OpusFEC,
+		OpusDTX:            msg.OpusDTX,
+		OpusStereo:         msg.OpusStereo,
+		SlowModeSeconds:    msg.SlowModeSeconds,
+		Description:        msg.Description,
+		NeededJoinPower:    msg.NeededJoinPower,
+		OrderIndex:         msg.OrderIndex,
+		ParentID:           msg.ParentID,
+		InheritPermissions: msg.InheritPermissions,
 	}); err != nil {
+		if errors.Is(err, channels.ErrInvalidMove) {
+			return s.sendError(client, errCodeMalformed, err.Error())
+		}
 		if errors.Is(err, channels.ErrChannelNotFound) {
 			return s.sendError(client, errCodeNotFound, "channel not found")
 		}
@@ -707,18 +730,15 @@ func (s *TCPServer) handleChannelEdit(ctx context.Context, client *Client, f *ne
 		return s.sendError(client, errCodeMalformed, "channel edit failed: "+err.Error())
 	}
 
+	// (157) re-parenting or flipping inheritance changes the resolved channel
+	// tier for every user in the affected subtree, and the loader caches per
+	// (user, channel) — nothing here can enumerate those pairs, so drop all.
+	if s.deps.Perms != nil && (msg.InheritPermissions != nil || msg.ParentID != nil) {
+		s.deps.Perms.InvalidateAll()
+	}
+
 	if ch, ok := s.deps.State.GetChannel(msg.ChannelID); ok {
-		s.broadcastEvent(eventChannelUpdated, channelUpdatedEvent{
-			ChannelID:       ch.ChannelID,
-			Topic:           ch.Topic,
-			MaxClients:      ch.MaxClients,
-			OpusBitrate:     ch.OpusBitrate,
-			OpusFEC:         ch.OpusFEC,
-			OpusDTX:         ch.OpusDTX,
-			OpusStereo:      ch.OpusStereo,
-			SlowModeSeconds: ch.SlowModeSeconds,
-			Description:     ch.Description,
-		})
+		s.broadcastEvent(eventChannelUpdated, channelUpdatedEventFor(ch))
 	}
 	topic := ""
 	if msg.Topic != nil {
@@ -738,17 +758,27 @@ func (s *TCPServer) BroadcastChannelUpdated(channelID int64) {
 	if !ok {
 		return
 	}
-	s.broadcastEvent(eventChannelUpdated, channelUpdatedEvent{
-		ChannelID:       ch.ChannelID,
-		Topic:           ch.Topic,
-		MaxClients:      ch.MaxClients,
-		OpusBitrate:     ch.OpusBitrate,
-		OpusFEC:         ch.OpusFEC,
-		OpusDTX:         ch.OpusDTX,
-		OpusStereo:      ch.OpusStereo,
-		SlowModeSeconds: ch.SlowModeSeconds,
-		Description:     ch.Description,
-	})
+	s.broadcastEvent(eventChannelUpdated, channelUpdatedEventFor(ch))
+}
+
+// channelUpdatedEventFor snapshots a channel's editable fields for the
+// channel_updated event.
+func channelUpdatedEventFor(ch *state.Channel) channelUpdatedEvent {
+	return channelUpdatedEvent{
+		ChannelID:          ch.ChannelID,
+		Topic:              ch.Topic,
+		MaxClients:         ch.MaxClients,
+		OpusBitrate:        ch.OpusBitrate,
+		OpusFEC:            ch.OpusFEC,
+		OpusDTX:            ch.OpusDTX,
+		OpusStereo:         ch.OpusStereo,
+		SlowModeSeconds:    ch.SlowModeSeconds,
+		Description:        ch.Description,
+		NeededJoinPower:    ch.NeededJoinPower,
+		OrderIndex:         ch.OrderIndex,
+		ParentID:           ch.ParentID,
+		InheritPermissions: ch.InheritPermissions,
+	}
 }
 
 // handleJoinChannel moves the calling client into the target channel. Joining
@@ -773,7 +803,10 @@ func (s *TCPServer) handleJoinChannel(ctx context.Context, client *Client, f *ne
 	if err != nil {
 		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
 	}
-	if !pc.joinAllowed(ch.NeededJoinPower) {
+	// Inheriting sub-channels are gated by the strongest needed power on their
+	// chain (157/168), so a child cannot be used as a back door into a gated
+	// parent's subtree.
+	if !pc.joinAllowed(s.deps.State.EffectiveJoinPower(ch.ChannelID)) {
 		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyChannelJoinPower))
 	}
 	if ch.PasswordHash != "" && !pc.granted(permissions.PermissionKeyChannelJoinIgnorePassword) {
@@ -927,7 +960,10 @@ func (s *TCPServer) handleChatSend(ctx context.Context, client *Client, f *netpr
 				return s.sendError(client, errCodePermissionDenied, "not a member of this channel")
 			}
 		}
-		if msg.Enc && s.chatKeys != nil {
+		if msg.Enc {
+			if s.chatKeys == nil {
+				return s.sendError(client, errCodeUnavailable, "chat key manager unavailable")
+			}
 			// Non-minting lookup: an unknown scope is "rejoin", never a mint.
 			currentID, _, err := s.chatKeys.current(ctx, channelID)
 			if errors.Is(err, ErrNoScopeKey) {
@@ -1254,13 +1290,15 @@ func eventEnvelope(eventType string, payload any) ([]byte, error) {
 	return json.Marshal(envelope)
 }
 
-// channelListResponse builds a ChannelList reply from the current state.
+// channelListResponse builds a ChannelList reply from the current state. The
+// list carries no order field, so the row order IS the order (163): it must be
+// the same total order the snapshot tree uses.
 func (s *TCPServer) channelListResponse() netproto.ChannelList {
 	var list netproto.ChannelList
 	if s.deps == nil || s.deps.State == nil {
 		return list
 	}
-	for _, ch := range s.deps.State.ChannelTree() {
+	for _, ch := range s.deps.State.ChannelTreeOrdered() {
 		list.Channels = append(list.Channels, netproto.Channel{
 			ID:      strconv.FormatInt(ch.ChannelID, 10),
 			Name:    ch.Name,

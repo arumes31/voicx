@@ -151,6 +151,10 @@ func TestNoPlaintextAnywhereInServerState(t *testing.T) {
 	send(t, alice, netproto.MsgChatPin, netproto.ChatPin{ChannelID: 1, MessageID: chat.ID, Pinned: true})
 	pinned := readEventOfType(t, alice, eventChatPinned)
 
+	alice.Close()
+	bob.Close()
+	env.stop()
+
 	for name, v := range map[string]any{
 		"chat store":        env.chat,
 		"spam tracker":      env.srv.chatSpam,

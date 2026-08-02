@@ -39,6 +39,10 @@ type Broadcaster struct {
 	closed bool
 	// clients maps clientID -> outbound channel.
 	clients map[string]chan []byte
+	// tap observes every server-wide event (231/232). It is the single seam
+	// between the per-connection fan-out and the event bus, so a bot sees
+	// exactly what connected clients see.
+	tap func(eventType string, payload []byte)
 }
 
 // New constructs a Broadcaster wired to the provided logger and state manager.
@@ -142,9 +146,24 @@ func (b *Broadcaster) BroadcastToClient(clientID string, payload []byte) error {
 	}
 }
 
+// SetEventTap installs an observer invoked for every BroadcastEvent, before
+// the client fan-out. The tap must not block (231).
+func (b *Broadcaster) SetEventTap(tap func(eventType string, payload []byte)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.tap = tap
+}
+
 // BroadcastEvent wraps the payload in a small envelope {"type": eventType,
 // "data": <payload>} and broadcasts it to all registered clients.
 func (b *Broadcaster) BroadcastEvent(eventType string, payload []byte) {
+	b.mu.RLock()
+	tap := b.tap
+	b.mu.RUnlock()
+	if tap != nil {
+		tap(eventType, payload)
+	}
+
 	envelope := struct {
 		Type string          `json:"type"`
 		Data json.RawMessage `json:"data"`

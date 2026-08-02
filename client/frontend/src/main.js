@@ -69,6 +69,7 @@ const state = {
     avatarPending: new Set(),
     settings: null,
     lastConnect: null,   // {addr, nick, pw, spw, bookmark} for reconnect-on-loss
+    tabConnects: new Map(), // (281) tab ID -> its own lastConnect record
     pendingBookmark: null, // (334) {name, addr} of the bookmark loaded into the login dialog
     reconnectAttempts: 0,
     reconnectTimer: null,
@@ -216,7 +217,7 @@ async function connectFromLogin() {
             return;
         }
         state.myNickname = nick;
-        state.lastConnect = { addr, nick, pw, spw, bookmark };
+        await rememberTabConnect({ addr, nick, pw, spw, bookmark });
         // (334) consumed: lastConnect carries the name for reconnects from
         // here on. Clearing only on success keeps the retry after a rejected
         // password identifiable.
@@ -286,6 +287,17 @@ async function showFingerprintWarning(addr, detail) {
     document.body.appendChild(overlay);
 }
 
+// rememberTabConnect files the credential record under the tab it belongs to
+// (281): switching away and back must restore the record a reconnect needs,
+// and only the connect call knows the password.
+async function rememberTabConnect(c) {
+    state.lastConnect = c;
+    try {
+        const active = (await window.go.main.App.ListTabs()).find((t) => t.active);
+        if (active) state.tabConnects.set(active.id, c);
+    } catch { /* lastConnect alone still covers the single-tab case */ }
+}
+
 async function disconnect() {
     state.lastConnect = null; // intentional disconnect: no reconnect
     if (state.reconnectTimer) {
@@ -329,6 +341,8 @@ window.runtime.EventsOn("disconnected", () => {
             if (!c) return;
             const err = await window.go.main.App.ConnectBookmarkTab(c.bookmark || "", c.addr, c.nick, c.pw, c.spw);
             if (err === "") {
+                // (281) the retry opened a NEW tab: the record has to move with it.
+                await rememberTabConnect(c);
                 try {
                     state.myClientID = await window.go.main.App.ClientID();
                 } catch { /* best-effort */ }
@@ -470,6 +484,7 @@ window.runtime.EventsOn("snapshot", (json) => {
     // (317) blocked users are locally muted on sight; (318) contact nickname
     // history updates from presence; (383) buddy alerts; (389) channel watch.
     applyBlockAndContacts();
+    expandMyBranch(); // (302)
     resolveTrackUsers();
     videoRefreshNames(); // (61/73) tile labels follow the refreshed client list
     window.__voicxNotify?.checkBuddyOnline();
@@ -531,6 +546,11 @@ function flattenChannel(node) {
         // SlowModeSeconds. Dropping it here is why the client could never show
         // or edit the rate limit it is subject to.
         SlowModeSeconds: node.SlowModeSeconds || 0,
+        // (157/160/163) join power, manual sort index and permission
+        // inheritance: the edit dialog and drag-reordering both read them.
+        NeededJoinPower: node.NeededJoinPower || 0,
+        OrderIndex: node.OrderIndex || 0,
+        InheritPermissions: !!node.InheritPermissions,
     });
     for (const c of node.clients || []) state.clients.push(c);
     for (const child of node.children || []) flattenChannel(child);
@@ -595,6 +615,7 @@ window.runtime.EventsOn("event", (json) => {
             if (c) c.channel_id = d.channel_id;
             if (d.client_id === state.myClientID) {
                 state.myChannelID = d.channel_id;
+                expandMyBranch(); // (302)
                 applyChannelAudio();
                 chatUI.onMyChannelChanged(); // (103/111) load history + header for the new channel
                 window.__voicxFiles?.onChannelChanged?.(); // (256) file browser follows the channel
@@ -623,6 +644,12 @@ window.runtime.EventsOn("event", (json) => {
                 ch.OpusDTX = !!d.opus_dtx;
                 ch.OpusStereo = !!d.opus_stereo;
                 ch.SlowModeSeconds = d.slow_mode_seconds || 0; // (114)
+                ch.NeededJoinPower = d.needed_join_power || 0; // (160)
+                ch.OrderIndex = d.order_index || 0;            // (163)
+                ch.InheritPermissions = !!d.inherit_permissions; // (157)
+                // a re-parent moves the row, so the cached ancestry has to
+                // follow it or the next edit dialog offers a stale parent.
+                ch.ParentID = d.parent_id || 0;
                 if (d.channel_id === state.myChannelID) applyChannelAudio();
             }
             break;
@@ -773,6 +800,18 @@ function recomputeClientCounts() {
     for (const ch of state.channels) ch.ClientCount = counts.get(ch.ChannelID) || 0;
 }
 
+// (302) expandMyBranch un-collapses my channel and its ancestors: a move into
+// a branch the user collapsed earlier would otherwise hide the channel they
+// are actually in.
+function expandMyBranch() {
+    let id = state.myChannelID;
+    let guard = 0;
+    while (id && guard++ < 1000) {
+        state.collapsedChannels.delete(id);
+        id = state.channels.find((c) => c.ChannelID === id)?.ParentID || 0;
+    }
+}
+
 function renderTree() {
     recomputeClientCounts();
     const root = $("channel-tree");
@@ -808,6 +847,11 @@ function renderTree() {
         const key = ch.ParentID || 0;
         if (!byParent.has(key)) byParent.set(key, []);
         byParent.get(key).push(ch);
+    }
+    // (163) the manual sort index decides sibling order; sort is stable, so
+    // equal indices keep the order the snapshot delivered them in.
+    for (const list of byParent.values()) {
+        list.sort((a, b) => (a.OrderIndex || 0) - (b.OrderIndex || 0));
     }
     // (319) live tree filter: matching channels/users stay; a channel stays
     // when it or a descendant or one of its users matches.
@@ -873,9 +917,19 @@ function renderChannel(parentEl, ch, byParent, depth) {
         el.appendChild(badge);
     }
     el.onclick = () => window.go.main.App.JoinChannel(ch.ChannelID);
+    // (163) drag a channel onto another to take that channel's slot among its
+    // siblings. Member rows and sub-channels live inside this element, so
+    // their own dragstart bubbles through here and must not be relabelled.
+    el.draggable = true;
+    el.addEventListener("dragstart", (e) => {
+        if (e.target !== el) return;
+        e.dataTransfer.setData("text/voicx-chid", String(ch.ChannelID));
+        e.dataTransfer.effectAllowed = "move";
+    });
     // (305) drag users onto a channel to move them there.
     el.addEventListener("dragover", (e) => {
-        if (e.dataTransfer.types.includes("text/voicx-uid")) {
+        if (e.dataTransfer.types.includes("text/voicx-uid") ||
+            e.dataTransfer.types.includes("text/voicx-chid")) {
             e.preventDefault();
             el.classList.add("drop-active");
         }
@@ -883,7 +937,15 @@ function renderChannel(parentEl, ch, byParent, depth) {
     el.addEventListener("dragleave", () => el.classList.remove("drop-active"));
     el.addEventListener("drop", (e) => {
         e.preventDefault();
+        // sub-channels are nested inside their parent's element, so without
+        // this a drop on a child also fires every ancestor's handler.
+        e.stopPropagation();
         el.classList.remove("drop-active");
+        const chid = Number(e.dataTransfer.getData("text/voicx-chid"));
+        if (chid) {
+            reorderChannel(chid, ch);
+            return;
+        }
         const uid = e.dataTransfer.getData("text/voicx-uid");
         const target = state.clients.find((c) => c.unique_id === uid);
         if (!target) return;
@@ -911,6 +973,22 @@ function renderChannel(parentEl, ch, byParent, depth) {
     }
 }
 
+// (163) reorderChannel puts the dragged channel in the drop target's slot
+// among the target's siblings. The named field list is deliberate: parent_id
+// 0 is the legitimate "move to root" value and so has no sentinel, and a
+// re-parent drops the server's whole permission cache — so "parent" is only
+// named when the drop actually changes the parent.
+async function reorderChannel(draggedID, target) {
+    if (draggedID === target.ChannelID) return;
+    const dragged = state.channels.find((c) => c.ChannelID === draggedID);
+    if (!dragged) return;
+    const reparent = (dragged.ParentID || 0) !== (target.ParentID || 0);
+    const err = await window.go.main.App.ChannelEditTree(
+        draggedID, reparent ? "order,parent" : "order",
+        0, target.OrderIndex || 0, target.ParentID || 0, false);
+    if (err) toast("channel reorder failed: " + err, "warn");
+}
+
 function clientRow(c) {
     const row = document.createElement("div");
     row.className = "client" + (c.is_speaking ? " speaking" : "") +
@@ -920,7 +998,10 @@ function clientRow(c) {
     row.tabIndex = 0; // (298) keyboard navigation
     row.setAttribute("role", "treeitem"); // (343)
     row.setAttribute("aria-label", (c.nickname || c.unique_id || "user") +
-        (c.status ? ", " + c.status : "") + (c.is_speaking ? ", speaking" : ""));
+        (c.status ? ", " + c.status : "") + (c.is_speaking ? ", speaking" : "") +
+        (c.priority_speaker ? ", priority speaker" : "") +
+        (c.client_id === state.myClientID && state.muted ? ", muted" : "") +
+        (c.client_id === state.myClientID && state.deafened ? ", deafened" : ""));
     // (140/305) users are draggable (group assign in the manager; move by
     // dropping onto a channel).
     if (c.unique_id) {
@@ -950,14 +1031,36 @@ function clientRow(c) {
     if (g) name.title = "group: " + g.name;
     row.appendChild(av);
     row.appendChild(name);
-    // (310) group icon next to the name when the primary group has one.
-    if (g && g.icon) {
+    // (310) group badge next to the name. Groups without an icon get a text
+    // chip in the group colour instead of nothing — colour and hoisting are
+    // settable on their own, so an icon is not what makes a group visible.
+    if (g) {
         const gi = document.createElement("span");
         gi.className = "group-icon";
-        P().groupIconURL(g.id).then((url) => {
-            if (url) gi.innerHTML = `<img src="${url}" alt="" title="${g.name}">`;
-        });
+        gi.title = "group: " + g.name;
+        if (g.icon) {
+            P().groupIconURL(g.id).then((url) => {
+                if (url) gi.innerHTML = `<img src="${url}" alt="">`;
+                else gi.textContent = g.name;
+            });
+        } else {
+            gi.classList.add("group-badge");
+            gi.textContent = g.name;
+            if (g.color) {
+                gi.style.color = g.color;
+                gi.style.borderColor = g.color;
+            }
+        }
         row.appendChild(gi);
+    }
+    // (307) priority speaker: the flag is broadcast for every client, so it
+    // belongs on their row and not only on my own voice-bar button.
+    if (c.priority_speaker) {
+        const pr = document.createElement("span");
+        pr.className = "status-icons";
+        pr.textContent = " ★";
+        pr.title = "priority speaker";
+        row.appendChild(pr);
     }
     // (307-309) presence status icons; (381) invisible marker (admin view).
     if (c.status === "away" || c.status === "busy" || c.status === "invisible") {
@@ -1068,9 +1171,20 @@ function onWhisperReceived(clientID, uniqueID, nickname) {
     if (uid && (state.settings?.blocked_users || []).includes(uid)) return;
     if (uid) state.lastWhispererUID = uid;
     const who = nickname || c?.nickname || uid || clientID || "someone";
+    trayMention();
     window.__voicxNotify?.notify("whisper", who + " is whispering to you",
         { uid, className: "messages", kind: "warn", noSound: !state.settings?.whisper_sound });
 }
+
+// (290) trayMention badges the tray for something directed at me in the ACTIVE
+// tab — the backend only counts background tabs, whose frames it relays. A
+// focused window means the user is already looking at it.
+function trayMention() {
+    if (document.hasFocus()) return;
+    window.go.main.App.TrayMention();
+}
+
+window.addEventListener("focus", () => window.go.main.App.TrayClearMentions());
 
 // ---------------------------------------------------------------------------
 // Avatars
@@ -1164,6 +1278,7 @@ function addChat(d) {
             if (sender) state.lastWhispererUID = sender.unique_id;
         }
         // (385) DMs dispatch through the notification matrix.
+        trayMention(); // (290)
         window.__voicxNotify?.notify("dm", (d.from || "someone") + ": " + (d.text || "").slice(0, 80),
             { uid: d.from_unique_id, className: "messages", kind: "warn", noSound: !state.settings?.whisper_sound });
     }
@@ -1789,7 +1904,10 @@ function resolveTrackUsers() {
         // (14) the share chain needs the unique ID too, or its publisher can
         // never be exempted from ducking.
         const sa = shareAudio.get(clientID);
-        if (sa && !sa.uid && publisher.unique_id) sa.uid = publisher.unique_id;
+        if (sa && !sa.uid && publisher.unique_id) {
+            sa.uid = publisher.unique_id;
+            applyShareAudio(clientID);
+        }
     }
 }
 

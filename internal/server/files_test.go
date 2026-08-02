@@ -11,6 +11,7 @@ import (
 	"voicx/internal/auth"
 	"voicx/internal/netproto"
 	"voicx/internal/permissions"
+	"voicx/internal/state"
 	"voicx/internal/store"
 )
 
@@ -22,7 +23,17 @@ type fakeFileTransfer struct {
 	files       []store.FileRecord
 	deleted     []string
 	renamed     [][2]string
+	moved       []ftMove
 	fingerprint string
+}
+
+// ftMove records a move with both channel ids so a cross-channel move (262)
+// can be told apart from a rename.
+type ftMove struct {
+	fromChannel int64
+	from        string
+	toChannel   int64
+	to          string
 }
 
 type ftCall struct {
@@ -31,12 +42,13 @@ type ftCall struct {
 	name      string
 	size      int64
 	uploader  string
+	quotaMB   int64
 }
 
-func (f *fakeFileTransfer) InitUpload(_ context.Context, channelID int64, folder, name string, size int64, uploader string) (string, string, error) {
+func (f *fakeFileTransfer) InitUpload(_ context.Context, channelID int64, folder, name string, size int64, uploader string, uploaderQuotaMB int64) (string, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.uploads = append(f.uploads, ftCall{channelID, folder, name, size, uploader})
+	f.uploads = append(f.uploads, ftCall{channelID, folder, name, size, uploader, uploaderQuotaMB})
 	return "tid-1", "tok-1", nil
 }
 
@@ -99,12 +111,18 @@ func (f *fakeFileTransfer) DeleteFile(_ context.Context, channelID int64, folder
 	return nil
 }
 
-func (f *fakeFileTransfer) RenameFile(_ context.Context, channelID int64, folder, name, newFolder, newName string) error {
+func (f *fakeFileTransfer) RenameFile(ctx context.Context, channelID int64, folder, name, newFolder, newName string) error {
+	return f.MoveFile(ctx, channelID, folder, name, channelID, newFolder, newName)
+}
+
+func (f *fakeFileTransfer) MoveFile(_ context.Context, channelID int64, folder, name string, newChannelID int64, newFolder, newName string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.moved = append(f.moved, ftMove{channelID, folder + "/" + name, newChannelID, newFolder + "/" + newName})
 	f.renamed = append(f.renamed, [2]string{folder + "/" + name, newFolder + "/" + newName})
 	for i, rec := range f.files {
 		if rec.Folder == folder && rec.Name == name {
+			f.files[i].ChannelID = newChannelID
 			f.files[i].Folder = newFolder
 			f.files[i].Name = newName
 		}
@@ -197,6 +215,101 @@ func TestFileTransferInitDenied(t *testing.T) {
 	}
 	if got := env.ft.uploadCount(); got != 0 {
 		t.Fatalf("uploads issued = %d, want 0", got)
+	}
+}
+
+// TestFileTransferUploadQuotaPermission verifies the caller's personal upload
+// ceiling (266) is resolved from permissions and handed to the backend, which
+// is the only thing that can enforce it.
+func TestFileTransferUploadQuotaPermission(t *testing.T) {
+	perms := tieredWith(&permissions.Permission{
+		Key:   permissions.PermissionKeyFTUploadQuotaMB,
+		Type:  permissions.PermissionTypeInteger,
+		Value: 25,
+	})
+	env := startTestEnv(t, &perms)
+	defer env.stop()
+
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+
+	send(t, conn, netproto.MsgFileTransferInit, netproto.FileTransferInit{
+		ChannelID: 1, Direction: "upload", Name: "a.txt", Size: 42,
+	})
+	readOfType(t, conn, netproto.MsgFileTransferInitResponse)
+
+	env.ft.mu.Lock()
+	defer env.ft.mu.Unlock()
+	if len(env.ft.uploads) != 1 || env.ft.uploads[0].quotaMB != 25 {
+		t.Fatalf("uploads = %+v, want quotaMB 25", env.ft.uploads)
+	}
+}
+
+// TestFileRenameCrossChannel verifies a move carries the target channel
+// through to the backend (262).
+func TestFileRenameCrossChannel(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	env.ft.files = []store.FileRecord{{ChannelID: 1, Name: "a.txt", Uploader: "user-uid"}}
+	env.state.AddChannel(&state.Channel{ChannelID: 2, Name: "target"})
+
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+
+	send(t, conn, netproto.MsgFileRename, netproto.FileRename{
+		ChannelID: 1, Name: "a.txt", NewName: "a.txt", NewChannelID: 2,
+	})
+	waitFor(t, "cross-channel move", func() bool {
+		env.ft.mu.Lock()
+		defer env.ft.mu.Unlock()
+		return len(env.ft.moved) == 1
+	})
+
+	env.ft.mu.Lock()
+	defer env.ft.mu.Unlock()
+	m := env.ft.moved[0]
+	if m.fromChannel != 1 || m.toChannel != 2 {
+		t.Fatalf("move = %+v, want channel 1 -> 2", m)
+	}
+}
+
+// TestFileRenameCrossChannelDenied verifies a move is refused when the caller
+// may not upload into the destination (262): managing a file in one channel
+// must not be a way to push it into a channel they cannot write to.
+func TestFileRenameCrossChannelDenied(t *testing.T) {
+	perms := tieredWith(&permissions.Permission{
+		Key:    permissions.PermissionKeyFTFileUploadPower,
+		Type:   permissions.PermissionTypeInteger,
+		Value:  0,
+		Negate: true,
+	}, &permissions.Permission{
+		Key:   permissions.PermissionKeyFTFileDelete,
+		Type:  permissions.PermissionTypeBoolean,
+		Value: 1,
+	})
+	env := startTestEnv(t, &perms)
+	defer env.stop()
+	env.ft.files = []store.FileRecord{{ChannelID: 1, Name: "a.txt", Uploader: "user-uid"}}
+	env.state.AddChannel(&state.Channel{ChannelID: 2, Name: "target"})
+
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+
+	send(t, conn, netproto.MsgFileRename, netproto.FileRename{
+		ChannelID: 1, Name: "a.txt", NewName: "a.txt", NewChannelID: 2,
+	})
+	f := readOfType(t, conn, netproto.MsgError)
+	var e netproto.Error
+	if err := netproto.Decode(f, &e); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if e.Code != errCodePermissionDenied {
+		t.Fatalf("error code = %d, want %d", e.Code, errCodePermissionDenied)
+	}
+	env.ft.mu.Lock()
+	defer env.ft.mu.Unlock()
+	if len(env.ft.moved) != 0 {
+		t.Fatalf("moves = %+v, want none", env.ft.moved)
 	}
 }
 

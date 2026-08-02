@@ -22,9 +22,10 @@ const PERMISSION_KEYS = [
     "b_client_use_channel_command", "i_client_talk_power", "i_client_needed_talk_power",
     "i_client_whisper_power", "i_client_needed_whisper_power",
     "b_client_video_publish", "b_client_priority_speaker", "b_client_ignore_antiflood",
-    "b_client_request_talker",
+    "b_client_request_talker", "b_client_is_bot",
     "i_ft_file_upload_power", "i_ft_needed_file_upload_power",
     "i_ft_file_download_power", "i_ft_needed_file_download_power",
+    "i_ft_quota_mb_upload_per_client", "b_ft_delete",
     "i_client_poke_power", "i_client_needed_poke_power", "b_client_poke",
     "b_client_remoteaddress_view", "i_permission_modify_power",
     "b_virtualserver_info_view", "b_virtualserver_connectioninfo_view", "b_virtualserver_recording",
@@ -219,6 +220,7 @@ function openPermissionManager() {
                 <div class="pm-right-head">
                     <input class="pm-filter dlg-input" placeholder="filter permissions… (154)" />
                     <button class="pm-export icon-btn" title="Export this target's permissions as JSON (148)">⬇</button>
+                    <button class="pm-export-csv icon-btn" title="Export this target's permissions as CSV (148)">CSV</button>
                 </div>
                 <div class="pm-grid"></div>
                 <div class="pm-trace"></div>
@@ -229,7 +231,8 @@ function openPermissionManager() {
     pm.q = q;
     q(".pm-close").onclick = () => closePermissionManager();
     q(".pm-filter").oninput = (e) => { pm.filter = e.target.value.trim().toLowerCase(); renderGrid(); };
-    q(".pm-export").onclick = exportPerms;
+    q(".pm-export").onclick = () => exportPerms("json");
+    q(".pm-export-csv").onclick = () => exportPerms("csv");
     dlg.querySelectorAll(".pm-tabs button").forEach((b) => {
         b.onclick = () => {
             pm.tab = b.dataset.tab;
@@ -294,6 +297,7 @@ async function renderTargets() {
 
     if (pm.tab === "clients") {
         renderTemplateButton(actions, "client");
+        renderCopyButton(actions);
         const clients = V().state.clients.filter((c) => c.unique_id);
         list.innerHTML = clients.length ? "" : `<div class="empty-state">No online users</div>`;
         for (const c of clients) {
@@ -462,22 +466,44 @@ async function renderTrace(key) {
     area.innerHTML = html + "</tbody></table>";
 }
 
-// exportPerms saves the current target's grid as JSON (148).
-async function exportPerms() {
+// csvCell quotes a CSV field: RFC 4180 doubling, and always quoted so a key
+// or label containing a separator cannot shift the columns.
+function csvCell(v) {
+    return '"' + String(v ?? "").replace(/"/g, '""') + '"';
+}
+
+// exportPerms saves the current target's grid (148). JSON round-trips into an
+// importer; CSV is the shape a spreadsheet or a diff of two servers wants.
+async function exportPerms(format) {
     if (!pm.target) {
         V().toast("select a target first", "warn");
         return;
     }
-    const out = {
-        tier: pm.target.tier,
-        target: { group_id: pm.target.groupID || 0, unique_id: pm.target.uniqueID || "", channel_id: pm.target.channelID || 0, label: pm.target.label },
-        exported_at: new Date().toISOString(),
-        entries: [...pm.entries.entries()].map(([key, e]) => ({ key, ...e })),
-    };
-    const name = "permissions-" + (pm.target.label || "target").replace(/[^a-z0-9_-]+/gi, "_") + ".json";
-    const err = await App().ExportChat(name, JSON.stringify(out, null, 2));
+    const t = pm.target;
+    const rows = [...pm.entries.entries()].map(([key, e]) => ({ key, ...e }));
+    const base = "permissions-" + (t.label || "target").replace(/[^a-z0-9_-]+/gi, "_");
+    let name, body;
+    if (format === "csv") {
+        const head = ["tier", "group_id", "unique_id", "channel_id", "key", "value", "grant", "skip", "negate"];
+        const lines = [head.join(",")];
+        for (const r of rows) {
+            lines.push([t.tier, t.groupID || 0, t.uniqueID || "", t.channelID || 0,
+                r.key, r.value, r.grant, r.skip ? 1 : 0, r.negate ? 1 : 0].map(csvCell).join(","));
+        }
+        name = base + ".csv";
+        body = lines.join("\n") + "\n";
+    } else {
+        name = base + ".json";
+        body = JSON.stringify({
+            tier: t.tier,
+            target: { group_id: t.groupID || 0, unique_id: t.uniqueID || "", channel_id: t.channelID || 0, label: t.label },
+            exported_at: new Date().toISOString(),
+            entries: rows,
+        }, null, 2);
+    }
+    const err = await App().ExportChat(name, body);
     if (err) V().toast("export failed: " + err, "warn");
-    else V().toast("permissions exported");
+    else V().toast("permissions exported (" + (format === "csv" ? "CSV" : "JSON") + ")");
 }
 
 // --- group management ----------------------------------------------------------
@@ -492,8 +518,10 @@ function renderGroupActions(actions, type) {
         <button class="ga-new" title="Create group">+ New</button>
         <button class="ga-rename" title="Rename selected">Rename</button>
         <button class="ga-delete" title="Delete selected">Delete</button>
-        <button class="ga-icon" title="Upload group icon (177)">Icon</button>`;
+        <button class="ga-icon" title="Upload group icon (177)">Icon</button>
+        ${type === "server" ? `<button class="ga-look" title="Nickname colour, hoisting and sort order (178/179)">Appearance…</button>` : ""}`;
     renderTemplateButton(actions, tabTier(pm.tab));
+    renderCopyButton(actions);
 
     actions.querySelector(".ga-new").onclick = async () => {
         const name = prompt("Group name:");
@@ -535,6 +563,179 @@ function renderGroupActions(actions, type) {
         const err = await App().GroupIconSet(pm.target.groupID, img.dataBase64);
         if (err) V().toast("icon failed: " + err, "warn");
         else V().toast("group icon updated");
+    };
+    const lookBtn = actions.querySelector(".ga-look");
+    if (lookBtn) {
+        lookBtn.onclick = () => {
+            if (!pm.target?.groupID) return V().toast("select a group first", "warn");
+            openGroupAppearance(pm.target.group);
+        };
+    }
+}
+
+// openGroupAppearance edits a server group's cosmetics (178 colour, 179
+// hoisting, sort order). The columns have existed since migration 009 and the
+// tree already renders them; this is the only thing that can write them.
+function openGroupAppearance(group) {
+    const g = group || {};
+    const { overlay, q } = modal("confirm-dlg", `
+        <h3>Group appearance</h3>
+        <div class="dlg-text">
+            <div class="ga-look-name"></div>
+            <label class="dlg-label">Nickname colour</label>
+            <div class="ce-icon-row">
+                <input type="color" class="ga-look-color" />
+                <input type="text" class="dlg-input mono ga-look-hex" placeholder="#rrggbb" maxlength="7" />
+                <button class="ga-look-clear" title="Clear back to the theme default">Clear</button>
+            </div>
+            <label class="dlg-label"><input type="checkbox" class="ga-look-hoist" /> hoist — show this group as its own section above the channel tree</label>
+            <label class="dlg-label">Sort order (lower sorts first; the lowest applicable group picks the nickname colour)</label>
+            <input type="number" class="dlg-input ga-look-sort" />
+        </div>
+        <div class="dlg-buttons">
+            <button class="dlg-cancel">Cancel</button>
+            <button class="dlg-ok">Save</button>
+        </div>`);
+    q(".ga-look-name").textContent = g.name || "";
+    const hex = q(".ga-look-hex");
+    const swatch = q(".ga-look-color");
+    hex.value = g.color || "";
+    swatch.value = /^#[0-9a-f]{6}$/i.test(g.color || "") ? g.color : "#7f7f7f";
+    q(".ga-look-hoist").checked = !!g.hoist;
+    q(".ga-look-sort").value = g.sort_id || 0;
+
+    swatch.oninput = () => { hex.value = swatch.value; };
+    hex.oninput = () => { if (/^#[0-9a-f]{6}$/i.test(hex.value)) swatch.value = hex.value; };
+    q(".ga-look-clear").onclick = () => { hex.value = ""; };
+    q(".dlg-cancel").onclick = () => overlay.remove();
+    q(".dlg-ok").onclick = async () => {
+        const color = hex.value.trim().toLowerCase();
+        // The server rejects anything else with errCodeMalformed; catching it
+        // here keeps the dialog open with the bad value still visible.
+        if (color && !/^#[0-9a-f]{6}$/.test(color)) {
+            return V().toast("colour must be #rrggbb (or empty for the theme default)", "warn");
+        }
+        try {
+            await App().GroupEdit(g.id, color, q(".ga-look-hoist").checked,
+                parseInt(q(".ga-look-sort").value, 10) || 0);
+        } catch (err) {
+            return V().toast("group appearance failed: " + err, "warn");
+        }
+        overlay.remove();
+        toastAudit("group appearance updated");
+        renderTargets();
+        refreshGroups().then(() => V().renderTree());
+    };
+}
+
+// renderCopyButton adds the copy-permissions action (141). The current target
+// is the source; the destination is picked in the dialog.
+function renderCopyButton(actions) {
+    if (!canPermManage()) return;
+    const btn = document.createElement("button");
+    btn.textContent = "Copy perms…";
+    btn.title = "Copy this target's permission entries onto another target (141)";
+    btn.onclick = () => {
+        if (!pm.target) return V().toast("select a source target first", "warn");
+        const kind = copyKindOf(pm.target.tier);
+        if (!kind) return V().toast("channel-tier entries cannot be copied", "warn");
+        openPermCopy(kind, copyIDOf(pm.target), pm.target.label);
+    };
+    actions.appendChild(btn);
+}
+
+// copyKindOf maps a grid tier onto a perm_copy kind ("" = unsupported).
+function copyKindOf(tier) {
+    switch (tier) {
+        case "server_group": return "servergroup";
+        case "channel_group": return "channelgroup";
+        case "client": return "client";
+        default: return "";
+    }
+}
+
+// copyIDOf renders a target's perm_copy id: a decimal group id, or the unique
+// ID for a client.
+function copyIDOf(t) {
+    return t.tier === "client" ? (t.uniqueID || "") : String(t.groupID || 0);
+}
+
+// openPermCopy asks for the destination and issues the copy. The server caps
+// every entry against the caller's own grant in both directions, so a denial
+// is a normal outcome and arrives as a servererror toast.
+async function openPermCopy(fromKind, fromID, fromLabel) {
+    const { overlay, q } = modal("confirm-dlg", `
+        <h3>Copy permissions</h3>
+        <div class="dlg-text">
+            <div>From <b class="pc-from"></b> <span class="mono pc-from-id"></span></div>
+            <label class="dlg-label">To</label>
+            <select class="dlg-input pc-kind">
+                <option value="servergroup">server group</option>
+                <option value="channelgroup">channel group</option>
+                <option value="client">client (unique ID)</option>
+            </select>
+            <select class="dlg-input pc-group"></select>
+            <input class="dlg-input pc-uid hidden" placeholder="destination unique ID" />
+            <label class="dlg-label">Channel scope (channel groups, and the per-channel client tier on both sides)</label>
+            <select class="dlg-input pc-channel">
+                <option value="0">— none —</option>
+            </select>
+            <label class="dlg-label"><input type="checkbox" class="pc-replace" /> replace — clear the destination's own entries first, so the result is an exact copy rather than a merge</label>
+        </div>
+        <div class="dlg-buttons">
+            <button class="dlg-cancel">Cancel</button>
+            <button class="dlg-ok">Copy</button>
+        </div>`);
+    q(".pc-from").textContent = fromLabel || fromID;
+    q(".pc-from-id").textContent = fromKind + ":" + fromID;
+    for (const c of V().state.channels) {
+        const opt = document.createElement("option");
+        opt.value = c.ChannelID;
+        opt.textContent = "# " + c.Name;
+        q(".pc-channel").appendChild(opt);
+    }
+    const kindSel = q(".pc-kind");
+    const groupSel = q(".pc-group");
+    kindSel.value = fromKind;
+
+    const fillGroups = async () => {
+        groupSel.innerHTML = "";
+        if (kindSel.value === "client") {
+            groupSel.classList.add("hidden");
+            q(".pc-uid").classList.remove("hidden");
+            return;
+        }
+        groupSel.classList.remove("hidden");
+        q(".pc-uid").classList.add("hidden");
+        let groups = [];
+        try {
+            const resp = await App().GroupList(kindSel.value === "channelgroup" ? "channel" : "server");
+            groups = resp.groups || [];
+        } catch { /* leave the select empty */ }
+        for (const g of groups) {
+            const opt = document.createElement("option");
+            opt.value = g.id;
+            opt.textContent = g.name;
+            groupSel.appendChild(opt);
+        }
+    };
+    kindSel.onchange = fillGroups;
+    await fillGroups();
+
+    q(".dlg-cancel").onclick = () => overlay.remove();
+    q(".dlg-ok").onclick = async () => {
+        const toKind = kindSel.value;
+        const toID = toKind === "client" ? q(".pc-uid").value.trim() : groupSel.value;
+        if (!toID) return V().toast("pick a destination", "warn");
+        const channelID = parseInt(q(".pc-channel").value, 10) || 0;
+        if (toKind === fromKind && toID === fromID) {
+            return V().toast("source and destination are the same target", "warn");
+        }
+        const err = await App().PermCopy(fromKind, fromID, toKind, toID, channelID, q(".pc-replace").checked);
+        overlay.remove();
+        if (err) return V().toast("copy failed: " + err, "warn");
+        toastAudit("permissions copied");
+        setTimeout(loadEntries, 500);
     };
 }
 
@@ -785,13 +986,12 @@ async function openChatFilters() {
         q(".dlg-buttons").remove();
         return;
     }
+    let lastFilters = null;
     const fill = (resp) => {
+        lastFilters = resp;
         q(".cf-words").value = resp.word_filter || "";
         q(".cf-black").value = resp.link_blacklist || "";
         q(".cf-white").value = resp.link_whitelist || "";
-        // from_config is the honest answer to "does my config.yaml still
-        // apply?" — the first save snapshots it into the server database and
-        // config.yaml stops being read entirely (117/118).
         q(".cf-source").textContent = resp.from_config
             ? "In force from config.yaml — no runtime override stored yet. Saving copies these lists into the server database, after which config.yaml is ignored."
             : "In force from the server database (runtime override). The chat filter settings in config.yaml are no longer applied.";
@@ -805,11 +1005,19 @@ async function openChatFilters() {
     };
     q(".cf-reload").onclick = load;
     q(".cf-save").onclick = async () => {
+        if (lastFilters?.from_config) {
+            const ok = confirm("Saving will copy these lists into the server database and override config.yaml going forward. Proceed?");
+            if (!ok) return;
+        }
+        const saveBtn = q(".cf-save");
+        saveBtn.disabled = true;
         try {
             fill(await App().ChatFilterSet(q(".cf-words").value, q(".cf-black").value, q(".cf-white").value));
             toastAudit("chat filters updated");
         } catch (err) {
             V().toast("chat filter save failed: " + err, "warn");
+        } finally {
+            saveBtn.disabled = false;
         }
     };
     load();
@@ -868,21 +1076,664 @@ async function openBanList() {
     render();
 }
 
+// --- complaint list (173) ---------------------------------------------------------
+
+// openComplaints reviews filed complaints. The server rides the ban gate
+// rather than a key of its own, so the client gates the same way.
+async function openComplaints() {
+    const { overlay, q } = modal("audit", `
+        <div class="pm-head">
+            <h3>Complaints</h3>
+            <button class="icon-btn cp-close" title="Close">✕</button>
+        </div>
+        <div class="cp-list"></div>`);
+    q(".cp-close").onclick = () => overlay.remove();
+    if (!canBan()) {
+        q(".cp-list").innerHTML = denyNotice("b_client_ban / i_client_ban_power");
+        return;
+    }
+    // Nicknames are best-effort server-side and may be "": the unique ID is
+    // the only identifier that always exists.
+    const who = (nick, uid) => nick || uid;
+    const render = (entries) => {
+        const list = q(".cp-list");
+        list.innerHTML = entries.length ? "" : `<div class="empty-state">no complaints</div>`;
+        if (!entries.length) return;
+        const table = document.createElement("table");
+        table.className = "perm-grid audit-grid";
+        table.innerHTML = `<thead><tr><th>against</th><th>from</th><th>reason</th><th>filed</th><th></th></tr></thead><tbody></tbody>`;
+        const tbody = table.querySelector("tbody");
+        for (const e of entries) {
+            const tr = document.createElement("tr");
+            tr.innerHTML = `<td class="cp-target"></td><td class="cp-from"></td><td class="cp-reason"></td>
+                <td class="mono">${fmtTime(e.created_at)}</td>
+                <td><button class="mem-del cp-one" title="Clear this complaint">✕</button>
+                    <button class="mem-del cp-all" title="Clear every complaint against this user">✕ all</button></td>`;
+            tr.querySelector(".cp-target").textContent = who(e.target_nickname, e.target_unique_id);
+            tr.querySelector(".cp-target").title = e.target_unique_id;
+            tr.querySelector(".cp-from").textContent = who(e.from_nickname, e.from_unique_id);
+            tr.querySelector(".cp-from").title = e.from_unique_id;
+            tr.querySelector(".cp-reason").textContent = e.reason || "";
+            tr.querySelector(".cp-one").onclick = () => clear(e.target_unique_id, e.from_unique_id);
+            tr.querySelector(".cp-all").onclick = async () => {
+                const ok = await confirmDlg("Clear complaints",
+                    `<p>Clear <b>every</b> complaint against <span class="mono">${esc(e.target_unique_id.slice(0, 24))}…</span>?</p>`,
+                    "Clear all", true);
+                if (ok) clear(e.target_unique_id, "");
+            };
+            tbody.appendChild(tr);
+        }
+        list.appendChild(table);
+    };
+    const clear = async (target, from) => {
+        try {
+            render((await App().ComplaintClear(target, from)).entries || []);
+            toastAudit("complaints cleared");
+        } catch (err) {
+            V().toast("clear failed: " + err, "warn");
+        }
+    };
+    try {
+        render((await App().ComplaintList()).entries || []);
+    } catch (err) {
+        q(".cp-list").innerHTML = `<div class="empty-state">complaint list failed: ${esc(err)}</div>`;
+    }
+}
+
+// --- invite links (176) -----------------------------------------------------------
+
+// inviteLink builds the handoff URL for a privilege key. Registering the
+// voicx:// scheme with the OS is an installer concern; generation and parsing
+// live here so a pasted link works even without the protocol handler.
+function inviteLink(addr, token) {
+    return "voicx://" + addr + "?token=" + encodeURIComponent(token);
+}
+
+// parseInviteLink reads voicx://host:port?token=… back into its parts
+// (null when the string is not an invite link).
+function parseInviteLink(url) {
+    const m = /^voicx:\/\/([^/?#]+)\/?(?:\?(.*))?$/i.exec(String(url || "").trim());
+    if (!m) return null;
+    const token = new URLSearchParams(m[2] || "").get("token") || "";
+    return { addr: m[1], token };
+}
+
+// --- QR codes (175) ---------------------------------------------------------------
+// Self-contained byte-mode QR encoder, versions 1-10 at EC level M. An npm
+// package or a remote generator is not an option here: the app ships with no
+// network CSP allowance and has to work offline.
+
+const QR_EC_PER_BLOCK = [10, 16, 26, 18, 24, 16, 18, 22, 22, 26];
+const QR_BLOCKS = [1, 1, 1, 2, 2, 4, 4, 4, 5, 5];
+const QR_TOTAL_CW = [26, 44, 70, 100, 134, 172, 196, 242, 292, 346];
+const QR_ALIGN = [[], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34], [6, 22, 38], [6, 24, 42], [6, 26, 46], [6, 28, 50]];
+const QR_VERSION_BITS = { 7: 0x07c94, 8: 0x085bc, 9: 0x09a99, 10: 0x0a4d3 };
+
+let QR_EXP = null;
+let QR_LOG = null;
+
+// qrTables builds the GF(256) log/antilog tables (primitive polynomial 0x11d).
+function qrTables() {
+    if (QR_EXP) return;
+    QR_EXP = new Uint8Array(512);
+    QR_LOG = new Uint8Array(256);
+    let x = 1;
+    for (let i = 0; i < 255; i++) {
+        QR_EXP[i] = x;
+        QR_LOG[x] = i;
+        x <<= 1;
+        if (x & 0x100) x ^= 0x11d;
+    }
+    for (let i = 255; i < 512; i++) QR_EXP[i] = QR_EXP[i - 255];
+}
+
+function qrMul(a, b) {
+    return a === 0 || b === 0 ? 0 : QR_EXP[QR_LOG[a] + QR_LOG[b]];
+}
+
+// qrGenPoly returns the Reed-Solomon generator polynomial of degree n,
+// highest coefficient first.
+function qrGenPoly(n) {
+    let g = [1];
+    for (let i = 0; i < n; i++) {
+        const res = new Array(g.length + 1).fill(0);
+        for (let k = 0; k < g.length; k++) res[k] ^= g[k];
+        for (let k = 0; k < g.length; k++) res[k + 1] ^= qrMul(g[k], QR_EXP[i]);
+        g = res;
+    }
+    return g;
+}
+
+function qrEC(data, n) {
+    const g = qrGenPoly(n);
+    const res = new Array(data.length + n).fill(0);
+    for (let i = 0; i < data.length; i++) res[i] = data[i];
+    for (let i = 0; i < data.length; i++) {
+        const lead = res[i];
+        if (!lead) continue;
+        for (let j = 0; j < g.length; j++) res[i + j] ^= qrMul(g[j], lead);
+    }
+    return res.slice(data.length);
+}
+
+function qrMaskFn(k) {
+    switch (k) {
+        case 0: return (r, c) => (r + c) % 2 === 0;
+        case 1: return (r) => r % 2 === 0;
+        case 2: return (r, c) => c % 3 === 0;
+        case 3: return (r, c) => (r + c) % 3 === 0;
+        case 4: return (r, c) => (Math.floor(r / 2) + Math.floor(c / 3)) % 2 === 0;
+        case 5: return (r, c) => ((r * c) % 2) + ((r * c) % 3) === 0;
+        case 6: return (r, c) => (((r * c) % 2) + ((r * c) % 3)) % 2 === 0;
+        default: return (r, c) => (((r + c) % 2) + ((r * c) % 3)) % 2 === 0;
+    }
+}
+
+// qrFormatBits is the 15-bit BCH format word for EC level M (00) and a mask.
+function qrFormatBits(mask) {
+    const data = mask;
+    let rem = data;
+    for (let i = 0; i < 10; i++) rem = (rem << 1) ^ ((rem >>> 9) * 0x537);
+    return ((data << 10) | rem) ^ 0x5412;
+}
+
+// qrPenalty scores a masked matrix by the four standard rules; the lowest
+// score wins, which is what keeps big flat areas from confusing scanners.
+function qrPenalty(mod, size) {
+    let score = 0;
+    const lines = [];
+    for (let r = 0; r < size; r++) {
+        let row = "";
+        for (let c = 0; c < size; c++) row += mod[r][c] ? "1" : "0";
+        lines.push(row);
+    }
+    for (let c = 0; c < size; c++) {
+        let col = "";
+        for (let r = 0; r < size; r++) col += mod[r][c] ? "1" : "0";
+        lines.push(col);
+    }
+    for (const line of lines) {
+        let run = 1;
+        for (let i = 1; i <= line.length; i++) {
+            if (i < line.length && line[i] === line[i - 1]) {
+                run++;
+                continue;
+            }
+            if (run >= 5) score += 3 + (run - 5);
+            run = 1;
+        }
+        for (const pat of ["10111010000", "00001011101"]) {
+            let at = line.indexOf(pat);
+            while (at !== -1) {
+                score += 40;
+                at = line.indexOf(pat, at + 1);
+            }
+        }
+    }
+    let dark = 0;
+    for (let r = 0; r < size - 1; r++) {
+        for (let c = 0; c < size - 1; c++) {
+            const v = mod[r][c];
+            if (v === mod[r][c + 1] && v === mod[r + 1][c] && v === mod[r + 1][c + 1]) score += 3;
+        }
+    }
+    for (let r = 0; r < size; r++) for (let c = 0; c < size; c++) dark += mod[r][c];
+    score += 10 * Math.floor(Math.abs((dark * 100) / (size * size) - 50) / 5);
+    return score;
+}
+
+// qrEncode returns the module matrix for text, or null when it does not fit a
+// version-10 code (far beyond any invite link).
+function qrEncode(text) {
+    qrTables();
+    const bytes = new TextEncoder().encode(text);
+    let version = 0;
+    let dataCw = 0;
+    for (let v = 1; v <= 10; v++) {
+        const cw = QR_TOTAL_CW[v - 1] - QR_EC_PER_BLOCK[v - 1] * QR_BLOCKS[v - 1];
+        if (4 + (v <= 9 ? 8 : 16) + bytes.length * 8 <= cw * 8) {
+            version = v;
+            dataCw = cw;
+            break;
+        }
+    }
+    if (!version) return null;
+
+    const bits = [];
+    const put = (val, len) => { for (let i = len - 1; i >= 0; i--) bits.push((val >>> i) & 1); };
+    put(4, 4);
+    put(bytes.length, version <= 9 ? 8 : 16);
+    for (const b of bytes) put(b, 8);
+    for (let i = 0; i < 4 && bits.length < dataCw * 8; i++) bits.push(0);
+    while (bits.length % 8) bits.push(0);
+    const data = [];
+    for (let i = 0; i < bits.length; i += 8) {
+        let b = 0;
+        for (let j = 0; j < 8; j++) b = (b << 1) | bits[i + j];
+        data.push(b);
+    }
+    for (let i = 0; data.length < dataCw; i++) data.push(i % 2 ? 0x11 : 0xec);
+
+    const nBlocks = QR_BLOCKS[version - 1];
+    const ecLen = QR_EC_PER_BLOCK[version - 1];
+    const shortLen = Math.floor(dataCw / nBlocks);
+    const nLong = dataCw % nBlocks;
+    const dataBlocks = [];
+    const ecBlocks = [];
+    let off = 0;
+    for (let i = 0; i < nBlocks; i++) {
+        const len = shortLen + (i >= nBlocks - nLong ? 1 : 0);
+        const blk = data.slice(off, off + len);
+        off += len;
+        dataBlocks.push(blk);
+        ecBlocks.push(qrEC(blk, ecLen));
+    }
+    const out = [];
+    for (let i = 0; i <= shortLen; i++) for (const b of dataBlocks) if (i < b.length) out.push(b[i]);
+    for (let i = 0; i < ecLen; i++) for (const b of ecBlocks) out.push(b[i]);
+
+    const size = version * 4 + 17;
+    const mod = Array.from({ length: size }, () => new Uint8Array(size));
+    const fixed = Array.from({ length: size }, () => new Uint8Array(size));
+    const setF = (r, c, v) => {
+        if (r < 0 || c < 0 || r >= size || c >= size) return;
+        mod[r][c] = v ? 1 : 0;
+        fixed[r][c] = 1;
+    };
+    const finder = (r0, c0) => {
+        for (let r = -1; r <= 7; r++) {
+            for (let c = -1; c <= 7; c++) {
+                const ring = r >= 0 && r <= 6 && c >= 0 && c <= 6 && (r === 0 || r === 6 || c === 0 || c === 6);
+                const core = r >= 2 && r <= 4 && c >= 2 && c <= 4;
+                setF(r0 + r, c0 + c, ring || core);
+            }
+        }
+    };
+    finder(0, 0);
+    finder(0, size - 7);
+    finder(size - 7, 0);
+    for (let i = 8; i < size - 8; i++) {
+        setF(6, i, i % 2 === 0);
+        setF(i, 6, i % 2 === 0);
+    }
+    const ap = QR_ALIGN[version - 1];
+    for (const r of ap) {
+        for (const c of ap) {
+            if ((r <= 8 && c <= 8) || (r <= 8 && c >= size - 9) || (r >= size - 9 && c <= 8)) continue;
+            for (let dr = -2; dr <= 2; dr++) {
+                for (let dc = -2; dc <= 2; dc++) setF(r + dr, c + dc, Math.max(Math.abs(dr), Math.abs(dc)) !== 1);
+            }
+        }
+    }
+    if (version >= 7) {
+        const vb = QR_VERSION_BITS[version];
+        for (let i = 0; i < 18; i++) {
+            const bit = (vb >>> i) & 1;
+            const r = Math.floor(i / 3);
+            const c = i % 3;
+            setF(size - 11 + c, r, bit);
+            setF(r, size - 11 + c, bit);
+        }
+    }
+    // Reserve the format areas before the data walk so the zig-zag skips them.
+    for (let i = 0; i <= 8; i++) {
+        if (!fixed[8][i]) setF(8, i, 0);
+        if (!fixed[i][8]) setF(i, 8, 0);
+    }
+    for (let i = 0; i < 8; i++) {
+        setF(8, size - 1 - i, 0);
+        setF(size - 1 - i, 8, 0);
+    }
+
+    let idx = 0;
+    let bitIdx = 0;
+    let upward = true;
+    for (let col = size - 1; col > 0; col -= 2) {
+        if (col === 6) col--;
+        for (let i = 0; i < size; i++) {
+            const r = upward ? size - 1 - i : i;
+            for (let j = 0; j < 2; j++) {
+                const c = col - j;
+                if (fixed[r][c]) continue;
+                let bit = 0;
+                if (idx < out.length) bit = (out[idx] >>> (7 - bitIdx)) & 1;
+                if (++bitIdx === 8) {
+                    bitIdx = 0;
+                    idx++;
+                }
+                mod[r][c] = bit;
+            }
+        }
+        upward = !upward;
+    }
+
+    let best = null;
+    let bestScore = Infinity;
+    for (let mask = 0; mask < 8; mask++) {
+        const fn = qrMaskFn(mask);
+        const cand = mod.map((row) => Uint8Array.from(row));
+        for (let r = 0; r < size; r++) {
+            for (let c = 0; c < size; c++) if (!fixed[r][c] && fn(r, c)) cand[r][c] ^= 1;
+        }
+        const fb = qrFormatBits(mask);
+        const gb = (i) => (fb >>> i) & 1;
+        const setFmt = (r, c, v) => { cand[r][c] = v; };
+        for (let i = 0; i <= 5; i++) setFmt(i, 8, gb(i));
+        setFmt(7, 8, gb(6));
+        setFmt(8, 8, gb(7));
+        setFmt(8, 7, gb(8));
+        for (let i = 9; i < 15; i++) setFmt(8, 14 - i, gb(i));
+        for (let i = 0; i < 8; i++) setFmt(8, size - 1 - i, gb(i));
+        for (let i = 8; i < 15; i++) setFmt(size - 15 + i, 8, gb(i));
+        setFmt(size - 8, 8, 1);
+        const score = qrPenalty(cand, size);
+        if (score < bestScore) {
+            bestScore = score;
+            best = cand;
+        }
+    }
+    return best;
+}
+
+// qrSVG renders text as an inline SVG. The payload only ever reaches the
+// markup as path geometry — the key itself is never written into an attribute
+// or a label.
+function qrSVG(text, px) {
+    const m = qrEncode(text);
+    if (!m) return null;
+    const size = m.length;
+    const quiet = 4;
+    const total = size + quiet * 2;
+    let d = "";
+    for (let r = 0; r < size; r++) {
+        for (let c = 0; c < size; c++) if (m[r][c]) d += `M${c + quiet} ${r + quiet}h1v1h-1z`;
+    }
+    return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${total} ${total}" width="${px}" height="${px}"` +
+        ` shape-rendering="crispEdges" role="img" aria-label="invite QR code">` +
+        `<rect width="${total}" height="${total}" fill="#ffffff"/><path d="${d}" fill="#000000"/></svg>`;
+}
+
+// --- privilege token manager (174/175/176) ----------------------------------------
+
+const canTokenList = () => hasPerm("b_virtualserver_token_list");
+const canTokenAdd = () => hasPerm("b_virtualserver_token_add");
+const canTokenDelete = () => hasPerm("b_virtualserver_token_delete");
+
+// copyText copies to the clipboard and reports without echoing the value —
+// a privilege key must never reach a toast or a log line.
+async function copyText(value, what) {
+    try {
+        await navigator.clipboard.writeText(value);
+        V().toast(what + " copied to the clipboard");
+    } catch {
+        V().toast("clipboard unavailable", "warn");
+    }
+}
+
+// openTokenShare shows the handoff surface for one key: the raw key, the
+// invite link, and a QR of the link.
+function openTokenShare(token) {
+    const addr = V().state.lastConnect?.addr || "";
+    const link = inviteLink(addr, token);
+    const { overlay, q } = modal("confirm-dlg", `
+        <h3>Share privilege key</h3>
+        <div class="dlg-text">
+            <label class="dlg-label">Key</label>
+            <input class="dlg-input mono tk-share-key" readonly />
+            <label class="dlg-label">Invite link</label>
+            <input class="dlg-input mono tk-share-link" readonly />
+            <div class="tk-qr"></div>
+            <div class="pm-dim tk-qr-note"></div>
+        </div>
+        <div class="dlg-buttons">
+            <button class="dlg-cancel tk-copy-key">Copy key</button>
+            <button class="dlg-cancel tk-copy-link">Copy link</button>
+            <button class="dlg-ok">Close</button>
+        </div>`);
+    // .value, never innerHTML: the key is a credential.
+    q(".tk-share-key").value = token;
+    q(".tk-share-link").value = link;
+    const svg = qrSVG(link, 200);
+    if (svg) {
+        q(".tk-qr").innerHTML = svg;
+        q(".tk-qr-note").textContent = addr
+            ? "Scan or paste the link into voicx to redeem."
+            : "Not connected — the link has no server address; copy the key instead.";
+    } else {
+        q(".tk-qr-note").textContent = "link too long for a QR code — copy it instead";
+    }
+    q(".tk-copy-key").onclick = () => copyText(token, "key");
+    q(".tk-copy-link").onclick = () => copyText(link, "invite link");
+    q(".dlg-ok").onclick = () => overlay.remove();
+}
+
+// openTokenManager lists, mints and revokes privilege keys. All three
+// messages answer with the full list, so the view cannot drift.
+async function openTokenManager() {
+    const { overlay, q } = modal("audit", `
+        <div class="pm-head">
+            <h3>Privilege Keys</h3>
+            <button class="icon-btn tk-close" title="Close">✕</button>
+        </div>
+        <div class="tk-add"></div>
+        <div class="tk-list"></div>`);
+    q(".tk-close").onclick = () => overlay.remove();
+    if (!canTokenList()) {
+        q(".tk-list").innerHTML = denyNotice("b_virtualserver_token_list");
+        q(".tk-add").remove();
+        return;
+    }
+
+    let known = new Set();
+    const channelName = (id) => V().state.channels.find((c) => c.ChannelID === id)?.Name || String(id);
+
+    const render = (entries) => {
+        const list = q(".tk-list");
+        list.innerHTML = entries.length ? "" : `<div class="empty-state">no privilege keys</div>`;
+        if (!entries.length) return;
+        const table = document.createElement("table");
+        table.className = "perm-grid audit-grid";
+        table.innerHTML = `<thead><tr><th>key</th><th>grants</th><th>channel</th><th>note</th><th>created</th><th>used by</th><th></th></tr></thead><tbody></tbody>`;
+        const tbody = table.querySelector("tbody");
+        for (const e of entries) {
+            const tr = document.createElement("tr");
+            tr.className = e.used_by ? "pm-dim" : "";
+            tr.innerHTML = `<td class="mono tk-key"></td><td class="tk-group"></td><td class="tk-chan"></td>
+                <td class="tk-desc"></td><td class="mono">${fmtTime(e.created_at)}</td><td class="mono tk-used"></td>
+                <td><button class="tk-share" title="Copy key / invite link / QR">Share…</button>
+                    ${canTokenDelete() ? `<button class="mem-del tk-del" title="Revoke this key">✕</button>` : ""}</td>`;
+            tr.querySelector(".tk-key").textContent = e.token;
+            tr.querySelector(".tk-group").textContent = e.group_id ? (e.group_name || "group " + e.group_id) : "server admin";
+            tr.querySelector(".tk-chan").textContent = e.channel_id ? "# " + channelName(e.channel_id) : "";
+            tr.querySelector(".tk-desc").textContent = e.description || "";
+            tr.querySelector(".tk-used").textContent = e.used_by || "";
+            tr.querySelector(".tk-share").onclick = () => openTokenShare(e.token);
+            const del = tr.querySelector(".tk-del");
+            if (del) {
+                del.onclick = async () => {
+                    const ok = await confirmDlg("Revoke key", `<p>Revoke this privilege key? Anyone holding it can no longer redeem it.</p>`, "Revoke", true);
+                    if (!ok) return;
+                    try {
+                        const resp = await App().TokenDelete(e.token);
+                        known = new Set((resp.entries || []).map((x) => x.token));
+                        render(resp.entries || []);
+                        toastAudit("privilege key revoked");
+                    } catch (err) {
+                        V().toast("revoke failed: " + err, "warn");
+                    }
+                };
+            }
+            tbody.appendChild(tr);
+        }
+        list.appendChild(table);
+    };
+
+    if (canTokenAdd()) {
+        q(".tk-add").innerHTML = `
+            <select class="dlg-input tk-new-group"><option value="0">server admin (admin only)</option></select>
+            <select class="dlg-input tk-new-chan"><option value="0">— no channel —</option></select>
+            <input class="dlg-input tk-new-desc" placeholder="note (optional)" />
+            <button class="tk-new">+ Create key</button>`;
+        try {
+            for (const g of (await App().GroupList("server")).groups || []) {
+                const opt = document.createElement("option");
+                opt.value = g.id;
+                opt.textContent = g.name;
+                q(".tk-new-group").appendChild(opt);
+            }
+        } catch { /* the admin option alone still works */ }
+        for (const c of V().state.channels) {
+            const opt = document.createElement("option");
+            opt.value = c.ChannelID;
+            opt.textContent = "# " + c.Name;
+            q(".tk-new-chan").appendChild(opt);
+        }
+        q(".tk-new").onclick = async () => {
+            const groupID = parseInt(q(".tk-new-group").value, 10) || 0;
+            const chanID = parseInt(q(".tk-new-chan").value, 10) || 0;
+            let resp;
+            try {
+                resp = await App().TokenAdd(groupID, chanID, q(".tk-new-desc").value.trim());
+            } catch (err) {
+                return V().toast("key creation failed: " + err, "warn");
+            }
+            const entries = resp.entries || [];
+            // The reply is the whole list, oldest-first: the new key is the
+            // one that was not there before.
+            const fresh = entries.find((e) => !known.has(e.token));
+            known = new Set(entries.map((e) => e.token));
+            render(entries);
+            q(".tk-new-desc").value = "";
+            toastAudit("privilege key created");
+            if (fresh) openTokenShare(fresh.token);
+        };
+    }
+
+    try {
+        const resp = await App().TokenList();
+        known = new Set((resp.entries || []).map((e) => e.token));
+        render(resp.entries || []);
+    } catch (err) {
+        q(".tk-list").innerHTML = `<div class="empty-state">key list failed: ${esc(err)}</div>`;
+    }
+}
+
+// --- token redemption -------------------------------------------------------------
+
+// pendingToken holds a key handed over while offline; the first snapshot after
+// the next login redeems it.
+let pendingToken = "";
+
+// redeemToken sends MsgTokenUse. Success is silent — the grant arrives as the
+// token_used event, which is where the permission refetch happens.
+async function redeemToken(token) {
+    if (!token) return;
+    if (!V().state.myClientID) {
+        pendingToken = token;
+        V().toast("not connected — the key will be redeemed after you log in");
+        return;
+    }
+    const err = await App().TokenUse(token);
+    if (err) V().toast("redeem failed: " + err, "warn");
+    else V().toast("privilege key sent for redemption…");
+}
+
+// openTokenRedeem takes a raw key or a voicx:// invite link. This is the only
+// path that can redeem the bootstrap admin key printed at first server start.
+function openTokenRedeem() {
+    const { overlay, q } = modal("confirm-dlg", `
+        <h3>Use a privilege key</h3>
+        <div class="dlg-text">
+            <p class="pm-dim">Paste a privilege key or a <span class="mono">voicx://</span> invite link. Guests cannot redeem keys — log into an account first.</p>
+            <input class="dlg-input mono tk-use-input" placeholder="key or voicx://host:port?token=…" />
+            <div class="pm-dim tk-use-hint"></div>
+        </div>
+        <div class="dlg-buttons">
+            <button class="dlg-cancel">Cancel</button>
+            <button class="dlg-ok">Redeem</button>
+        </div>`);
+    const input = q(".tk-use-input");
+    input.oninput = () => {
+        const link = parseInviteLink(input.value);
+        q(".tk-use-hint").textContent = link ? "invite link for " + link.addr : "";
+    };
+    q(".dlg-cancel").onclick = () => overlay.remove();
+    q(".dlg-ok").onclick = () => {
+        const raw = input.value.trim();
+        if (!raw) return;
+        const link = parseInviteLink(raw);
+        overlay.remove();
+        if (!link) return redeemToken(raw);
+        if (!link.token) return V().toast("that invite link carries no key", "warn");
+        const addr = V().state.lastConnect?.addr || "";
+        if (V().state.myClientID && (!link.addr || link.addr === addr)) return redeemToken(link.token);
+        // A link for another server: stash the key and point the user at the
+        // right address; the redemption fires on the next snapshot.
+        pendingToken = link.token;
+        const el = document.getElementById("login-addr");
+        if (el) el.value = link.addr;
+        V().showLogin();
+        V().toast("connect to " + link.addr + " — the key is redeemed automatically");
+    };
+    input.focus();
+}
+
 // --- wiring ------------------------------------------------------------------
 
 export function initPermsUI() {
     // Grant-cap / permission errors from fire-and-forget writes arrive here
     // (the server sends MsgError); surface them as toasts.
     window.runtime.EventsOn("servererror", (msg) => {
-        if (String(msg).includes("grant cap") || String(msg).includes("insufficient permission")) {
-            V().toast("server: " + msg, "warn");
+        const s = String(msg);
+        // Token redemption is silent on success, so its failures (unknown key,
+        // no uses left, guest) only ever arrive here.
+        if (s.includes("grant cap") || s.includes("insufficient permission") ||
+            s.includes("token") || s.includes("privilege")) {
+            V().toast("server: " + s, "warn");
         }
     });
+    // (151) push-based cache invalidation: the server tells every client whose
+    // resolution could have moved to refetch. group_edit also carries the
+    // cosmetics, so it refreshes the group list and the tree as well.
+    window.runtime.EventsOn("perms_invalid", (reason) => {
+        V().refreshPermissions();
+        if (String(reason) === "group_edit") {
+            refreshGroups().then(() => V().renderTree());
+        }
+    });
+
+    // Redemption is silent on the wire; the grant lands as this event.
+    window.runtime.EventsOn("event", (json) => {
+        let env;
+        try {
+            env = JSON.parse(json);
+        } catch {
+            return;
+        }
+        if (env.type !== "token_used") return;
+        const d = env.data || {};
+        if (d.client_id && d.client_id !== V().state.myClientID) return;
+        V().toast(d.group_id ? "privilege key redeemed" : "privilege key redeemed — you are now a server admin");
+        V().refreshPermissions();
+        refreshGroups().then(() => V().renderTree());
+    });
+
+    // A key handed over while offline (invite link) redeems on the first
+    // snapshot after login — the point at which the account row exists.
+    window.runtime.EventsOn("snapshot", () => {
+        if (!pendingToken) return;
+        const token = pendingToken;
+        pendingToken = "";
+        redeemToken(token);
+    });
+
     window.__voicxPerms = {
         openPermissionManager, openAuditViewer, openBanList, openChatFilters,
+        openComplaints, openTokenManager, openTokenRedeem,
         refreshGroups, groupColorFor, primaryGroup, hoistedGroups, groupIconURL,
         canPermManage, canAuditView, canGroupManage, canBan, canKickChannel, canKickServer,
-        canChatFilterManage,
+        canChatFilterManage, canTokenList,
+        inviteLink, parseInviteLink,
         esc,
     };
 }

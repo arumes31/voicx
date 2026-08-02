@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -287,5 +288,124 @@ func TestMigrateSettingsRestoresPlaySounds(t *testing.T) {
 	cur.PlaySounds = false
 	if migrateSettings(cur).PlaySounds {
 		t.Error("migration overrode a deliberate opt-out")
+	}
+}
+
+// TestWindowOpacityMigration covers 292: opacity defaults to fully opaque, an
+// older file (which carries 0) gets that back, and a deliberate value survives.
+func TestWindowOpacityMigration(t *testing.T) {
+	if DefaultSettings().WindowOpacity != 100 {
+		t.Fatalf("default opacity = %d, want 100", DefaultSettings().WindowOpacity)
+	}
+	old := DefaultSettings()
+	old.SettingsVersion = 2
+	old.WindowOpacity = 0
+	if got := migrateSettings(old).WindowOpacity; got != 100 {
+		t.Errorf("pre-version file opacity = %d, want 100", got)
+	}
+	cur := DefaultSettings()
+	cur.WindowOpacity = 70
+	if got := migrateSettings(cur).WindowOpacity; got != 70 {
+		t.Errorf("migration overrode a deliberate opacity: %d", got)
+	}
+}
+
+// TestAutoAwayMessage covers 390: the away line has a non-zero default, an
+// older file gets it back, and the resolver clamps to the server's limit.
+func TestAutoAwayMessage(t *testing.T) {
+	if DefaultSettings().AutoAwayMessage != defaultAutoAwayMessage {
+		t.Fatalf("default away message = %q", DefaultSettings().AutoAwayMessage)
+	}
+
+	// A file written before the field existed must not publish a blank line.
+	old := DefaultSettings()
+	old.SettingsVersion = 1
+	old.AutoAwayMessage = ""
+	if got := migrateSettings(old).AutoAwayMessage; got != defaultAutoAwayMessage {
+		t.Errorf("migrated away message = %q, want %q", got, defaultAutoAwayMessage)
+	}
+	// A deliberate current-version value survives.
+	cur := DefaultSettings()
+	cur.AutoAwayMessage = "bin gleich zurück"
+	if got := migrateSettings(cur).AutoAwayMessage; got != "bin gleich zurück" {
+		t.Errorf("migration overrode a chosen message: %q", got)
+	}
+
+	a := &App{settings: DefaultSettings(), settingsPath: filepath.Join(t.TempDir(), "settings.json")}
+	a.settings.AutoAwayMessage = "  away from keyboard  "
+	if got := a.autoAwayMessage(); got != "away from keyboard" {
+		t.Errorf("away message = %q", got)
+	}
+	a.settings.AutoAwayMessage = ""
+	if got := a.autoAwayMessage(); got != defaultAutoAwayMessage {
+		t.Errorf("empty away message = %q, want the default", got)
+	}
+	a.settings.AutoAwayMessage = strings.Repeat("x", 400)
+	if got := len(a.autoAwayMessage()); got != 200 {
+		t.Errorf("away message length = %d, want the server limit of 200", got)
+	}
+}
+
+// TestIdentitySettingsRoundTrip covers 351/354: the active identity and the
+// key-protection mode persist, and an empty protection mode means "protect
+// when possible" so a file predating the option needs no migration.
+func TestIdentitySettingsRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	s := DefaultSettings()
+	if s.ActiveIdentity != "" || s.IdentityKeyProtection != "" {
+		t.Fatalf("identity defaults should be empty: %+v", s)
+	}
+	s.ActiveIdentity = "work-account"
+	s.IdentityKeyProtection = "off"
+	if err := saveSettingsAt(path, s); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	loaded := loadSettingsAt(path)
+	if loaded.ActiveIdentity != "work-account" || loaded.IdentityKeyProtection != "off" {
+		t.Fatalf("identity settings lost: %+v", loaded)
+	}
+
+	old := keyProtectionSetting
+	t.Cleanup(func() { keyProtectionSetting = old })
+	keyProtectionSetting = func() string { return "" }
+	if !keyProtectionWanted() {
+		t.Error("empty protection mode must mean auto, not off")
+	}
+	keyProtectionSetting = func() string { return "off" }
+	if keyProtectionWanted() {
+		t.Error("off must disable key protection")
+	}
+}
+
+// TestActiveIdentityIsGoOwned verifies a settings blob the frontend cached
+// before an identity switch cannot revert it (351).
+func TestActiveIdentityIsGoOwned(t *testing.T) {
+	a := &App{
+		settings:     DefaultSettings(),
+		hotkeys:      map[string]*hotkeyReg{},
+		settingsPath: filepath.Join(t.TempDir(), "settings.json"),
+	}
+	stale := a.GetSettings()
+	a.settings.ActiveIdentity = "work-account"
+	if err := a.SaveSettings(stale); err != "" {
+		t.Fatalf("save: %s", err)
+	}
+	if a.settings.ActiveIdentity != "work-account" {
+		t.Fatalf("stale frontend save reverted the active identity: %q", a.settings.ActiveIdentity)
+	}
+}
+
+// TestEventSoundsCoverMatrix pins the sound presets against the notification
+// matrix rows (385): a matrix event with no sound entry is how the two lists
+// drifted apart before.
+func TestEventSoundsCoverMatrix(t *testing.T) {
+	sounds := DefaultSettings().EventSounds
+	for _, event := range []string{
+		"mention", "keyword", "dm", "whisper", "poke", "join_leave",
+		"buddy_online", "kick", "announcement", "channel_watch",
+	} {
+		if !sounds[event] {
+			t.Errorf("notification matrix event %q has no default event sound", event)
+		}
 	}
 }

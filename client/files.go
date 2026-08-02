@@ -12,8 +12,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
+	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -48,10 +51,13 @@ func (a *App) FileDelete(channelID int64, folder, name string) string {
 	return ""
 }
 
-// FileRename renames or moves a channel file.
-func (a *App) FileRename(channelID int64, folder, name, newFolder, newName string) string {
+// FileRename renames or moves a channel file. newChannelID 0 keeps the file
+// in its channel; anything else is a cross-channel move (262), which the
+// server checks against both channels.
+func (a *App) FileRename(channelID int64, folder, name, newFolder, newName string, newChannelID int64) string {
 	if err := a.cmLoad().write(netproto.MsgFileRename, netproto.FileRename{
-		ChannelID: channelID, Folder: folder, Name: name, NewFolder: newFolder, NewName: newName,
+		ChannelID: channelID, Folder: folder, Name: name,
+		NewFolder: newFolder, NewName: newName, NewChannelID: newChannelID,
 	}); err != nil {
 		return err.Error()
 	}
@@ -110,6 +116,58 @@ func (a *App) ServerIconGet() (netproto.ServerIconData, error) {
 	return data, nil
 }
 
+// ServerBannerSet uploads the server banner (admin only, 270).
+func (a *App) ServerBannerSet(dataBase64 string) string {
+	if err := a.cmLoad().write(netproto.MsgServerBannerSet, netproto.ServerBannerSet{DataBase64: dataBase64}); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+// ServerBannerGet fetches the server banner (empty = none).
+func (a *App) ServerBannerGet() (netproto.ServerBannerData, error) {
+	f, err := a.cmLoad().request(netproto.MsgServerBannerGet, netproto.MsgServerBannerDat,
+		netproto.ServerBannerGet{}, 5*time.Second)
+	if err != nil {
+		return netproto.ServerBannerData{}, err
+	}
+	var data netproto.ServerBannerData
+	if err := decodeJSON(f, &data); err != nil {
+		return netproto.ServerBannerData{}, err
+	}
+	return data, nil
+}
+
+// ChannelIconGet fetches a channel's icon (271; empty = none set).
+func (a *App) ChannelIconGet(channelID int64) (netproto.ChannelIconData, error) {
+	f, err := a.cmLoad().request(netproto.MsgChannelIconGet, netproto.MsgChannelIconData,
+		netproto.ChannelIconGet{ChannelID: channelID}, 5*time.Second)
+	if err != nil {
+		return netproto.ChannelIconData{}, err
+	}
+	var data netproto.ChannelIconData
+	if err := decodeJSON(f, &data); err != nil {
+		return netproto.ChannelIconData{}, err
+	}
+	return data, nil
+}
+
+// EmojiDelete removes a custom server emoji (272, b_emoji_manage).
+func (a *App) EmojiDelete(name string) string {
+	if err := a.cmLoad().write(netproto.MsgEmojiDelete, netproto.EmojiDelete{Name: name}); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+// EmojiRename renames a custom server emoji (272, b_emoji_manage).
+func (a *App) EmojiRename(name, newName string) string {
+	if err := a.cmLoad().write(netproto.MsgEmojiRename, netproto.EmojiRename{Name: name, NewName: newName}); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
 // ChannelIconSet uploads a channel icon, or copies it from another channel
 // (copyFromChannelID != 0, 271 icon library).
 func (a *App) ChannelIconSet(channelID int64, dataBase64 string, copyFromChannelID int64) string {
@@ -133,6 +191,10 @@ type ftProgress struct {
 	BytesPerSec int64  `json:"bytes_per_sec"`
 	Status      string `json:"status"` // active | done | error | canceled
 	Error       string `json:"error,omitempty"`
+	// Resumed is how many bytes this attempt inherited from an interrupted
+	// one (259); it lets the transfer list say so instead of looking like a
+	// download that started implausibly fast.
+	Resumed int64 `json:"resumed,omitempty"`
 }
 
 // transfers tracks in-flight transfers for cancel (258).
@@ -251,6 +313,117 @@ func (a *App) ftUploadProgress(id string, ep ftEndpoint, token, transferID strin
 	return ftReadStatus(conn)
 }
 
+// PickUploadPaths opens the native multi-file picker and returns the chosen
+// paths ([] = cancelled). Uploading by path is the streaming route: the
+// browser route has to read the whole file into memory and base64 it into a
+// single IPC argument, which stops working a few MiB in.
+func (a *App) PickUploadPaths() []string {
+	paths, err := wailsRuntime.OpenMultipleFilesDialog(a.ctx, wailsRuntime.OpenDialogOptions{
+		Title: "Upload files",
+	})
+	if err != nil || paths == nil {
+		return []string{}
+	}
+	return paths
+}
+
+// UploadPathProgress uploads a local file into a channel folder, streaming it
+// off disk in chunks instead of buffering and base64-encoding it (259). It
+// returns immediately ("" or an init error); completion arrives as ft_progress
+// status changes.
+func (a *App) UploadPathProgress(id string, channelID int64, folder, path string) string {
+	st, err := os.Stat(path)
+	if err != nil {
+		return "cannot read " + filepath.Base(path) + ": " + err.Error()
+	}
+	if st.IsDir() {
+		return filepath.Base(path) + " is a folder"
+	}
+	name := filepath.Base(path)
+	f, err := a.cmLoad().request(netproto.MsgFileTransferInit, netproto.MsgFileTransferInitResponse,
+		netproto.FileTransferInit{ChannelID: channelID, Direction: "upload", Name: name, Folder: folder, Size: st.Size()},
+		10*time.Second)
+	if err != nil {
+		return err.Error()
+	}
+	var init netproto.FileTransferInitResponse
+	if err := decodeJSON(f, &init); err != nil {
+		return err.Error()
+	}
+	ep, err := a.ftTarget(init)
+	if err != nil {
+		return err.Error()
+	}
+	go guardCrash("ft upload path", func() {
+		p := ftProgress{ID: id, Direction: "upload", Name: name, Total: st.Size(), Status: "active"}
+		err := a.ftUploadFile(id, ep, init.Token, init.TransferID, path, &p)
+		if err != nil {
+			p.Status = "error"
+			if errors.Is(err, errTransferCanceled) {
+				p.Status = "canceled"
+			}
+			p.Error = err.Error()
+		} else {
+			p.Status = "done"
+			p.Transferred = p.Total
+		}
+		a.ftEmit(p)
+	})
+	return ""
+}
+
+// ftUploadFile streams a file off disk to the data port, hashing as it goes so
+// nothing larger than one chunk is ever held in memory.
+func (a *App) ftUploadFile(id string, ep ftEndpoint, token, transferID, path string, p *ftProgress) error {
+	src, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	conn, err := ftDial(ep)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	untrack := trackTransfer(id, conn)
+	defer untrack()
+
+	if err := ftWriteJSON(conn, ftInit, map[string]string{"token": token, "transfer_id": transferID}); err != nil {
+		return err
+	}
+	h := sha256.New()
+	buf := make([]byte, 32*1024)
+	start := time.Now()
+	for {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			if err := netproto.WriteFrame(conn, &netproto.Frame{Type: ftChunk, Payload: buf[:n]}); err != nil {
+				if isClosedConn(err) {
+					return errTransferCanceled
+				}
+				return err
+			}
+			h.Write(buf[:n])
+			p.Transferred += int64(n)
+			if d := time.Since(start).Seconds(); d > 0 {
+				p.BytesPerSec = int64(float64(p.Transferred) / d)
+			}
+			a.ftEmit(*p)
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
+	if err := ftWriteJSON(conn, ftDigest, map[string]string{"sha256": hex.EncodeToString(h.Sum(nil))}); err != nil {
+		return err
+	}
+	return ftReadStatus(conn)
+}
+
 // isClosedConn reports whether the error came from our own cancel close.
 func isClosedConn(err error) bool {
 	var nerr *net.OpError
@@ -270,9 +443,30 @@ func (a *App) PickSavePath(defaultName string) string {
 	return path
 }
 
+// DownloadPath returns where a download should land without asking: the
+// configured download folder joined with name, or "" when the user has not
+// set one, in which case the caller falls back to PickSavePath. This is what
+// gives the Downloads settings page's folder an effect.
+func (a *App) DownloadPath(name string) string {
+	dir := a.settings.DownloadFolder
+	if dir == "" {
+		return ""
+	}
+	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+		return ""
+	}
+	return filepath.Join(dir, filepath.Base(name))
+}
+
+// partSuffix marks the incomplete download sitting next to its destination.
+// It survives a failed or cancelled transfer on purpose: that leftover IS the
+// resume state (259).
+const partSuffix = ".vcxpart"
+
 // DownloadFileProgress downloads a channel file to destPath with progress
-// events.
-func (a *App) DownloadFileProgress(id string, channelID int64, folder, name, destPath string) string {
+// events. Calling it again for the same destination resumes from whatever the
+// interrupted attempt already wrote (259).
+func (a *App) DownloadFileProgress(id string, channelID int64, folder, name, destPath string, total int64) string {
 	f, err := a.cmLoad().request(netproto.MsgFileTransferInit, netproto.MsgFileTransferInitResponse,
 		netproto.FileTransferInit{ChannelID: channelID, Direction: "download", Folder: folder, Name: name},
 		10*time.Second)
@@ -288,7 +482,9 @@ func (a *App) DownloadFileProgress(id string, channelID int64, folder, name, des
 		return err.Error()
 	}
 	go guardCrash("ft download", func() {
-		p := ftProgress{ID: id, Direction: "download", Name: name, Status: "active"}
+		// total comes from the listing row: the wire never carries the size on
+		// the data port, and without it a resumed transfer has no denominator.
+		p := ftProgress{ID: id, Direction: "download", Name: name, Total: total, Status: "active"}
 		err := a.ftDownloadProgress(id, ep, init.Token, init.TransferID, destPath, &p)
 		if err != nil {
 			p.Status = "error"
@@ -305,32 +501,62 @@ func (a *App) DownloadFileProgress(id string, channelID int64, folder, name, des
 	return ""
 }
 
-// ftDownloadProgress streams a download into destPath with progress.
+// resumeState opens the partial file for destPath and returns it positioned
+// at the end, the byte count already on disk, and a hasher primed with those
+// bytes (259). The server's digest covers the whole file, so the prefix we
+// keep has to go through the same hash or a resumed transfer could never
+// verify.
+func resumeState(destPath string) (*os.File, int64, hash.Hash, error) {
+	partPath := destPath + partSuffix
+	h := sha256.New()
+	f, err := os.OpenFile(partPath, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	have, err := io.Copy(h, f)
+	if err != nil {
+		_ = f.Close()
+		return nil, 0, nil, err
+	}
+	return f, have, h, nil
+}
+
+// ftDownloadProgress streams a download into destPath with progress. It
+// writes to destPath+partSuffix and only renames on a verified digest, so an
+// interrupted attempt leaves a resumable remnant instead of a truncated file
+// that looks complete.
 func (a *App) ftDownloadProgress(id string, ep ftEndpoint, token, transferID, destPath string, p *ftProgress) error {
+	partPath := destPath + partSuffix
+	out, have, h, err := resumeState(destPath)
+	if err != nil {
+		return err
+	}
+	p.Transferred = have
+	p.Resumed = have
+
 	conn, err := ftDial(ep)
 	if err != nil {
+		_ = out.Close()
 		return err
 	}
 	defer conn.Close()
 	untrack := trackTransfer(id, conn)
 	defer untrack()
 
-	if err := ftWriteJSON(conn, ftInit, map[string]string{"token": token, "transfer_id": transferID}); err != nil {
+	if err := ftWriteJSON(conn, ftInit, map[string]any{
+		"token": token, "transfer_id": transferID, "offset": have,
+	}); err != nil {
+		_ = out.Close()
 		return err
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	defer conn.SetReadDeadline(time.Time{})
 
-	out, err := os.Create(destPath)
-	if err != nil {
-		return err
-	}
 	fail := func(err error) error {
 		_ = out.Close()
 		return err
 	}
 
-	h := sha256.New()
 	start := time.Now()
 	for {
 		f, err := netproto.ReadFrame(conn)
@@ -352,11 +578,13 @@ func (a *App) ftDownloadProgress(id string, ep ftEndpoint, token, transferID, de
 				p.Total = -1 // unknown until the digest frame
 			}
 			if d := time.Since(start).Seconds(); d > 0 {
-				p.BytesPerSec = int64(float64(p.Transferred) / d)
+				p.BytesPerSec = int64(float64(p.Transferred-have) / d)
 			}
 			a.ftEmit(*p)
 		case ftDigest:
-			_ = out.Close()
+			if err := out.Close(); err != nil {
+				return err
+			}
 			var d struct {
 				SHA256 string `json:"sha256"`
 			}
@@ -364,9 +592,19 @@ func (a *App) ftDownloadProgress(id string, ep ftEndpoint, token, transferID, de
 				return err
 			}
 			if d.SHA256 != hex.EncodeToString(h.Sum(nil)) {
+				// A stale remnant from a different version of the file would
+				// poison every retry, so drop it and let the next attempt
+				// start clean.
+				_ = os.Remove(partPath)
 				return errors.New("file digest mismatch")
 			}
-			return ftReadStatus(conn)
+			if err := ftReadStatus(conn); err != nil {
+				return err
+			}
+			// Windows refuses a rename onto an existing name, and the save
+			// dialog hands back paths the user already agreed to replace.
+			_ = os.Remove(destPath)
+			return os.Rename(partPath, destPath)
 		default:
 			return fail(fmt.Errorf("unexpected frame type %d", f.Type))
 		}

@@ -608,7 +608,7 @@ func TestLiveFileManagement(t *testing.T) {
 	}
 
 	// Rename/move into the root folder (262).
-	if err := app.FileRename(channelID, "docs", folderFile, "", "moved.txt"); err != "" {
+	if err := app.FileRename(channelID, "docs", folderFile, "", "moved.txt", 0); err != "" {
 		t.Fatalf("FileRename: %s", err)
 	}
 	defer app.FileDelete(channelID, "", "moved.txt")

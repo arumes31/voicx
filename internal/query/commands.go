@@ -3,12 +3,11 @@
 package query
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -16,12 +15,18 @@ import (
 	"go.uber.org/zap"
 )
 
-// session holds per-connection query state.
+// session holds per-connection query state. It is transport-agnostic (224):
+// the raw TCP port and the SSH transport differ only in the reader/writer and
+// in whether read deadlines are available.
 type session struct {
-	conn     net.Conn
-	remoteIP string
-	authed   bool
-	username string
+	r *bufio.Reader
+	w io.Writer
+	// setReadDeadline arms the idle timeout; nil when the transport has no
+	// deadline of its own.
+	setReadDeadline func(time.Time) error
+	remoteIP        string
+	authed          bool
+	username        string
 }
 
 // command is a parsed command line: name, key=value args (unescaped), and
@@ -169,6 +174,8 @@ func (s *Server) execute(ctx context.Context, sess *session, line string) bool {
 		return s.cmdCustominfo(ctx, sess, cmd)
 	case "logview":
 		return s.cmdLogview(ctx, sess, cmd)
+	case "serverrules":
+		return s.cmdServerrules(ctx, sess)
 	default:
 		return s.write(sess, errorLine(errUnknownCommand, "unknown command: "+cmd.name))
 	}
@@ -176,7 +183,7 @@ func (s *Server) execute(ctx context.Context, sess *session, line string) bool {
 
 // write sends lines to the client. It returns false when the write fails.
 func (s *Server) write(sess *session, text string) bool {
-	_, err := io.WriteString(sess.conn, text)
+	_, err := io.WriteString(sess.w, text)
 	return err == nil
 }
 
@@ -377,10 +384,12 @@ func (s *Server) cmdChannelinfo(ctx context.Context, sess *session, cmd command)
 // cmdChanneledit edits a channel:
 // channeledit cid=<id> [channel_topic=<t>] [channel_maxclients=<n>]
 // [opus_bitrate=<bps>] [opus_fec=0|1] [opus_dtx=0|1] [opus_stereo=0|1]
+// [channel_needed_join_power=<n>] [channel_order=<n>] [cpid=<id>]
+// [channel_inherit_permissions=0|1]
 func (s *Server) cmdChanneledit(ctx context.Context, sess *session, cmd command) bool {
 	cid, err := strconv.ParseInt(cmd.args["cid"], 10, 64)
 	if err != nil {
-		return s.write(sess, errorLine(errInvalidParameter, "usage: channeledit cid=<id> [channel_topic=<t>] [channel_maxclients=<n>] [opus_bitrate=<bps>] [opus_fec=0|1] [opus_dtx=0|1] [opus_stereo=0|1] [slow_mode_seconds=<n>]"))
+		return s.write(sess, errorLine(errInvalidParameter, "usage: "+channeleditUsage))
 	}
 	var params ChannelEditParams
 	if v, ok := cmd.args["channel_topic"]; ok {
@@ -407,6 +416,28 @@ func (s *Server) cmdChanneledit(ctx context.Context, sess *session, cmd command)
 		}
 		params.SlowModeSeconds = &n
 	}
+	if v, ok := cmd.args["channel_needed_join_power"]; ok {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return s.write(sess, errorLine(errInvalidParameter, "invalid channel_needed_join_power"))
+		}
+		params.NeededJoinPower = &n
+	}
+	if v, ok := cmd.args["channel_order"]; ok {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return s.write(sess, errorLine(errInvalidParameter, "invalid channel_order"))
+		}
+		params.OrderIndex = &n
+	}
+	// cpid is the TS3 name for the parent; 0 moves the channel to the root (168).
+	if v, ok := cmd.args["cpid"]; ok {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return s.write(sess, errorLine(errInvalidParameter, "invalid cpid"))
+		}
+		params.ParentID = &n
+	}
 	for _, b := range []struct {
 		key string
 		dst **bool
@@ -414,6 +445,7 @@ func (s *Server) cmdChanneledit(ctx context.Context, sess *session, cmd command)
 		{"opus_fec", &params.OpusFEC},
 		{"opus_dtx", &params.OpusDTX},
 		{"opus_stereo", &params.OpusStereo},
+		{"channel_inherit_permissions", &params.InheritPermissions},
 	} {
 		if v, ok := cmd.args[b.key]; ok {
 			val, err := parseBoolArg(v)
@@ -466,18 +498,25 @@ const chatFiltersUsage = `chat_filters value must be a JSON document with the th
 // are rejected: a misspelled key would otherwise decode into an empty document
 // and clear all three lists.
 func validateChatFilters(value string) error {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || trimmed == "null" {
+		return fmt.Errorf("%s: invalid json document", chatFiltersUsage)
+	}
 	dec := json.NewDecoder(strings.NewReader(value))
 	dec.DisallowUnknownFields()
 	var doc chatFiltersDoc
 	if err := dec.Decode(&doc); err != nil {
-		return errors.New(chatFiltersUsage)
+		return fmt.Errorf("%s: %w", chatFiltersUsage, err)
+	}
+	if dec.More() {
+		return fmt.Errorf("%s: trailing data after json document", chatFiltersUsage)
 	}
 	return nil
 }
 
 // cmdServerset stores a server setting (wave 5a: motd, announcement; 117/118:
-// chat_filters):
-// serverset key=<motd|announcement|chat_filters> value=<text>
+// chat_filters; 215: server_rules):
+// serverset key=<motd|announcement|server_rules|chat_filters> value=<text>
 // Setting "announcement" also broadcasts it to all online clients; setting
 // chat_filters drops the server's memoised lists, so it takes effect on the
 // next message rather than at the next restart.
@@ -486,12 +525,15 @@ func (s *Server) cmdServerset(ctx context.Context, sess *session, cmd command) b
 	value := cmd.args["value"]
 	switch key {
 	case "motd", "announcement":
+	// (215) rules are operator content shown on first join; an empty value
+	// clears them and stops the dialog being asked.
+	case "server_rules":
 	case "chat_filters":
 		if err := validateChatFilters(value); err != nil {
 			return s.write(sess, errorLine(errInvalidParameter, err.Error()))
 		}
 	default:
-		return s.write(sess, errorLine(errInvalidParameter, "usage: serverset key=<motd|announcement|chat_filters> value=<text>"))
+		return s.write(sess, errorLine(errInvalidParameter, "usage: serverset key=<motd|announcement|server_rules|chat_filters> value=<text>"))
 	}
 	if err := s.backend.ServerSet(ctx, key, value); err != nil {
 		return s.write(sess, errorLine(errServerError, err.Error()))
@@ -633,6 +675,10 @@ func (s *Server) cmdAuditlog(ctx context.Context, sess *session, cmd command) bo
 	return s.write(sess, b.String())
 }
 
+// channeleditUsage is shared by the help text and the parameter errors so the
+// two cannot drift as fields are added.
+const channeleditUsage = "channeledit cid=<id> [channel_topic=<t>] [channel_maxclients=<n>] [opus_bitrate=<bps>] [opus_fec=0|1] [opus_dtx=0|1] [opus_stereo=0|1] [slow_mode_seconds=<n>] [channel_needed_join_power=<n>] [channel_order=<n>] [cpid=<id>] [channel_inherit_permissions=0|1]"
+
 // helpText documents the command set.
 const helpText = `available commands:
 login <unique_id> <password>
@@ -649,8 +695,9 @@ sendtextmessage targetmode=<1|2|3> target=<id> msg=<text>
 channelcreate channel_name=<name> [channel_topic=<t>] [channel_flag_permanent=1|channel_flag_semi_permanent=1]
 channeldelete cid=<id> [force=1]
 channelinfo cid=<id>
-channeledit cid=<id> [channel_topic=<t>] [channel_maxclients=<n>] [opus_bitrate=<bps>] [opus_fec=0|1] [opus_dtx=0|1] [opus_stereo=0|1] [slow_mode_seconds=<n>]
-serverset key=<motd|announcement|chat_filters> value=<text>
+` + channeleditUsage + `
+serverset key=<motd|announcement|server_rules|chat_filters> value=<text>
+serverrules
 banclient clid=<id> [time=<seconds>] [banreason=<text>]
 complaintlist
 complaintdel id=<id>
@@ -675,7 +722,7 @@ servergroupclientlist sgid=<id>
 customset cldbid=<unique_id> ident=<key> value=<v>
 customdel cldbid=<unique_id> ident=<key>
 custominfo cldbid=<unique_id>
-logview [lines=<n>] [filter=<substr>]
+logview [lines=<n>] [filter=<substr>] [follow=<seconds>]
 `
 
 // ---------------------------------------------------------------------------
@@ -684,23 +731,35 @@ logview [lines=<n>] [filter=<substr>]
 
 // cmdServeredit updates server name / welcome message / max-clients override
 // (217): serveredit [virtualserver_name=<n>] [virtualserver_welcomemessage=<m>]
-// [virtualserver_maxclients=<n>]. All fields optional; omitted = keep.
+// [virtualserver_maxclients=<n>].
+//
+// A field counts as edited when the KEY is present, not when its value is
+// non-empty: passing an empty value is the only way to drop an override and
+// fall back to the config.yaml default.
 func (s *Server) cmdServeredit(ctx context.Context, sess *session, cmd command) bool {
-	name := cmd.args["virtualserver_name"]
-	welcome := cmd.args["virtualserver_welcomemessage"]
-	maxClients := 0
-	if v := cmd.args["virtualserver_maxclients"]; v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 0 {
-			return s.write(sess, errorLine(errInvalidParameter, "invalid virtualserver_maxclients"))
-		}
-		maxClients = n
+	var params ServerEditParams
+	if v, ok := cmd.args["virtualserver_name"]; ok {
+		params.Name = &v
 	}
-	if name == "" && welcome == "" && maxClients == 0 {
+	if v, ok := cmd.args["virtualserver_welcomemessage"]; ok {
+		params.Welcome = &v
+	}
+	if v, ok := cmd.args["virtualserver_maxclients"]; ok {
+		n := 0
+		if v != "" {
+			var err error
+			n, err = strconv.Atoi(v)
+			if err != nil || n < 0 {
+				return s.write(sess, errorLine(errInvalidParameter, "invalid virtualserver_maxclients"))
+			}
+		}
+		params.MaxClients = &n
+	}
+	if params.Name == nil && params.Welcome == nil && params.MaxClients == nil {
 		return s.write(sess, errorLine(errInvalidParameter,
 			"usage: serveredit [virtualserver_name=<n>] [virtualserver_welcomemessage=<m>] [virtualserver_maxclients=<n>]"))
 	}
-	if err := s.backend.ServerEdit(ctx, name, welcome, maxClients); err != nil {
+	if err := s.backend.ServerEdit(ctx, params); err != nil {
 		return s.write(sess, errorLine(errServerError, err.Error()))
 	}
 	return s.write(sess, errorLine(errOK, "ok"))
@@ -781,6 +840,9 @@ func (s *Server) cmdChanneladdperm(ctx context.Context, sess *session, cmd comma
 	if err != nil || cmd.args["permid"] == "" || cmd.args["permvalue"] == "" {
 		return s.write(sess, errorLine(errInvalidParameter,
 			"usage: channeladdperm cid=<id> permid=<key> permvalue=<v> [permgrant=<g>] [permskip=0|1] [permnegate=0|1]"))
+	}
+	if !knownPermKey(cmd.args["permid"]) {
+		return s.write(sess, errorLine(errInvalidParameter, "unknown permid: "+cmd.args["permid"]))
 	}
 	value, err := strconv.Atoi(cmd.args["permvalue"])
 	if err != nil {
@@ -950,8 +1012,27 @@ func (s *Server) cmdCustominfo(ctx context.Context, sess *session, cmd command) 
 	return s.write(sess, b.String())
 }
 
+// cmdServerrules shows the rules new users must accept, the hash acceptances
+// are keyed by, and how many users accepted the current wording (215). The
+// text is written with `serverset key=server_rules value=<text>`.
+func (s *Server) cmdServerrules(ctx context.Context, sess *session) bool {
+	text, hash, accepted, err := s.backend.ServerRules(ctx)
+	if err != nil {
+		return s.write(sess, errorLine(errServerError, err.Error()))
+	}
+	line := fmt.Sprintf("rules=%s rules_hash=%s accepted_clients=%d\n",
+		escape(text), escape(hash), accepted)
+	return s.write(sess, line+errorLine(errOK, "ok"))
+}
+
+// maxFollowSeconds caps `logview follow` so a forgotten bot session cannot
+// hold a query connection open forever.
+const maxFollowSeconds = 3600
+
 // cmdLogview returns recent server log lines (223):
-// logview [lines=<n>] [filter=<substr>]
+// logview [lines=<n>] [filter=<substr>] [follow=<seconds>]
+// follow keeps streaming lines as they are emitted for up to <seconds>, then
+// closes the response normally; the connection stays usable afterwards.
 func (s *Server) cmdLogview(ctx context.Context, sess *session, cmd command) bool {
 	lines := 50
 	if v := cmd.args["lines"]; v != "" {
@@ -961,14 +1042,72 @@ func (s *Server) cmdLogview(ctx context.Context, sess *session, cmd command) boo
 		}
 		lines = n
 	}
-	entries, err := s.backend.LogView(ctx, lines, cmd.args["filter"])
+	follow := 0
+	if v := cmd.args["follow"]; v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 || n > maxFollowSeconds {
+			return s.write(sess, errorLine(errInvalidParameter,
+				fmt.Sprintf("invalid follow (want 1..%d seconds)", maxFollowSeconds)))
+		}
+		follow = n
+	}
+	filter := cmd.args["filter"]
+
+	// Subscribe BEFORE reading the tail so nothing emitted between the two is
+	// lost; the cost is that one line can repeat at the seam. The
+	// subscription is released before the response is closed, so an idle
+	// connection leaves no follower behind.
+	var stream <-chan string
+	cancel := func() {}
+	if follow > 0 {
+		stream, cancel = s.backend.LogFollow()
+	}
+
+	entries, err := s.backend.LogView(ctx, lines, filter)
 	if err != nil {
+		cancel()
 		return s.write(sess, errorLine(errServerError, err.Error()))
 	}
 	var b strings.Builder
 	for _, l := range entries {
 		b.WriteString("line=" + escape(l) + "\n")
 	}
-	b.WriteString(errorLine(errOK, "ok"))
-	return s.write(sess, b.String())
+	if !s.write(sess, b.String()) {
+		cancel()
+		return false
+	}
+	streamed := true
+	if follow > 0 {
+		streamed = s.streamLog(ctx, sess, stream, filter, time.Duration(follow)*time.Second)
+	}
+	cancel()
+	if !streamed {
+		return false
+	}
+	return s.write(sess, errorLine(errOK, "ok"))
+}
+
+// streamLog writes live log lines until the follow window closes or the server
+// shuts down. It returns false when a write failed.
+func (s *Server) streamLog(ctx context.Context, sess *session, stream <-chan string, filter string, window time.Duration) bool {
+	deadline := time.NewTimer(window)
+	defer deadline.Stop()
+	lower := strings.ToLower(filter)
+	for {
+		select {
+		case <-ctx.Done():
+			return true
+		case <-s.stopCh:
+			return true
+		case <-deadline.C:
+			return true
+		case line := <-stream:
+			if lower != "" && !strings.Contains(strings.ToLower(line), lower) {
+				continue
+			}
+			if !s.write(sess, "line="+escape(line)+"\n") {
+				return false
+			}
+		}
+	}
 }

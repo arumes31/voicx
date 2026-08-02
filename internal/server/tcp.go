@@ -539,6 +539,10 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 		return s.handleServerIconSet(ctx, client, f)
 	case netproto.MsgServerIconGet:
 		return s.handleServerIconGet(ctx, client, f)
+	case netproto.MsgServerBannerSet:
+		return s.handleServerBannerSet(ctx, client, f)
+	case netproto.MsgServerBannerGet:
+		return s.handleServerBannerGet(ctx, client, f)
 	case netproto.MsgSetStatus:
 		return s.handleSetStatus(ctx, client, f)
 	case netproto.MsgPoke:
@@ -551,6 +555,8 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 		return s.handleAvatarGet(ctx, client, f)
 	case netproto.MsgChannelIconSet:
 		return s.handleChannelIconSet(ctx, client, f)
+	case netproto.MsgChannelIconGet:
+		return s.handleChannelIconGet(ctx, client, f)
 	case netproto.MsgTokenUse:
 		return s.handleTokenUse(ctx, client, f)
 	case netproto.MsgComplaint:
@@ -593,6 +599,10 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 		return s.handleEmojiList(ctx, client, f)
 	case netproto.MsgEmojiGet:
 		return s.handleEmojiGet(ctx, client, f)
+	case netproto.MsgEmojiDelete:
+		return s.handleEmojiDelete(ctx, client, f)
+	case netproto.MsgEmojiRename:
+		return s.handleEmojiRename(ctx, client, f)
 	case netproto.MsgClientInfoQuery:
 		return s.handleClientInfoQuery(ctx, client, f)
 	case netproto.MsgGroupList:
@@ -629,6 +639,20 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 		return s.handleBanList(ctx, client, f)
 	case netproto.MsgBanRemove:
 		return s.handleBanRemove(ctx, client, f)
+	case netproto.MsgGroupEdit:
+		return s.handleGroupEdit(ctx, client, f)
+	case netproto.MsgPermCopy:
+		return s.handlePermCopy(ctx, client, f)
+	case netproto.MsgComplaintList:
+		return s.handleComplaintList(ctx, client, f)
+	case netproto.MsgComplaintClear:
+		return s.handleComplaintClear(ctx, client, f)
+	case netproto.MsgTokenList:
+		return s.handleTokenList(ctx, client, f)
+	case netproto.MsgTokenAdd:
+		return s.handleTokenAdd(ctx, client, f)
+	case netproto.MsgTokenDelete:
+		return s.handleTokenDelete(ctx, client, f)
 	case netproto.MsgPing:
 		return s.handlePing(ctx, client, f)
 	case netproto.MsgPong:

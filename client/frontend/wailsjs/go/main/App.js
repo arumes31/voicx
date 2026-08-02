@@ -30,6 +30,10 @@ export function ChannelEdit(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9
   return window['go']['main']['App']['ChannelEdit'](arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9);
 }
 
+export function ChannelEditTree(arg1, arg2, arg3, arg4, arg5, arg6) {
+  return window['go']['main']['App']['ChannelEditTree'](arg1, arg2, arg3, arg4, arg5, arg6);
+}
+
 export function ChannelIconSet(arg1, arg2, arg3) {
   return window['go']['main']['App']['ChannelIconSet'](arg1, arg2, arg3);
 }
@@ -94,6 +98,14 @@ export function CloseTab(arg1) {
   return window['go']['main']['App']['CloseTab'](arg1);
 }
 
+export function ComplaintClear(arg1, arg2) {
+  return window['go']['main']['App']['ComplaintClear'](arg1, arg2);
+}
+
+export function ComplaintList() {
+  return window['go']['main']['App']['ComplaintList']();
+}
+
 export function Connect(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['Connect'](arg1, arg2, arg3, arg4);
 }
@@ -130,8 +142,16 @@ export function CreateChannel(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, ar
   return window['go']['main']['App']['CreateChannel'](arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10, arg11);
 }
 
+export function CreateIdentity(arg1) {
+  return window['go']['main']['App']['CreateIdentity'](arg1);
+}
+
 export function DeleteChannel(arg1) {
   return window['go']['main']['App']['DeleteChannel'](arg1);
+}
+
+export function DeleteIdentity(arg1) {
+  return window['go']['main']['App']['DeleteIdentity'](arg1);
 }
 
 export function Disconnect() {
@@ -162,6 +182,10 @@ export function DMHistoryPeers() {
   return window['go']['main']['App']['DMHistoryPeers']();
 }
 
+export function DownloadChatAttachment(arg1, arg2, arg3) {
+  return window['go']['main']['App']['DownloadChatAttachment'](arg1, arg2, arg3);
+}
+
 export function DMSearch(arg1, arg2, arg3) {
   return window['go']['main']['App']['DMSearch'](arg1, arg2, arg3);
 }
@@ -190,8 +214,12 @@ export function ExportChat(arg1, arg2) {
   return window['go']['main']['App']['ExportChat'](arg1, arg2);
 }
 
-export function ExportIdentity() {
-  return window['go']['main']['App']['ExportIdentity']();
+export function ExportChatEncrypted(arg1, arg2) {
+  return window['go']['main']['App']['ExportChatEncrypted'](arg1, arg2);
+}
+
+export function ExportIdentity(arg1) {
+  return window['go']['main']['App']['ExportIdentity'](arg1);
 }
 
 export function ExportLogs() {
@@ -258,6 +286,10 @@ export function GroupDelete(arg1, arg2, arg3) {
   return window['go']['main']['App']['GroupDelete'](arg1, arg2, arg3);
 }
 
+export function GroupEdit(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['GroupEdit'](arg1, arg2, arg3, arg4);
+}
+
 export function GroupIconGet(arg1) {
   return window['go']['main']['App']['GroupIconGet'](arg1);
 }
@@ -282,12 +314,20 @@ export function GroupUnassign(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['GroupUnassign'](arg1, arg2, arg3, arg4);
 }
 
+export function IdentityBackupPending() {
+  return window['go']['main']['App']['IdentityBackupPending']();
+}
+
 export function IdentityInfo() {
   return window['go']['main']['App']['IdentityInfo']();
 }
 
 export function IdentityUID() {
   return window['go']['main']['App']['IdentityUID']();
+}
+
+export function ImproveIdentityLevel(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ImproveIdentityLevel'](arg1, arg2, arg3);
 }
 
 export function ImportIdentity() {
@@ -308,6 +348,10 @@ export function KickClient(arg1, arg2, arg3, arg4, arg5) {
 
 export function LastCrash() {
   return window['go']['main']['App']['LastCrash']();
+}
+
+export function ListIdentities() {
+  return window['go']['main']['App']['ListIdentities']();
 }
 
 export function ListTabs() {
@@ -332,6 +376,10 @@ export function Notify(arg1, arg2) {
 
 export function OpenLogFolder() {
   return window['go']['main']['App']['OpenLogFolder']();
+}
+
+export function PermCopy(arg1, arg2, arg3, arg4, arg5, arg6) {
+  return window['go']['main']['App']['PermCopy'](arg1, arg2, arg3, arg4, arg5, arg6);
 }
 
 export function PermList(arg1, arg2, arg3, arg4) {
@@ -450,6 +498,14 @@ export function SetPrioritySpeaker(arg1) {
   return window['go']['main']['App']['SetPrioritySpeaker'](arg1);
 }
 
+export function RenameIdentity(arg1, arg2) {
+  return window['go']['main']['App']['RenameIdentity'](arg1, arg2);
+}
+
+export function SwitchIdentity(arg1) {
+  return window['go']['main']['App']['SwitchIdentity'](arg1);
+}
+
 export function SetScreenShare(arg1) {
   return window['go']['main']['App']['SetScreenShare'](arg1);
 }
@@ -462,8 +518,28 @@ export function SetVideoQuality(arg1) {
   return window['go']['main']['App']['SetVideoQuality'](arg1);
 }
 
+export function TokenAdd(arg1, arg2, arg3) {
+  return window['go']['main']['App']['TokenAdd'](arg1, arg2, arg3);
+}
+
+export function TokenDelete(arg1) {
+  return window['go']['main']['App']['TokenDelete'](arg1);
+}
+
+export function TokenList() {
+  return window['go']['main']['App']['TokenList']();
+}
+
+export function TokenUse(arg1) {
+  return window['go']['main']['App']['TokenUse'](arg1);
+}
+
 export function TrustServerFingerprint(arg1, arg2) {
   return window['go']['main']['App']['TrustServerFingerprint'](arg1, arg2);
+}
+
+export function UploadChatAttachment(arg1, arg2, arg3) {
+  return window['go']['main']['App']['UploadChatAttachment'](arg1, arg2, arg3);
 }
 
 export function UploadFile(arg1, arg2, arg3) {

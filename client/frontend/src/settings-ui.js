@@ -1,6 +1,7 @@
 // settings-ui.js — TS3-style settings dialog with left icon nav.
 import { t } from "./i18n.js";
 import { SOUND_EVENTS } from "./sounds.js";
+import { MATRIX_EVENTS, defaultMatrixRow } from "./notifications.js";
 
 const V = () => window.__voicx;
 
@@ -33,8 +34,9 @@ async function commit() {
     if (V().applyChatPrefs) V().applyChatPrefs();
     // (294-297) appearance applies live (theme/accent/user CSS/font/compact).
     if (V().applyAppearance) V().applyAppearance();
-    // (291) always-on-top applies immediately.
+    // (291) always-on-top and (292) opacity apply immediately.
     window.go.main.App.SetAlwaysOnTop(!!draft.always_on_top);
+    window.go.main.App.SetWindowOpacity(draft.window_opacity || 100);
     return true;
 }
 
@@ -86,16 +88,13 @@ function hint(text) {
     return el;
 }
 
-function disabledRow(label, tooltip) {
-    const el = row(label, (() => {
-        const b = document.createElement("button");
-        b.textContent = "…";
-        b.disabled = true;
-        b.title = tooltip || "coming soon";
-        return b;
-    })());
-    el.classList.add("set-disabled");
-    return el;
+// revertLivePreview puts the saved appearance back after a cancelled dialog:
+// window opacity (292) and the theme swatches (295) both preview live, so
+// discarding the draft has to discard what is on screen too.
+function revertLivePreview() {
+    const saved = V().state.settings || {};
+    V().applyAppearance();
+    window.go.main.App.SetWindowOpacity(saved.window_opacity || 100);
 }
 
 // --- device enumeration --------------------------------------------------------
@@ -136,6 +135,21 @@ function pageApplication() {
     el.appendChild(row("Toasts for connection events", checkbox(s.notify_connection, (v) => { s.notify_connection = v; })));
     el.appendChild(row("Reconnect on connection loss (5 tries)", checkbox(s.reconnect_on_loss, (v) => { s.reconnect_on_loss = v; })));
     el.appendChild(row("Check for updates at startup", checkbox(s.updates_auto_check !== false, (v) => { s.updates_auto_check = v; })));
+
+    // Presence (308/390): the idle timer and the status line it publishes.
+    const psep = document.createElement("div");
+    psep.className = "set-subhead";
+    psep.textContent = "Presence";
+    el.appendChild(psep);
+    el.appendChild(row("Auto-away after (minutes, 0 = off)", numberInput(s.auto_away_minutes ?? 15, 0, 240, (v) => { s.auto_away_minutes = v; })));
+    const awayMsg = document.createElement("input");
+    awayMsg.className = "dlg-input";
+    awayMsg.maxLength = 200;
+    awayMsg.placeholder = "auto-away";
+    awayMsg.value = s.auto_away_message ?? "";
+    awayMsg.onchange = () => { s.auto_away_message = awayMsg.value; };
+    el.appendChild(row("Auto-away status message (390)", awayMsg));
+    el.appendChild(hint("Other clients see this text next to your 🕐 away icon while you are idle."));
 
     // Window / system integration (wave 8a).
     const sep = document.createElement("div");
@@ -184,7 +198,14 @@ function pageApplication() {
     el.appendChild(row("Reduce motion (344)", checkbox(s.reduce_motion, (v) => { s.reduce_motion = v; })));
     el.appendChild(row("Pause video when unfocused (342)", checkbox(s.idle_video_pause !== false, (v) => { s.idle_video_pause = v; })));
     el.appendChild(row("Close to tray (287)", checkbox(s.close_to_tray, (v) => { s.close_to_tray = v; })));
-    el.appendChild(disabledRow("Minimize to tray", "Wails v2 exposes no minimize event — only close-to-tray works"));
+    el.appendChild(row("Minimize to tray (288)", checkbox(s.minimize_to_tray, (v) => { s.minimize_to_tray = v; })));
+    // (292) the floor keeps the window clickable. Applied on release, not per
+    // drag frame: the binding persists the settings file on every call.
+    const opacity = slider(s.window_opacity || 100, 20, 100, (v) => { s.window_opacity = v; });
+    opacity.querySelector("input").addEventListener("change",
+        () => window.go.main.App.SetWindowOpacity(s.window_opacity || 100));
+    el.appendChild(row("Window opacity (292)", opacity));
+    el.appendChild(themeEditor(s)); // (295)
     const css = document.createElement("textarea");
     css.className = "dlg-input user-css";
     css.rows = 4;
@@ -193,6 +214,127 @@ function pageApplication() {
     css.onchange = () => { s.user_css = css.value; };
     el.appendChild(row("User CSS", css));
     return el;
+}
+
+// --- theme editor (295) --------------------------------------------------------
+
+// THEME_VARS are the palette variables the editor exposes. Only the opaque
+// ones: a color input cannot express the rgba() borders and shadows, and
+// --accent already has its own control (296) whose inline style would win.
+const THEME_VARS = [
+    ["--bg", "Background"],
+    ["--bg-raised", "Raised surface"],
+    ["--bg-panel", "Panel"],
+    ["--bg-hover", "Hover"],
+    ["--text", "Text"],
+    ["--text-dim", "Text (dim)"],
+    ["--text-faint", "Text (faint)"],
+    ["--warn", "Warning"],
+    ["--danger", "Danger"],
+];
+
+// The editor owns the block between these markers inside user_css; anything
+// the user typed by hand around it survives an edit.
+const THEME_START = "/* voicx-theme-start */";
+const THEME_END = "/* voicx-theme-end */";
+
+// themeBlockBody returns the CSS between the markers ("" when absent).
+function themeBlockBody(css) {
+    const a = (css || "").indexOf(THEME_START);
+    const b = (css || "").indexOf(THEME_END);
+    return a >= 0 && b > a ? css.slice(a + THEME_START.length, b) : "";
+}
+
+// parseThemeOverrides reads the editor's own block back into a map.
+function parseThemeOverrides(css) {
+    const out = {};
+    for (const m of themeBlockBody(css).matchAll(/(--[a-z-]+)\s*:\s*([^;]+);/g)) {
+        out[m[1]] = m[2].trim();
+    }
+    return out;
+}
+
+// writeThemeOverrides splices the block back into user_css. The selector
+// carries an attribute so it outranks the :root[data-theme="…"] palettes,
+// which a bare :root block would lose to.
+function writeThemeOverrides(css, overrides) {
+    const keys = Object.keys(overrides);
+    const block = keys.length === 0 ? "" : THEME_START + "\n:root, :root[data-theme] {\n" +
+        keys.map((k) => `    ${k}: ${overrides[k]};`).join("\n") + "\n}\n" + THEME_END;
+    const a = (css || "").indexOf(THEME_START);
+    const b = (css || "").indexOf(THEME_END);
+    if (a >= 0 && b > a) {
+        return (css.slice(0, a) + block + css.slice(b + THEME_END.length)).trim();
+    }
+    return (block + "\n" + (css || "")).trim();
+}
+
+// currentVar resolves a variable to a #rrggbb value for the color input.
+function currentVar(name, overrides) {
+    const raw = overrides[name] || getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    const rgb = raw.match(/^rgba?\((\d+)[,\s]+(\d+)[,\s]+(\d+)/);
+    if (rgb) {
+        return "#" + [1, 2, 3].map((i) => Number(rgb[i]).toString(16).padStart(2, "0")).join("");
+    }
+    // #abc shorthand: the color input only accepts the six-digit form.
+    if (/^#[0-9a-f]{3}$/i.test(raw)) return "#" + raw.slice(1).split("").map((c) => c + c).join("");
+    return /^#[0-9a-f]{6}$/i.test(raw) ? raw : "#000000";
+}
+
+// themeEditor builds the CSS-variable editor (295): every swatch rewrites the
+// managed block in user_css, which applyAppearance injects as a stylesheet.
+function themeEditor(s) {
+    const wrap = document.createElement("div");
+    const head = document.createElement("div");
+    head.className = "set-subhead";
+    head.textContent = "Theme colors (295)";
+    wrap.appendChild(head);
+    const grid = document.createElement("div");
+    grid.className = "theme-grid";
+    const overrides = parseThemeOverrides(s.user_css);
+    const apply = () => {
+        s.user_css = writeThemeOverrides(s.user_css, overrides);
+        // Preview by writing the same style element applyAppearance owns. A
+        // full applyAppearance would rebuild the menu bar on every frame of a
+        // swatch drag; cancelling the dialog calls it and restores the saved
+        // stylesheet.
+        let st = document.getElementById("user-css");
+        if (!st) {
+            st = document.createElement("style");
+            st.id = "user-css";
+            document.head.appendChild(st);
+        }
+        st.textContent = s.user_css;
+    };
+    for (const [name, label] of THEME_VARS) {
+        const cell = document.createElement("label");
+        cell.className = "theme-cell";
+        const inp = document.createElement("input");
+        inp.type = "color";
+        inp.value = currentVar(name, overrides);
+        inp.oninput = () => {
+            overrides[name] = inp.value;
+            apply();
+        };
+        const txt = document.createElement("span");
+        txt.textContent = label;
+        txt.title = name;
+        cell.appendChild(inp);
+        cell.appendChild(txt);
+        grid.appendChild(cell);
+    }
+    wrap.appendChild(grid);
+    const reset = document.createElement("button");
+    reset.textContent = "Reset theme colors";
+    reset.onclick = () => {
+        for (const k of Object.keys(overrides)) delete overrides[k];
+        apply();
+        for (const [i, [name]] of THEME_VARS.entries()) {
+            grid.children[i].querySelector("input").value = currentVar(name, overrides);
+        }
+    };
+    wrap.appendChild(reset);
+    return wrap;
 }
 
 function pageCapture() {
@@ -563,7 +705,7 @@ function pageDownloads() {
     wrap.className = "set-folder";
     wrap.appendChild(folder); wrap.appendChild(change);
     el.appendChild(row("Download folder", wrap));
-    el.appendChild(hint("Client-side file download UI is future work; the folder is stored for it."));
+    el.appendChild(hint("Downloads from the file browser land here without asking. Leave it unset to be prompted for a location each time."));
     return el;
 }
 
@@ -625,89 +767,203 @@ function pageChat() {
     return el;
 }
 
+// refreshIdentities repaints the identity manager table (351) from the Go
+// side, which owns the store.
+async function refreshIdentities(tbody) {
+    let list = [];
+    try {
+        list = await window.go.main.App.ListIdentities();
+    } catch (e) {
+        tbody.innerHTML = "";
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td colspan="6" class="warn"></td>`;
+        tr.querySelector("td").textContent = "identities unavailable: " + e;
+        tbody.appendChild(tr);
+        return;
+    }
+    // (351) the draft is a clone taken when the dialog opened; switching an
+    // identity writes settings behind its back, so mirror it or OK reverts it.
+    const active = list.find((x) => x.active);
+    if (active && settings()) settings().active_identity = active.id;
+    tbody.innerHTML = "";
+    for (const e of list) {
+        const tr = document.createElement("tr");
+        if (e.active) tr.classList.add("id-active");
+
+        const name = document.createElement("td");
+        name.textContent = (e.active ? "● " : "") + e.name;
+        name.title = e.path;
+        tr.appendChild(name);
+
+        const uid = document.createElement("td");
+        uid.className = "mono id-uid";
+        uid.textContent = e.unique_id ? e.unique_id.slice(0, 16) + "…" : "(unreadable)";
+        uid.title = e.unique_id || "";
+        uid.onclick = () => {
+            if (!e.unique_id) return;
+            navigator.clipboard.writeText(e.unique_id).then(() => V().toast("unique ID copied"));
+        };
+        tr.appendChild(uid);
+
+        // (352) proof-of-work level on the unique ID.
+        const lvl = document.createElement("td");
+        lvl.className = "mono";
+        lvl.textContent = String(e.security_level ?? 0);
+        tr.appendChild(lvl);
+
+        // (354) which storage mode the key is actually in.
+        const prot = document.createElement("td");
+        prot.textContent = e.protection === "dpapi" ? "🔒 DPAPI" : "📄 plaintext";
+        prot.title = e.protection === "dpapi"
+            ? "private key sealed to this Windows account — a copy of this file will not open elsewhere"
+            : "private key stored in the clear (no OS key store in use)";
+        tr.appendChild(prot);
+
+        // (353) backup state.
+        const backup = document.createElement("td");
+        backup.textContent = e.exported_at ? "✓ " + e.exported_at : "⚠ never";
+        if (!e.exported_at) backup.className = "warn";
+        tr.appendChild(backup);
+
+        const actions = document.createElement("td");
+        actions.className = "id-actions";
+        const mk = (label, title, fn) => {
+            const b = document.createElement("button");
+            b.textContent = label;
+            b.title = title;
+            b.onclick = fn;
+            actions.appendChild(b);
+            return b;
+        };
+        mk("Use", "make this the identity used on the next connect", async () => {
+            const err = await window.go.main.App.SwitchIdentity(e.id);
+            if (err) V().toast("switch failed: " + err, "warn");
+            else V().toast("active identity: " + e.name + " — reconnect to use it", "warn");
+            refreshIdentities(tbody);
+        }).disabled = e.active;
+        mk("Rename", "change the display label", async () => {
+            const name = prompt("Identity name:", e.name);
+            if (!name) return;
+            const err = await window.go.main.App.RenameIdentity(e.id, name);
+            if (err) V().toast("rename failed: " + err, "warn");
+            refreshIdentities(tbody);
+        });
+        mk("Export", "save a portable backup of this identity", async () => {
+            const err = await window.go.main.App.ExportIdentity(e.id);
+            if (err) V().toast("export failed: " + err, "warn");
+            else V().toast("identity exported — keep the file safe");
+            refreshIdentities(tbody);
+        });
+        mk("Level…", "raise the proof-of-work security level (352)", async () => {
+            const target = parseInt(prompt("Target security level (leading zero bits, 1-40):", String((e.security_level || 0) + 4)), 10);
+            if (!target) return;
+            V().toast("computing security level (up to 30s)…");
+            const res = await window.go.main.App.ImproveIdentityLevel(e.id, target, 30);
+            if (res.error) V().toast("level failed: " + res.error, "warn");
+            else V().toast(`security level ${res.level} (counter ${res.counter})`);
+            refreshIdentities(tbody);
+        });
+        mk("Delete", "remove this identity from this machine", async () => {
+            const warn = e.exported_at
+                ? `Delete identity "${e.name}"?`
+                : `"${e.name}" has NEVER been exported. Deleting it loses that account on every server forever. Delete anyway?`;
+            if (!confirm(warn)) return;
+            const err = await window.go.main.App.DeleteIdentity(e.id);
+            if (err) V().toast("delete failed: " + err, "warn");
+            refreshIdentities(tbody);
+        }).classList.add("danger-btn");
+        tr.appendChild(actions);
+        tbody.appendChild(tr);
+    }
+}
+
 function pageSecurity() {
+    const s = settings();
     const el = document.createElement("div");
-    const uidLine = document.createElement("div");
-    uidLine.className = "set-uid mono";
-    uidLine.textContent = "…";
-    const created = document.createElement("div");
-    created.className = "set-hint";
-    const copyBtn = document.createElement("button");
-    copyBtn.textContent = "Copy";
-    copyBtn.onclick = () => {
-        navigator.clipboard.writeText(uidLine.dataset.uid || "").then(() => V().toast("unique ID copied"));
+
+    // (351) multiple identities: the identity IS the account, so the manager
+    // is the primary control here.
+    const sub = document.createElement("div");
+    sub.className = "set-subhead";
+    sub.textContent = "Identities (351)";
+    el.appendChild(sub);
+
+    const table = document.createElement("table");
+    table.className = "perm-grid identity-grid";
+    table.innerHTML = `<thead><tr><th>name</th><th>unique ID</th><th>level</th><th>key storage</th><th>backup</th><th></th></tr></thead><tbody></tbody>`;
+    const tbody = table.querySelector("tbody");
+    el.appendChild(table);
+    // (350) the settings search rebuilds every page on each keystroke; only
+    // the page that is really on screen may hit the identity store, which
+    // unseals a protected key per row.
+    setTimeout(() => { if (tbody.isConnected) refreshIdentities(tbody); }, 0);
+
+    const bar = document.createElement("div");
+    bar.className = "set-folder";
+    const newBtn = document.createElement("button");
+    newBtn.textContent = "New identity…";
+    newBtn.onclick = async () => {
+        const name = prompt("Name for the new identity (e.g. \"gaming\"):");
+        if (!name) return;
+        const err = await window.go.main.App.CreateIdentity(name);
+        if (err) V().toast("create failed: " + err, "warn");
+        refreshIdentities(tbody);
     };
-    el.appendChild(row("Unique ID", (() => {
-        const w = document.createElement("div");
-        w.className = "set-folder";
-        w.appendChild(uidLine); w.appendChild(copyBtn);
-        return w;
-    })()));
-    el.appendChild(created);
+    const importBtn = document.createElement("button");
+    importBtn.textContent = "Import…";
+    importBtn.onclick = async () => {
+        const err = await window.go.main.App.ImportIdentity();
+        if (err) V().toast("import failed: " + err, "warn");
+        else V().toast("identity imported and selected — reconnect to use it", "warn");
+        refreshIdentities(tbody);
+    };
+    const regen = document.createElement("button");
+    regen.className = "danger-btn";
+    regen.textContent = "Regenerate active";
+    regen.onclick = async () => {
+        if (!confirm("Regenerating replaces the ACTIVE identity's key. Servers will see you as a NEW user (registered accounts keep working via password). Continue?")) return;
+        const uid = await window.go.main.App.RegenerateIdentity();
+        V().toast("identity regenerated (" + uid.slice(0, 16) + "…) — reconnect to use it", "warn");
+        refreshIdentities(tbody);
+    };
+    bar.append(newBtn, importBtn, regen);
+    el.appendChild(bar);
+    el.appendChild(hint("The active identity (●) is used on the next connect. Click a unique ID to copy it. "
+        + "An export is a portable plaintext copy — it is the only way to recover an identity if this machine dies (353)."));
+
+    // (354) key storage at rest, with its fallback stated plainly.
+    const protSel = document.createElement("select");
+    for (const [v, label] of [["auto", "Use the OS key store when available (default)"], ["off", "Always store in plaintext"]]) {
+        const o = document.createElement("option");
+        o.value = v;
+        o.textContent = label;
+        protSel.appendChild(o);
+    }
+    protSel.value = s.identity_key_protection === "off" ? "off" : "auto";
+    protSel.onchange = () => { s.identity_key_protection = protSel.value; };
+    el.appendChild(row("Private key storage (354)", protSel));
+    el.appendChild(hint("On Windows the private key is sealed with DPAPI to your user account, so a stolen copy of the file "
+        + "is useless elsewhere. Where DPAPI is unavailable the client falls back to the plaintext file instead of refusing to "
+        + "start. Applies the next time an identity file is written (switch, rename, level, regenerate)."));
 
     // (4a) Transport security: TLS is the default; plaintext is an explicit
     // dev opt-in.
-    const s = settings();
+    const tsub = document.createElement("div");
+    tsub.className = "set-subhead";
+    tsub.textContent = "Transport";
+    el.appendChild(tsub);
     el.appendChild(row("Allow plaintext connections (dev servers)", checkbox(!!s.allow_plaintext, (v) => { s.allow_plaintext = v; })));
     el.appendChild(hint("Server connections use TLS with trust-on-first-use fingerprint pinning (known_servers.json). Enable plaintext only for local dev servers."));
-
-    window.go.main.App.IdentityInfo().then((info) => {
-        uidLine.textContent = info.unique_id || "(none)";
-        uidLine.dataset.uid = info.unique_id || "";
-        created.textContent = info.created_at ? `created ${info.created_at} · ${info.path}` : info.path;
-    });
-
-    el.appendChild(row("Export identity", (() => {
-        const b = document.createElement("button");
-        b.textContent = "Export…";
-        b.onclick = async () => {
-            const err = await window.go.main.App.ExportIdentity();
-            if (err) V().toast("export failed: " + err, "warn");
-            else V().toast("identity exported");
-        };
-        return b;
-    })()));
-    el.appendChild(row("Import identity", (() => {
-        const b = document.createElement("button");
-        b.textContent = "Import…";
-        b.onclick = async () => {
-            const err = await window.go.main.App.ImportIdentity();
-            if (err) V().toast("import failed: " + err, "warn");
-            else V().toast("identity imported — reconnect to use it", "warn");
-        };
-        return b;
-    })()));
-
-    const danger = document.createElement("div");
-    danger.className = "set-danger";
-    const regen = document.createElement("button");
-    regen.className = "danger-btn";
-    regen.textContent = "Regenerate identity";
-    regen.onclick = () => {
-        if (!confirm("Regenerating replaces your identity key. Servers will see you as a NEW user (registered accounts keep working via password). Continue?")) return;
-        window.go.main.App.RegenerateIdentity().then(() => {
-            V().toast("identity regenerated — reconnect to use it", "warn");
-            window.go.main.App.IdentityInfo().then((info) => {
-                uidLine.textContent = info.unique_id;
-                uidLine.dataset.uid = info.unique_id;
-            });
-        });
-    };
-    danger.appendChild(regen);
-    el.appendChild(danger);
     return el;
 }
 
 function pageNotifications() {
     const s = settings();
     const el = document.createElement("div");
-    // (385) notification matrix: rows = events, columns = outputs.
-    const EVENTS = [
-        ["mention", "mention"], ["keyword", "keyword highlight"], ["dm", "direct message"],
-        ["poke", "poke"], ["join_leave", "join/leave (your channel)"],
-        ["buddy_online", "watched contact online"], ["kick", "kick/ban"],
-        ["announcement", "announcement"], ["channel_watch", "channel watch"],
-    ];
+    // (385) notification matrix: rows = events, columns = outputs. The rows
+    // are the dispatcher's own event list, so every event it can fire has
+    // reachable toggles here and the two cannot drift apart.
+    const EVENTS = MATRIX_EVENTS;
     const matrix = document.createElement("table");
     matrix.className = "perm-grid notify-matrix";
     matrix.innerHTML = `<thead><tr><th>event</th><th>toast</th><th>sound</th><th>flash</th><th>native</th><th>custom beep (384)</th></tr></thead><tbody></tbody>`;
@@ -715,7 +971,9 @@ function pageNotifications() {
     s.notify_matrix = s.notify_matrix || {};
     s.custom_sounds = s.custom_sounds || {};
     for (const [event, label] of EVENTS) {
-        const rowData = s.notify_matrix[event] || { toast: true, sound: true, flash: true, native: true };
+        // Unset rows seed from the dispatcher's default: this grid writes what
+        // it shows, so a local guess would change behaviour on first visit.
+        const rowData = s.notify_matrix[event] || defaultMatrixRow(event);
         s.notify_matrix[event] = rowData;
         const tr = document.createElement("tr");
         tr.innerHTML = `<td class="mono">${label}</td>`;
@@ -926,9 +1184,13 @@ function openSettings(pageId = "application") {
     overlay.querySelector("#set-ok").onclick = async () => {
         if (await applyAll()) overlay.remove();
     };
-    overlay.querySelector("#set-cancel").onclick = () => overlay.remove();
+    const cancel = () => {
+        overlay.remove();
+        revertLivePreview();
+    };
+    overlay.querySelector("#set-cancel").onclick = cancel;
     overlay.querySelector("#set-apply").onclick = applyAll;
-    overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+    overlay.onclick = (e) => { if (e.target === overlay) cancel(); };
 
     document.body.appendChild(overlay);
     renderPage(pageId);

@@ -75,6 +75,10 @@ const (
 	PermissionKeyFTNeededFileUploadPower   PermissionKey = "i_ft_needed_file_upload_power"
 	PermissionKeyFTFileDownloadPower       PermissionKey = "i_ft_file_download_power"
 	PermissionKeyFTNeededFileDownloadPower PermissionKey = "i_ft_needed_file_download_power"
+	// PermissionKeyFTUploadQuotaMB caps how many MiB one client may store
+	// server-wide (266). Unset or 0 is unlimited, and admins are never
+	// capped; the highest tier wins, so a group can lift a stricter default.
+	PermissionKeyFTUploadQuotaMB PermissionKey = "i_ft_quota_mb_upload_per_client"
 	// PermissionKeyFTFileDelete allows deleting/renaming other users' files
 	// (263); uploaders may always manage their own files.
 	PermissionKeyFTFileDelete PermissionKey = "b_ft_delete"
@@ -111,6 +115,15 @@ const (
 	// word/link moderation lists (117/118): the word list tells an evader
 	// exactly what to avoid, so the read is as sensitive as the write.
 	PermissionKeyChatFilterManage PermissionKey = "b_chat_filter_manage"
+
+	// --- Accounts ---
+	// PermissionKeyClientIsBot marks an account as a bot (180): the client
+	// paints a bot badge and the flood gates are relaxed for it. It lives
+	// here rather than in a users column so it is assignable to a whole
+	// "Bots" server group, revocable without an account migration, audited
+	// and grant-capped like every other write. Guests can never hold it —
+	// resolution needs a users row.
+	PermissionKeyClientIsBot PermissionKey = "b_client_is_bot"
 
 	// --- Group & permission management (wave 6a) ---
 	PermissionKeyServerGroupManage  PermissionKey = "b_server_group_manage"

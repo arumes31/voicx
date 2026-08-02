@@ -42,7 +42,7 @@ type fakeBackend struct {
 	auditEntries []AuditEntry
 
 	// wave 10a state
-	serverEdits    []serverEditCall
+	serverEdits    []ServerEditParams
 	shutdownCalled bool
 	channelPerms   []ChannelPerm
 	groups         []GroupInfo
@@ -50,11 +50,14 @@ type fakeBackend struct {
 	groupMembers   []GroupMemberInfo
 	custom         map[string]string
 	logLines       []string
-}
-
-type serverEditCall struct {
-	name, welcome string
-	maxClients    int
+	// logStream feeds `logview follow`; followCancelled records that the
+	// command released its subscription.
+	logStream       chan string
+	followCancelled bool
+	// server rules shown on first join (215)
+	rulesText     string
+	rulesHash     string
+	rulesAccepted int
 }
 
 type kickCall struct {
@@ -245,10 +248,10 @@ func (f *fakeBackend) AuditLog(_ context.Context, limit int) ([]AuditEntry, erro
 
 // --- wave 10a fakes -----------------------------------------------------------
 
-func (f *fakeBackend) ServerEdit(_ context.Context, name, welcome string, maxClients int) error {
+func (f *fakeBackend) ServerEdit(_ context.Context, params ServerEditParams) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.serverEdits = append(f.serverEdits, serverEditCall{name, welcome, maxClients})
+	f.serverEdits = append(f.serverEdits, params)
 	return nil
 }
 
@@ -402,6 +405,23 @@ func (f *fakeBackend) LogView(_ context.Context, lines int, filter string) ([]st
 	return f.logLines, nil
 }
 
+func (f *fakeBackend) ServerRules(context.Context) (string, string, int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rulesText, f.rulesHash, f.rulesAccepted, nil
+}
+
+func (f *fakeBackend) LogFollow() (<-chan string, func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.followCancelled = false
+	return f.logStream, func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.followCancelled = true
+	}
+}
+
 func newFakeBackend() *fakeBackend {
 	return &fakeBackend{
 		users: map[string]struct {
@@ -417,8 +437,9 @@ func newFakeBackend() *fakeBackend {
 		channels: []ChannelInfo{
 			{ChannelID: 1, ParentID: 0, Name: "Lobby", Type: 2, ClientCount: 1},
 		},
-		info:   Info{Name: "voicx test", Uptime: 90 * time.Second, ClientsOnline: 1, MaxClients: 1024, ChannelsOnline: 1},
-		custom: map[string]string{},
+		info:      Info{Name: "voicx test", Uptime: 90 * time.Second, ClientsOnline: 1, MaxClients: 1024, ChannelsOnline: 1},
+		custom:    map[string]string{},
+		logStream: make(chan string, 8),
 	}
 }
 
@@ -984,7 +1005,8 @@ func TestServeredit(t *testing.T) {
 	backend.mu.Lock()
 	call := backend.serverEdits[0]
 	backend.mu.Unlock()
-	if call.name != "My Server" || call.maxClients != 50 || call.welcome != "" {
+	if call.Name == nil || *call.Name != "My Server" ||
+		call.MaxClients == nil || *call.MaxClients != 50 || call.Welcome != nil {
 		t.Fatalf("serveredit call = %+v", call)
 	}
 
@@ -992,6 +1014,19 @@ func TestServeredit(t *testing.T) {
 	lines = sendCmd(t, conn, r, "serveredit")
 	if got := lastErr(t, lines); !strings.HasPrefix(got, "error id=512") {
 		t.Fatalf("serveredit empty = %q", got)
+	}
+
+	// An EMPTY value clears the override; it must reach the backend as a
+	// present-but-empty field, not as "unchanged" (217).
+	lines = sendCmd(t, conn, r, "serveredit virtualserver_name= virtualserver_maxclients=")
+	if got := lastErr(t, lines); got != "error id=0 msg=ok" {
+		t.Fatalf("serveredit clear = %q", got)
+	}
+	backend.mu.Lock()
+	call = backend.serverEdits[len(backend.serverEdits)-1]
+	backend.mu.Unlock()
+	if call.Name == nil || *call.Name != "" || call.MaxClients == nil || *call.MaxClients != 0 {
+		t.Fatalf("serveredit clear call = %+v", call)
 	}
 }
 
@@ -1163,5 +1198,97 @@ func TestLogview(t *testing.T) {
 	}
 	if lines[0] != `line=first\sline` {
 		t.Fatalf("logview row = %q", lines[0])
+	}
+}
+
+// TestLogviewFollow verifies that follow streams lines emitted after the tail,
+// honours the filter, and releases the subscription (223).
+func TestLogviewFollow(t *testing.T) {
+	backend := newFakeBackend()
+	backend.logLines = []string{"tail line"}
+	addr, _ := startQueryServer(t, backend)
+	conn, r := dialQuery(t, addr)
+	defer conn.Close()
+	loginOK(t, conn, r)
+
+	// Queue the live lines up front: the follow window is short, and the
+	// stream buffer holds them until the command drains it.
+	backend.logStream <- "ignored by filter"
+	backend.logStream <- "live marker line"
+
+	lines := sendCmd(t, conn, r, "logview lines=5 filter=marker follow=1")
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, `line=live\smarker\sline`) {
+		t.Fatalf("follow output = %v", lines)
+	}
+	if strings.Contains(joined, "ignored") {
+		t.Fatalf("filter not applied to the live stream: %v", lines)
+	}
+	backend.mu.Lock()
+	cancelled := backend.followCancelled
+	backend.mu.Unlock()
+	if !cancelled {
+		t.Fatal("follow did not release its subscription")
+	}
+
+	// Out-of-range windows are rejected before anything is streamed.
+	lines = sendCmd(t, conn, r, "logview follow=0")
+	if got := lastErr(t, lines); !strings.HasPrefix(got, "error id=512") {
+		t.Fatalf("logview follow=0 = %q", got)
+	}
+}
+
+// TestServerrules verifies the rules read-back and the serverset write path
+// (215).
+func TestServerrules(t *testing.T) {
+	backend := newFakeBackend()
+	backend.rulesText = "be nice\nno spam"
+	backend.rulesHash = "abc123"
+	backend.rulesAccepted = 7
+	addr, _ := startQueryServer(t, backend)
+	conn, r := dialQuery(t, addr)
+	defer conn.Close()
+	loginOK(t, conn, r)
+
+	lines := sendCmd(t, conn, r, "serverrules")
+	if len(lines) != 2 {
+		t.Fatalf("serverrules = %v", lines)
+	}
+	if !strings.Contains(lines[0], `rules_hash=abc123`) ||
+		!strings.Contains(lines[0], "accepted_clients=7") ||
+		!strings.Contains(lines[0], `rules=be\snice`) {
+		t.Fatalf("serverrules row = %q", lines[0])
+	}
+
+	lines = sendCmd(t, conn, r, `serverset key=server_rules value=new\srules`)
+	if got := lastErr(t, lines); got != "error id=0 msg=ok" {
+		t.Fatalf("serverset server_rules = %q", got)
+	}
+	backend.mu.Lock()
+	stored := backend.settings["server_rules"]
+	backend.mu.Unlock()
+	if stored != "new rules" {
+		t.Fatalf("stored rules = %q", stored)
+	}
+}
+
+// TestChanneladdpermUnknownKey verifies that an unknown permid is refused
+// before it becomes a dead permission row (220).
+func TestChanneladdpermUnknownKey(t *testing.T) {
+	backend := newFakeBackend()
+	addr, _ := startQueryServer(t, backend)
+	conn, r := dialQuery(t, addr)
+	defer conn.Close()
+	loginOK(t, conn, r)
+
+	lines := sendCmd(t, conn, r, "channeladdperm cid=1 permid=i_client_needed_talkpower permvalue=50")
+	if got := lastErr(t, lines); !strings.HasPrefix(got, "error id=512") {
+		t.Fatalf("unknown permid = %q", got)
+	}
+	backend.mu.Lock()
+	stored := len(backend.channelPerms)
+	backend.mu.Unlock()
+	if stored != 0 {
+		t.Fatalf("unknown permid stored %d rows", stored)
 	}
 }

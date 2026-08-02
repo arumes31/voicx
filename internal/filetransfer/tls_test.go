@@ -110,7 +110,7 @@ func TestFileTransferRequiresTLS(t *testing.T) {
 	addr, _, s := startTLSServer(t, fs)
 
 	content := []byte("plaintext peer")
-	id, token, err := s.InitUpload(context.Background(), 7, "", "nope.txt", int64(len(content)), "uid-1")
+	id, token, err := s.InitUpload(context.Background(), 7, "", "nope.txt", int64(len(content)), "uid-1", 0)
 	if err != nil {
 		t.Fatalf("InitUpload: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestFileTransferTLSRoundTrip(t *testing.T) {
 	}
 
 	content := []byte("sealed in transit")
-	id, token, err := s.InitUpload(context.Background(), 7, "", "tls.txt", int64(len(content)), "uid-1")
+	id, token, err := s.InitUpload(context.Background(), 7, "", "tls.txt", int64(len(content)), "uid-1", 0)
 	if err != nil {
 		t.Fatalf("InitUpload: %v", err)
 	}
@@ -308,7 +308,7 @@ func TestEncryptedAttachmentNameMustMatchDigest(t *testing.T) {
 	}
 
 	const forged = "holiday-photos.vcx"
-	id, token, err := s.InitUpload(context.Background(), 7, "", forged, int64(len(content)), "uid-1")
+	id, token, err := s.InitUpload(context.Background(), 7, "", forged, int64(len(content)), "uid-1", 0)
 	if err != nil {
 		t.Fatalf("InitUpload %s: %v", forged, err)
 	}

@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
 	"voicx/internal/auth"
@@ -22,7 +23,9 @@ import (
 	"voicx/internal/channels"
 	"voicx/internal/chatcrypto"
 	"voicx/internal/config"
+	"voicx/internal/eventbus"
 	"voicx/internal/filetransfer"
+	"voicx/internal/grpcserver"
 	"voicx/internal/health"
 	"voicx/internal/logging"
 	"voicx/internal/metrics"
@@ -31,6 +34,7 @@ import (
 	"voicx/internal/query"
 	"voicx/internal/recorder"
 	"voicx/internal/redisx"
+	"voicx/internal/rules"
 	"voicx/internal/server"
 	"voicx/internal/state"
 	"voicx/internal/store"
@@ -299,9 +303,15 @@ func run() error {
 	// the database and the in-memory state manager, including automatic cleanup
 	// of empty temporary channels.
 	channelMgr := channels.New(dbStore, stateManager, logger)
+	// (165) operator-configurable temporary channel lifetime; <= 0 keeps the default.
+	channelMgr.SetCleanupDelay(time.Duration(cfg.ChannelTempLifetimeSeconds) * time.Second)
 	defer channelMgr.Close()
+	cleanupDelay := channels.DefaultCleanupDelay
+	if cfg.ChannelTempLifetimeSeconds > 0 {
+		cleanupDelay = time.Duration(cfg.ChannelTempLifetimeSeconds) * time.Second
+	}
 	logger.Info("channel manager ready",
-		zap.Duration("cleanup_delay", channels.DefaultCleanupDelay),
+		zap.Duration("cleanup_delay", cleanupDelay),
 	)
 
 	// Load persisted channels into the in-memory state so the channel tree is
@@ -316,7 +326,7 @@ func run() error {
 	// in it hear their own audio routed back. Empty name disables it.
 	var echoChannelID int64
 	if cfg.EchoChannelName != "" {
-		for _, ch := range stateManager.ChannelTree() {
+		for _, ch := range stateManager.ChannelTreeOrdered() {
 			if ch.Name == cfg.EchoChannelName {
 				echoChannelID = ch.ChannelID
 				break
@@ -344,6 +354,14 @@ func run() error {
 	broadcaster := broadcast.New(logger, stateManager)
 	defer broadcaster.Close()
 	logger.Info("broadcaster ready")
+
+	// (231/232) tap the server-wide event fan-out into the event bus, so bots
+	// on the WebSocket and gRPC streams observe exactly what connected clients
+	// observe. The bus is lossy by design: a bot that stops reading is dropped,
+	// never allowed to slow this call down.
+	events := eventbus.New(logger)
+	defer events.Close()
+	broadcaster.SetEventTap(events.Publish)
 
 	// Initialize the permission loader (DB-backed, with a short-lived cache)
 	// and the stateless resolver used by the TCP permission middleware.
@@ -462,14 +480,16 @@ func run() error {
 	// references it for token issuance). The control channel issues transfer
 	// tokens (permission-checked); the file port trusts only the token.
 	ftServer := filetransfer.New(filetransfer.Config{
-		Addr:           cfg.FileAddr,
-		RootDir:        cfg.FileRoot,
-		MaxKBps:        cfg.FileMaxKBps,
-		ChannelQuotaMB: cfg.FileChannelQuotaMB,
-		MaxSizeMB:      cfg.FileMaxSizeMB,
-		TLSEnabled:     fileTLS,
-		Cert:           tlsCert,
-		Fingerprint:    tlsFP,
+		Addr:            cfg.FileAddr,
+		RootDir:         cfg.FileRoot,
+		MaxKBps:         cfg.FileMaxKBps,
+		QuietHoursStart: cfg.FileQuietHoursStart,
+		QuietHoursEnd:   cfg.FileQuietHoursEnd,
+		ChannelQuotaMB:  cfg.FileChannelQuotaMB,
+		MaxSizeMB:       cfg.FileMaxSizeMB,
+		TLSEnabled:      fileTLS,
+		Cert:            tlsCert,
+		Fingerprint:     tlsFP,
 	}, dbStore, logger)
 	ftServer.OnTransferComplete = m.IncFileTransfer
 	// Download links (267): the control channel mints expiring tokens; the
@@ -577,7 +597,7 @@ func run() error {
 	// takes the same path as SIGTERM. restart only logs the supervisor
 	// dependency (docker restart=unless-stopped brings the server back).
 	shutdownReq := make(chan bool, 1)
-	queryServer := query.New(cfg.QueryAddr, logger, &queryBackend{
+	qBackend := &queryBackend{
 		authSvc:    authSvc,
 		stateMgr:   stateManager,
 		channelMgr: channelMgr,
@@ -595,13 +615,42 @@ func run() error {
 		startedAt:  time.Now(),
 		serverName: cfg.ServerName,
 		maxClients: cfg.MaxClients,
-	})
+		rules:      rules.New(dbStore, dbStore.DB()),
+	}
+	queryServer := query.New(cfg.QueryAddr, logger, qBackend)
 	queryErr := make(chan error, 1)
 	go func() {
 		if err := queryServer.Start(ctx); err != nil {
 			queryErr <- err
 		}
 	}()
+
+	// (231) the event stream for bots, on the health listener next to
+	// /metrics. Same credentials as ServerQuery: the stream reveals who is
+	// where, so it is admin-only.
+	healthServer.Handle("/events", eventbus.Handler(events, qBackend.Authenticate, logger))
+	registerEventBusMetrics(m.Registry(), events, logger)
+
+	// (232) the gRPC API on the reserved port: same backend, same
+	// admin-only credentials, plus Events.Subscribe on the event bus.
+	grpcServer := grpcserver.New(cfg.GRPCAddr, qBackend, events, logger)
+	grpcErr := make(chan error, 1)
+	go func() {
+		if err := grpcServer.Start(ctx); err != nil {
+			grpcErr <- err
+		}
+	}()
+
+	// (224) the same command set over SSH, opt-in.
+	var sshQuery *query.SSHServer
+	if cfg.QuerySSHEnabled {
+		sshQuery = query.NewSSH(cfg.QuerySSHAddr, cfg.QuerySSHHostKey, queryServer)
+		go func() {
+			if err := sshQuery.Start(ctx); err != nil {
+				queryErr <- err
+			}
+		}()
+	}
 
 	// Start the file-transfer listener.
 	ftErr := make(chan error, 1)
@@ -637,6 +686,8 @@ func run() error {
 		logger.Error("query server exited unexpectedly", zap.Error(err))
 	case err := <-ftErr:
 		logger.Error("file transfer server exited unexpectedly", zap.Error(err))
+	case err := <-grpcErr:
+		logger.Error("gRPC server exited unexpectedly", zap.Error(err))
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -651,6 +702,13 @@ func run() error {
 	if err := queryServer.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		logger.Warn("query server shutdown error", zap.Error(err))
 	}
+	if sshQuery != nil {
+		if err := sshQuery.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			logger.Warn("query ssh server shutdown error", zap.Error(err))
+		}
+	}
+	// Event subscriptions are open-ended, so this cannot wait for them.
+	grpcServer.Stop()
 	if err := ftServer.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		logger.Warn("file transfer server shutdown error", zap.Error(err))
 	}
@@ -715,6 +773,34 @@ func iceServersProvider(cfg *config.Config, logger *zap.Logger) func(string) []n
 	}
 }
 
+// registerEventBusMetrics publishes the event-bus counters on /metrics (231):
+// the drop policy is only defensible if an operator can see it firing.
+func registerEventBusMetrics(reg *prometheus.Registry, bus *eventbus.Bus, logger *zap.Logger) {
+	collectors := []prometheus.Collector{
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "voicx_eventbus_subscribers",
+			Help: "Current number of event-bus subscribers (bots).",
+		}, func() float64 { return float64(bus.Stats().Subscribers) }),
+		prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "voicx_eventbus_published_total",
+			Help: "Events published to the event bus.",
+		}, func() float64 { return float64(bus.Stats().Published) }),
+		prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "voicx_eventbus_dropped_total",
+			Help: "Events dropped because a subscriber was not draining its buffer.",
+		}, func() float64 { return float64(bus.Stats().Dropped) }),
+		prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "voicx_eventbus_evicted_total",
+			Help: "Subscribers evicted for persistently failing to drain.",
+		}, func() float64 { return float64(bus.Stats().Evicted) }),
+	}
+	for _, c := range collectors {
+		if err := reg.Register(c); err != nil {
+			logger.Warn("registering event-bus metric failed", zap.Error(err))
+		}
+	}
+}
+
 // queryBackend adapts the server's building blocks to the query.Backend
 // interface. Only admins may log in; every operation after that is trusted.
 type queryBackend struct {
@@ -728,6 +814,8 @@ type queryBackend struct {
 	startedAt  time.Time
 	serverName string
 	maxClients int
+	// rules serves the server rules shown on first join (215).
+	rules *rules.Service
 }
 
 func (q *queryBackend) Authenticate(ctx context.Context, uniqueID, password string) (bool, bool, error) {
@@ -757,7 +845,8 @@ func (q *queryBackend) ListClients(context.Context) []query.ClientInfo {
 }
 
 func (q *queryBackend) ListChannels(context.Context) []query.ChannelInfo {
-	channels := q.stateMgr.ChannelTree()
+	// Totally ordered so channellist agrees with the tree clients see (163).
+	channels := q.stateMgr.ChannelTreeOrdered()
 	out := make([]query.ChannelInfo, 0, len(channels))
 	for _, ch := range channels {
 		out = append(out, query.ChannelInfo{
@@ -801,15 +890,24 @@ func (q *queryBackend) ChannelInfo(_ context.Context, channelID int64) (query.Ch
 
 func (q *queryBackend) EditChannel(ctx context.Context, channelID int64, params query.ChannelEditParams) error {
 	if err := q.channelMgr.UpdateChannel(ctx, channelID, channels.ChannelUpdate{
-		Topic:           params.Topic,
-		MaxClients:      params.MaxClients,
-		OpusBitrate:     params.OpusBitrate,
-		OpusFEC:         params.OpusFEC,
-		OpusDTX:         params.OpusDTX,
-		OpusStereo:      params.OpusStereo,
-		SlowModeSeconds: params.SlowModeSeconds,
+		Topic:              params.Topic,
+		MaxClients:         params.MaxClients,
+		OpusBitrate:        params.OpusBitrate,
+		OpusFEC:            params.OpusFEC,
+		OpusDTX:            params.OpusDTX,
+		OpusStereo:         params.OpusStereo,
+		SlowModeSeconds:    params.SlowModeSeconds,
+		NeededJoinPower:    params.NeededJoinPower,
+		OrderIndex:         params.OrderIndex,
+		ParentID:           params.ParentID,
+		InheritPermissions: params.InheritPermissions,
 	}); err != nil {
 		return err
+	}
+	// (157) same reason as the control-channel edit: re-parenting or flipping
+	// inheritance changes the resolved channel tier for a whole subtree.
+	if q.permLoader != nil && (params.InheritPermissions != nil || params.ParentID != nil) {
+		q.permLoader.InvalidateAll()
 	}
 	q.db.Audit(ctx, "serverquery", "channel_edit", strconv.FormatInt(channelID, 10), "")
 	// Keep connected clients in sync (the control-channel edit path does the
@@ -958,27 +1056,41 @@ func (q *queryBackend) effectiveName(ctx context.Context) string {
 	return q.serverName
 }
 
-func (q *queryBackend) ServerEdit(ctx context.Context, name, welcome string, maxClients int) error {
-	if name != "" {
-		if err := q.db.SetServerSetting(ctx, "server_name", name, 0); err != nil {
+// ServerEdit applies the fields serveredit passed (217). An empty stored value
+// is how both readers spell "unset", so writing one is the clear path.
+func (q *queryBackend) ServerEdit(ctx context.Context, params query.ServerEditParams) error {
+	if params.Name != nil {
+		if err := q.db.SetServerSetting(ctx, "server_name", *params.Name, 0); err != nil {
 			return err
 		}
 	}
-	if welcome != "" {
+	if params.Welcome != nil {
 		// Through the server so the MOTD is sealed under the global
 		// generation; a raw store write would put operator text in the dump.
-		if err := q.tcp.SetServerSettingAndAnnounce(ctx, "motd", welcome); err != nil {
+		if err := q.tcp.SetServerSettingAndAnnounce(ctx, "motd", *params.Welcome); err != nil {
 			return err
 		}
 	}
-	if maxClients > 0 {
-		if err := q.db.SetServerSetting(ctx, "max_clients_override", fmt.Sprint(maxClients), 0); err != nil {
+	if params.MaxClients != nil {
+		value := ""
+		if *params.MaxClients > 0 {
+			value = fmt.Sprint(*params.MaxClients)
+		}
+		if err := q.db.SetServerSetting(ctx, "max_clients_override", value, 0); err != nil {
 			return err
 		}
 	}
-	q.db.Audit(ctx, "serverquery", "serveredit", name,
-		fmt.Sprintf("welcome=%t maxclients=%d", welcome != "", maxClients))
+	q.db.Audit(ctx, "serverquery", "serveredit", derefOr(params.Name, ""),
+		fmt.Sprintf("welcome=%t maxclients=%d", params.Welcome != nil, derefOr(params.MaxClients, 0)))
 	return nil
+}
+
+// derefOr reads an optional serveredit field.
+func derefOr[T any](p *T, fallback T) T {
+	if p == nil {
+		return fallback
+	}
+	return *p
 }
 
 func (q *queryBackend) Shutdown(_ context.Context, restart bool) error {
@@ -1131,4 +1243,20 @@ func (q *queryBackend) CustomInfo(ctx context.Context, uniqueID string) ([]query
 
 func (q *queryBackend) LogView(_ context.Context, lines int, filter string) ([]string, error) {
 	return logging.Recent(lines, filter), nil
+}
+
+func (q *queryBackend) LogFollow() (<-chan string, func()) {
+	return logging.Follow()
+}
+
+func (q *queryBackend) ServerRules(ctx context.Context) (string, string, int, error) {
+	text, hash, err := q.rules.Text(ctx)
+	if err != nil {
+		return "", "", 0, err
+	}
+	accepted, err := q.rules.AcceptedCount(ctx)
+	if err != nil {
+		return "", "", 0, err
+	}
+	return text, hash, accepted, nil
 }

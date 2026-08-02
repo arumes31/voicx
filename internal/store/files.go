@@ -146,12 +146,20 @@ func likeEscape(s string) string {
 	return r.Replace(s)
 }
 
-// RenameFile moves/renames a file record (262).
+// RenameFile moves/renames a file record within its channel (262).
 func (s *Store) RenameFile(ctx context.Context, channelID int64, folder, name, newFolder, newName string) error {
-	const q = `UPDATE files SET folder = $4, name = $5 WHERE channel_id = $1 AND folder = $2 AND name = $3`
-	res, err := s.db.ExecContext(ctx, q, channelID, folder, name, newFolder, newName)
+	return s.MoveFile(ctx, channelID, folder, name, channelID, newFolder, newName)
+}
+
+// MoveFile relocates a file record, possibly into another channel (262). The
+// uploader travels with the row, so the file keeps counting against the
+// person who put it there (266) rather than against whoever moved it.
+func (s *Store) MoveFile(ctx context.Context, channelID int64, folder, name string, newChannelID int64, newFolder, newName string) error {
+	const q = `UPDATE files SET channel_id = $4, folder = $5, name = $6
+	          WHERE channel_id = $1 AND folder = $2 AND name = $3`
+	res, err := s.db.ExecContext(ctx, q, channelID, folder, name, newChannelID, newFolder, newName)
 	if err != nil {
-		return fmt.Errorf("renaming file: %w", err)
+		return fmt.Errorf("moving file: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrFileNotFound
@@ -192,13 +200,34 @@ func (s *Store) FindFileBySHA(ctx context.Context, channelID int64, sha256, excl
 	return &rec, nil
 }
 
-// ChannelFileUsage returns the total bytes of all files in a channel (used
-// for quota enforcement).
+// ChannelFileUsage returns the bytes a channel's files physically occupy
+// (265). Identical blobs inside a channel are hard-linked rather than stored
+// twice (275 dedup), so summing logical row sizes charges a deduped copy
+// against the quota even though it costs no disk: count each distinct content
+// hash once.
 func (s *Store) ChannelFileUsage(ctx context.Context, channelID int64) (int64, error) {
 	var total int64
-	const q = `SELECT COALESCE(SUM(size), 0) FROM files WHERE channel_id = $1`
+	const q = `SELECT COALESCE(SUM(sz), 0) FROM
+	          (SELECT MAX(size) AS sz FROM files WHERE channel_id = $1 GROUP BY sha256) t`
 	if err := s.db.QueryRowContext(ctx, q, channelID).Scan(&total); err != nil {
 		return 0, fmt.Errorf("querying channel file usage: %w", err)
+	}
+	return total, nil
+}
+
+// UploaderFileUsage returns the bytes one uploader's files physically occupy
+// across every channel (266). Dedup only hard-links within a channel, so the
+// same blob uploaded to two channels really is stored twice and is charged
+// twice here.
+func (s *Store) UploaderFileUsage(ctx context.Context, uploader string) (int64, error) {
+	if uploader == "" {
+		return 0, nil
+	}
+	var total int64
+	const q = `SELECT COALESCE(SUM(sz), 0) FROM
+	          (SELECT MAX(size) AS sz FROM files WHERE uploader = $1 GROUP BY channel_id, sha256) t`
+	if err := s.db.QueryRowContext(ctx, q, uploader).Scan(&total); err != nil {
+		return 0, fmt.Errorf("querying uploader file usage: %w", err)
 	}
 	return total, nil
 }

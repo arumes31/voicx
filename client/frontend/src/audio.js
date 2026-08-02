@@ -216,37 +216,37 @@ export async function applyCaptureProfile(pc, stream, ch) {
     // the first is still in flight would swap the sender's track twice.
     if (recapturing) return { track: cur, changed: false };
     recapturing = true;
-    let fresh = null;
     try {
-        fresh = await navigator.mediaDevices.getUserMedia({ audio: captureConstraints(ch) });
-    } catch {
-        recapturing = false;
-        return { track: cur, changed: false };
-    }
-    recapturing = false;
-    const next = fresh.getAudioTracks()[0];
-    if (!next) {
-        fresh.getTracks().forEach((t) => t.stop());
-        return { track: cur, changed: false };
-    }
-    trackProfiles.set(next, want);
-    // mute/PTT gate the track with .enabled: a fresh track starts enabled and
-    // would un-mute the user behind their back.
-    next.enabled = cur.enabled;
-    next.contentHint = want === "music" ? "music" : "speech";
-    const sender = pc?.getSenders().find((s) => s.track && s.track.kind === "audio") || null;
-    if (sender) {
+        let fresh = null;
         try {
-            await sender.replaceTrack(next);
+            fresh = await navigator.mediaDevices.getUserMedia({ audio: captureConstraints(ch) });
         } catch {
-            next.stop();
             return { track: cur, changed: false };
         }
+        const next = fresh.getAudioTracks()[0];
+        if (!next) {
+            fresh.getTracks().forEach((t) => t.stop());
+            return { track: cur, changed: false };
+        }
+        trackProfiles.set(next, want);
+        next.enabled = cur.enabled;
+        next.contentHint = want === "music" ? "music" : "speech";
+        const sender = pc?.getSenders().find((s) => s.track && s.track.kind === "audio") || null;
+        if (sender) {
+            try {
+                await sender.replaceTrack(next);
+            } catch {
+                next.stop();
+                return { track: cur, changed: false };
+            }
+        }
+        cur.stop();
+        stream.removeTrack(cur);
+        stream.addTrack(next);
+        return { track: next, changed: true };
+    } finally {
+        recapturing = false;
     }
-    cur.stop();
-    stream.removeTrack(cur);
-    stream.addTrack(next);
-    return { track: next, changed: true };
 }
 
 // ---------------------------------------------------------------------------

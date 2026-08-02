@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -233,6 +234,39 @@ func (s *Store) SetGroupIcon(ctx context.Context, groupID int64, icon string) er
 	const q = `UPDATE server_groups SET icon = $1 WHERE id = $2`
 	if _, err := s.db.ExecContext(ctx, q, icon, groupID); err != nil {
 		return fmt.Errorf("setting group icon: %w", err)
+	}
+	return nil
+}
+
+// SetGroupCosmetics updates a server group's colour, hoisting and sort order
+// (178/179). A nil field is left unchanged so a dialog may send only what the
+// operator touched; colour/hoist exist only on server groups.
+func (s *Store) SetGroupCosmetics(ctx context.Context, groupID int64, color *string, hoist *bool, sortID *int) error {
+	sets := make([]string, 0, 3)
+	args := make([]any, 0, 4)
+	if color != nil {
+		args = append(args, *color)
+		sets = append(sets, fmt.Sprintf("color = $%d", len(args)))
+	}
+	if hoist != nil {
+		args = append(args, *hoist)
+		sets = append(sets, fmt.Sprintf("hoist = $%d", len(args)))
+	}
+	if sortID != nil {
+		args = append(args, *sortID)
+		sets = append(sets, fmt.Sprintf("sort_id = $%d", len(args)))
+	}
+	if len(sets) == 0 {
+		return errors.New("no cosmetic fields to set")
+	}
+	args = append(args, groupID)
+	q := fmt.Sprintf(`UPDATE server_groups SET %s WHERE id = $%d`, strings.Join(sets, ", "), len(args))
+	res, err := s.db.ExecContext(ctx, q, args...)
+	if err != nil {
+		return fmt.Errorf("setting group cosmetics: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return errors.New("group not found")
 	}
 	return nil
 }

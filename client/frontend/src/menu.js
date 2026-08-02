@@ -356,7 +356,16 @@ export function initMenu() {
                 head.textContent = folder;
                 bookmarkList.appendChild(head);
             }
-            bookmarkList.appendChild(menuAction(b.name, () => connectBookmark(b)));
+            const item = menuAction(b.name, () => connectBookmark(b));
+            if (b.color) {
+                // (284) same swatch the tab bar uses, so a bookmark reads the
+                // same in the menu as it does once connected.
+                const dot = document.createElement("span");
+                dot.className = "srv-tab-dot";
+                dot.style.background = b.color;
+                item.prepend(dot);
+            }
+            bookmarkList.appendChild(item);
         }
     };
     const bookmarks = buildMenu(t("menu.bookmarks"), [
@@ -425,6 +434,17 @@ export function initMenu() {
             if (!V().state.myClientID) return V().toast("not connected", "warn");
             window.__voicxPerms.openChatFilters();
         }),
+        // (173) complaint review, gated the same way as the audit viewer.
+        menuAction("Complaints…", () => {
+            if (!V().state.myClientID) return V().toast("not connected", "warn");
+            window.__voicxPerms.openComplaints();
+        }),
+        // (174/175/176) privilege key management and handoff.
+        menuAction("Privilege keys…", () => {
+            if (!V().state.myClientID) return V().toast("not connected", "warn");
+            window.__voicxPerms.openTokenManager();
+        }),
+        menuAction("Use a privilege key…", () => window.__voicxPerms.openTokenRedeem()),
         divider(),
         menuAction(t("menu.debugConsole"), () => {
             if (!V().state.myClientID) return V().toast("not connected", "warn");

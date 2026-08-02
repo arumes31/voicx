@@ -36,7 +36,7 @@ function trackTransfer(p) {
     }
     Object.assign(t, {
         transferred: p.transferred, total: p.total, bps: p.bytes_per_sec,
-        status: p.status, error: p.error || "",
+        status: p.status, error: p.error || "", resumed: p.resumed || 0,
     });
     if (p.status === "active") {
         t.history.push(p.bytes_per_sec || 0);
@@ -172,8 +172,10 @@ function renderFbList() {
 // isChatAttachment reports a row the browser cannot make sense of: a chat
 // attachment is sealed with a per-file key that exists only inside the
 // encrypted chat message linking it, so downloading it here yields ciphertext
-// that looks like corruption (91-135). The .vcx suffix is content-derived and
-// always present; the server's encrypted flag is honoured when it sends one.
+// that looks like corruption (91-135). The server's flag is authoritative
+// when set, but it is omitempty on the wire — false and absent look identical
+// — so the content-derived ".vcx" suffix stays as the fallback. Both err
+// toward showing the lock, which is the safe direction.
 function isChatAttachment(e) {
     return !!e.encrypted || (e.name || "").toLowerCase().endsWith(".vcx");
 }
@@ -210,14 +212,17 @@ function fileRow(e) {
         return b;
     };
     const dl = btn("⬇", "download", () => downloadFile(e));
+    const link = btn("🔗", "copy download link (15 min)", () => linkFile(e));
     if (sealed) {
         dl.disabled = true;
         dl.title = "open it from the chat message that carries its key";
+        link.disabled = true;
+        link.title = "sealed files cannot be linked directly";
     }
-    btn("🔗", "copy download link (15 min)", () => linkFile(e));
     btn("✓", "verify checksum (re-downloads and compares)", () => verifyFile(e, tr));
     btn("▾", "versions (264)", () => toggleVersions(e, tr));
-    btn("✎", "rename / move", () => renameFile(e));
+    btn("✎", "rename / move within this channel", () => renameFile(e));
+    btn("⇄", "move to another channel (262)", () => moveToChannel(e));
     btn("🗑", "delete", () => deleteFile(e));
     return tr;
 }
@@ -226,14 +231,30 @@ function fileRow(e) {
 
 let xferSeq = 0;
 
-function downloadFile(e) {
-    App().PickSavePath(e.name).then((path) => {
-        if (!path) return;
-        const id = `dl-${++xferSeq}`;
-        const err = App().DownloadFileProgress(id, fb.channelID, fb.folder, e.name, path);
-        if (err) V().toast("download failed: " + err, "warn");
-        else V().toast("downloading " + e.name);
-    });
+// startDownload runs one download attempt and remembers its arguments so the
+// transfer list can retry it — a retry into the same destination resumes from
+// the partial file rather than starting over (259).
+async function startDownload(args, id) {
+    id = id || `dl-${++xferSeq}`;
+    const err = await App().DownloadFileProgress(id, args.channelID, args.folder, args.name, args.path, args.size || 0);
+    if (err) {
+        V().toast("download failed: " + err, "warn");
+        return;
+    }
+    downloadArgs.set(id, args);
+    V().toast("downloading " + args.name);
+}
+
+// downloadArgs keeps the retry payload per transfer id.
+const downloadArgs = new Map();
+
+async function downloadFile(e) {
+    // The configured download folder (Downloads settings) wins; only fall back
+    // to the save dialog when the user has not set one.
+    let path = await App().DownloadPath(e.name);
+    if (!path) path = await App().PickSavePath(e.name);
+    if (!path) return;
+    startDownload({ channelID: fb.channelID, folder: fb.folder, name: e.name, path, size: e.size || 0 });
 }
 
 async function linkFile(e) {
@@ -291,7 +312,7 @@ async function toggleVersions(e, tr) {
             dl.className = "icon-btn";
             dl.textContent = "⬇";
             dl.title = "download this version";
-            dl.onclick = () => downloadFile({ ...e, name: v.name });
+            dl.onclick = () => downloadFile({ ...e, name: v.name, size: v.size });
             row.appendChild(dl);
             list.appendChild(row);
         }
@@ -310,9 +331,55 @@ async function renameFile(e) {
         newFolder = name.slice(0, i);
         newName = name.slice(i + 1);
     }
-    const err = await App().FileRename(fb.channelID, fb.folder, e.name, newFolder, newName);
+    const err = await App().FileRename(fb.channelID, fb.folder, e.name, newFolder, newName, 0);
     if (err) V().toast("rename failed: " + err, "warn");
     setTimeout(refreshFiles, 400);
+}
+
+// moveToChannel moves a file into another channel (262). The server checks
+// both channels, so a target the user cannot upload to is refused there.
+async function moveToChannel(e) {
+    const channels = (V().state.channels || []).filter((c) => c.ChannelID !== fb.channelID);
+    if (channels.length === 0) {
+        V().toast("no other channel to move into", "warn");
+        return;
+    }
+    const overlay = document.createElement("div");
+    overlay.className = "dlg-overlay";
+    overlay.innerHTML = `
+        <div class="dlg">
+            <h3>Move to channel</h3>
+            <div class="dlg-text fb-move-what"></div>
+            <label class="dlg-label">target channel</label>
+            <select class="dlg-input fb-move-ch"></select>
+            <label class="dlg-label">folder in the target (blank = root)</label>
+            <input class="dlg-input fb-move-folder" placeholder="docs/2024" />
+            <div class="dlg-buttons">
+                <button class="dlg-ok">Move</button>
+                <button class="dlg-cancel">Cancel</button>
+            </div>
+        </div>`;
+    overlay.querySelector(".fb-move-what").textContent = e.name;
+    const sel = overlay.querySelector(".fb-move-ch");
+    for (const c of channels) {
+        const opt = document.createElement("option");
+        opt.value = String(c.ChannelID);
+        opt.textContent = c.Name;
+        sel.appendChild(opt);
+    }
+    const close = () => overlay.remove();
+    overlay.querySelector(".dlg-cancel").onclick = close;
+    overlay.onclick = (ev) => { if (ev.target === overlay) close(); };
+    overlay.querySelector(".dlg-ok").onclick = async () => {
+        const target = parseInt(sel.value, 10);
+        const folder = overlay.querySelector(".fb-move-folder").value.replace(/^\/+|\/+$/g, "");
+        close();
+        const err = await App().FileRename(fb.channelID, fb.folder, e.name, folder, e.name, target);
+        if (err) V().toast("move failed: " + err, "warn");
+        else V().toast(`moved ${e.name} to ${sel.options[sel.selectedIndex].textContent}`);
+        setTimeout(refreshFiles, 400);
+    };
+    document.body.appendChild(overlay);
 }
 
 async function deleteFile(e) {
@@ -327,46 +394,80 @@ async function deleteFile(e) {
 const uploadQueue = [];
 let uploadActive = false;
 
+// DROP_MAX caps the browser-File route: a dropped File has no path on disk we
+// can hand to Go, so its bytes must travel base64 inside one IPC argument.
+// Past a few MiB that argument stops arriving at all, so refuse it loudly and
+// point at the picker, which streams (259).
+const DROP_MAX = 4 * 1024 * 1024;
+
+// queueUploads takes browser File objects (drag & drop).
 function queueUploads(files) {
     if (!fb.channelID) {
         V().toast("join a channel first", "warn");
         return;
     }
+    let queued = 0;
     for (const f of files) {
+        if (f.size > DROP_MAX) {
+            V().toast(`${f.name} is too large to drop (${humanBytes(f.size)}) — use ⬆ to upload it`, "warn");
+            continue;
+        }
         uploadQueue.push({ file: f, folder: fb.folder });
+        queued++;
     }
-    V().toast(uploadQueue.length + " file(s) queued for upload");
+    if (queued) V().toast(queued + " file(s) queued for upload");
     pumpUploads();
+}
+
+// queueUploadPaths takes native paths from the picker: those stream off disk.
+function queueUploadPaths(paths) {
+    if (!fb.channelID) {
+        V().toast("join a channel first", "warn");
+        return;
+    }
+    for (const p of paths) uploadQueue.push({ path: p, folder: fb.folder });
+    V().toast(paths.length + " file(s) queued for upload");
+    pumpUploads();
+}
+
+// awaitUpload keeps the queue sequential (260): the next file starts only once
+// this one has left the active state.
+function awaitUpload(id) {
+    const check = setInterval(() => {
+        const t = transfers.get(id);
+        if (t && t.status !== "active") {
+            clearInterval(check);
+            uploadActive = false;
+            if (t.status === "done") refreshFiles();
+            pumpUploads();
+        }
+    }, 300);
 }
 
 async function pumpUploads() {
     if (uploadActive || uploadQueue.length === 0) return;
     uploadActive = true;
-    const { file, folder } = uploadQueue.shift();
+    const { file, path, folder } = uploadQueue.shift();
+    const id = `up-${++xferSeq}`;
+    const label = path ? path.split(/[\\/]/).pop() : file.name;
     try {
-        const buf = await file.arrayBuffer();
-        const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
-        const id = `up-${++xferSeq}`;
-        const err = App().UploadFileProgress(id, fb.channelID, folder, file.name, b64);
+        let err;
+        if (path) {
+            err = await App().UploadPathProgress(id, fb.channelID, folder, path);
+        } else {
+            const buf = await file.arrayBuffer();
+            const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+            err = await App().UploadFileProgress(id, fb.channelID, folder, file.name, b64);
+        }
         if (err) {
-            V().toast("upload " + file.name + " failed: " + err, "warn");
+            V().toast("upload " + label + " failed: " + err, "warn");
             uploadActive = false;
             pumpUploads();
             return;
         }
-        // Wait for this transfer to finish before starting the next
-        // (sequential queue, 260).
-        const check = setInterval(() => {
-            const t = transfers.get(id);
-            if (t && t.status !== "active") {
-                clearInterval(check);
-                uploadActive = false;
-                if (t.status === "done") refreshFiles();
-                pumpUploads();
-            }
-        }, 300);
+        awaitUpload(id);
     } catch (err) {
-        V().toast("reading " + file.name + " failed: " + err, "warn");
+        V().toast("reading " + label + " failed: " + err, "warn");
         uploadActive = false;
         pumpUploads();
     }
@@ -447,11 +548,12 @@ function renderTransfers() {
         const eta = t.status === "active" && t.bps > 0 && t.total > 0
             ? Math.max(0, Math.round((t.total - t.transferred) / t.bps)) + "s"
             : "";
+        const resumed = t.resumed > 0 ? ` · resumed at ${humanBytes(t.resumed)}` : "";
         row.innerHTML = `
             <span class="tr-dir">${t.direction === "upload" ? "⬆" : "⬇"}</span>
             <span class="tr-name" title="${esc(t.name)}">${esc(t.name)}</span>
             <span class="tr-bar"><span class="tr-fill" style="width:${pct}%"></span></span>
-            <span class="tr-meta mono">${pct}% · ${humanBytes(t.bps || 0)}/s ${eta ? "· " + eta : ""}</span>
+            <span class="tr-meta mono">${pct}% · ${humanBytes(t.bps || 0)}/s ${eta ? "· " + eta : ""}${resumed}</span>
             <span class="tr-status mono">${t.status}${t.error ? ": " + esc(t.error) : ""}</span>`;
         if (t.status === "active") {
             const cancel = document.createElement("button");
@@ -460,12 +562,25 @@ function renderTransfers() {
             cancel.title = "cancel transfer";
             cancel.onclick = () => App().CancelTransfer(t.id);
             row.appendChild(cancel);
+        } else if (t.status !== "done" && downloadArgs.has(t.id)) {
+            // (259) retrying into the same destination picks up where the
+            // interrupted attempt stopped instead of re-fetching the whole file.
+            const retry = document.createElement("button");
+            retry.className = "icon-btn";
+            retry.textContent = "↻";
+            retry.title = "resume from where this stopped";
+            retry.onclick = () => {
+                const args = downloadArgs.get(t.id);
+                t.history = [];
+                startDownload(args, t.id);
+            };
+            row.appendChild(retry);
         }
         list.appendChild(row);
     }
 }
 
-// --- server icon (270) ---------------------------------------------------------
+// --- server icon + banner (270) ------------------------------------------------
 
 async function loadServerIcon() {
     try {
@@ -478,6 +593,207 @@ async function loadServerIcon() {
             el.classList.add("hidden");
         }
     } catch { /* no icon */ }
+    // Both halves of the server's branding load on the same trigger (connect
+    // and menu refresh), so the banner rides along here.
+    loadServerBanner();
+}
+
+// bannerEl returns the banner image, creating it under the sidebar brand on
+// first use. It is built here rather than in the page markup so the whole
+// feature stays in one file.
+function bannerEl() {
+    let el = document.getElementById("server-banner");
+    if (el) return el;
+    const sidebar = document.getElementById("sidebar");
+    const brand = sidebar && sidebar.querySelector(".brand");
+    if (!brand) return null;
+    el = document.createElement("img");
+    el.id = "server-banner";
+    el.alt = "";
+    el.title = "server banner";
+    el.style.cssText = "display:none;width:100%;max-height:96px;object-fit:cover;border-radius:6px;margin:6px 0";
+    brand.after(el);
+    return el;
+}
+
+async function loadServerBanner() {
+    const el = bannerEl();
+    if (!el) return;
+    try {
+        const data = await App().ServerBannerGet();
+        if (data && data.data_base64) {
+            el.src = `data:${data.content_type};base64,${data.data_base64}`;
+            el.style.display = "";
+        } else {
+            el.removeAttribute("src");
+            el.style.display = "none";
+        }
+    } catch {
+        el.style.display = "none";
+    }
+}
+
+// setServerBanner uploads a new banner (admin only). Reachable from the files
+// toolbar; the server refuses non-admins.
+async function setServerBanner() {
+    const { pickIcon } = await import("./image-tools.js");
+    // Banners are wide, so allow more pixels than a 256px icon; the quality
+    // loop still keeps it under the server's 256 KiB cap (274).
+    const img = await pickIcon(1600, 0.85);
+    if (!img) return;
+    const err = await App().ServerBannerSet(img.dataBase64);
+    if (err) {
+        V().toast("banner failed: " + err, "warn");
+        return;
+    }
+    V().toast("server banner updated");
+    setTimeout(loadServerBanner, 400);
+}
+
+// --- channel icons (271) --------------------------------------------------------
+
+// channelIcons caches one entry per channel: a data URL, or null for "asked,
+// none set". Without the cache every tree re-render would re-fetch.
+const channelIcons = new Map();
+
+// decorateChannelIcons swaps the placeholder glyph in the channel tree for the
+// real icon. The tree is rendered elsewhere and re-rendered often, so this
+// runs from an observer rather than being woven into the render.
+function decorateChannelIcons() {
+    const rows = document.querySelectorAll("#channel-tree .channel[data-chid]");
+    for (const row of rows) {
+        const id = Number(row.dataset.chid);
+        const slot = row.querySelector(".ch-icon");
+        if (!slot || slot.dataset.iconFor === String(id)) continue;
+        if (!channelIcons.has(id)) {
+            channelIcons.set(id, null); // claim it so concurrent passes do not refetch
+            App().ChannelIconGet(id).then((d) => {
+                if (d && d.data_base64) {
+                    channelIcons.set(id, `data:${d.content_type};base64,${d.data_base64}`);
+                    decorateChannelIcons();
+                }
+            }).catch(() => { /* no icon */ });
+            continue;
+        }
+        const url = channelIcons.get(id);
+        if (!url) continue;
+        slot.dataset.iconFor = String(id);
+        slot.textContent = "";
+        const img = document.createElement("img");
+        img.src = url;
+        img.alt = "";
+        img.style.cssText = "width:14px;height:14px;border-radius:3px;object-fit:cover;vertical-align:-2px";
+        slot.appendChild(img);
+    }
+}
+
+// watchChannelIcons re-decorates after any tree re-render.
+function watchChannelIcons() {
+    const tree = document.getElementById("channel-tree");
+    if (!tree) return;
+    let queued = false;
+    new MutationObserver(() => {
+        if (queued) return;
+        queued = true;
+        setTimeout(() => { queued = false; decorateChannelIcons(); }, 50);
+    }).observe(tree, { childList: true, subtree: true });
+    decorateChannelIcons();
+}
+
+// --- emoji manager (272) --------------------------------------------------------
+
+// The picker and its quick-upload live in the chat pane; this is the full
+// asset manager for the same files — previews, rename, delete and upload in
+// one place, reached from the media (files) pane.
+async function openEmojiManager() {
+    const overlay = document.createElement("div");
+    overlay.className = "dlg-overlay";
+    overlay.innerHTML = `
+        <div class="dlg">
+            <div class="pm-head">
+                <h3>Custom emoji</h3>
+                <button class="icon-btn em-close" title="Close">✕</button>
+            </div>
+            <div class="em-list">loading…</div>
+            <div class="dlg-buttons">
+                <button class="em-add">Upload emoji…</button>
+            </div>
+        </div>`;
+    const close = () => overlay.remove();
+    overlay.querySelector(".em-close").onclick = close;
+    overlay.onclick = (e) => { if (e.target === overlay) close(); };
+    overlay.querySelector(".em-add").onclick = () => addEmoji(overlay);
+    document.body.appendChild(overlay);
+    renderEmojiList(overlay);
+}
+
+async function renderEmojiList(overlay) {
+    const list = overlay.querySelector(".em-list");
+    let resp;
+    try {
+        resp = await App().EmojiList();
+    } catch (err) {
+        list.textContent = "emoji list failed: " + err;
+        return;
+    }
+    const emojis = resp.emojis || [];
+    if (emojis.length === 0) {
+        list.innerHTML = `<div class="empty-state">No custom emoji yet</div>`;
+        return;
+    }
+    list.innerHTML = "";
+    for (const e of emojis) {
+        const row = document.createElement("div");
+        row.className = "em-row";
+        row.style.cssText = "display:flex;align-items:center;gap:8px;padding:4px 0";
+        const img = document.createElement("img");
+        img.style.cssText = "width:24px;height:24px;object-fit:contain";
+        img.alt = e.name;
+        App().EmojiGet(e.name)
+            .then((d) => { if (d && d.data_base64) img.src = `data:${d.content_type};base64,${d.data_base64}`; })
+            .catch(() => { /* preview is optional */ });
+        const name = document.createElement("span");
+        name.className = "mono";
+        name.style.flex = "1";
+        name.textContent = ":" + e.name + ":";
+        const ren = document.createElement("button");
+        ren.className = "icon-btn";
+        ren.textContent = "✎";
+        ren.title = "rename (messages already sent keep the old name)";
+        ren.onclick = async () => {
+            const next = prompt("New emoji name (a-z 0-9 _ -):", e.name);
+            if (!next || next === e.name) return;
+            const err = await App().EmojiRename(e.name, next);
+            if (err) V().toast("rename failed: " + err, "warn");
+            setTimeout(() => renderEmojiList(overlay), 400);
+        };
+        const del = document.createElement("button");
+        del.className = "icon-btn";
+        del.textContent = "🗑";
+        del.title = "delete";
+        del.onclick = async () => {
+            if (!confirm(`Delete :${e.name}:?`)) return;
+            const err = await App().EmojiDelete(e.name);
+            if (err) V().toast("delete failed: " + err, "warn");
+            setTimeout(() => renderEmojiList(overlay), 400);
+        };
+        row.append(img, name, ren, del);
+        list.appendChild(row);
+    }
+}
+
+async function addEmoji(overlay) {
+    const name = prompt("Emoji name (a-z 0-9 _ -):");
+    if (!name) return;
+    const { pickIcon } = await import("./image-tools.js");
+    const img = await pickIcon(128, 0.9);
+    if (!img) return;
+    const err = await App().EmojiUpload(name, img.dataBase64);
+    if (err) {
+        V().toast("upload failed: " + err, "warn");
+        return;
+    }
+    setTimeout(() => renderEmojiList(overlay), 400);
 }
 
 // --- wiring ---------------------------------------------------------------------
@@ -491,6 +807,8 @@ export function initFilesUI() {
             <button class="icon-btn fb-refresh" title="Refresh">⟳</button>
             <button class="icon-btn fb-upload" title="Upload files">⬆</button>
             <button class="icon-btn fb-mkdir" title="New folder (virtual — persists only while it contains files)">📁+</button>
+            <button class="icon-btn fb-emoji" title="Custom emoji manager (272)">😀</button>
+            <button class="icon-btn fb-banner" title="Set the server banner (admin, 270)">🖼</button>
             <button class="icon-btn fb-transfers" title="Transfers">⇅</button>
         </div>
         <div class="fb-quota hidden"><div class="fb-quota-fill"></div></div>
@@ -498,12 +816,13 @@ export function initFilesUI() {
 
     pane.querySelector(".fb-refresh").onclick = refreshFiles;
     pane.querySelector(".fb-transfers").onclick = openTransfers;
-    pane.querySelector(".fb-upload").onclick = () => {
-        const input = document.createElement("input");
-        input.type = "file";
-        input.multiple = true;
-        input.onchange = () => queueUploads([...input.files]);
-        input.click();
+    pane.querySelector(".fb-emoji").onclick = openEmojiManager;
+    pane.querySelector(".fb-banner").onclick = setServerBanner;
+    pane.querySelector(".fb-upload").onclick = async () => {
+        // Native picker, not <input type=file>: it yields paths, which upload
+        // by streaming instead of by base64 blob (259).
+        const paths = await App().PickUploadPaths();
+        if (paths && paths.length) queueUploadPaths(paths);
     };
     pane.querySelector(".fb-mkdir").onclick = () => {
         const name = prompt("New folder name (virtual — persists only while it contains files):");
@@ -548,6 +867,28 @@ export function initFilesUI() {
     document.getElementById("tab-transfers").onclick = openTransfers;
 
     window.runtime.EventsOn("ft_progress", trackTransfer);
+
+    // (270/271) branding changes announced by the server: drop the cached copy
+    // so the next paint shows the new image instead of waiting for a reconnect.
+    window.runtime.EventsOn("event", (json) => {
+        let env;
+        try {
+            env = JSON.parse(json);
+        } catch {
+            return;
+        }
+        if (env.type === "server_banner_changed") {
+            loadServerBanner();
+        } else if (env.type === "channel_icon_changed") {
+            const id = (env.data || {}).channel_id;
+            if (!id) return;
+            channelIcons.delete(id);
+            document.querySelectorAll(`#channel-tree .channel[data-chid="${id}"] .ch-icon`)
+                .forEach((el) => { delete el.dataset.iconFor; });
+            decorateChannelIcons();
+        }
+    });
+    watchChannelIcons();
 
     window.__voicxFiles = {
         refreshFiles, openTransfers, loadServerIcon,

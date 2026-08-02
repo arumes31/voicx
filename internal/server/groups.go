@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -162,6 +163,14 @@ func (s *TCPServer) handleGroupDelete(ctx context.Context, client *Client, f *ne
 	if s.deps == nil || s.deps.Groups == nil {
 		return s.sendError(client, errCodeUnavailable, "group store unavailable")
 	}
+	// The members are the audience of the invalidation, so they have to be
+	// read while the memberships still exist (151).
+	groupType := groupTypeOf(msg.Type)
+	tier := store.PermTierServerGroup
+	if groupType == "channel" {
+		tier = store.PermTierChannelGroup
+	}
+	audience := s.permAudience(ctx, tier, store.PermTarget{GroupID: msg.GroupID})
 	if err := s.deps.Groups.DeleteGroup(ctx, msg.Type, msg.GroupID, msg.Force); err != nil {
 		return s.sendError(client, errCodeMalformed, "delete failed: "+err.Error())
 	}
@@ -169,7 +178,78 @@ func (s *TCPServer) handleGroupDelete(ctx context.Context, client *Client, f *ne
 	if s.deps.Perms != nil {
 		s.deps.Perms.InvalidateAll()
 	}
+	s.notifyPermsInvalid("group_delete", audience)
 	return nil
+}
+
+// validGroupColor accepts "#rrggbb", or "" to clear back to the theme default
+// (178). The value is painted straight into the client's CSS, so anything else
+// is refused rather than stored.
+func validGroupColor(c string) bool {
+	if c == "" {
+		return true
+	}
+	if len(c) != 7 || c[0] != '#' {
+		return false
+	}
+	for i := 1; i < 7; i++ {
+		switch {
+		case c[i] >= '0' && c[i] <= '9',
+			c[i] >= 'a' && c[i] <= 'f',
+			c[i] >= 'A' && c[i] <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// handleGroupEdit writes a server group's cosmetics: colour (178), hoisting
+// (179) and sort order. A nil field is left unchanged. Colour and hoist exist
+// only on server groups, so this is gated by b_server_group_manage.
+func (s *TCPServer) handleGroupEdit(ctx context.Context, client *Client, f *netproto.Frame) error {
+	var msg netproto.GroupEdit
+	if err := netproto.Decode(f, &msg); err != nil {
+		return s.sendError(client, errCodeMalformed, "malformed group_edit: "+err.Error())
+	}
+	pc, err := s.permCheckerFor(ctx, client)
+	if err != nil {
+		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+	}
+	if !pc.granted(permissions.PermissionKeyServerGroupManage) {
+		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyServerGroupManage))
+	}
+	if s.deps == nil || s.deps.Groups == nil {
+		return s.sendError(client, errCodeUnavailable, "group store unavailable")
+	}
+	if msg.Color == nil && msg.Hoist == nil && msg.SortID == nil {
+		return s.sendError(client, errCodeMalformed, "group_edit carries no fields")
+	}
+	if msg.Color != nil && !validGroupColor(*msg.Color) {
+		return s.sendError(client, errCodeMalformed, "color must be #rrggbb or empty")
+	}
+	if err := s.deps.Groups.SetGroupCosmetics(ctx, msg.GroupID, msg.Color, msg.Hoist, msg.SortID); err != nil {
+		return s.sendError(client, errCodeNotFound, "group edit failed: "+err.Error())
+	}
+	detail := ""
+	if msg.Color != nil {
+		detail += "color=" + *msg.Color + " "
+	}
+	if msg.Hoist != nil {
+		detail += fmt.Sprintf("hoist=%t ", *msg.Hoist)
+	}
+	if msg.SortID != nil {
+		detail += fmt.Sprintf("sort_id=%d", *msg.SortID)
+	}
+	s.audit(ctx, client.UniqueID, "group_edit", fmt.Sprintf("server:%d", msg.GroupID), strings.TrimSpace(detail))
+	// The members are the ones whose nickname colour and hoisted section just
+	// moved, so they are the ones that must refetch (151).
+	s.notifyPermsInvalid("group_edit", s.serverGroupAudience(ctx, msg.GroupID))
+	resp, err := s.groupListResponse(ctx, "server")
+	if err != nil {
+		return s.sendError(client, errCodeUnavailable, "group list failed")
+	}
+	return s.writeMessage(client, netproto.MsgGroupListResponse, resp)
 }
 
 // --- membership --------------------------------------------------------------
@@ -216,6 +296,7 @@ func (s *TCPServer) handleGroupAssign(ctx context.Context, client *Client, f *ne
 	if s.deps.Perms != nil {
 		s.deps.Perms.InvalidateAll()
 	}
+	s.notifyPermsInvalid("group_assign", []string{user.UniqueID})
 	if g, _ := s.deps.Groups.GetGroup(ctx, msg.Type, msg.GroupID); g != nil {
 		s.notifyGroupEvent(user.UniqueID, eventGroupAssigned, map[string]any{
 			"group_id": msg.GroupID, "group_name": g.Name, "by": client.UniqueID,
@@ -261,6 +342,7 @@ func (s *TCPServer) handleGroupUnassign(ctx context.Context, client *Client, f *
 	if s.deps.Perms != nil {
 		s.deps.Perms.InvalidateAll()
 	}
+	s.notifyPermsInvalid("group_unassign", []string{user.UniqueID})
 	if g, _ := s.deps.Groups.GetGroup(ctx, msg.Type, msg.GroupID); g != nil {
 		s.notifyGroupEvent(user.UniqueID, eventGroupUnassigned, map[string]any{
 			"group_id": msg.GroupID, "group_name": g.Name, "by": client.UniqueID,
@@ -293,6 +375,114 @@ func (s *TCPServer) notifyGroupEvent(uniqueID, eventType string, data any) {
 		}
 		_ = s.deps.Broadcast.BroadcastToClient(c.ID, payload)
 	}
+}
+
+// --- permission cache invalidation push (151) --------------------------------
+
+// notifyPermsInvalid pushes MsgPermsInvalid to the named users that are
+// currently online. It replaces the client's 5 s permission poll, so it has to
+// carry the reason and reach everyone whose resolution moved — not just the
+// caller who triggered the write.
+func (s *TCPServer) notifyPermsInvalid(reason string, uniqueIDs []string) {
+	if len(uniqueIDs) == 0 {
+		return
+	}
+	want := make(map[string]bool, len(uniqueIDs))
+	for _, id := range uniqueIDs {
+		if id != "" {
+			want[id] = true
+		}
+	}
+	// Collect under the registry lock but write outside it: a slow peer must
+	// not stall every other handler that needs the client registry.
+	s.mu.RLock()
+	targets := make([]*Client, 0, len(want))
+	for _, c := range s.clients {
+		if want[c.uniqueID()] {
+			targets = append(targets, c)
+		}
+	}
+	s.mu.RUnlock()
+	for _, c := range targets {
+		_ = s.writeMessage(c, netproto.MsgPermsInvalid, netproto.PermsInvalid{Reason: reason})
+	}
+}
+
+// permAudience returns the unique IDs whose resolution a write on this
+// tier/target can move (151). Group tiers reach every member, the channel tier
+// reaches whoever occupies the channel, client tiers reach the one user.
+// Channel-group membership is per channel, so only members standing in the
+// channel their membership belongs to are affected.
+func (s *TCPServer) permAudience(ctx context.Context, tier store.PermTier, target store.PermTarget) []string {
+	if s.deps == nil || s.deps.Groups == nil {
+		return nil
+	}
+	switch tier {
+	case store.PermTierServerGroup:
+		return s.serverGroupAudience(ctx, target.GroupID)
+	case store.PermTierChannelGroup:
+		var out []string
+		for _, channelID := range s.occupiedChannels() {
+			members, err := s.deps.Groups.ListChannelGroupMembers(ctx, target.GroupID, channelID)
+			if err != nil {
+				continue
+			}
+			for _, m := range members {
+				out = append(out, m.UniqueID)
+			}
+		}
+		return out
+	case store.PermTierChannel:
+		if s.deps.State == nil {
+			return nil
+		}
+		var out []string
+		for _, c := range s.deps.State.ChannelMembers(target.ChannelID) {
+			out = append(out, c.UniqueID)
+		}
+		return out
+	case store.PermTierClient, store.PermTierChannelClient:
+		uniqueID, err := s.deps.Groups.UserUniqueID(ctx, target.UserID)
+		if err != nil {
+			return nil
+		}
+		return []string{uniqueID}
+	}
+	return nil
+}
+
+// serverGroupAudience returns the unique IDs of a server group's members.
+func (s *TCPServer) serverGroupAudience(ctx context.Context, groupID int64) []string {
+	if s.deps == nil || s.deps.Groups == nil {
+		return nil
+	}
+	members, err := s.deps.Groups.ListServerGroupMembers(ctx, groupID)
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(members))
+	for _, m := range members {
+		out = append(out, m.UniqueID)
+	}
+	return out
+}
+
+// occupiedChannels returns the distinct channels online clients stand in, so
+// the channel-group audience is looked up only where it can matter.
+func (s *TCPServer) occupiedChannels() []int64 {
+	if s.deps == nil || s.deps.State == nil {
+		return nil
+	}
+	seen := map[int64]bool{}
+	var out []int64
+	for _, c := range s.deps.State.ListClients() {
+		if c.ChannelID == 0 || seen[c.ChannelID] {
+			continue
+		}
+		seen[c.ChannelID] = true
+		out = append(out, c.ChannelID)
+	}
+	return out
 }
 
 // NotifyGroupExpired informs an online user that a timed membership ended
@@ -330,6 +520,7 @@ func (s *TCPServer) ReapExpiredGroups(ctx context.Context) {
 			zap.Int64("group_id", groupID),
 		)
 		s.NotifyGroupExpired(uniqueID, groupID)
+		s.notifyPermsInvalid("group_expired", []string{uniqueID})
 	}
 }
 
@@ -558,6 +749,7 @@ func (s *TCPServer) handlePermSet(ctx context.Context, client *Client, f *netpro
 	if s.deps.Perms != nil {
 		s.deps.Perms.InvalidateAll()
 	}
+	s.notifyPermsInvalid("perm_set", s.permAudience(ctx, tier, target))
 	return nil
 }
 
@@ -637,35 +829,217 @@ func (s *TCPServer) handlePermUnset(ctx context.Context, client *Client, f *netp
 	if s.deps.Perms != nil {
 		s.deps.Perms.InvalidateAll()
 	}
+	s.notifyPermsInvalid("perm_unset", s.permAudience(ctx, tier, target))
+	return nil
+}
+
+// --- permission copy (141) ----------------------------------------------------
+
+// permCopyTarget resolves one side of a copy to a store tier and target.
+// A client kind with a channel scopes to the channel_client tier, which is the
+// only way a per-channel client copy can be addressed.
+func (s *TCPServer) permCopyTarget(ctx context.Context, kind, id string, channelID int64) (store.PermTier, store.PermTarget, error) {
+	var target store.PermTarget
+	switch kind {
+	case "servergroup", "channelgroup":
+		groupID, err := strconv.ParseInt(id, 10, 64)
+		if err != nil || groupID == 0 {
+			return "", target, fmt.Errorf("%s id must be a group id", kind)
+		}
+		target.GroupID = groupID
+		if kind == "channelgroup" {
+			return store.PermTierChannelGroup, target, nil
+		}
+		return store.PermTierServerGroup, target, nil
+	case "client":
+		if id == "" {
+			return "", target, errors.New("client id must be a unique id")
+		}
+		if s.deps == nil || s.deps.Auth == nil {
+			return "", target, errors.New("auth backend unavailable")
+		}
+		user, err := s.deps.Auth.LookupUser(ctx, id)
+		if err != nil {
+			return "", target, fmt.Errorf("user %q not found", id)
+		}
+		target.UserID = user.ID
+		if channelID != 0 {
+			target.ChannelID = channelID
+			return store.PermTierChannelClient, target, nil
+		}
+		return store.PermTierClient, target, nil
+	default:
+		return "", target, fmt.Errorf("unknown kind %q (want servergroup|channelgroup|client)", kind)
+	}
+}
+
+// handlePermCopy copies a target's permission entries onto another target
+// (141). Every entry is capped like a direct write, in both directions: a
+// caller may not deposit an entry it could not have set, and with Replace it
+// may not clear one it could not have unset.
+func (s *TCPServer) handlePermCopy(ctx context.Context, client *Client, f *netproto.Frame) error {
+	var msg netproto.PermCopy
+	if err := netproto.Decode(f, &msg); err != nil {
+		return s.sendError(client, errCodeMalformed, "malformed perm_copy: "+err.Error())
+	}
+	if s.deps == nil || s.deps.Groups == nil {
+		return s.sendError(client, errCodeUnavailable, "group store unavailable")
+	}
+	pc, err := s.permCheckerFor(ctx, client)
+	if err != nil {
+		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+	}
+	if !pc.granted(permissions.PermissionKeyPermissionManage) {
+		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyPermissionManage))
+	}
+	fromTier, fromTarget, err := s.permCopyTarget(ctx, msg.FromKind, msg.FromID, msg.ChannelID)
+	if err != nil {
+		return s.sendError(client, errCodeMalformed, "source: "+err.Error())
+	}
+	toTier, toTarget, err := s.permCopyTarget(ctx, msg.ToKind, msg.ToID, msg.ChannelID)
+	if err != nil {
+		return s.sendError(client, errCodeMalformed, "destination: "+err.Error())
+	}
+	if fromTier == toTier && fromTarget == toTarget {
+		return s.sendError(client, errCodeMalformed, "source and destination are the same target")
+	}
+
+	s.permWriteMu.Lock()
+	defer s.permWriteMu.Unlock()
+
+	src, err := s.deps.Groups.ListPermissions(ctx, fromTier, fromTarget)
+	if err != nil {
+		return s.sendError(client, errCodeUnavailable, "perm lookup failed")
+	}
+	dstEntries, err := s.deps.Groups.ListPermissions(ctx, toTier, toTarget)
+	if err != nil {
+		return s.sendError(client, errCodeUnavailable, "perm lookup failed")
+	}
+	current := make(map[string]store.PermEntry, len(dstEntries))
+	for _, e := range dstEntries {
+		current[e.Key] = e
+	}
+	copied := make(map[string]bool, len(src))
+	for _, e := range src {
+		copied[e.Key] = true
+		if !s.grantCapOkWrite(pc, current, e.Key, e.Value, e.Grant) {
+			return s.sendError(client, errCodePermissionDenied, "grant cap exceeded: "+e.Key+" is outside your own grant")
+		}
+	}
+	if msg.Replace {
+		for key, e := range current {
+			if copied[key] {
+				continue
+			}
+			if !s.grantCapOk(pc, key, e.Value, e.Grant) {
+				return s.sendError(client, errCodePermissionDenied, "grant cap exceeded: replacing would clear "+key+", which is outside your own grant")
+			}
+		}
+	}
+
+	// Replace makes the destination an exact copy rather than a merge, so the
+	// entries the source does not carry go first.
+	if msg.Replace {
+		for key := range current {
+			if copied[key] {
+				continue
+			}
+			if err := s.deps.Groups.UnsetPermission(ctx, toTier, toTarget, key); err != nil {
+				return s.sendError(client, errCodeUnavailable, "perm copy failed: "+err.Error())
+			}
+		}
+	}
+	for _, e := range src {
+		if err := s.deps.Groups.SetPermission(ctx, toTier, toTarget, e.Key, e.Value, e.Grant, e.Skip, e.Negate); err != nil {
+			return s.sendError(client, errCodeUnavailable, "perm copy failed: "+err.Error())
+		}
+	}
+	s.audit(ctx, client.UniqueID, "perm_copy",
+		fmt.Sprintf("%s:%s->%s:%s", msg.FromKind, msg.FromID, msg.ToKind, msg.ToID),
+		fmt.Sprintf("entries=%d replace=%t channel_id=%d", len(src), msg.Replace, msg.ChannelID))
+	if s.deps.Perms != nil {
+		s.deps.Perms.InvalidateAll()
+	}
+	s.notifyPermsInvalid("perm_copy", s.permAudience(ctx, toTier, toTarget))
 	return nil
 }
 
 // --- permission templates (142) ----------------------------------------------
 
-// permTemplates are the four built-in permission bundles (fixed in code this
-// wave; key -> value). guest/member stay minimal on purpose: most
-// permissions default to allowed-when-unset.
-var permTemplates = map[string]map[string]int{
-	"guest":  {},
-	"member": {},
+// permTemplateEntry is one key in a bundle. Grant matters as much as Value:
+// an entry written with grant 0 can never be delegated further, so a bundle
+// that hands out b_permission_manage without a grant produces an operator who
+// can open the editor and write nothing (142).
+type permTemplateEntry struct {
+	Value int
+	Grant int
+}
+
+// permTemplates are the four built-in permission bundles (fixed in code).
+//
+// Only keys that are denied-on-unset need to appear: the open defaults (talk,
+// whisper, file transfer, channel join) are already allowed for everyone, and
+// an entry would only narrow them. Powers rise with the tier so the needed_*
+// counterparts an operator sets on a target keep working.
+var permTemplates = map[string]map[string]permTemplateEntry{
+	// guest: nothing. Every privileged action is denied-on-unset already, and
+	// everything else is open, which is exactly the guest experience.
+	"guest": {},
+	// member: the two things a registered user is expected to do that the
+	// deny-on-unset default otherwise blocks.
+	"member": {
+		"b_client_poke":              {Value: 1},
+		"b_channel_create_temporary": {Value: 1},
+	},
 	"moderator": {
-		"b_chat_delete_any":         1,
-		"b_channel_modify":          1,
-		"b_client_priority_speaker": 1,
+		"b_client_poke":              {Value: 1},
+		"b_channel_create_temporary": {Value: 1},
+		"b_chat_delete_any":          {Value: 1},
+		"b_chat_mention_all":         {Value: 1},
+		"b_chat_slowmode_bypass":     {Value: 1},
 		// moderating chat means owning the word/link lists too, or 117/118
 		// stay admin-only in practice.
-		"b_chat_filter_manage": 1,
+		"b_chat_filter_manage":      {Value: 1},
+		"b_channel_modify":          {Value: 1},
+		"b_channel_delete":          {Value: 1},
+		"b_client_priority_speaker": {Value: 1},
+		"b_ft_delete":               {Value: 1},
+		// enforcement powers: without these a moderator can see the offence
+		// and do nothing about it.
+		"b_client_ban":                     {Value: 1},
+		"i_client_ban_power":               {Value: 50},
+		"i_client_kick_from_channel_power": {Value: 50},
+		"i_client_kick_from_server_power":  {Value: 50},
+		"i_client_move_power":              {Value: 50},
 	},
+	// admin: everything a moderator holds, at a power that outranks it, plus
+	// the management keys — each with a grant so an admin can actually
+	// delegate the bundle instead of only holding it.
 	"admin": {
-		"b_chat_delete_any":         1,
-		"b_channel_modify":          1,
-		"b_client_priority_speaker": 1,
-		"b_chat_filter_manage":      1,
-		"b_emoji_manage":            1,
-		"b_permission_manage":       1,
-		"b_server_group_manage":     1,
-		"b_channel_group_manage":    1,
-		"b_audit_view":              1,
+		"b_client_poke":                    {Value: 1, Grant: 1},
+		"b_channel_create_temporary":       {Value: 1, Grant: 1},
+		"b_channel_create_semi_permanent":  {Value: 1, Grant: 1},
+		"b_channel_create_permanent":       {Value: 1, Grant: 1},
+		"b_chat_delete_any":                {Value: 1, Grant: 1},
+		"b_chat_mention_all":               {Value: 1, Grant: 1},
+		"b_chat_slowmode_bypass":           {Value: 1, Grant: 1},
+		"b_chat_filter_manage":             {Value: 1, Grant: 1},
+		"b_channel_modify":                 {Value: 1, Grant: 1},
+		"b_channel_delete":                 {Value: 1, Grant: 1},
+		"b_client_priority_speaker":        {Value: 1, Grant: 1},
+		"b_ft_delete":                      {Value: 1, Grant: 1},
+		"b_client_ban":                     {Value: 1, Grant: 1},
+		"i_client_ban_power":               {Value: 75, Grant: 75},
+		"i_client_kick_from_channel_power": {Value: 75, Grant: 75},
+		"i_client_kick_from_server_power":  {Value: 75, Grant: 75},
+		"i_client_move_power":              {Value: 75, Grant: 75},
+		"b_client_remoteaddress_view":      {Value: 1, Grant: 1},
+		"b_virtualserver_recording":        {Value: 1, Grant: 1},
+		"b_emoji_manage":                   {Value: 1, Grant: 1},
+		"b_permission_manage":              {Value: 1, Grant: 1},
+		"b_server_group_manage":            {Value: 1, Grant: 1},
+		"b_channel_group_manage":           {Value: 1, Grant: 1},
+		"b_audit_view":                     {Value: 1, Grant: 1},
 	},
 }
 
@@ -698,18 +1072,21 @@ func (s *TCPServer) handlePermTemplateApply(ctx context.Context, client *Client,
 	}
 	// A template is a batch of perm_set writes: cap every key it carries
 	// against the value it writes and the entry it would replace, or the admin
-	// template becomes a privilege-escalation shortcut.
+	// template becomes a privilege-escalation shortcut. The lock spans the
+	// check and the writes for the same reason perm_set holds it.
+	s.permWriteMu.Lock()
+	defer s.permWriteMu.Unlock()
 	current, err := s.currentPerms(ctx, pc, tier, target)
 	if err != nil {
 		return s.sendError(client, errCodeUnavailable, "perm lookup failed")
 	}
-	for key, value := range tmpl {
-		if !s.grantCapOkWrite(pc, current, key, value, 0) {
+	for key, e := range tmpl {
+		if !s.grantCapOkWrite(pc, current, key, e.Value, e.Grant) {
 			return s.sendError(client, errCodePermissionDenied, "grant cap exceeded: the template's "+key+" is outside your own grant")
 		}
 	}
-	for key, value := range tmpl {
-		if err := s.deps.Groups.SetPermission(ctx, tier, target, key, value, 0, false, false); err != nil {
+	for key, e := range tmpl {
+		if err := s.deps.Groups.SetPermission(ctx, tier, target, key, e.Value, e.Grant, false, false); err != nil {
 			return s.sendError(client, errCodeUnavailable, "template apply failed: "+err.Error())
 		}
 	}
@@ -717,6 +1094,7 @@ func (s *TCPServer) handlePermTemplateApply(ctx context.Context, client *Client,
 	if s.deps.Perms != nil {
 		s.deps.Perms.InvalidateAll()
 	}
+	s.notifyPermsInvalid("perm_template_apply", s.permAudience(ctx, tier, target))
 	return nil
 }
 
@@ -838,6 +1216,32 @@ func (s *TCPServer) assignDefaultGroup(ctx context.Context, client *Client) {
 		zap.String("client_id", client.ID),
 		zap.String("unique_id", client.UniqueID),
 	)
+}
+
+// --- bot accounts (180) -------------------------------------------------------
+
+// ClientIsBot reports whether a connected client's account carries
+// b_client_is_bot. It resolves through the tier hierarchy like any other
+// permission but deliberately does not honour the admin bypass permChecker
+// applies: bot-ness is a property of the account, not a privilege, and every
+// server admin would otherwise wear a bot badge. Guests can never be bots —
+// the flag is granted through a users row's groups.
+func (s *TCPServer) ClientIsBot(ctx context.Context, client *Client) bool {
+	if client == nil || client.UserID == 0 {
+		return false
+	}
+	if s.deps == nil || s.deps.Perms == nil || s.deps.Resolver == nil {
+		return false
+	}
+	tp, err := s.deps.Perms.LoadForClient(ctx, client.UserID, 0)
+	if err != nil {
+		return false
+	}
+	perm, _, err := s.deps.Resolver.Resolve(tp, permissions.PermissionKeyClientIsBot)
+	if err != nil || perm == nil {
+		return false
+	}
+	return !perm.Negate && perm.Value != 0
 }
 
 // guestGroupSet returns the Guest default group's permission set for

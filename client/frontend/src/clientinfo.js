@@ -317,8 +317,6 @@ function humanDuration(sec) {
     return `${s}s`;
 }
 
-let refreshTimer = null;
-
 function openClientInfo(client) {
     const overlay = document.createElement("div");
     overlay.className = "dlg-overlay";
@@ -416,6 +414,7 @@ function openClientInfo(client) {
         refreshVoiceStats(overlay, client);
     };
 
+    let refreshTimer = null;
     const close = () => {
         if (refreshTimer) {
             clearInterval(refreshTimer);
@@ -734,6 +733,23 @@ function matchPreset(bitrate, fec, dtx, stereo) {
     return "custom";
 }
 
+// subtreeOf returns a channel and every descendant of it (168): a channel
+// cannot become its own ancestor.
+function subtreeOf(channelID) {
+    const out = new Set([channelID]);
+    let grew = true;
+    while (grew) {
+        grew = false;
+        for (const c of V().state.channels) {
+            if (!out.has(c.ChannelID) && out.has(c.ParentID || 0)) {
+                out.add(c.ChannelID);
+                grew = true;
+            }
+        }
+    }
+    return out;
+}
+
 function openChannelEdit(channel) {
     const overlay = document.createElement("div");
     overlay.className = "dlg-overlay";
@@ -770,6 +786,15 @@ function openChannelEdit(channel) {
                 <label><input type="checkbox" class="ce-dtx" /> DTX</label>
                 <label><input type="checkbox" class="ce-stereo" /> Stereo</label>
             </div>
+            <label class="dlg-label">Needed join power (0 = open to everyone)</label>
+            <input type="number" class="dlg-input ce-joinpower" min="0" title="a client needs i_channel_join_power at or above this to join; you cannot raise it above your own join power (160)" />
+            <label class="dlg-label">Parent channel (168)</label>
+            <select class="dlg-input ce-parent">
+                <option value="0">— top level —</option>
+            </select>
+            <label class="dlg-label">Sort index (163; lower sorts first among siblings)</label>
+            <input type="number" class="dlg-input ce-order" />
+            <label class="dlg-label"><input type="checkbox" class="ce-inherit" /> inherit the parent's channel permissions and join power (157)</label>
             <label class="dlg-label">Channel icon</label>
             <div class="ce-icon-row">
                 <button class="icon-btn ce-icon-upload" title="Upload icon (compressed, max 1024px)">⬆ Upload…</button>
@@ -796,6 +821,23 @@ function openChannelEdit(channel) {
     q(".ce-stereo").checked = !!channel.OpusStereo;
     q(".ce-preset").value = matchPreset(
         channel.OpusBitrate || 32000, !!channel.OpusFEC, !!channel.OpusDTX, !!channel.OpusStereo);
+
+    // (160/163/168/157) tree fields. The parent list omits the channel itself
+    // and its subtree: the server refuses a cycle, and offering one is a
+    // guaranteed error dialog.
+    q(".ce-joinpower").value = channel.NeededJoinPower || 0;
+    q(".ce-order").value = channel.OrderIndex || 0;
+    q(".ce-inherit").checked = !!channel.InheritPermissions;
+    const banned = subtreeOf(channel.ChannelID);
+    const parentSel = q(".ce-parent");
+    for (const c of V().state.channels) {
+        if (banned.has(c.ChannelID)) continue;
+        const opt = document.createElement("option");
+        opt.value = c.ChannelID;
+        opt.textContent = "# " + c.Name;
+        parentSel.appendChild(opt);
+    }
+    parentSel.value = String(channel.ParentID || 0);
 
     q(".ce-preset").onchange = () => {
         const p = QUALITY_PRESETS[q(".ce-preset").value];
@@ -848,8 +890,27 @@ function openChannelEdit(channel) {
             q(".ce-stereo").checked,
             q(".ce-desc").value,
             parseInt(q(".ce-slowmode").value, 10) || 0);
+
+        // Only the tree fields the user actually moved are sent: a parent_id
+        // on the wire drops the server's whole permission cache, so an
+        // untouched re-parent must not ride along with a topic edit.
+        const joinPower = parseInt(q(".ce-joinpower").value, 10) || 0;
+        const orderIndex = parseInt(q(".ce-order").value, 10) || 0;
+        const parentID = parseInt(parentSel.value, 10) || 0;
+        const inherit = q(".ce-inherit").checked;
+        const fields = [];
+        if (joinPower !== (channel.NeededJoinPower || 0)) fields.push("join_power");
+        if (orderIndex !== (channel.OrderIndex || 0)) fields.push("order");
+        if (parentID !== (channel.ParentID || 0)) fields.push("parent");
+        if (inherit !== !!channel.InheritPermissions) fields.push("inherit");
+        let treeErr = "";
+        if (fields.length) {
+            treeErr = await window.go.main.App.ChannelEditTree(
+                channel.ChannelID, fields.join(","), joinPower, orderIndex, parentID, inherit);
+        }
         overlay.remove();
         if (err) V().sysMsg("channel edit failed: " + err);
+        if (treeErr) V().sysMsg("channel edit failed: " + treeErr);
         // On success the server broadcasts channel_updated, which refreshes
         // the tree (main.js).
     };

@@ -867,13 +867,16 @@ func startTestEnvLogger(t *testing.T, perms *permissions.TieredPermissions, muta
 	_ = conn.Close() // connectivity probe only
 
 	env := &testEnv{addr: addr, state: sm, channels: fc, auth: fa, spool: fs, voice: fv, recorder: fr, ft: ft, perms: fp, tokens: ftk, complaints: fcm, chat: fchat, groups: fg, banAdmin: fba, deps: deps, srv: srv}
+	var stopOnce sync.Once
 	env.stop = func() {
-		cancel()
-		if err := <-startErr; err != nil {
-			t.Errorf("server start returned error: %v", err)
-		}
-		_ = srv.Shutdown()
-		bc.Close()
+		stopOnce.Do(func() {
+			cancel()
+			if err := <-startErr; err != nil {
+				t.Errorf("server start returned error: %v", err)
+			}
+			_ = srv.Shutdown()
+			bc.Close()
+		})
 	}
 	return env
 }

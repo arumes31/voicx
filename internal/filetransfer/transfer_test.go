@@ -93,7 +93,7 @@ func TestUploadRoundTrip(t *testing.T) {
 	addr, s := startServer(t, fs)
 
 	content := []byte("hello world")
-	id, token, err := s.InitUpload(context.Background(), 7, "", "hello.txt", int64(len(content)), "uid-1")
+	id, token, err := s.InitUpload(context.Background(), 7, "", "hello.txt", int64(len(content)), "uid-1", 0)
 	if err != nil {
 		t.Fatalf("InitUpload: %v", err)
 	}
@@ -139,7 +139,7 @@ func TestUploadSizeMismatch(t *testing.T) {
 	fs := newFakeFileStore()
 	addr, s := startServer(t, fs)
 
-	id, token, err := s.InitUpload(context.Background(), 7, "", "m.txt", 4, "uid-1")
+	id, token, err := s.InitUpload(context.Background(), 7, "", "m.txt", 4, "uid-1", 0)
 	if err != nil {
 		t.Fatalf("InitUpload: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestUploadChecksumMismatch(t *testing.T) {
 	addr, s := startServer(t, fs)
 
 	content := []byte("abcd")
-	id, token, err := s.InitUpload(context.Background(), 7, "", "c.txt", 4, "uid-1")
+	id, token, err := s.InitUpload(context.Background(), 7, "", "c.txt", 4, "uid-1", 0)
 	if err != nil {
 		t.Fatalf("InitUpload: %v", err)
 	}
@@ -249,6 +249,87 @@ done:
 	st := readStatus(t, conn)
 	if !st.OK {
 		t.Fatalf("status = %+v, want ok", st)
+	}
+}
+
+// TestDownloadResume verifies an offset download sends only the tail while
+// the digest still covers the whole file (259), and that an offset past the
+// end is refused.
+func TestDownloadResume(t *testing.T) {
+	fs := newFakeFileStore()
+	addr, s := startServer(t, fs)
+
+	content := []byte("resume me from the middle, please")
+	const offset = 11
+	if err := os.MkdirAll(filepath.Join(s.cfg.RootDir, "7"), 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(s.cfg.RootDir, "7", "part.txt"), content, 0o600); err != nil {
+		t.Fatalf("write seed file: %v", err)
+	}
+	if err := fs.AddFile(context.Background(), store.FileRecord{
+		ChannelID: 7, Name: "part.txt", Size: int64(len(content)), SHA256: sha256Hex(content),
+	}); err != nil {
+		t.Fatalf("AddFile: %v", err)
+	}
+
+	read := func(off int64) ([]byte, digestMsg, statusMsg) {
+		t.Helper()
+		id, token, err := s.InitDownload(context.Background(), 7, "", "part.txt")
+		if err != nil {
+			t.Fatalf("InitDownload: %v", err)
+		}
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		if err := writeJSON(conn, frameInit, initMsg{Token: token, TransferID: id, Offset: off}); err != nil {
+			t.Fatalf("write init: %v", err)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		var got []byte
+		var digest digestMsg
+		for {
+			f, err := netproto.ReadFrame(conn)
+			if err != nil {
+				t.Fatalf("read frame: %v", err)
+			}
+			if f.Type == frameStatus {
+				var st statusMsg
+				if err := json.Unmarshal(f.Payload, &st); err != nil {
+					t.Fatalf("decode status: %v", err)
+				}
+				return got, digest, st
+			}
+			switch f.Type {
+			case frameChunk:
+				got = append(got, f.Payload...)
+			case frameDigest:
+				if err := json.Unmarshal(f.Payload, &digest); err != nil {
+					t.Fatalf("decode digest: %v", err)
+				}
+			default:
+				t.Fatalf("unexpected frame type %d", f.Type)
+			}
+		}
+	}
+
+	got, digest, st := read(offset)
+	if !st.OK {
+		t.Fatalf("status = %+v, want ok", st)
+	}
+	if string(got) != string(content[offset:]) {
+		t.Fatalf("resumed body = %q, want %q", got, content[offset:])
+	}
+	// The prefix the client already holds is hashed but not re-sent, so the
+	// digest must still be the whole file's.
+	if digest.SHA256 != sha256Hex(content) {
+		t.Fatalf("digest = %q, want whole-file %q", digest.SHA256, sha256Hex(content))
+	}
+
+	if _, _, st := read(int64(len(content)) + 1); st.OK {
+		t.Fatal("offset past the end accepted")
 	}
 }
 

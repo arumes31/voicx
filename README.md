@@ -170,6 +170,26 @@ go run ./cmd/e2e -tls-insecure \
 
 Note: authentication uses the **unique ID** printed by adduser, not the nickname. Ports default to localhost standard values; override with `-addr`, `-query-addr`, `-health-url`, `-udp-addr`, `-file-addr`, and `-server-password` if the server has a global password. Since the control channel is TLS by default (self-signed cert), e2e and loadtest need `-tls-insecure` (skips certificate verification, logs the presented fingerprint once); omit it only against a `tls_enabled: false` server.
 
+### Database chaos drill (467)
+
+`-chaos` adds one extra, deliberately destructive check to the end of the checklist: it stops PostgreSQL while traffic is in flight and verifies the server degrades and recovers instead of falling over. It needs Docker (or whatever command you point it at) and is never part of a normal run.
+
+```bash
+export E2E_ALICE_UID=<alice uid> E2E_ALICE_PASS=alicepw
+export E2E_BOB_UID=<bob uid>     E2E_BOB_PASS=bobpw
+export E2E_ADMIN_UID=<admin uid> E2E_ADMIN_PASS=adminpw
+make chaos                       # or: ./scripts/chaos-db.sh
+```
+
+The whole checklist runs first, because the drill uses the channel it creates. With two authenticated sessions live and a third generating traffic (a ping every 200 ms, an encrypted channel message every second — slower than the pings so the 5-per-3s chat rate limit cannot be mistaken for a backend failure), it asserts:
+
+1. `/readyz` stops reporting ready within 10s while `/healthz` stays 200 — liveness must not follow the database. (The server answers **500**, not the more conventional 503; the check accepts either.)
+2. The established TCP sessions stay open and their pings keep being answered throughout the outage.
+3. A DB-backed request (channel history) comes back as an **error frame** on a live connection — not a dropped connection, a hang, or a panic. `handleChatHistory` and the chat-send store path both answer `errCodeUnavailable`, so the failure is visible to the client and the session survives.
+4. After the restart, `/readyz` returns 200 within 30s, a fresh `dialAuth` succeeds, and a message sent afterwards is retrievable through a history query — i.e. writes reach storage again, not just the relay.
+
+Override the disruption with `-chaos-stop-cmd` / `-chaos-start-cmd` (or `CHAOS_STOP_CMD` / `CHAOS_START_CMD`) to target a non-compose database; the command line is split on whitespace and run **without a shell**, so quoting and shell operators are not supported. The drill always tries to restart the database, including when a step fails.
+
 ## Load testing
 
 `cmd/loadtest` is a headless client simulator (TCP auth, channel join, chat, ping, optional UDP pings):
@@ -223,10 +243,16 @@ Note: recording currently expects the publisher codecs the generated SDP adverti
 
 TURN is only needed for clients behind restrictive NATs (symmetric NAT, UDP-blocking firewalls); LAN and direct-WAN deployments can skip it entirely. To enable:
 
-1. Start coturn via the compose profile: `TURN_SECRET=<random> docker compose --profile turn up -d` (publishes 3478 tcp/udp, 5349, relay range 49152-49252/udp).
-2. Point the server at it with the same secret: `VOICX_TURN_SECRET=<random>`, `VOICX_TURN_URIS=turn:<host>:3478?transport=udp,turn:<host>:3478?transport=tcp`.
+1. Put **all four** variables in `.env` — `TURN_SECRET`/`TURN_REALM` configure the coturn container, `VOICX_TURN_SECRET`/`VOICX_TURN_REALM` configure the server, and they must match. Setting only one pair leaves coturn on its placeholder secret while the server has TURN disabled, and the mismatch is silent (445).
+2. Set `TURN_EXTERNAL_IP` to the public IP clients reach the host on. **This is required for every client outside the host**: coturn runs on the `voicx-net` bridge, so without `--external-ip` it discovers only its `172.x` container address and advertises relay candidates nobody can reach — the ports being published does not help, because the address in the candidate is wrong. Leave it empty only for host-local testing.
+3. Start coturn: `docker compose --profile turn up -d` (publishes 3478 tcp/udp and the relay range 49152-49252/udp).
+4. Point the server at it: `VOICX_TURN_URIS=turn:<host>:3478?transport=udp,turn:<host>:3478?transport=tcp`.
 
 The server then mints time-limited credentials per client (`internal/turn`, coturn REST API: `username = <expiry>:<uid>`, `credential = base64(HMAC-SHA1(secret, username))`, TTL `turn.credentials_ttl`, default 24h) and delivers them together with the STUN defaults in the auth response; clients merge them into their `RTCPeerConnection` automatically.
+
+**`turns:` (TLS/DTLS) is off by default** and the compose file no longer advertises port 5349, because a working `turns:` needs a real certificate for the TURN hostname that this repo cannot ship — advertising the port without one gives clients an endpoint that always fails. To enable it: obtain a certificate for the TURN hostname (e.g. certbot), place `fullchain.pem`/`privkey.pem` in `./data/turn-certs`, uncomment the cert volume and the 5349 port mappings in the coturn service, replace `--no-tls`/`--no-dtls` with `--tls-listening-port=5349 --cert=/etc/coturn/certs/fullchain.pem --pkey=/etc/coturn/certs/privkey.pem`, and append `turns:<host>:5349?transport=tcp` to `VOICX_TURN_URIS`.
+
+**Known gap (445):** TURN credentials are minted once during authentication and never refreshed for a live session. A session that outlives `turn.credentials_ttl` (default 24h) presents expired credentials on a later ICE restart, and relayed media fails to re-establish until the client reconnects. Shortening the TTL makes this *more* likely, not less.
 
 Client-side hardware encode/decode is negotiated by the WebRTC client, not the server: the Phase 8 client should prefer hardware-backed codecs in `RTCPeerConnection` (platform default on most browsers; on native clients pick HW-accelerated encoder implementations and match the codec list the server advertises — VP8/VP9/H.264, optional AV1 via `webrtc.enable_av1`).
 

@@ -270,11 +270,16 @@ async function ensureCustomEmoji() {
     }
 }
 
+const ALLOWED_EMOJI_MIME = /^image\/(png|jpeg|jpg|gif|webp|svg\+xml)$/i;
+
 async function emojiURL(name) {
     if (emojiURLs.has(name)) return emojiURLs.get(name);
     emojiURLs.set(name, ""); // marks "loading/failed until proven otherwise"
     try {
         const d = await app().EmojiGet(name);
+        if (!d || !d.content_type || !ALLOWED_EMOJI_MIME.test(d.content_type)) {
+            return "";
+        }
         const u = `data:${d.content_type};base64,${d.data_base64}`;
         emojiURLs.set(name, u);
         return u;
@@ -291,8 +296,15 @@ function applyCustomEmoji(html) {
     for (const e of customEmoji) {
         const url = emojiURLs.get(e.name);
         if (url) {
-            html = html.split(":" + e.name + ":").join(
-                `<img class="md-emoji" src="${url}" alt=":${escapeHTML(e.name)}:">`);
+            const img = `<img class="md-emoji" src="${escapeHTML(url)}" alt=":${escapeHTML(e.name)}:">`;
+            const parts = html.split(/(<[^>]+>)/g);
+            const target = ":" + e.name + ":";
+            for (let i = 0; i < parts.length; i++) {
+                if (!parts[i].startsWith("<")) {
+                    parts[i] = parts[i].split(target).join(img);
+                }
+            }
+            html = parts.join("");
         } else if (url === undefined) {
             emojiURL(e.name);
         }
@@ -450,18 +462,23 @@ const INLINE_MAX_B64 = 8 * 1024 * 1024; // ~6 MB of media rendered inline
 // parseFileRef in client/chat.go.
 export function parseFileRef(cap) {
     const i = cap.indexOf("#");
-    if (i < 0) return { storage: cap, key: "", name: cap };       // legacy [file:photo.png]
+    if (i < 0) return { storage: cap, key: "", name: cap, valid: true, legacy: true };       // legacy plain [file:photo.png]
     const j = cap.indexOf("#", i + 1);
-    if (j < 0) return { storage: cap, key: "", name: cap };       // malformed -> treat as plain
-    return { storage: cap.slice(0, i), key: cap.slice(i + 1, j), name: cap.slice(j + 1) };
+    if (j < 0) return { storage: cap, key: "", name: cap, valid: false, legacy: false };      // malformed (1 separator)
+    return { storage: cap.slice(0, i), key: cap.slice(i + 1, j), name: cap.slice(j + 1), valid: true, legacy: false };
 }
 
 // attachFileRef takes the RAW capture and parses it here rather than in
 // renderBody, so the file key never crosses the split boundary. The key goes
 // straight into the Go call: never into textContent, an attribute or a src.
 function attachFileRef(container, m, cap) {
-    const chID = m.channelID ?? V().state.myChannelID ?? 0;
     const ref = parseFileRef(cap);
+    if (!ref.valid) {
+        container.appendChild(document.createTextNode(`[file:${cap}]`));
+        return;
+    }
+    const isDM = m.isDM || !m.channelID || m.channelID === "0" || m.channelID === 0;
+    const chID = isDM ? 0 : Number(m.channelID);
     const name = ref.name;
     const ext = (name.split(".").pop() || "").toLowerCase();
     const wrap = document.createElement("span");
@@ -1365,8 +1382,10 @@ export function addChat(d) {
     pushMsg(key, m);
     if (key === activeKey()) {
         appendLive(m);
-    } else if (!m.self) {
-        // (104) unread badge for a non-selected channel.
+    } else if (!m.self && !window.__voicxNotify?.channelOverride?.(chID)?.muted) {
+        // (104) unread badge for a non-selected channel. A muted channel (387)
+        // suppresses the badge too — silencing only the sound would still nag
+        // through the tree.
         const u = unread.get(chID) || { n: 0, mention: false };
         u.n++;
         u.mention = u.mention || m.mentioned;
@@ -1685,7 +1704,8 @@ export async function sendMessage() {
             V().sysMsg("upload failed: " + e);
             continue;
         }
-        await app().SendChat(scope, target, token);
+        const err = await app().SendChat(scope, target, token);
+        if (err) V().sysMsg("chat failed: " + err);
     }
 
     if (text) {
@@ -1918,25 +1938,47 @@ function metaContent(html, key) {
 async function linkPreview(url) {
     if (linkCards.has(url)) return linkCards.get(url);
     let card = { title: null, desc: null, image: null };
+    if (!/^https?:\/\//i.test(url)) {
+        linkCards.set(url, card);
+        return card;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
     try {
-        const resp = await fetch(url);
-        const html = (await resp.text()).slice(0, 256 * 1024); // <head> is at the front
+        const resp = await fetch(url, { signal: controller.signal });
+        let html = "";
+        if (resp.body) {
+            const reader = resp.body.getReader();
+            const decoder = new TextDecoder();
+            let loaded = 0;
+            const maxBytes = 256 * 1024;
+            while (loaded < maxBytes) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                loaded += value.byteLength;
+                html += decoder.decode(value, { stream: true });
+            }
+            reader.cancel().catch(() => {});
+        } else {
+            html = (await resp.text()).slice(0, 256 * 1024);
+        }
         card.title = metaContent(html, "og:title") ||
             html.match(/<title[^>]*>([^<]*)<\/title>/i)?.[1]?.trim() || null;
         card.desc = metaContent(html, "og:description") || metaContent(html, "description");
         const img = metaContent(html, "og:image");
-        // https only: an http thumbnail would mixed-content-block anyway, and
-        // a javascript:/data: value must never reach an <img src>.
         if (img && /^https:\/\//i.test(img)) card.image = img;
         if (card.title) card.title = card.title.slice(0, 120);
         if (card.desc) card.desc = card.desc.slice(0, 200);
-    } catch { /* CORS etc. — domain-only card */ }
+    } catch { /* CORS/timeout — domain-only card */ }
+    finally { clearTimeout(timer); }
     linkCards.set(url, card);
     return card;
 }
 
 function scheduleLinkCard(linkEl) {
     closeLinkCard();
+    const settings = V().settings || {};
+    if (settings.link_previews === false) return;
     const url = linkEl.getAttribute("data-url");
     if (!url) return;
     linkCardTimer = setTimeout(async () => {
@@ -2000,6 +2042,11 @@ async function togglePinsPanel() {
 
 async function loadPinsPanel() {
     if (!pinsPanel) return;
+    if (view.kind === "channel" && !V().state.myChannelID) {
+        V().toast("join a channel to view its pinned messages — or switch to global", "info", "alert");
+        closePinsPanel();
+        return;
+    }
     const chID = view.kind === "global" ? 0 : V().state.myChannelID;
     pinsPanel.innerHTML = "";
     const head = document.createElement("div");
@@ -2130,6 +2177,11 @@ async function searchAll() {
     const q = $("chat-search").value.trim();
     if (!q) return;
     const btn = $("chat-search-server");
+    if (btn && btn.disabled) return;
+    if (view.kind === "channel" && !V().state.myChannelID) {
+        V().toast("join a channel to search its history — or switch to global", "info", "alert");
+        return;
+    }
     if (view.kind === "dm") {
         // (122/110) the server is E2EE-blind for DMs, so the only searchable
         // history is this device's own sealed log.
@@ -2519,8 +2571,16 @@ export function resetView() {
     jl.verb = null;
     jl.names = [];
     jl.el = null;
-    // Per-server derived state: pins, thread chains and typing indicators all
-    // reference message ids and nicknames of the server being left (281).
+    customEmoji = [];
+    emojiURLs.clear();
+    customDirty = true;
+    for (const b of offlineBatch.values()) {
+        if (b.timer) clearTimeout(b.timer);
+    }
+    offlineBatch.clear();
+    linkCards.clear();
+    receipts.clear();
+    myReactions.clear();
     pinnedIDs.clear();
     threadCache.clear();
     closeThreadPanel();
@@ -2705,11 +2765,20 @@ function openQS() {
 // @nickname tab-completion in the chat input (105/106)
 // ---------------------------------------------------------------------------
 
-let tabCycle = null; // {start, base, matches, idx}
+let tabCycle = null; // {start, end, base, matches, idx}
 
 function handleTabComplete(e) {
     const input = $("chat-text");
     const pos = input.selectionStart ?? input.value.length;
+    if (tabCycle && pos === tabCycle.end) {
+        e.preventDefault();
+        tabCycle.idx = (tabCycle.idx + 1) % tabCycle.matches.length;
+        const pick = tabCycle.matches[tabCycle.idx];
+        input.value = input.value.slice(0, tabCycle.start) + "@" + pick + " " + input.value.slice(tabCycle.end);
+        tabCycle.end = tabCycle.start + pick.length + 2;
+        input.selectionStart = input.selectionEnd = tabCycle.end;
+        return;
+    }
     const before = input.value.slice(0, pos);
     const m = before.match(/@([\w-]*)$/);
     if (!m) {
@@ -2721,9 +2790,6 @@ function handleTabComplete(e) {
         .filter((c) => c.client_id !== V().state.myClientID)
         .map((c) => c.nickname || c.unique_id)
         .filter((n) => n && n.toLowerCase().startsWith(base));
-    // (105) the mass-mention forms are completed only for a user the resolved
-    // permission actually allows them to; without b_chat_mention_all the
-    // server drops them, so offering them would just be a lie in the UI.
     if (canMentionAll()) {
         for (const f of MENTION_ALL_FORMS) if (f.startsWith(base)) names.push(f);
     }
@@ -2732,14 +2798,12 @@ function handleTabComplete(e) {
         return;
     }
     e.preventDefault();
-    if (tabCycle && tabCycle.start === pos - m[0].length && tabCycle.base === base) {
-        tabCycle.idx = (tabCycle.idx + 1) % tabCycle.matches.length; // cycle
-    } else {
-        tabCycle = { start: pos - m[0].length, base, matches: names, idx: 0 };
-    }
-    const pick = tabCycle.matches[tabCycle.idx];
-    input.value = input.value.slice(0, tabCycle.start) + "@" + pick + " " + input.value.slice(pos);
-    input.selectionStart = input.selectionEnd = tabCycle.start + pick.length + 2;
+    const start = pos - m[0].length;
+    const pick = names[0];
+    const end = start + pick.length + 2;
+    tabCycle = { start, end, base, matches: names, idx: 0 };
+    input.value = input.value.slice(0, start) + "@" + pick + " " + input.value.slice(pos);
+    input.selectionStart = input.selectionEnd = end;
 }
 
 // ---------------------------------------------------------------------------
@@ -2865,6 +2929,7 @@ export function initChat() {
     // @nick completion (106) + typing indicator (120).
     $("chat-text").addEventListener("keydown", (e) => {
         if (e.key === "Tab") handleTabComplete(e);
+        else tabCycle = null;
     });
     $("chat-text").addEventListener("input", noteTyping);
     $("chat-text").addEventListener("blur", resetTypingOut);

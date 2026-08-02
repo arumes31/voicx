@@ -3,8 +3,15 @@
 // fans incoming RTP packets out to the appropriate subscribers.
 //
 // Design notes:
-//   - The SFU never decodes or re-encodes media: packets are forwarded as-is
-//     (headers included) to each subscriber's per-publisher output track.
+//   - The SFU never decodes or re-encodes media, and never copies a payload
+//     (436). One ReadRTP produces one *rtp.Packet, and that SAME packet is
+//     handed to every TrackWriter: pion's TrackLocalStaticRTP.WriteRTP
+//     value-copies the rtp.Header into a pooled packet and rewrites
+//     Header.SSRC / Header.PayloadType per binding — each output track has its
+//     own SSRC and negotiated payload type — while the payload slice stays
+//     SHARED with the packet the read loop owns. So headers are rewritten, not
+//     forwarded as-is, and the payload is never cloned or re-marshaled on the
+//     hot path.
 //     Each (subscriber, publisher) pair has dedicated output tracks, one per
 //     media SLOT the publisher occupies (see slotTrackID / slotStreamID), so
 //     clients can map an incoming track to (publisher, slot) via the MSID.
@@ -37,6 +44,13 @@ type TrackReader interface {
 
 // TrackWriter is the subset of *webrtc.TrackLocalStaticRTP the router writes
 // to.
+//
+// ALIASING CONTRACT (436): the router fans ONE packet out to every writer
+// without cloning it, and pkt.Payload aliases the read loop's receive buffer.
+// An implementation therefore MUST NOT mutate pkt or its Payload, and MUST NOT
+// retain either past the WriteRTP call — the next ReadRTP invalidates them and
+// the writers that follow would see the damage. Recorder taps included: a tap
+// that wants the bytes later has to copy them itself.
 type TrackWriter interface {
 	WriteRTP(pkt *rtp.Packet) error
 }
@@ -1041,6 +1055,11 @@ func (r *Router) detachPeer(clientID string, leaveChannel bool) {
 // is dropped rather than written somewhere else (70). Taps (e.g. recorders)
 // receive it on their single output track. The sender never receives its own
 // audio. It returns the number of successful writes.
+//
+// pkt is passed to every writer unchanged and uncloned (see TrackWriter's
+// aliasing contract). The two slices built here — targetSubscribersLocked's
+// result and the writers slice — are the only remaining per-packet
+// allocations on the audio hot path (436).
 func (r *Router) ForwardRTP(senderID, slot string, pkt *rtp.Packet) int {
 	r.mu.RLock()
 	subs := r.targetSubscribersLocked(senderID)
@@ -1179,10 +1198,29 @@ func (r *Router) ReadLoop(clientID, slot string, track TrackReader, extID uint8)
 	v := &vad{}
 	muted := false
 
+	var nonMicPkts uint64
 	for {
 		pkt, _, err := track.ReadRTP()
 		if err != nil {
 			break
+		}
+
+		if slot != SlotMic {
+			nonMicPkts++
+			if nonMicPkts%50 == 0 {
+				if !r.allowTalk(clientID) {
+					r.mu.RLock()
+					music := r.isMusicChannelLocked(clientID)
+					r.mu.RUnlock()
+					if !music {
+						r.logger.Info("router: audio publish revoked",
+							zap.String("client_id", clientID),
+							zap.String("slot", slot),
+						)
+						break
+					}
+				}
+			}
 		}
 
 		if extID != 0 {
@@ -1447,6 +1485,10 @@ func (r *Router) ReadVideoLoop(clientID, slot string, track VideoTrackReader) {
 // preference. A packet whose slot has no output track is dropped rather than
 // written somewhere else (70). Taps receive it on their single output track.
 // It returns the number of successful writes.
+//
+// Like ForwardRTP, pkt reaches every writer unchanged and uncloned (see
+// TrackWriter's aliasing contract), and the subscriber and accepted slices are
+// the only remaining per-packet allocations on the video hot path (436).
 func (r *Router) ForwardVideo(senderID, slot, rid string, pkt *rtp.Packet) int {
 	r.mu.RLock()
 	subs := r.targetSubscribersLocked(senderID)

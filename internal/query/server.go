@@ -177,13 +177,21 @@ func (s *Server) serve(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	sess := &session{conn: conn, remoteIP: remoteIP(conn)}
-	reader := bufio.NewReader(conn)
+	s.runSession(ctx, &session{
+		r:               bufio.NewReader(conn),
+		w:               conn,
+		setReadDeadline: conn.SetReadDeadline,
+		remoteIP:        remoteIP(conn),
+	})
+}
 
+// runSession is the transport-agnostic command loop shared by the raw TCP
+// port and the SSH transport (224).
+func (s *Server) runSession(ctx context.Context, sess *session) {
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(s.IdleTimeout))
+		sess.armIdleTimeout(s.IdleTimeout)
 
-		line, err := reader.ReadString('\n')
+		line, err := sess.r.ReadString('\n')
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
 				s.logger.Debug("query read error", zap.Error(err))
@@ -195,7 +203,7 @@ func (s *Server) serve(ctx context.Context, conn net.Conn) {
 			continue
 		}
 		if len(line) > s.MaxLineLength {
-			if _, err := io.WriteString(conn, errorLine(errInvalidParameter, "line too long")); err != nil {
+			if !s.write(sess, errorLine(errInvalidParameter, "line too long")) {
 				return
 			}
 			continue
@@ -212,6 +220,13 @@ func (s *Server) serve(ctx context.Context, conn net.Conn) {
 		if !s.execute(ctx, sess, line) {
 			return
 		}
+	}
+}
+
+// armIdleTimeout re-arms the read deadline when the transport has one.
+func (sess *session) armIdleTimeout(d time.Duration) {
+	if sess.setReadDeadline != nil {
+		_ = sess.setReadDeadline(time.Now().Add(d))
 	}
 }
 
