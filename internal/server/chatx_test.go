@@ -6,6 +6,8 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -15,6 +17,27 @@ import (
 	"voicx/internal/netproto"
 	"voicx/internal/permissions"
 )
+
+func TestTypingTrackerCleanupIsRateLimited(t *testing.T) {
+	tracker := newTypingTracker()
+	now := time.Now()
+	tracker.lastCleanup = now
+	for i := 0; i <= 10_000; i++ {
+		tracker.last[fmt.Sprintf("old-%d", i)] = now.Add(-time.Minute)
+	}
+	if !tracker.allow("first", now.Add(time.Second)) {
+		t.Fatal("new typing key was unexpectedly throttled")
+	}
+	if len(tracker.last) <= 10_000 {
+		t.Fatal("cleanup ran again inside the cleanup interval")
+	}
+	if !tracker.allow("second", now.Add(10*time.Second)) {
+		t.Fatal("second typing key was unexpectedly throttled")
+	}
+	if len(tracker.last) != 2 {
+		t.Fatalf("entries after scheduled cleanup = %d, want 2", len(tracker.last))
+	}
+}
 
 // chatPair sets up two authed, key-published clients in channel 1 and
 // returns them, bob's unsealed scope key, its generation, and bob's X25519
@@ -45,21 +68,24 @@ func sendEncChat(t *testing.T, conn net.Conn, key [32]byte, keyID uint32, channe
 	})
 }
 
-// TestChatHistoryEncryptedRoundTrip verifies an encrypted message is stored
-// decrypted and history returns plaintext to a channel member (103).
+// TestChatHistoryEncryptedRoundTrip verifies history ships CIPHERTEXT plus
+// the generations that page references, and that a member can open it with
+// nothing but its own X25519 private key (103/91).
 func TestChatHistoryEncryptedRoundTrip(t *testing.T) {
+	const canary = "canary-7f3a"
 	env := startTestEnv(t, nil)
 	defer env.stop()
-	alice, bob, key, keyID, _ := chatPair(t, env)
+	alice, bob, key, keyID, bobPriv := chatPair(t, env)
 	defer alice.Close()
 	defer bob.Close()
+	bobPub := x25519Pub(bobPriv)
 
-	sendEncChat(t, bob, key, keyID, "1", "hello history")
+	sendEncChat(t, bob, key, keyID, "1", canary)
 
 	// Wait for the broadcast (implies processing) then query history.
-	readEventOfType(t, alice, eventChat)
-	send(t, alice, netproto.MsgChatHistory, netproto.ChatHistory{ChannelID: 1})
-	f := readOfType(t, alice, netproto.MsgChatHistoryResponse)
+	readEventOfType(t, bob, eventChat)
+	send(t, bob, netproto.MsgChatHistory, netproto.ChatHistory{ChannelID: 1})
+	f := readOfType(t, bob, netproto.MsgChatHistoryResponse)
 	var resp netproto.ChatHistoryResponse
 	if err := netproto.Decode(f, &resp); err != nil {
 		t.Fatalf("decode history: %v", err)
@@ -68,8 +94,15 @@ func TestChatHistoryEncryptedRoundTrip(t *testing.T) {
 		t.Fatalf("history size = %d, want 1", len(resp.Messages))
 	}
 	m := resp.Messages[0]
-	if m.Body != "hello history" || m.FromUniqueID != "user-uid" || m.Deleted || m.EditedAt != 0 {
+	if m.Body != "" || m.BodyEnc == "" || m.KeyID == 0 || m.FromUniqueID != "user-uid" || m.Deleted || m.EditedAt != 0 {
 		t.Fatalf("history entry = %+v", m)
+	}
+	if len(resp.Keys) != 1 || resp.Keys[0].KeyID != m.KeyID || resp.Truncated || len(resp.Refused) != 0 {
+		t.Fatalf("piggybacked keys = %+v truncated=%v refused=%v", resp.Keys, resp.Truncated, resp.Refused)
+	}
+	gen := unsealScopeKey(t, resp.Keys[0], bobPub, bobPriv)
+	if got := openScopeTest(t, gen, m.BodyEnc); got != canary {
+		t.Fatalf("history body = %q, want %q", got, canary)
 	}
 
 	// A non-member may not read the channel's history.
@@ -86,6 +119,333 @@ func TestChatHistoryEncryptedRoundTrip(t *testing.T) {
 	}
 	if e.Code != errCodePermissionDenied {
 		t.Fatalf("error = %d, want permission denied", e.Code)
+	}
+}
+
+// TestChatPinsRequiresMembership verifies pins are gated exactly like
+// history: without it any authenticated client, guest included, enumerates
+// the ids, authors, timestamps and bodies of a channel it never joined.
+func TestChatPinsRequiresMembership(t *testing.T) {
+	env := startTestEnv(t, permsWithPin())
+	defer env.stop()
+	alice, bob, key, keyID, _ := chatPair(t, env)
+	defer alice.Close()
+	defer bob.Close()
+
+	sendEncChat(t, bob, key, keyID, "1", "pin me")
+	data := readEventOfType(t, alice, eventChat)
+	var chat netproto.ChatBroadcast
+	if err := json.Unmarshal(data, &chat); err != nil {
+		t.Fatalf("unmarshal chat: %v", err)
+	}
+	send(t, alice, netproto.MsgChatPin, netproto.ChatPin{ChannelID: 1, MessageID: chat.ID, Pinned: true})
+	readEventOfType(t, alice, eventChatPinned)
+
+	// An outsider joins channel 2 and asks for channel 1's pins.
+	env.state.AddChannel(testChannel(2))
+	outsider, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer outsider.Close()
+	opub, _ := testX25519(t)
+	publishKey(t, outsider, opub)
+	send(t, outsider, netproto.MsgJoinChannel, netproto.JoinChannel{ChannelID: 2})
+	readChannelKeyFor(t, outsider, 2)
+
+	send(t, outsider, netproto.MsgChatPins, netproto.ChatPins{ChannelID: 1})
+	f := readOfType(t, outsider, netproto.MsgError)
+	var e netproto.Error
+	if err := netproto.Decode(f, &e); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if e.Code != errCodePermissionDenied {
+		t.Fatalf("pins for a foreign channel: error = %d, want permission denied", e.Code)
+	}
+}
+
+// TestHistoryRefusedWithoutPublishedKey verifies a client that never
+// published an X25519 key is refused outright rather than handed rows it
+// provably cannot decrypt.
+func TestHistoryRefusedWithoutPublishedKey(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+
+	send(t, conn, netproto.MsgChatHistory, netproto.ChatHistory{ChannelID: 0})
+	f := readOfType(t, conn, netproto.MsgError)
+	var e netproto.Error
+	if err := netproto.Decode(f, &e); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if e.Code != errCodePermissionDenied || !strings.Contains(e.Message, "publish an encryption key") {
+		t.Fatalf("error = %d %q, want permission denied about publishing a key", e.Code, e.Message)
+	}
+}
+
+// TestHistoryAcrossRotation verifies one history fetch spanning a rotation
+// returns BOTH generations in Keys and that both bodies decrypt.
+func TestHistoryAcrossRotation(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	alice, bob, key1, gen1, bobPriv := chatPair(t, env)
+	defer alice.Close()
+	defer bob.Close()
+	bobPub := x25519Pub(bobPriv)
+
+	sendEncChat(t, bob, key1, gen1, "1", "before rotation")
+	readEventOfType(t, bob, eventChat)
+
+	env.srv.doRotateScopeKey(t.Context(), 1)
+	ck2 := readChannelKeyFor(t, bob, 1)
+	key2 := unsealScopeKey(t, ck2, bobPub, bobPriv)
+	if ck2.KeyID == gen1 {
+		t.Fatalf("rotation did not bump the generation (still %d)", gen1)
+	}
+	sendEncChat(t, bob, key2, ck2.KeyID, "1", "after rotation")
+	readEventOfType(t, bob, eventChat)
+
+	send(t, bob, netproto.MsgChatHistory, netproto.ChatHistory{ChannelID: 1})
+	f := readOfType(t, bob, netproto.MsgChatHistoryResponse)
+	var resp netproto.ChatHistoryResponse
+	if err := netproto.Decode(f, &resp); err != nil {
+		t.Fatalf("decode history: %v", err)
+	}
+	if len(resp.Messages) != 2 || len(resp.Keys) != 2 {
+		t.Fatalf("history = %d messages, %d keys; want 2 and 2", len(resp.Messages), len(resp.Keys))
+	}
+	keys := map[uint32][32]byte{}
+	for _, ck := range resp.Keys {
+		keys[ck.KeyID] = unsealScopeKey(t, ck, bobPub, bobPriv)
+	}
+	got := map[string]bool{}
+	for _, m := range resp.Messages {
+		k, ok := keys[m.KeyID]
+		if !ok {
+			t.Fatalf("history references generation %d that the bundle does not carry", m.KeyID)
+		}
+		got[openScopeTest(t, k, m.BodyEnc)] = true
+	}
+	if !got["before rotation"] || !got["after rotation"] {
+		t.Fatalf("decrypted history = %v", got)
+	}
+}
+
+// TestKeyBundleTruncationIsNotRefusal verifies a page spanning more than 64
+// generations sets Truncated and does NOT list the surplus in Refused —
+// conflating the two turns a transient cap into a permanent "[missing key]".
+func TestKeyBundleTruncationIsNotRefusal(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	alice, bob, _, _, _ := chatPair(t, env)
+	defer alice.Close()
+	defer bob.Close()
+
+	ctx := t.Context()
+	for i := 0; i < maxKeysPerResponse+6; i++ {
+		gen, _, err := env.srv.chatKeys.rotate(ctx, 1)
+		if err != nil {
+			t.Fatalf("rotate %d: %v", i, err)
+		}
+		if _, _, err := env.chat.StoreChatMessage(ctx, 1, "user-uid", "user", "ct", gen, 0, ""); err != nil {
+			t.Fatalf("store: %v", err)
+		}
+	}
+
+	send(t, bob, netproto.MsgChatHistory, netproto.ChatHistory{ChannelID: 1, Limit: 200})
+	f := readOfType(t, bob, netproto.MsgChatHistoryResponse)
+	var resp netproto.ChatHistoryResponse
+	if err := netproto.Decode(f, &resp); err != nil {
+		t.Fatalf("decode history: %v", err)
+	}
+	if len(resp.Keys) != maxKeysPerResponse {
+		t.Fatalf("keys = %d, want the %d cap", len(resp.Keys), maxKeysPerResponse)
+	}
+	if !resp.Truncated {
+		t.Fatal("the surplus generations were dropped without setting Truncated")
+	}
+	if len(resp.Refused) != 0 {
+		t.Fatalf("truncation reported as refusal: %v", resp.Refused)
+	}
+}
+
+// TestPlaintextEscapeHatchStillStoresAndRelaysCiphertext verifies the branch
+// where the SERVER is the encryptor: chat_allow_plaintext lets an unencrypted
+// send in, and both the stored row and the relay are still ciphertext (91).
+func TestPlaintextEscapeHatchStillStoresAndRelaysCiphertext(t *testing.T) {
+	const canary = "canary-7f3a"
+	env := startTestEnv(t, nil) // the harness sets ChatAllowPlaintext
+	defer env.stop()
+	alice, bob, key, _, _ := chatPair(t, env)
+	defer alice.Close()
+	defer bob.Close()
+
+	send(t, bob, netproto.MsgChatSend, netproto.ChatSend{ChannelID: "1", Text: canary})
+	data := readEventOfType(t, alice, eventChat)
+	var chat netproto.ChatBroadcast
+	if err := json.Unmarshal(data, &chat); err != nil {
+		t.Fatalf("unmarshal chat: %v", err)
+	}
+	if !chat.Enc || chat.KeyID == 0 {
+		t.Fatalf("relay enc/key = %v/%d, want true and a real generation", chat.Enc, chat.KeyID)
+	}
+	if chat.Text == canary {
+		t.Fatal("the relay fanned out plaintext")
+	}
+	if got := openScopeTest(t, key, chat.Text); got != canary {
+		t.Fatalf("relayed ciphertext opens to %q, want %q", got, canary)
+	}
+	stored, err := env.chat.GetChatMessage(t.Context(), chat.ID)
+	if err != nil || stored == nil {
+		t.Fatalf("stored message lookup: %v", err)
+	}
+	if stored.BodyEnc != chat.Text || stored.KeyID != chat.KeyID {
+		t.Fatalf("stored row = %+v, want the relayed ciphertext", stored)
+	}
+}
+
+// TestStorageFailureIsNotRelayed verifies a storage error fails the send:
+// relaying anyway would turn a constraint violation into invisible,
+// indefinite history loss.
+func TestStorageFailureIsNotRelayed(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	alice, bob, key, keyID, _ := chatPair(t, env)
+	defer alice.Close()
+	defer bob.Close()
+
+	env.chat.failStores(errors.New("chat_messages_no_plaintext violated"))
+	sendEncChat(t, bob, key, keyID, "1", "never stored")
+
+	f := readOfType(t, bob, netproto.MsgError)
+	var e netproto.Error
+	if err := netproto.Decode(f, &e); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if e.Code != errCodeUnavailable {
+		t.Fatalf("error = %d %q, want unavailable", e.Code, e.Message)
+	}
+	if env.chat.messageCount() != 0 {
+		t.Fatalf("messages stored = %d, want 0", env.chat.messageCount())
+	}
+	expectNoEvent(t, alice, eventChat)
+}
+
+// TestEditRejectsStaleKeyID verifies an edit naming a retired generation is
+// refused up front rather than failing confusingly deeper in the pipeline.
+func TestEditRejectsStaleKeyID(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	alice, bob, key, keyID, bobPriv := chatPair(t, env)
+	defer alice.Close()
+	defer bob.Close()
+
+	sendEncChat(t, bob, key, keyID, "1", "original")
+	data := readEventOfType(t, bob, eventChat)
+	var chat netproto.ChatBroadcast
+	if err := json.Unmarshal(data, &chat); err != nil {
+		t.Fatalf("unmarshal chat: %v", err)
+	}
+
+	env.srv.doRotateScopeKey(t.Context(), 1)
+	readChannelKeyFor(t, bob, 1)
+	_ = bobPriv
+
+	send(t, bob, netproto.MsgChatEdit, netproto.ChatEdit{
+		MessageID: chat.ID, NewText: sealScopeTest(t, key, "edited"), Enc: true, KeyID: keyID,
+	})
+	f := readOfType(t, bob, netproto.MsgError)
+	var e netproto.Error
+	if err := netproto.Decode(f, &e); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if !strings.HasPrefix(e.Message, "stale chat key") {
+		t.Fatalf("error = %q, want a stale-key rejection", e.Message)
+	}
+}
+
+// TestEditStoresCiphertextVerbatim verifies the sender's own bytes reach the
+// store and the broadcast unchanged: the bytes that were moderated are
+// exactly the bytes that end up at rest.
+func TestEditStoresCiphertextVerbatim(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	alice, bob, key, keyID, _ := chatPair(t, env)
+	defer alice.Close()
+	defer bob.Close()
+
+	sendEncChat(t, bob, key, keyID, "1", "original")
+	data := readEventOfType(t, bob, eventChat)
+	var chat netproto.ChatBroadcast
+	if err := json.Unmarshal(data, &chat); err != nil {
+		t.Fatalf("unmarshal chat: %v", err)
+	}
+
+	newCT := sealScopeTest(t, key, "edited body")
+	send(t, bob, netproto.MsgChatEdit, netproto.ChatEdit{
+		MessageID: chat.ID, NewText: newCT, Enc: true, KeyID: keyID,
+	})
+	edited := readEventOfType(t, alice, eventChatEdited)
+	var ev struct {
+		Body  string `json:"body"`
+		Enc   bool   `json:"enc"`
+		KeyID uint32 `json:"key_id"`
+	}
+	if err := json.Unmarshal(edited, &ev); err != nil {
+		t.Fatalf("unmarshal edit: %v", err)
+	}
+	if ev.Body != newCT || !ev.Enc || ev.KeyID != keyID {
+		t.Fatalf("edit broadcast = %+v, want the caller's bytes under generation %d", ev, keyID)
+	}
+	stored, err := env.chat.GetChatMessage(t.Context(), chat.ID)
+	if err != nil || stored == nil {
+		t.Fatalf("stored message lookup: %v", err)
+	}
+	if stored.BodyEnc != newCT || stored.KeyID != keyID {
+		t.Fatalf("stored row = %q/%d, want the caller's bytes under %d", stored.BodyEnc, stored.KeyID, keyID)
+	}
+}
+
+// TestModerationPipelineOrderUnchanged asserts the invariant the moderation
+// tests cannot: the filters (117/118), the spam heuristic (116) and mention
+// parsing (105) all run on the SAME decrypted body, in that order, strictly
+// before storage — and none of them reads from the store.
+func TestModerationPipelineOrderUnchanged(t *testing.T) {
+	env := startTestEnvFull(t, nil, func(c *config.Config) { c.ChatWordFilter = "forbidden" })
+	defer env.stop()
+	alice, bob, key, keyID, _ := chatPair(t, env)
+	defer alice.Close()
+	defer bob.Close()
+
+	// A body the word filter rejects must never reach the spam tracker (which
+	// runs after it) nor the store (which runs after both).
+	rejected := "a forbidden word @admin [file:ab.vcx#SECRETKEY#photo.png]"
+	sendEncChat(t, bob, key, keyID, "1", rejected)
+	expectChatError(t, bob, "word filter")
+	if env.chat.messageCount() != 0 {
+		t.Fatalf("a filtered message reached the store")
+	}
+	if len(env.srv.chatSpam.recentFor("user-uid")) > 0 {
+		t.Fatal("the spam tracker ran before the word filter")
+	}
+
+	// A clean body: the spam tracker sees the attachment-stripped plaintext,
+	// mentions are parsed from the same plaintext, and only then is it stored.
+	clean := "hello @admin [file:ab.vcx#SECRETKEY#photo.png]"
+	sendEncChat(t, bob, key, keyID, "1", clean)
+	data := readEventOfType(t, alice, eventChat)
+	var chat netproto.ChatBroadcast
+	if err := json.Unmarshal(data, &chat); err != nil {
+		t.Fatalf("unmarshal chat: %v", err)
+	}
+	if len(chat.Mentions) != 1 || chat.Mentions[0] != "admin-uid" {
+		t.Fatalf("mentions = %v, want [admin-uid] parsed from the decrypted body", chat.Mentions)
+	}
+	entries := env.srv.chatSpam.recentFor("user-uid")
+	if len(entries) != 1 || entries[0].sum != bodyDigest(stripAttachmentRefs(clean)) {
+		t.Fatalf("spam tracker recorded %d entries, want one digest of the stripped body", len(entries))
+	}
+	if env.chat.messageCount() != 1 {
+		t.Fatalf("messages stored = %d, want 1", env.chat.messageCount())
 	}
 }
 
@@ -138,7 +498,7 @@ func TestChatEditDelete(t *testing.T) {
 	env.chat.mu.Lock()
 	stored := env.chat.messages[msgID]
 	env.chat.mu.Unlock()
-	if stored.Body != "edited body" || stored.EditedAt == nil {
+	if stored.BodyEnc == "" || stored.EditedAt == nil {
 		t.Fatalf("stored after edit = %+v", stored)
 	}
 
@@ -174,7 +534,7 @@ func TestChatEditDelete(t *testing.T) {
 	env.chat.mu.Lock()
 	stored = env.chat.messages[msgID]
 	env.chat.mu.Unlock()
-	if stored.Body != "" || stored.DeletedAt == nil {
+	if stored.BodyEnc != "" || stored.DeletedAt == nil {
 		t.Fatalf("stored after delete = %+v", stored)
 	}
 }
@@ -232,6 +592,33 @@ func TestSlowMode(t *testing.T) {
 	if !strings.Contains(e.Message, "slow mode") {
 		t.Fatalf("error = %q, want slow mode rejection", e.Message)
 	}
+
+	// The bypass is b_chat_slowmode_bypass, and alice (admin) holds it by
+	// bypassing every check: two messages back to back both land.
+	sendEncChat(t, alice, key, ck.KeyID, "3", "bypass one")
+	readEventOfType(t, bob, eventChat)
+	sendEncChat(t, alice, key, ck.KeyID, "3", "bypass two")
+	readEventOfType(t, bob, eventChat)
+}
+
+// TestSlowModeBypassPermission pins the documented bypass key for a
+// non-admin: without b_chat_slowmode_bypass the second message is rejected,
+// with it both land (114).
+func TestSlowModeBypassPermission(t *testing.T) {
+	perms := tieredWith(boolPerm(permissions.PermissionKeyChatSlowmodeBypass, true))
+	env := startTestEnv(t, &perms)
+	defer env.stop()
+	alice, bob, key, keyID, _ := chatPair(t, env)
+	defer alice.Close()
+	defer bob.Close()
+
+	if ch, ok := env.state.GetChannel(1); ok {
+		ch.SlowModeSeconds = 60
+	}
+	sendEncChat(t, bob, key, keyID, "1", "first")
+	readEventOfType(t, alice, eventChat)
+	sendEncChat(t, bob, key, keyID, "1", "second, would be slow-moded")
+	readEventOfType(t, alice, eventChat)
 }
 
 // readChatOutcome reads frames until a chat event (accepted) or an error
@@ -325,6 +712,185 @@ func TestWordAndLinkFilters(t *testing.T) {
 	// A whitelisted link passes.
 	sendEncChat(t, bob, key, keyID, "1", "visit http://good.example/x")
 	readEventOfType(t, alice, eventChat)
+}
+
+// TestChatMaxLength pins the 119 cap on BOTH paths that enforce it. The limit
+// counts plaintext UTF-8 bytes post-decrypt, including multi-byte runes.
+func TestChatMaxLength(t *testing.T) {
+	const limit = 32
+	env := startTestEnvFull(t, nil, func(c *config.Config) { c.ChatMaxLength = limit })
+	defer env.stop()
+	alice, bob, key, keyID, _ := chatPair(t, env)
+	defer alice.Close()
+	defer bob.Close()
+
+	// Exactly at the limit, in two-byte runes: accepted.
+	atLimit := strings.Repeat("é", limit/2)
+	sendEncChat(t, bob, key, keyID, "1", atLimit)
+	data := readEventOfType(t, alice, eventChat)
+	var chat netproto.ChatBroadcast
+	if err := json.Unmarshal(data, &chat); err != nil {
+		t.Fatalf("unmarshal chat: %v", err)
+	}
+	msgID := chat.ID
+
+	// One byte over on the send path: rejected, and never stored.
+	before := env.chat.messageCount()
+	sendEncChat(t, bob, key, keyID, "1", strings.Repeat("a", limit+1))
+	expectChatError(t, bob, "message too long (max 32 bytes)")
+	if got := env.chat.messageCount(); got != before {
+		t.Fatalf("over-length message was stored: count %d -> %d", before, got)
+	}
+
+	// The edit path enforces the same cap and leaves the message untouched.
+	send(t, bob, netproto.MsgChatEdit, netproto.ChatEdit{
+		MessageID: msgID, NewText: sealScopeTest(t, key, strings.Repeat("b", limit+1)), Enc: true, KeyID: keyID,
+	})
+	expectChatError(t, bob, "message too long (max 32 bytes)")
+	env.chat.mu.Lock()
+	stored := env.chat.messages[msgID]
+	env.chat.mu.Unlock()
+	if stored.EditedAt != nil {
+		t.Fatal("over-length edit was applied")
+	}
+
+	// An edit at the limit is accepted.
+	send(t, bob, netproto.MsgChatEdit, netproto.ChatEdit{
+		MessageID: msgID, NewText: sealScopeTest(t, key, atLimit), Enc: true, KeyID: keyID,
+	})
+	readEventOfType(t, alice, "chat_edited")
+}
+
+// TestLinkFilterIsURLAware pins the 118 rewrite: the lists match the HOST of
+// each http(s) URL, not raw substrings of the body. Substring matching made
+// the whitelist a formality (any body mentioning an allowed domain passed) and
+// the blacklist a prose filter (a message naming a domain with no link at all
+// was rejected).
+func TestLinkFilterIsURLAware(t *testing.T) {
+	env := startTestEnvFull(t, nil, func(c *config.Config) {
+		c.ChatLinkBlacklist = "evil.example"
+		c.ChatLinkWhitelist = "good.example"
+		c.ChatRateMsgs = 100
+	})
+	defer env.stop()
+	alice, bob, key, keyID, _ := chatPair(t, env)
+	defer alice.Close()
+	defer bob.Close()
+
+	for _, tc := range []struct {
+		name string
+		body string
+		want string // "" = accepted
+	}{
+		{"whitelist entry in a query string does not license the link",
+			"look http://evil.tld/?q=good.example", "allowed domains"},
+		{"prose naming a blocked domain is not a link",
+			"evil.example is a bad site, do not go there", ""},
+		{"subdomain of a whitelisted host is allowed",
+			"docs at http://docs.good.example/x", ""},
+		{"suffix match must land on a label boundary",
+			"look http://notgood.example/x", "allowed domains"},
+		{"userinfo cannot disguise the real host",
+			"look http://good.example@evil.example/x", "blocked link"},
+		{"one allowed link does not license the others",
+			"see http://good.example/a and http://other.tld/b", "allowed domains"},
+		{"subdomain of a blacklisted host is blocked",
+			"see http://cdn.evil.example/x", "blocked link"},
+		{"a whitelisted link passes",
+			"see http://good.example/x", ""},
+	} {
+		sendEncChat(t, bob, key, keyID, "1", tc.body)
+		got := readChatOutcome(t, bob)
+		if tc.want == "" && got != "" {
+			t.Fatalf("%s: rejected with %q, want accepted", tc.name, got)
+		}
+		if tc.want != "" && !strings.Contains(got, tc.want) {
+			t.Fatalf("%s: outcome %q, want substring %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// readFilterResponse reads one ChatFilterResponse.
+func readFilterResponse(t *testing.T, conn net.Conn) netproto.ChatFilterResponse {
+	t.Helper()
+	f := readOfType(t, conn, netproto.MsgChatFilterResponse)
+	var resp netproto.ChatFilterResponse
+	if err := netproto.Decode(f, &resp); err != nil {
+		t.Fatalf("decode chat_filter_response: %v", err)
+	}
+	return resp
+}
+
+// TestChatFiltersRuntimeManaged verifies 117/118 are manageable without a
+// restart: gated reads, a persisted+audited write, the new list applying to
+// the very next message, and the config value it replaced going quiet.
+func TestChatFiltersRuntimeManaged(t *testing.T) {
+	env := startTestEnvFull(t, nil, func(c *config.Config) {
+		c.ChatWordFilter = "bootword"
+		c.ChatRateMsgs = 100
+	})
+	defer env.stop()
+	alice, bob, key, keyID, _ := chatPair(t, env) // alice is admin, bob is not
+	defer alice.Close()
+	defer bob.Close()
+
+	// Reading the lists is gated too: they say exactly what to evade.
+	send(t, bob, netproto.MsgChatFilterGet, netproto.ChatFilterGet{})
+	expectChatError(t, bob, string(permissionKeyChatFilterManage))
+
+	// The admin sees the config defaults, flagged as not yet overridden.
+	send(t, alice, netproto.MsgChatFilterGet, netproto.ChatFilterGet{})
+	if got := readFilterResponse(t, alice); got.WordFilter != "bootword" || !got.FromConfig {
+		t.Fatalf("filters = %+v, want the config defaults", got)
+	}
+
+	words := " runtimeword , , "
+	send(t, alice, netproto.MsgChatFilterSet, netproto.ChatFilterSet{WordFilter: &words})
+	if got := readFilterResponse(t, alice); got.WordFilter != "runtimeword" || got.FromConfig {
+		t.Fatalf("set reply = %+v, want the normalised runtime list", got)
+	}
+
+	// The new list applies immediately...
+	sendEncChat(t, bob, key, keyID, "1", "this has RuntimeWord in it")
+	expectChatError(t, bob, "word filter")
+
+	// ...and the config value it replaced no longer applies.
+	sendEncChat(t, bob, key, keyID, "1", "this has bootword in it")
+	readEventOfType(t, alice, eventChat)
+
+	// The write is persisted unsealed (moderation config, not message content)
+	// and audited like other admin actions.
+	v, keyGen, err := env.chat.GetServerSetting(t.Context(), chatFiltersKey)
+	if err != nil || keyGen != 0 || !strings.Contains(v, "runtimeword") {
+		t.Fatalf("chat_filters row = %q gen=%d err=%v", v, keyGen, err)
+	}
+	env.groups.mu.Lock()
+	audited := false
+	for _, a := range env.groups.audit {
+		if a.Action == "chat_filter_set" && a.Actor == "admin-uid" {
+			audited = true
+		}
+	}
+	env.groups.mu.Unlock()
+	if !audited {
+		t.Fatal("chat_filter_set was not audited")
+	}
+}
+
+// TestChatFilterManageIsDelegable proves the gate is the permission and not
+// admin-ness: a non-admin holding b_chat_filter_manage may manage the lists.
+func TestChatFilterManageIsDelegable(t *testing.T) {
+	perms := tieredWith(boolPerm(permissionKeyChatFilterManage, true))
+	env := startTestEnv(t, &perms)
+	defer env.stop()
+	bob, _ := dialAuthed(t, env.addr, "user-uid")
+	defer bob.Close()
+
+	words := "delegated"
+	send(t, bob, netproto.MsgChatFilterSet, netproto.ChatFilterSet{WordFilter: &words})
+	if got := readFilterResponse(t, bob); got.WordFilter != "delegated" || got.FromConfig {
+		t.Fatalf("filters = %+v", got)
+	}
 }
 
 func expectChatError(t *testing.T, conn net.Conn, want string) {
@@ -427,7 +993,7 @@ func TestChatPins(t *testing.T) {
 	if err := netproto.Decode(f, &resp); err != nil {
 		t.Fatalf("decode pins: %v", err)
 	}
-	if len(resp.Pins) != 1 || resp.Pins[0].MessageID != chat.ID || resp.Pins[0].Message.Body != "pin me" {
+	if len(resp.Pins) != 1 || resp.Pins[0].MessageID != chat.ID || resp.Pins[0].Message.BodyEnc == "" {
 		t.Fatalf("pins = %+v", resp.Pins)
 	}
 
@@ -570,62 +1136,338 @@ func TestEmojiUpload(t *testing.T) {
 	}
 }
 
-// TestMOTDAndAnnouncement verifies the MOTD lands in the auth response and
-// the announcement is delivered on login and on change (132/133).
-func TestMOTDAndAnnouncement(t *testing.T) {
-	env := startTestEnv(t, nil)
+// TestMOTDSealedInAuthResponse verifies the MOTD travels SEALED under the
+// global generation, which the same response carries sealed to the client's
+// X25519 key — so the client renders it before Connect() returns, with no
+// extra frame and no ordering rule (133).
+func TestMOTDSealedInAuthResponse(t *testing.T) {
+	const canary = "canary-7f3a"
+	env := startTestEnvFull(t, nil, func(c *config.Config) { c.ChatAllowPlaintext = false })
 	defer env.stop()
-	if err := env.chat.SetServerSetting(t.Context(), "motd", "welcome to voicx"); err != nil {
+	if err := env.srv.SetServerSettingAndAnnounce(t.Context(), "motd", canary); err != nil {
 		t.Fatalf("set motd: %v", err)
 	}
-	if err := env.chat.SetServerSetting(t.Context(), "announcement", "big news"); err != nil {
-		t.Fatalf("set announcement: %v", err)
+	if v, _, _ := env.chat.GetServerSetting(t.Context(), "motd"); v == canary {
+		t.Fatal("the MOTD is stored in the clear")
 	}
 
-	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	pub, priv := testX25519(t)
+	conn, resp := dialAuthedX25519(t, env.addr, "user-uid", pub)
 	defer conn.Close()
 
-	// The announcement event arrives on login.
-	data := readEventOfType(t, conn, "announcement")
-	var ann struct {
-		Text string `json:"text"`
+	if !resp.MOTDEnc || resp.MOTDKeyID == 0 || resp.MOTD == canary {
+		t.Fatalf("motd = %q enc=%v key=%d, want sealed", resp.MOTD, resp.MOTDEnc, resp.MOTDKeyID)
 	}
-	if err := json.Unmarshal(data, &ann); err != nil {
-		t.Fatalf("unmarshal announcement: %v", err)
+	if len(resp.ChatKeys) != 1 || resp.ChatKeys[0].ChannelID != globalChatScope || resp.ChatKeys[0].KeyID != resp.MOTDKeyID {
+		t.Fatalf("chat keys = %+v, want the global generation %d", resp.ChatKeys, resp.MOTDKeyID)
 	}
-	if ann.Text != "big news" {
-		t.Fatalf("announcement = %q", ann.Text)
+	global := unsealScopeKey(t, resp.ChatKeys[0], pub, priv)
+	if got := openScopeTest(t, global, resp.MOTD); got != canary {
+		t.Fatalf("motd opens to %q, want %q", got, canary)
 	}
 
-	// Changing the announcement broadcasts to online clients.
-	if err := env.srv.SetServerSettingAndAnnounce(t.Context(), "announcement", "newer news"); err != nil {
-		t.Fatalf("SetServerSettingAndAnnounce: %v", err)
-	}
-	data = readEventOfType(t, conn, "announcement")
-	if err := json.Unmarshal(data, &ann); err != nil {
-		t.Fatalf("unmarshal announcement: %v", err)
-	}
-	if ann.Text != "newer news" {
-		t.Fatalf("updated announcement = %q", ann.Text)
-	}
+	// A client that publishes no encryption key could not open it, so it gets
+	// neither the key nor the MOTD.
+	plainConn, _ := dialAuthedPlain(t, env.addr, "admin-uid")
+	defer plainConn.Close()
 }
 
-// TestMOTDInAuthResponse verifies the motd field of the auth response.
-func TestMOTDInAuthResponse(t *testing.T) {
-	env := startTestEnv(t, nil)
-	defer env.stop()
-	if err := env.chat.SetServerSetting(t.Context(), "motd", "welcome to voicx"); err != nil {
-		t.Fatalf("set motd: %v", err)
-	}
-	conn := dialRetry(t, env.addr)
-	defer conn.Close()
-	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: "user-uid", Password: "pw"})
+// dialAuthedPlain authenticates without presenting an encryption key and
+// asserts the response carries neither chat keys nor a MOTD.
+func dialAuthedPlain(t *testing.T, addr, uniqueID string) (net.Conn, netproto.AuthResponse) {
+	t.Helper()
+	conn := dialRetry(t, addr)
+	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: uniqueID, Password: "pw"})
 	f := readOfType(t, conn, netproto.MsgAuthResponse)
 	var resp netproto.AuthResponse
 	if err := netproto.Decode(f, &resp); err != nil {
 		t.Fatalf("decode auth response: %v", err)
 	}
-	if resp.MOTD != "welcome to voicx" {
-		t.Fatalf("motd = %q", resp.MOTD)
+	if resp.MOTD != "" || len(resp.ChatKeys) != 0 {
+		t.Fatalf("keyless client got motd=%q keys=%d, want neither", resp.MOTD, len(resp.ChatKeys))
+	}
+	readOfType(t, conn, netproto.MsgSnapshot)
+	return conn, resp
+}
+
+// TestAnnouncementSealed verifies the announcement is sealed at rest and on
+// the wire, and that the auth-time replay still reaches a client that never
+// publishes a key — moving it behind key publish would drop it for all of
+// them (132).
+func TestAnnouncementSealed(t *testing.T) {
+	const canary = "canary-7f3a"
+	env := startTestEnv(t, nil)
+	defer env.stop()
+
+	pub, priv := testX25519(t)
+	conn, resp := dialAuthedX25519(t, env.addr, "user-uid", pub)
+	defer conn.Close()
+	if len(resp.ChatKeys) != 1 {
+		t.Fatalf("auth response carried %d chat keys, want 1", len(resp.ChatKeys))
+	}
+	global := unsealScopeKey(t, resp.ChatKeys[0], pub, priv)
+
+	if err := env.srv.SetServerSettingAndAnnounce(t.Context(), "announcement", canary); err != nil {
+		t.Fatalf("SetServerSettingAndAnnounce: %v", err)
+	}
+	if v, _, _ := env.chat.GetServerSetting(t.Context(), "announcement"); v == canary {
+		t.Fatal("the announcement is stored in the clear")
+	}
+
+	data := readEventOfType(t, conn, eventAnnouncement)
+	var ann struct {
+		Text  string `json:"text"`
+		Enc   bool   `json:"enc"`
+		KeyID uint32 `json:"key_id"`
+	}
+	if err := json.Unmarshal(data, &ann); err != nil {
+		t.Fatalf("unmarshal announcement: %v", err)
+	}
+	if !ann.Enc || ann.KeyID != resp.ChatKeys[0].KeyID {
+		t.Fatalf("announcement enc/key = %v/%d, want true/%d", ann.Enc, ann.KeyID, resp.ChatKeys[0].KeyID)
+	}
+	if got := openScopeTest(t, global, ann.Text); got != canary {
+		t.Fatalf("announcement opens to %q, want %q", got, canary)
+	}
+
+	// The replay on login still reaches a client that never published a key.
+	late, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer late.Close()
+	replay := readEventOfType(t, late, eventAnnouncement)
+	var ann2 struct {
+		Text  string `json:"text"`
+		Enc   bool   `json:"enc"`
+		KeyID uint32 `json:"key_id"`
+	}
+	if err := json.Unmarshal(replay, &ann2); err != nil {
+		t.Fatalf("unmarshal replayed announcement: %v", err)
+	}
+	if !ann2.Enc || ann2.Text != ann.Text {
+		t.Fatalf("replayed announcement = %+v, want the same ciphertext", ann2)
+	}
+
+	// A client that JUST joined must be able to READ the replay, not merely
+	// receive it: the generation it names has to be the one the same auth
+	// response handed over, or the banner renders a placeholder forever.
+	lpub, lpriv := testX25519(t)
+	keyed, keyedResp := dialAuthedX25519(t, env.addr, "user-uid", lpub)
+	defer keyed.Close()
+	if len(keyedResp.ChatKeys) != 1 {
+		t.Fatalf("late joiner got %d chat keys, want 1", len(keyedResp.ChatKeys))
+	}
+	var ann3 struct {
+		Text  string `json:"text"`
+		KeyID uint32 `json:"key_id"`
+	}
+	if err := json.Unmarshal(readEventOfType(t, keyed, eventAnnouncement), &ann3); err != nil {
+		t.Fatalf("unmarshal late-joiner announcement: %v", err)
+	}
+	if ann3.KeyID != keyedResp.ChatKeys[0].KeyID {
+		t.Fatalf("replay names generation %d, auth response carried %d", ann3.KeyID, keyedResp.ChatKeys[0].KeyID)
+	}
+	lateKey := unsealScopeKey(t, keyedResp.ChatKeys[0], lpub, lpriv)
+	if got := openScopeTest(t, lateKey, ann3.Text); got != canary {
+		t.Fatalf("late joiner opens the announcement to %q, want %q", got, canary)
+	}
+}
+
+// TestServerTextSealed verifies SendServerText seals in all three target
+// modes. Mode 1 is a server notice sealed under the GLOBAL key, not an E2EE
+// direct message — the server has no DM key and never did.
+func TestServerTextSealed(t *testing.T) {
+	const canary = "canary-7f3a"
+	env := startTestEnv(t, nil)
+	defer env.stop()
+
+	apub, apriv := testX25519(t)
+	alice, resp := dialAuthedX25519(t, env.addr, "admin-uid", apub)
+	defer alice.Close()
+	global := unsealScopeKey(t, resp.ChatKeys[0], apub, apriv)
+	clientID := resp.ClientID
+
+	publishKey(t, alice, apub)
+	env.state.AddChannel(testChannel(1))
+	send(t, alice, netproto.MsgJoinChannel, netproto.JoinChannel{ChannelID: 1})
+	ck := readChannelKeyFor(t, alice, 1)
+	channelKey := unsealScopeKey(t, ck, apub, apriv)
+
+	for _, tc := range []struct {
+		name   string
+		mode   int
+		target string
+		key    [32]byte
+		keyID  uint32
+	}{
+		{"direct notice", 1, clientID, global, resp.ChatKeys[0].KeyID},
+		{"channel", 2, "1", channelKey, ck.KeyID},
+		{"global", 3, "", global, resp.ChatKeys[0].KeyID},
+	} {
+		if err := env.srv.SendServerText(tc.mode, tc.target, canary); err != nil {
+			t.Fatalf("%s: SendServerText: %v", tc.name, err)
+		}
+		data := readEventOfType(t, alice, eventChat)
+		var chat netproto.ChatBroadcast
+		if err := json.Unmarshal(data, &chat); err != nil {
+			t.Fatalf("%s: unmarshal chat: %v", tc.name, err)
+		}
+		if !chat.Enc || chat.KeyID != tc.keyID {
+			t.Fatalf("%s: enc/key = %v/%d, want true/%d", tc.name, chat.Enc, chat.KeyID, tc.keyID)
+		}
+		if got := openScopeTest(t, tc.key, chat.Text); got != canary {
+			t.Fatalf("%s: opens to %q, want %q", tc.name, got, canary)
+		}
+	}
+}
+
+// TestServerInfoMOTDPlaintextIsOptIn pins the only way a MOTD can leave the
+// server unsealed (313): an operator setting server_info_motd. The default
+// must stay off, or the server-info reply reopens the plaintext path the rest
+// of 91-135 closes.
+func TestServerInfoMOTDPlaintextIsOptIn(t *testing.T) {
+	const motd = "public welcome text"
+
+	if cfg, err := config.Load(); err != nil {
+		t.Fatalf("load config: %v", err)
+	} else if cfg.ServerInfoMOTD {
+		t.Fatal("server_info_motd defaults to on: the MOTD would be served in the clear")
+	}
+
+	env := startTestEnvFull(t, nil, func(c *config.Config) { c.ServerInfoMOTD = true })
+	defer env.stop()
+	if err := env.srv.SetServerSettingAndAnnounce(t.Context(), "motd", motd); err != nil {
+		t.Fatalf("set motd: %v", err)
+	}
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer conn.Close()
+	send(t, conn, netproto.MsgServerInfoQuery, netproto.ServerInfoQuery{})
+	f := readOfType(t, conn, netproto.MsgServerInfoResponse)
+	var info netproto.ServerInfoResponse
+	if err := netproto.Decode(f, &info); err != nil {
+		t.Fatalf("decode server info: %v", err)
+	}
+	if info.MOTD != motd {
+		t.Fatalf("server info motd = %q, want the plaintext %q", info.MOTD, motd)
+	}
+
+	off := startTestEnvFull(t, nil, func(c *config.Config) { c.ServerInfoMOTD = false })
+	defer off.stop()
+	if err := off.srv.SetServerSettingAndAnnounce(t.Context(), "motd", motd); err != nil {
+		t.Fatalf("set motd: %v", err)
+	}
+	conn2, _ := dialAuthed(t, off.addr, "user-uid")
+	defer conn2.Close()
+	send(t, conn2, netproto.MsgServerInfoQuery, netproto.ServerInfoQuery{})
+	f = readOfType(t, conn2, netproto.MsgServerInfoResponse)
+	var info2 netproto.ServerInfoResponse
+	if err := netproto.Decode(f, &info2); err != nil {
+		t.Fatalf("decode server info: %v", err)
+	}
+	if info2.MOTD != "" {
+		t.Fatalf("server_info_motd=false still served %q", info2.MOTD)
+	}
+}
+
+// TestLegacyChatBackfillSeals verifies the one-time conversion: pre-012
+// plaintext is sealed in place, the audit count reaches zero, both
+// constraints are validated, the marker is stamped, and a second run is a
+// no-op (91).
+func TestLegacyChatBackfillSeals(t *testing.T) {
+	const canary = "canary-7f3a"
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	ctx := t.Context()
+
+	env.chat.seedLegacy(1, 0, canary)
+	env.chat.seedLegacy(2, 5, "") // the empty-plaintext row 012 must survive
+	if err := env.chat.SetServerSetting(ctx, "motd", canary, 0); err != nil {
+		t.Fatalf("seed motd: %v", err)
+	}
+
+	if err := env.srv.EncryptLegacyChatHistory(ctx, "encrypt"); err != nil {
+		t.Fatalf("EncryptLegacyChatHistory: %v", err)
+	}
+	if n, _ := env.chat.CountPlaintextBodies(ctx); n != 0 {
+		t.Fatalf("plaintext bodies left = %d, want 0", n)
+	}
+	if !env.chat.validated {
+		t.Fatal("the plaintext constraints were never validated")
+	}
+	if stamp, _, _ := env.chat.GetServerSetting(ctx, backfillMarker); stamp == "" {
+		t.Fatal("the backfill marker was not stamped")
+	}
+	motd, motdGen, _ := env.chat.GetServerSetting(ctx, "motd")
+	if motd == canary || motdGen == 0 {
+		t.Fatalf("motd = %q under generation %d, want sealed", motd, motdGen)
+	}
+	if got := env.srv.serverSettingPlain(ctx, "motd"); got != canary {
+		t.Fatalf("sealed motd opens to %q, want %q", got, canary)
+	}
+	for _, id := range []int64{1, 2} {
+		m, err := env.chat.GetChatMessage(ctx, id)
+		if err != nil || m == nil {
+			t.Fatalf("legacy row %d: %v", id, err)
+		}
+		if m.BodyEnc == "" || m.KeyID == 0 {
+			t.Fatalf("legacy row %d = %+v, want sealed", id, m)
+		}
+		plain, err := env.srv.chatKeys.open(ctx, m.ChannelID, m.KeyID, m.BodyEnc)
+		if err != nil {
+			t.Fatalf("opening legacy row %d: %v", id, err)
+		}
+		if id == 1 && plain != canary {
+			t.Fatalf("legacy row 1 opens to %q, want %q", plain, canary)
+		}
+	}
+	if containsCanary(t, env.chat, canary) {
+		t.Fatal("the chat store still holds the plaintext canary")
+	}
+
+	// A second run is a no-op that neither re-seals nor errors.
+	if err := env.srv.EncryptLegacyChatHistory(ctx, "encrypt"); err != nil {
+		t.Fatalf("second EncryptLegacyChatHistory: %v", err)
+	}
+	if m, _ := env.chat.GetChatMessage(ctx, 1); m.BodyEnc == "" {
+		t.Fatal("the second run disturbed an already-sealed row")
+	}
+}
+
+// TestLegacyChatBackfillPurge verifies chat_legacy_history=purge leaves zero
+// plaintext AND zero ciphertext.
+func TestLegacyChatBackfillPurge(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	ctx := t.Context()
+
+	env.chat.seedLegacy(1, 0, "canary-7f3a")
+	if err := env.srv.EncryptLegacyChatHistory(ctx, "purge"); err != nil {
+		t.Fatalf("EncryptLegacyChatHistory(purge): %v", err)
+	}
+	if n, _ := env.chat.CountPlaintextBodies(ctx); n != 0 {
+		t.Fatalf("plaintext bodies left = %d, want 0", n)
+	}
+	if m, _ := env.chat.GetChatMessage(ctx, 1); m != nil {
+		t.Fatalf("purge left a row behind: %+v", m)
+	}
+	if stamp, _, _ := env.chat.GetServerSetting(ctx, backfillMarker); stamp == "" {
+		t.Fatal("the backfill marker was not stamped")
+	}
+}
+
+// expectNoEvent asserts no event of the given type arrives shortly.
+func expectNoEvent(t *testing.T, conn net.Conn, want string) {
+	t.Helper()
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		_ = conn.SetReadDeadline(deadline)
+		f, err := netproto.ReadFrame(conn)
+		if err != nil {
+			return // nothing more arrived
+		}
+		if netproto.MessageType(f.Type) != netproto.MsgEvent {
+			continue
+		}
+		if evType, _ := decodeEvent(t, f); evType == want {
+			t.Fatalf("unexpected %s event", want)
+		}
 	}
 }

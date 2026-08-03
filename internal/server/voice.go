@@ -12,6 +12,7 @@ import (
 
 	"voicx/internal/netproto"
 	"voicx/internal/permissions"
+	"voicx/internal/webrtc"
 )
 
 // Broadcast event types for the voice pipeline.
@@ -19,7 +20,43 @@ const (
 	eventSpeakingChanged        = "speaking_changed"
 	eventPosition               = "position"
 	eventPrioritySpeakerChanged = "priority_speaker_changed"
+	// eventWhisper is delivered ONLY to the targets of an active whisper. It
+	// cannot ride the broadcast speaking event: that one goes to everybody, so
+	// it can say THAT someone whispers but never that they whispered to YOU —
+	// which is exactly what the receiving client needs to sound the whisper
+	// cue, flash the taskbar (32) and remember who to whisper back to (33).
+	eventWhisper = "whisper"
 )
+
+// whisperTargeter is the optional VoiceBackend capability that reports which
+// clients a speaker's active whisper currently reaches. webrtc.Voice
+// implements it; a backend that does not simply produces no whisper events.
+type whisperTargeter interface {
+	WhisperTargets(clientID string) []string
+}
+
+// trackSlotDeclarer is the optional VoiceBackend capability that accepts the
+// media slot of each track in a client's offer (70). webrtc.Voice implements
+// it; a backend that does not routes every track to its kind's default slot.
+type trackSlotDeclarer interface {
+	DeclareTrackSlots(clientID string, slots map[string]string)
+}
+
+// The production backend must satisfy the optional capability: a signature
+// drift would make the type assertion in handleWebRTCOffer miss silently and
+// every screen share would publish its audio into the microphone slot.
+var _ trackSlotDeclarer = (*webrtc.Voice)(nil)
+
+// whisperEvent is the payload of whisper events, emitted to every target of an
+// active whisper when the whisperer's VAD state toggles. FromUniqueID is the
+// handle the whisper-reply hotkey whispers back to (33); Speaking mirrors the
+// speaking event so the receiver can clear the indicator again.
+type whisperEvent struct {
+	FromClientID string `json:"from_client_id"`
+	FromUniqueID string `json:"from_unique_id"`
+	FromNickname string `json:"from_nickname"`
+	Speaking     bool   `json:"speaking"`
+}
 
 // prioritySpeakerEvent is the payload of priority_speaker_changed events,
 // emitted when a client toggles its priority-speaker flag.
@@ -34,6 +71,10 @@ type prioritySpeakerEvent struct {
 type speakingEvent struct {
 	ClientID string `json:"client_id"`
 	Speaking bool   `json:"speaking"`
+	// Whisper marks the transmission as a whisper (32). It names no targets —
+	// this event is broadcast, and who is being whispered to is only disclosed
+	// to those targets, via eventWhisper.
+	Whisper bool `json:"whisper,omitempty"`
 }
 
 // positionEvent is the payload of position events, relaying a client's 3D
@@ -56,6 +97,19 @@ func (s *TCPServer) handleWebRTCOffer(_ context.Context, client *Client, f *netp
 	}
 	if s.deps == nil || s.deps.Voice == nil {
 		return s.sendError(client, errCodeUnavailable, "voice backend unavailable")
+	}
+
+	// The slot declaration has to land BEFORE the offer is applied: the
+	// backend builds this client's output tracks while answering, and the
+	// other members' extra output tracks are added from here too (70).
+	if d, ok := s.deps.Voice.(trackSlotDeclarer); ok {
+		slots := make(map[string]string, len(msg.Tracks))
+		for _, t := range msg.Tracks {
+			if t.TrackID != "" {
+				slots[t.TrackID] = t.Slot
+			}
+		}
+		d.DeclareTrackSlots(client.ID, slots)
 	}
 
 	answer, err := s.deps.Voice.HandleOffer(client.ID, msg.SDP,
@@ -314,13 +368,47 @@ func (s *TCPServer) canPublishVideo(clientID string) bool {
 // state manager and announces the transition to all clients. The event
 // carries no channel ID; clients already track membership via snapshots and
 // user_moved events.
+//
+// When the speaker is whispering, each target additionally gets a directed
+// whisper event naming the whisperer (32/33).
 func (s *TCPServer) onSpeakingChanged(clientID string, speaking bool) {
 	if s.deps == nil || s.deps.State == nil {
 		return
 	}
 	s.deps.State.SetSpeaking(clientID, speaking)
+
+	var targets []string
+	if wt, ok := s.deps.Voice.(whisperTargeter); ok {
+		targets = wt.WhisperTargets(clientID)
+	}
 	s.broadcastEvent(eventSpeakingChanged, speakingEvent{
 		ClientID: clientID,
 		Speaking: speaking,
+		Whisper:  len(targets) > 0,
 	})
+	if len(targets) == 0 || s.deps.Broadcast == nil {
+		return
+	}
+
+	ev := whisperEvent{FromClientID: clientID, Speaking: speaking}
+	if c, ok := s.clientByID(clientID); ok {
+		ev.FromUniqueID = c.uniqueID()
+		ev.FromNickname = c.Username
+	}
+	payload, err := eventEnvelope(eventWhisper, ev)
+	if err != nil {
+		s.logger.Error("encoding whisper event failed", zap.Error(err))
+		return
+	}
+	for _, target := range targets {
+		if target == clientID {
+			continue
+		}
+		if err := s.deps.Broadcast.BroadcastToClient(target, payload); err != nil {
+			s.logger.Debug("whisper event undeliverable",
+				zap.String("client_id", target),
+				zap.Error(err),
+			)
+		}
+	}
 }

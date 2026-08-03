@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -13,13 +15,17 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
 	"voicx/internal/auth"
 	"voicx/internal/broadcast"
 	"voicx/internal/channels"
+	"voicx/internal/chatcrypto"
 	"voicx/internal/config"
+	"voicx/internal/eventbus"
 	"voicx/internal/filetransfer"
+	"voicx/internal/grpcserver"
 	"voicx/internal/health"
 	"voicx/internal/logging"
 	"voicx/internal/metrics"
@@ -28,19 +34,159 @@ import (
 	"voicx/internal/query"
 	"voicx/internal/recorder"
 	"voicx/internal/redisx"
+	"voicx/internal/rules"
 	"voicx/internal/server"
 	"voicx/internal/state"
 	"voicx/internal/store"
+	"voicx/internal/tlscert"
 	"voicx/internal/turn"
 	"voicx/internal/version"
 	"voicx/internal/webrtc"
 )
 
 func main() {
-	if err := run(); err != nil {
+	var err error
+	if len(os.Args) > 1 && os.Args[1] == "rewrap-chat-keys" {
+		err = rewrapChatKeys()
+	} else {
+		err = run()
+	}
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "voicx: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// hasFlag reports whether the argument list carries name.
+func hasFlag(name string) bool {
+	for _, a := range os.Args[1:] {
+		if a == name {
+			return true
+		}
+	}
+	return false
+}
+
+// rewrapChatKeys re-wraps every stored scope key generation under the newest
+// KEK. It is the ONLY thing that ever rewrites wrapped_key: the scope keys
+// themselves are unchanged, so every stored message still opens (91).
+func rewrapChatKeys() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
+	}
+	logger, err := logging.New(cfg.DevMode, cfg.LogLevel)
+	if err != nil {
+		return fmt.Errorf("initializing logger: %w", err)
+	}
+	defer logger.Sync()
+
+	dbStore, err := store.New(cfg.DatabaseURL, logger,
+		cfg.DBMaxOpenConns, cfg.DBMaxIdleConns, cfg.DBConnMaxLifetime)
+	if err != nil {
+		return fmt.Errorf("opening store: %w", err)
+	}
+	defer dbStore.Close()
+
+	ring, err := chatcrypto.LoadKEKRing(cfg.ChatMasterKeyFile, os.Getenv("VOICX_CHAT_MASTER_KEY"), false)
+	if err != nil {
+		return fmt.Errorf("loading chat master key: %w", err)
+	}
+	newest := ring.NewestID()
+
+	ctx := context.Background()
+	rows, err := dbStore.DB().QueryContext(ctx,
+		`SELECT scope_id, key_id, wrapped_key, kek_id FROM chat_scope_keys WHERE kek_id <> $1`, int16(newest))
+	if err != nil {
+		return fmt.Errorf("listing scope keys: %w", err)
+	}
+	type pending struct {
+		scope int64
+		keyID int64
+		key   [32]byte
+	}
+	var todo []pending
+	for rows.Next() {
+		var (
+			p       pending
+			wrapped []byte
+			kekID   int16
+		)
+		if err := rows.Scan(&p.scope, &p.keyID, &wrapped, &kekID); err != nil {
+			rows.Close()
+			return fmt.Errorf("scanning scope key: %w", err)
+		}
+		key, err := ring.Unwrap(uint16(kekID), wrapped)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("unwrapping scope %d generation %d: %w", p.scope, p.keyID, err)
+		}
+		p.key = key
+		todo = append(todo, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("listing scope keys: %w", err)
+	}
+
+	for _, p := range todo {
+		kekID, wrapped, err := ring.Wrap(p.key)
+		if err != nil {
+			return fmt.Errorf("wrapping scope %d generation %d: %w", p.scope, p.keyID, err)
+		}
+		if _, err := dbStore.DB().ExecContext(ctx,
+			`UPDATE chat_scope_keys SET wrapped_key = $1, kek_id = $2 WHERE scope_id = $3 AND key_id = $4`,
+			wrapped, int16(kekID), p.scope, p.keyID); err != nil {
+			return fmt.Errorf("rewrapping scope %d generation %d: %w", p.scope, p.keyID, err)
+		}
+	}
+	logger.Info("chat scope keys rewrapped",
+		zap.Int("generations", len(todo)),
+		zap.Uint16("kek_id", newest),
+		zap.String("fingerprint", ring.Fingerprint()),
+	)
+	return nil
+}
+
+// resetChatKeys abandons all chat history: it drops every scope key
+// generation and tombstones every message. It exists for the operator who
+// lost the master key, for whom the alternative is a server that never
+// starts again. It always asks first.
+func resetChatKeys(ctx context.Context, dbStore *store.Store, logger *zap.Logger) error {
+	fmt.Fprintln(os.Stderr, "--reset-chat-keys DESTROYS all chat history: every scope key generation")
+	fmt.Fprintln(os.Stderr, "is dropped and every stored message is tombstoned. This cannot be undone.")
+	fmt.Fprint(os.Stderr, "Type yes to continue: ")
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("reading the --reset-chat-keys confirmation: %w", err)
+	}
+	if strings.TrimSpace(strings.ToLower(line)) != "yes" {
+		return errors.New("--reset-chat-keys not confirmed")
+	}
+
+	tx, err := dbStore.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning chat key reset: %w", err)
+	}
+	// Tombstone first: a message row referencing a generation that no longer
+	// exists would decrypt to nothing, undetectably and forever.
+	stmts := []string{
+		`UPDATE chat_messages SET body = '', body_enc = '', key_id = 0, deleted_at = COALESCE(deleted_at, NOW())`,
+		`UPDATE server_settings SET value = '', key_id = 0 WHERE key IN ('motd', 'announcement')`,
+		`DELETE FROM chat_scope_keys`,
+		`DELETE FROM chat_scope_seq`,
+	}
+	for _, q := range stmts {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("resetting chat keys: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing the chat key reset: %w", err)
+	}
+	logger.Warn("chat keys reset: all chat history has been tombstoned and every scope key generation dropped")
+	return nil
 }
 
 func run() error {
@@ -83,7 +229,36 @@ func run() error {
 	if err := dbStore.Migrate(); err != nil {
 		return fmt.Errorf("running migrations: %w", err)
 	}
+	piiCipher, err := store.LoadOrCreatePIICipher(cfg.PIIKeyFile)
+	if err != nil {
+		return fmt.Errorf("loading PII encryption key: %w", err)
+	}
+	dbStore.SetPIICipher(piiCipher)
 	logger.Info("database migrations applied")
+
+	// (91) chat key material. --reset-chat-keys runs first so an operator who
+	// lost the master key can start over instead of being locked out forever;
+	// it leaves zero generations behind, which is exactly the state that lets
+	// LoadKEKRing create a fresh ring below.
+	if hasFlag("--reset-chat-keys") {
+		if err := resetChatKeys(context.Background(), dbStore, logger); err != nil {
+			return err
+		}
+	}
+	scopeKeyCount, err := dbStore.CountScopeKeys(context.Background())
+	if err != nil {
+		return fmt.Errorf("counting chat scope keys: %w", err)
+	}
+	chatKEK, err := chatcrypto.LoadKEKRing(cfg.ChatMasterKeyFile,
+		os.Getenv("VOICX_CHAT_MASTER_KEY"), scopeKeyCount == 0)
+	if err != nil {
+		return fmt.Errorf("loading chat master key: %w", err)
+	}
+	logger.Warn("chat master key loaded — BACK THIS UP WITH THE DATABASE: losing it destroys all channel and global chat history irreversibly",
+		zap.String("file", cfg.ChatMasterKeyFile),
+		zap.String("fingerprint", chatKEK.Fingerprint()),
+		zap.Int64("scope_key_generations", scopeKeyCount),
+	)
 
 	// Default groups (138/143/144): ensure the Guest and Member server groups
 	// exist so the TCP server can assign them at login. Seeding is idempotent
@@ -92,6 +267,15 @@ func run() error {
 	if cfg.DefaultGroupsEnabled {
 		if defaultGuestGroupID, err = ensureServerGroup(context.Background(), dbStore, "Guest", 0); err != nil {
 			return fmt.Errorf("ensuring default Guest group: %w", err)
+		}
+		for _, key := range []permissions.PermissionKey{
+			permissions.PermissionKeyFTFileUploadPower,
+			permissions.PermissionKeyClientAvatarUpload,
+		} {
+			if err := dbStore.SetPermission(context.Background(), store.PermTierServerGroup,
+				store.PermTarget{GroupID: defaultGuestGroupID}, string(key), 0, 0, false, true); err != nil {
+				return fmt.Errorf("hardening default Guest group %s: %w", key, err)
+			}
 		}
 		if defaultMemberGroupID, err = ensureServerGroup(context.Background(), dbStore, "Member", 100); err != nil {
 			return fmt.Errorf("ensuring default Member group: %w", err)
@@ -133,9 +317,15 @@ func run() error {
 	// the database and the in-memory state manager, including automatic cleanup
 	// of empty temporary channels.
 	channelMgr := channels.New(dbStore, stateManager, logger)
+	// (165) operator-configurable temporary channel lifetime; <= 0 keeps the default.
+	channelMgr.SetCleanupDelay(time.Duration(cfg.ChannelTempLifetimeSeconds) * time.Second)
 	defer channelMgr.Close()
+	cleanupDelay := channels.DefaultCleanupDelay
+	if cfg.ChannelTempLifetimeSeconds > 0 {
+		cleanupDelay = time.Duration(cfg.ChannelTempLifetimeSeconds) * time.Second
+	}
 	logger.Info("channel manager ready",
-		zap.Duration("cleanup_delay", channels.DefaultCleanupDelay),
+		zap.Duration("cleanup_delay", cleanupDelay),
 	)
 
 	// Load persisted channels into the in-memory state so the channel tree is
@@ -150,7 +340,7 @@ func run() error {
 	// in it hear their own audio routed back. Empty name disables it.
 	var echoChannelID int64
 	if cfg.EchoChannelName != "" {
-		for _, ch := range stateManager.ChannelTree() {
+		for _, ch := range stateManager.ChannelTreeOrdered() {
 			if ch.Name == cfg.EchoChannelName {
 				echoChannelID = ch.ChannelID
 				break
@@ -179,6 +369,14 @@ func run() error {
 	defer broadcaster.Close()
 	logger.Info("broadcaster ready")
 
+	// (231/232) tap the server-wide event fan-out into the event bus, so bots
+	// on the WebSocket and gRPC streams observe exactly what connected clients
+	// observe. The bus is lossy by design: a bot that stops reading is dropped,
+	// never allowed to slow this call down.
+	events := eventbus.New(logger)
+	defer events.Close()
+	broadcaster.SetEventTap(events.Publish)
+
 	// Initialize the permission loader (DB-backed, with a short-lived cache)
 	// and the stateless resolver used by the TCP permission middleware.
 	permLoader := permissions.NewLoader(dbStore, logger)
@@ -187,6 +385,27 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go func() {
+		run := func() {
+			count, err := dbStore.CompressPermissionAudit(ctx, time.Now().AddDate(0, 0, -30))
+			if err != nil && ctx.Err() == nil {
+				logger.Warn("permission audit compression failed", zap.Error(err))
+			} else if count > 0 {
+				logger.Info("permission audit compressed", zap.Int64("rows", count))
+			}
+		}
+		run()
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				run()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	// Initialize the Pion WebRTC engine and the voice facade (engine + SFU
 	// router) that the TCP control server drives via signaling messages.
@@ -255,6 +474,7 @@ func run() error {
 	// Start the health/readiness HTTP endpoint. /healthz reports liveness;
 	// /readyz pings Postgres. /metrics serves Prometheus metrics.
 	m := metrics.New()
+	m.RegisterDBPool(dbStore.DB())
 	voiceRouter.SetForwardObserver(m.IncRTPForwarded)
 	healthServer := health.New(cfg.HealthAddr, logger, func(context.Context) error {
 		// Retry once on transient pool errors (e.g. "driver: bad connection"
@@ -267,20 +487,46 @@ func run() error {
 		return err
 	})
 	healthServer.Handle("/metrics", m.Handler())
+	healthServer.Handle("/api/v1/schema/version", health.SchemaVersionHandler(dbStore.SchemaVersion))
 	healthErr := make(chan error, 1)
 	go func() {
 		healthErr <- healthServer.Start()
 	}()
 
+	// TLS material is minted ONCE here and handed to both listeners: the data
+	// port must present the same certificate as the control channel so the
+	// client re-uses the pin it already holds, and two independent
+	// tlscert.Ensure calls on a fresh install would race to create two certs.
+	var (
+		tlsCert tls.Certificate
+		tlsFP   string
+	)
+	if cfg.TLSEnabled {
+		tlsCert, tlsFP, err = tlscert.Ensure(cfg.TLSDir, cfg.TLSCertFile, cfg.TLSKeyFile,
+			[]string{"localhost", cfg.ServerName})
+		if err != nil {
+			return fmt.Errorf("preparing TLS material: %w", err)
+		}
+	}
+	fileTLS := cfg.TLSEnabled && cfg.FileTLSEnabled
+	if cfg.FileTLSEnabled && !cfg.TLSEnabled {
+		logger.Warn("file_tls_enabled is set but tls_enabled is false: there is no certificate to present, file transfers stay PLAINTEXT")
+	}
+
 	// Construct the file-transfer server before the control server (which
 	// references it for token issuance). The control channel issues transfer
 	// tokens (permission-checked); the file port trusts only the token.
 	ftServer := filetransfer.New(filetransfer.Config{
-		Addr:           cfg.FileAddr,
-		RootDir:        cfg.FileRoot,
-		MaxKBps:        cfg.FileMaxKBps,
-		ChannelQuotaMB: cfg.FileChannelQuotaMB,
-		MaxSizeMB:      cfg.FileMaxSizeMB,
+		Addr:            cfg.FileAddr,
+		RootDir:         cfg.FileRoot,
+		MaxKBps:         cfg.FileMaxKBps,
+		QuietHoursStart: cfg.FileQuietHoursStart,
+		QuietHoursEnd:   cfg.FileQuietHoursEnd,
+		ChannelQuotaMB:  cfg.FileChannelQuotaMB,
+		MaxSizeMB:       cfg.FileMaxSizeMB,
+		TLSEnabled:      fileTLS,
+		Cert:            tlsCert,
+		Fingerprint:     tlsFP,
 	}, dbStore, logger)
 	ftServer.OnTransferComplete = m.IncFileTransfer
 	// Download links (267): the control channel mints expiring tokens; the
@@ -317,8 +563,16 @@ func run() error {
 		}
 	}
 
+	// (215) one rules service for both readers: ServerQuery edits the wording
+	// and the control server hands it out, and a second instance would only
+	// be a second place for the two to disagree.
+	rulesSvc := rules.New(dbStore, dbStore.DB())
+
 	// Start the TCP control listener, wired to the auth, state, channels,
 	// broadcast, permissions, and voice backends.
+	if err := server.LoadPersistedServerConfig(context.Background(), cfg, dbStore); err != nil {
+		return fmt.Errorf("loading persisted server configuration: %w", err)
+	}
 	tcpServer := server.New(cfg, logger, &server.Deps{
 		Auth:               authSvc,
 		State:              stateManager,
@@ -328,6 +582,7 @@ func run() error {
 		Resolver:           permResolver,
 		Bans:               dbStore,
 		Spool:              dbStore,
+		PreKeys:            dbStore,
 		Voice:              voice,
 		Recorder:           rec,
 		FileTransfer:       ftServer,
@@ -337,12 +592,30 @@ func run() error {
 		Groups:             dbStore,
 		BanAdmin:           dbStore,
 		Metrics:            m,
+		Rules:              rulesSvc,
+		ScopeKeys:          dbStore,
+		ChatKEK:            chatKEK,
 		ServerPasswordHash: serverPasswordHash,
 		ICEServers:         iceServersProvider(cfg, logger),
 
 		DefaultGuestGroupID:  defaultGuestGroupID,
 		DefaultMemberGroupID: defaultMemberGroupID,
 	})
+	if cfg.TLSEnabled {
+		tcpServer.UseTLSMaterial(tlsCert, tlsFP)
+	}
+
+	// The global generation is minted eagerly: it is a fixed known scope, and
+	// minting it here removes the only legitimate lazy mint from a hot path.
+	// Both of these are fatal — a half-encrypted table behind a NOT VALID
+	// constraint is the silent-plaintext state 91 forbids.
+	if err := tcpServer.EnsureGlobalScopeKey(context.Background()); err != nil {
+		return fmt.Errorf("ensuring the global chat key: %w", err)
+	}
+	if err := tcpServer.EncryptLegacyChatHistory(context.Background(), cfg.ChatLegacyHistory); err != nil {
+		return fmt.Errorf("encrypting legacy chat history: %w", err)
+	}
+
 	serverErr := make(chan error, 1)
 	go func() {
 		if err := tcpServer.Start(ctx); err != nil {
@@ -371,7 +644,7 @@ func run() error {
 	// takes the same path as SIGTERM. restart only logs the supervisor
 	// dependency (docker restart=unless-stopped brings the server back).
 	shutdownReq := make(chan bool, 1)
-	queryServer := query.New(cfg.QueryAddr, logger, &queryBackend{
+	qBackend := &queryBackend{
 		authSvc:    authSvc,
 		stateMgr:   stateManager,
 		channelMgr: channelMgr,
@@ -389,13 +662,42 @@ func run() error {
 		startedAt:  time.Now(),
 		serverName: cfg.ServerName,
 		maxClients: cfg.MaxClients,
-	})
+		rules:      rulesSvc,
+	}
+	queryServer := query.New(cfg.QueryAddr, logger, qBackend)
 	queryErr := make(chan error, 1)
 	go func() {
 		if err := queryServer.Start(ctx); err != nil {
 			queryErr <- err
 		}
 	}()
+
+	// (231) the event stream for bots, on the health listener next to
+	// /metrics. Same credentials as ServerQuery: the stream reveals who is
+	// where, so it is admin-only.
+	healthServer.Handle("/events", eventbus.Handler(events, qBackend.Authenticate, logger))
+	registerEventBusMetrics(m.Registry(), events, logger)
+
+	// (232) the gRPC API on the reserved port: same backend, same
+	// admin-only credentials, plus Events.Subscribe on the event bus.
+	grpcServer := grpcserver.New(cfg.GRPCAddr, qBackend, events, logger, queryServer)
+	grpcErr := make(chan error, 1)
+	go func() {
+		if err := grpcServer.Start(ctx); err != nil {
+			grpcErr <- err
+		}
+	}()
+
+	// (224) the same command set over SSH, opt-in.
+	var sshQuery *query.SSHServer
+	if cfg.QuerySSHEnabled {
+		sshQuery = query.NewSSH(cfg.QuerySSHAddr, cfg.QuerySSHHostKey, queryServer)
+		go func() {
+			if err := sshQuery.Start(ctx); err != nil {
+				queryErr <- err
+			}
+		}()
+	}
 
 	// Start the file-transfer listener.
 	ftErr := make(chan error, 1)
@@ -431,6 +733,8 @@ func run() error {
 		logger.Error("query server exited unexpectedly", zap.Error(err))
 	case err := <-ftErr:
 		logger.Error("file transfer server exited unexpectedly", zap.Error(err))
+	case err := <-grpcErr:
+		logger.Error("gRPC server exited unexpectedly", zap.Error(err))
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -445,6 +749,13 @@ func run() error {
 	if err := queryServer.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		logger.Warn("query server shutdown error", zap.Error(err))
 	}
+	if sshQuery != nil {
+		if err := sshQuery.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			logger.Warn("query ssh server shutdown error", zap.Error(err))
+		}
+	}
+	// Event subscriptions are open-ended, so this cannot wait for them.
+	grpcServer.Stop()
 	if err := ftServer.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		logger.Warn("file transfer server shutdown error", zap.Error(err))
 	}
@@ -509,6 +820,34 @@ func iceServersProvider(cfg *config.Config, logger *zap.Logger) func(string) []n
 	}
 }
 
+// registerEventBusMetrics publishes the event-bus counters on /metrics (231):
+// the drop policy is only defensible if an operator can see it firing.
+func registerEventBusMetrics(reg *prometheus.Registry, bus *eventbus.Bus, logger *zap.Logger) {
+	collectors := []prometheus.Collector{
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "voicx_eventbus_subscribers",
+			Help: "Current number of event-bus subscribers (bots).",
+		}, func() float64 { return float64(bus.Stats().Subscribers) }),
+		prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "voicx_eventbus_published_total",
+			Help: "Events published to the event bus.",
+		}, func() float64 { return float64(bus.Stats().Published) }),
+		prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "voicx_eventbus_dropped_total",
+			Help: "Events dropped because a subscriber was not draining its buffer.",
+		}, func() float64 { return float64(bus.Stats().Dropped) }),
+		prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "voicx_eventbus_evicted_total",
+			Help: "Subscribers evicted for persistently failing to drain.",
+		}, func() float64 { return float64(bus.Stats().Evicted) }),
+	}
+	for _, c := range collectors {
+		if err := reg.Register(c); err != nil {
+			logger.Warn("registering event-bus metric failed", zap.Error(err))
+		}
+	}
+}
+
 // queryBackend adapts the server's building blocks to the query.Backend
 // interface. Only admins may log in; every operation after that is trusted.
 type queryBackend struct {
@@ -522,6 +861,8 @@ type queryBackend struct {
 	startedAt  time.Time
 	serverName string
 	maxClients int
+	// rules serves the server rules shown on first join (215).
+	rules *rules.Service
 }
 
 func (q *queryBackend) Authenticate(ctx context.Context, uniqueID, password string) (bool, bool, error) {
@@ -551,7 +892,8 @@ func (q *queryBackend) ListClients(context.Context) []query.ClientInfo {
 }
 
 func (q *queryBackend) ListChannels(context.Context) []query.ChannelInfo {
-	channels := q.stateMgr.ChannelTree()
+	// Totally ordered so channellist agrees with the tree clients see (163).
+	channels := q.stateMgr.ChannelTreeOrdered()
 	out := make([]query.ChannelInfo, 0, len(channels))
 	for _, ch := range channels {
 		out = append(out, query.ChannelInfo{
@@ -595,15 +937,24 @@ func (q *queryBackend) ChannelInfo(_ context.Context, channelID int64) (query.Ch
 
 func (q *queryBackend) EditChannel(ctx context.Context, channelID int64, params query.ChannelEditParams) error {
 	if err := q.channelMgr.UpdateChannel(ctx, channelID, channels.ChannelUpdate{
-		Topic:           params.Topic,
-		MaxClients:      params.MaxClients,
-		OpusBitrate:     params.OpusBitrate,
-		OpusFEC:         params.OpusFEC,
-		OpusDTX:         params.OpusDTX,
-		OpusStereo:      params.OpusStereo,
-		SlowModeSeconds: params.SlowModeSeconds,
+		Topic:              params.Topic,
+		MaxClients:         params.MaxClients,
+		OpusBitrate:        params.OpusBitrate,
+		OpusFEC:            params.OpusFEC,
+		OpusDTX:            params.OpusDTX,
+		OpusStereo:         params.OpusStereo,
+		SlowModeSeconds:    params.SlowModeSeconds,
+		NeededJoinPower:    params.NeededJoinPower,
+		OrderIndex:         params.OrderIndex,
+		ParentID:           params.ParentID,
+		InheritPermissions: params.InheritPermissions,
 	}); err != nil {
 		return err
+	}
+	// (157) same reason as the control-channel edit: re-parenting or flipping
+	// inheritance changes the resolved channel tier for a whole subtree.
+	if q.permLoader != nil && (params.InheritPermissions != nil || params.ParentID != nil) {
+		q.permLoader.InvalidateAll()
 	}
 	q.db.Audit(ctx, "serverquery", "channel_edit", strconv.FormatInt(channelID, 10), "")
 	// Keep connected clients in sync (the control-channel edit path does the
@@ -746,31 +1097,47 @@ func (q *queryBackend) AuditLog(ctx context.Context, limit int) ([]query.AuditEn
 
 // effectiveName returns the effective server name (217 serveredit override).
 func (q *queryBackend) effectiveName(ctx context.Context) string {
-	if name, err := q.db.GetServerSetting(ctx, "server_name"); err == nil && name != "" {
+	if name, _, err := q.db.GetServerSetting(ctx, "server_name"); err == nil && name != "" {
 		return name
 	}
 	return q.serverName
 }
 
-func (q *queryBackend) ServerEdit(ctx context.Context, name, welcome string, maxClients int) error {
-	if name != "" {
-		if err := q.db.SetServerSetting(ctx, "server_name", name); err != nil {
+// ServerEdit applies the fields serveredit passed (217). An empty stored value
+// is how both readers spell "unset", so writing one is the clear path.
+func (q *queryBackend) ServerEdit(ctx context.Context, params query.ServerEditParams) error {
+	if params.Name != nil {
+		if err := q.db.SetServerSetting(ctx, "server_name", *params.Name, 0); err != nil {
 			return err
 		}
 	}
-	if welcome != "" {
-		if err := q.db.SetServerSetting(ctx, "motd", welcome); err != nil {
+	if params.Welcome != nil {
+		// Through the server so the MOTD is sealed under the global
+		// generation; a raw store write would put operator text in the dump.
+		if err := q.tcp.SetServerSettingAndAnnounce(ctx, "motd", *params.Welcome); err != nil {
 			return err
 		}
 	}
-	if maxClients > 0 {
-		if err := q.db.SetServerSetting(ctx, "max_clients_override", fmt.Sprint(maxClients)); err != nil {
+	if params.MaxClients != nil {
+		value := ""
+		if *params.MaxClients > 0 {
+			value = fmt.Sprint(*params.MaxClients)
+		}
+		if err := q.db.SetServerSetting(ctx, "max_clients_override", value, 0); err != nil {
 			return err
 		}
 	}
-	q.db.Audit(ctx, "serverquery", "serveredit", name,
-		fmt.Sprintf("welcome=%t maxclients=%d", welcome != "", maxClients))
+	q.db.Audit(ctx, "serverquery", "serveredit", derefOr(params.Name, ""),
+		fmt.Sprintf("welcome=%t maxclients=%d", params.Welcome != nil, derefOr(params.MaxClients, 0)))
 	return nil
+}
+
+// derefOr reads an optional serveredit field.
+func derefOr[T any](p *T, fallback T) T {
+	if p == nil {
+		return fallback
+	}
+	return *p
 }
 
 func (q *queryBackend) Shutdown(_ context.Context, restart bool) error {
@@ -923,4 +1290,20 @@ func (q *queryBackend) CustomInfo(ctx context.Context, uniqueID string) ([]query
 
 func (q *queryBackend) LogView(_ context.Context, lines int, filter string) ([]string, error) {
 	return logging.Recent(lines, filter), nil
+}
+
+func (q *queryBackend) LogFollow() (<-chan string, func()) {
+	return logging.Follow()
+}
+
+func (q *queryBackend) ServerRules(ctx context.Context) (string, string, int, error) {
+	text, hash, err := q.rules.Text(ctx)
+	if err != nil {
+		return "", "", 0, err
+	}
+	accepted, err := q.rules.AcceptedCount(ctx)
+	if err != nil {
+		return "", "", 0, err
+	}
+	return text, hash, accepted, nil
 }

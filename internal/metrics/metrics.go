@@ -5,6 +5,7 @@
 package metrics
 
 import (
+	"database/sql"
 	"net/http"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -26,6 +27,23 @@ type Sink interface {
 	SetWebRTCPeers(n int)
 	IncRTPForwarded(media string, n int)
 	IncFileTransfer(direction, result string)
+}
+
+// RegisterDBPool exports database/sql pool pressure so MaxOpenConns,
+// MaxIdleConns and MaxConnLifetime can be tuned from measured saturation.
+// GaugeFuncs sample DB.Stats at scrape time and add no hot-path work.
+func (m *Metrics) RegisterDBPool(db *sql.DB) {
+	if m == nil || db == nil {
+		return
+	}
+	gauges := []prometheus.Collector{
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: "voicx", Subsystem: "db_pool", Name: "open_connections", Help: "Open PostgreSQL pool connections."}, func() float64 { return float64(db.Stats().OpenConnections) }),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: "voicx", Subsystem: "db_pool", Name: "in_use_connections", Help: "PostgreSQL pool connections currently in use."}, func() float64 { return float64(db.Stats().InUse) }),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: "voicx", Subsystem: "db_pool", Name: "idle_connections", Help: "Idle PostgreSQL pool connections."}, func() float64 { return float64(db.Stats().Idle) }),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: "voicx", Subsystem: "db_pool", Name: "wait_count_total", Help: "Requests that waited for a PostgreSQL pool connection."}, func() float64 { return float64(db.Stats().WaitCount) }),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: "voicx", Subsystem: "db_pool", Name: "wait_duration_seconds_total", Help: "Total time spent waiting for PostgreSQL pool connections."}, func() float64 { return db.Stats().WaitDuration.Seconds() }),
+	}
+	m.registry.MustRegister(gauges...)
 }
 
 // Metrics is the Prometheus-backed Sink.

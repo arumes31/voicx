@@ -38,7 +38,8 @@ type fakeVoice struct {
 	taps        [][2]any
 	removedTaps []string
 
-	whispers []whisperCall
+	whispers       []whisperCall
+	whisperTargets map[string][]string // clientID -> targets of its active whisper
 }
 
 type whisperCall struct {
@@ -100,6 +101,24 @@ func (f *fakeVoice) SetWhisper(clientID string, clients []string, channels []int
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.whispers = append(f.whispers, whisperCall{clientID, clients, channels, active})
+	// Mirror the router's routing state so WhisperTargets answers like the real
+	// backend does (32/33). Channel targets are not modelled: the fake has no
+	// membership.
+	if f.whisperTargets == nil {
+		f.whisperTargets = make(map[string][]string)
+	}
+	if active {
+		f.whisperTargets[clientID] = clients
+	} else {
+		delete(f.whisperTargets, clientID)
+	}
+}
+
+// WhisperTargets satisfies the optional whisperTargeter capability.
+func (f *fakeVoice) WhisperTargets(clientID string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.whisperTargets[clientID]
 }
 
 // SetVideoHandlers records the video gate callback.
@@ -194,14 +213,14 @@ func TestWebRTCOfferAnswer(t *testing.T) {
 	if cb == nil {
 		t.Fatal("no candidate callback captured by fake voice")
 	}
-	cb("candidate:1 udp 127.0.0.1 9987 typ host", "0", 0)
+	cb("candidate:1 udp 127.0.0.1 12334 typ host", "0", 0)
 
 	f = readOfType(t, conn, netproto.MsgICECandidate)
 	var ice netproto.ICECandidate
 	if err := netproto.Decode(f, &ice); err != nil {
 		t.Fatalf("decode ice candidate: %v", err)
 	}
-	if ice.Candidate != "candidate:1 udp 127.0.0.1 9987 typ host" {
+	if ice.Candidate != "candidate:1 udp 127.0.0.1 12334 typ host" {
 		t.Fatalf("candidate = %q", ice.Candidate)
 	}
 }
@@ -280,6 +299,74 @@ func TestWhisperSetDenied(t *testing.T) {
 	}
 	if _, ok := env.voice.lastWhisper(); ok {
 		t.Fatal("whisper recorded despite denied permission")
+	}
+}
+
+// TestWhisperSpeakingSignalsTarget verifies the receive-side whisper signal
+// (32/33): while a whisper is active the broadcast speaking event is marked as
+// a whisper, and the targets — and only the targets — additionally get a
+// whisper event naming the whisperer's unique ID (what the reply hotkey
+// whispers back to).
+func TestWhisperSpeakingSignalsTarget(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+
+	adminConn, adminID := dialAuthed(t, env.addr, "admin-uid")
+	defer adminConn.Close()
+	userConn, userID := dialAuthed(t, env.addr, "user-uid")
+	defer userConn.Close()
+
+	send(t, userConn, netproto.MsgWhisperSet, netproto.WhisperSet{
+		UniqueIDs: []string{"admin-uid"},
+		Active:    true,
+	})
+	waitFor(t, "whisper recorded", func() bool {
+		call, ok := env.voice.lastWhisper()
+		return ok && call.active && len(call.clients) == 1 && call.clients[0] == adminID
+	})
+
+	// The router reports the speaking transition of a whispering publisher.
+	env.voice.mu.Lock()
+	onSpeaking := env.voice.onSpeakingFn
+	env.voice.mu.Unlock()
+	if onSpeaking == nil {
+		t.Fatal("speaking callback not installed by server.New")
+	}
+	onSpeaking(userID, true)
+
+	data := readEventOfType(t, adminConn, eventSpeakingChanged)
+	var se speakingEvent
+	if err := json.Unmarshal(data, &se); err != nil {
+		t.Fatalf("unmarshal speaking event: %v", err)
+	}
+	if se.ClientID != userID || !se.Speaking || !se.Whisper {
+		t.Fatalf("speaking event = %+v, want client %s speaking as a whisper", se, userID)
+	}
+
+	data = readEventOfType(t, adminConn, eventWhisper)
+	var we whisperEvent
+	if err := json.Unmarshal(data, &we); err != nil {
+		t.Fatalf("unmarshal whisper event: %v", err)
+	}
+	if we.FromClientID != userID || we.FromUniqueID != "user-uid" || !we.Speaking {
+		t.Fatalf("whisper event = %+v, want %s / user-uid speaking", we, userID)
+	}
+
+	// Turning the whisper off makes the next transition an ordinary one.
+	send(t, userConn, netproto.MsgWhisperSet, netproto.WhisperSet{Active: false})
+	waitFor(t, "whisper cleared", func() bool {
+		call, ok := env.voice.lastWhisper()
+		return ok && !call.active
+	})
+	onSpeaking(userID, false)
+
+	data = readEventOfType(t, adminConn, eventSpeakingChanged)
+	se = speakingEvent{}
+	if err := json.Unmarshal(data, &se); err != nil {
+		t.Fatalf("unmarshal speaking event: %v", err)
+	}
+	if se.Whisper {
+		t.Fatalf("speaking event = %+v, want whisper cleared", se)
 	}
 }
 

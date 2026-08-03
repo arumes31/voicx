@@ -54,6 +54,13 @@ func (f *fakeTrackReader) ReadRTP() (*rtp.Packet, interceptor.Attributes, error)
 	return p, nil, nil
 }
 
+// reads reports how many packets have been consumed.
+func (f *fakeTrackReader) reads() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.idx
+}
+
 // makeAudioPacket builds an RTP packet; when level >= 0 an ssrc-audio-level
 // header extension with that level is attached at extension ID 1.
 func makeAudioPacket(t *testing.T, seq uint16, level int) *rtp.Packet {
@@ -165,13 +172,13 @@ func TestForwardRTPChannelFanout(t *testing.T) {
 	}
 
 	pkt := makeAudioPacket(t, 1, -1)
-	if sent := r.ForwardRTP("a", pkt); sent != 2 {
+	if sent := r.ForwardRTP("a", SlotMic, pkt); sent != 2 {
 		t.Fatalf("ForwardRTP sent = %d, want 2 (b and c have tracks for a)", sent)
 	}
 
 	// A member without a peer connection is skipped silently.
 	r.JoinChannel(1, "d")
-	if sent := r.ForwardRTP("a", pkt); sent != 2 {
+	if sent := r.ForwardRTP("a", SlotMic, pkt); sent != 2 {
 		t.Fatalf("ForwardRTP sent = %d, want 2 (d has no PC)", sent)
 	}
 }
@@ -182,7 +189,7 @@ func TestForwardRTPNotInChannel(t *testing.T) {
 	r := NewRouter(nil)
 	r.JoinChannel(1, "b")
 
-	if sent := r.ForwardRTP("ghost", makeAudioPacket(t, 1, -1)); sent != 0 {
+	if sent := r.ForwardRTP("ghost", SlotMic, makeAudioPacket(t, 1, -1)); sent != 0 {
 		t.Fatalf("ForwardRTP sent = %d, want 0", sent)
 	}
 }
@@ -206,7 +213,7 @@ func TestForwardRTPTap(t *testing.T) {
 	r.AddOutput("recorder:1", tap)
 	r.JoinChannel(1, "recorder:1")
 
-	if sent := r.ForwardRTP("a", makeAudioPacket(t, 1, -1)); sent != 2 {
+	if sent := r.ForwardRTP("a", SlotMic, makeAudioPacket(t, 1, -1)); sent != 2 {
 		t.Fatalf("ForwardRTP sent = %d, want 2 (b's track + tap)", sent)
 	}
 	if tap.count() != 1 {
@@ -236,13 +243,13 @@ func TestWhisperRouting(t *testing.T) {
 	// a whispers to client c and channel 2 (d), bypassing channel-mate b.
 	r.SetWhisper("a", []string{"c"}, []int64{2}, true)
 	pkt := makeAudioPacket(t, 1, -1)
-	if sent := r.ForwardRTP("a", pkt); sent != 2 {
+	if sent := r.ForwardRTP("a", SlotMic, pkt); sent != 2 {
 		t.Fatalf("whisper forward sent = %d, want 2 (c and d)", sent)
 	}
 
 	// Deactivating the whisper restores normal channel fanout.
 	r.SetWhisper("a", nil, nil, false)
-	if sent := r.ForwardRTP("a", pkt); sent != 2 {
+	if sent := r.ForwardRTP("a", SlotMic, pkt); sent != 2 {
 		t.Fatalf("channel forward sent = %d, want 2 (b and c)", sent)
 	}
 }
@@ -263,7 +270,7 @@ func TestWhisperDedup(t *testing.T) {
 	r.JoinChannel(2, "c")
 
 	r.SetWhisper("a", []string{"c"}, []int64{2}, true)
-	if sent := r.ForwardRTP("a", makeAudioPacket(t, 1, -1)); sent != 1 {
+	if sent := r.ForwardRTP("a", SlotMic, makeAudioPacket(t, 1, -1)); sent != 1 {
 		t.Fatalf("whisper forward sent = %d, want 1 (dedup)", sent)
 	}
 }
@@ -326,7 +333,7 @@ func TestReadLoopSpeakingAndForwarding(t *testing.T) {
 		makeAudioPacket(t, 1, 20), // voice
 		makeAudioPacket(t, 2, 25), // voice
 	}}
-	r.ReadLoop("talker", track, 1)
+	r.ReadLoop("talker", SlotMic, track, 1)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -354,7 +361,7 @@ func TestReadLoopTalkGateMuted(t *testing.T) {
 	track := &fakeTrackReader{packets: []*rtp.Packet{
 		makeAudioPacket(t, 1, 20), // voice, but muted
 	}}
-	r.ReadLoop("muted-talker", track, 1)
+	r.ReadLoop("muted-talker", SlotMic, track, 1)
 
 	if spoke {
 		t.Fatal("muted client entered speaking state")
@@ -418,6 +425,181 @@ func TestAttachPeer(t *testing.T) {
 	}
 	if _, ok := r.pubTracks["c2"]["c1"]; ok {
 		t.Fatal("DetachPeer left publisher pair on c2 behind")
+	}
+}
+
+// TestPublisherTrackMSID verifies the MSID contract clients rely on: one
+// stream ID per publisher (so the browser builds one MediaStream per
+// publisher) and the publisher's client ID as track ID.
+func TestPublisherTrackMSID(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
+	r := NewRouter(nil)
+
+	for _, id := range []string{"a", "b", "c"} {
+		attachFakePeer(t, e, r, id)
+		r.JoinChannel(1, id)
+	}
+
+	fromA := pubTrackFor(r, "c", "a")
+	fromB := pubTrackFor(r, "c", "b")
+	if fromA == nil || fromB == nil {
+		t.Fatal("missing pub tracks on c")
+	}
+
+	mic, cam := fromA.audio[SlotMic], fromA.video[SlotCam]
+	if mic == nil || cam == nil {
+		t.Fatal("publisher a is missing a default slot on c")
+	}
+	if mic.track.ID() != "a" || cam.track.ID() != "a" {
+		t.Fatalf("track IDs = %q/%q, want both %q", mic.track.ID(), cam.track.ID(), "a")
+	}
+	if mic.track.StreamID() != cam.track.StreamID() {
+		t.Fatalf("audio/video stream IDs = %q/%q, want one stream per publisher",
+			mic.track.StreamID(), cam.track.StreamID())
+	}
+	if mic.track.StreamID() == fromB.audio[SlotMic].track.StreamID() {
+		t.Fatalf("publishers a and b share stream ID %q; the browser then merges them into one MediaStream",
+			mic.track.StreamID())
+	}
+}
+
+// TestTrackSlotMSID verifies the extra-slot MSID contract clients rely on:
+// a non-default slot gets its own track ID and its own stream ID, so screen
+// audio never lands in the microphone's MediaStream (70).
+func TestTrackSlotMSID(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
+	r := NewRouter(nil)
+
+	for _, id := range []string{"a", "b"} {
+		attachFakePeer(t, e, r, id)
+		r.JoinChannel(1, id)
+	}
+	r.SetTrackSlots("a", map[string]string{"remote-1": SlotScreenAudio})
+
+	fromA := pubTrackFor(r, "b", "a")
+	if fromA == nil {
+		t.Fatal("missing pub tracks on b")
+	}
+	share := fromA.audio[SlotScreenAudio]
+	if share == nil {
+		t.Fatal("declaring the screen-audio slot created no output track")
+	}
+	if got, want := share.track.ID(), "a|screenaudio"; got != want {
+		t.Fatalf("screen audio track ID = %q, want %q", got, want)
+	}
+	if got, want := share.track.StreamID(), "voicx-a|screenaudio"; got != want {
+		t.Fatalf("screen audio stream ID = %q, want %q", got, want)
+	}
+	if share.track.StreamID() == fromA.audio[SlotMic].track.StreamID() {
+		t.Fatal("screen audio shares the microphone's stream ID; the browser then feeds both through one gain chain")
+	}
+
+	// Undeclaring the slot tears the extra track down again.
+	r.SetTrackSlots("a", nil)
+	if pubTrackFor(r, "b", "a").audio[SlotScreenAudio] != nil {
+		t.Fatal("undeclaring the screen-audio slot left its output track behind")
+	}
+	if pubTrackFor(r, "b", "a").audio[SlotMic] == nil {
+		t.Fatal("undeclaring an extra slot dropped the default slot")
+	}
+}
+
+// TestForwardRTPUnknownSlotDropped verifies a packet whose slot has no output
+// track is dropped instead of being written into another slot's track (70).
+func TestForwardRTPUnknownSlotDropped(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
+	r := NewRouter(nil)
+
+	for _, id := range []string{"a", "b"} {
+		attachFakePeer(t, e, r, id)
+		r.JoinChannel(1, id)
+	}
+	pkt := makeAudioPacket(t, 1, -1)
+	if sent := r.ForwardRTP("a", SlotMic, pkt); sent != 1 {
+		t.Fatalf("mic forward sent = %d, want 1", sent)
+	}
+	if sent := r.ForwardRTP("a", SlotScreenAudio, pkt); sent != 0 {
+		t.Fatalf("undeclared screen audio sent = %d, want 0 (no track to carry it)", sent)
+	}
+}
+
+// TestReadLoopSlotClaimedOnce verifies a second inbound track claiming a live
+// slot is dropped, so two sources can never be muxed into one output track
+// (70).
+func TestReadLoopSlotClaimedOnce(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
+	r := NewRouter(nil)
+
+	attachFakePeer(t, e, r, "b")
+	r.JoinChannel(1, "b")
+	r.JoinChannel(1, "a")
+
+	token, ok := r.claimSlot("a", SlotMic)
+	if !ok {
+		t.Fatal("first claim of the mic slot was refused")
+	}
+	second := &fakeTrackReader{packets: []*rtp.Packet{makeAudioPacket(t, 1, 10)}}
+	r.ReadLoop("a", SlotMic, second, 1)
+	if second.reads() != 0 {
+		t.Fatalf("refused track was read %d times, want 0", second.reads())
+	}
+
+	// Releasing the claim lets the next track in.
+	r.releaseSlot("a", SlotMic, token)
+	third := &fakeTrackReader{packets: []*rtp.Packet{makeAudioPacket(t, 1, 10)}}
+	r.ReadLoop("a", SlotMic, third, 1)
+	if third.reads() == 0 {
+		t.Fatal("track was refused after the slot was released")
+	}
+}
+
+// TestEnsurePublishersEchoSelfPair verifies a peer rebuild (re-offer / ICE
+// restart) restores the echo channel's self pair, so the client keeps hearing
+// itself (15).
+func TestEnsurePublishersEchoSelfPair(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
+	r := NewRouter(nil)
+	r.SetEchoChannel(15)
+
+	attachFakePeer(t, e, r, "a")
+	r.JoinChannel(15, "a")
+	if pubTrackFor(r, "a", "a") == nil {
+		t.Fatal("no echo self pair after JoinChannel")
+	}
+
+	// Peer rebuild: the connection and its tracks go, membership stays.
+	r.DetachPeerKeepChannel("a")
+	if err := e.ClosePeerConnection("a"); err != nil {
+		t.Fatalf("ClosePeerConnection: %v", err)
+	}
+	attachFakePeer(t, e, r, "a")
+	r.EnsurePublishers("a")
+
+	if pubTrackFor(r, "a", "a") == nil {
+		t.Fatal("peer rebuild lost the echo self pair")
+	}
+	if sent := r.ForwardRTP("a", SlotMic, makeAudioPacket(t, 1, -1)); sent != 1 {
+		t.Fatalf("ForwardRTP sent = %d, want 1 (echoed back to a)", sent)
 	}
 }
 
@@ -488,6 +670,124 @@ func TestVoiceHandleOffer(t *testing.T) {
 	}
 	if got := v.PeerCount(); got != 0 {
 		t.Fatalf("PeerCount after ClosePeer = %d, want 0", got)
+	}
+}
+
+// TestVoiceHandleOfferKeepsChannel verifies a re-offer (ICE restart) does not
+// drop the client's channel membership or its publisher tracks (59), while a
+// real ClosePeer still tears membership down.
+func TestVoiceHandleOfferKeepsChannel(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
+	r := NewRouter(nil)
+	v := NewVoice(e, r, testLogger())
+
+	// A second member with a peer connection, so publisher tracks exist in
+	// both directions.
+	attachFakePeer(t, e, r, "c2")
+	r.JoinChannel(7, "c2")
+
+	clientME := &webrtc.MediaEngine{}
+	if err := registerCodecs(clientME, false); err != nil {
+		t.Fatalf("registerCodecs: %v", err)
+	}
+	clientPC, err := webrtc.NewAPI(webrtc.WithMediaEngine(clientME)).NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatalf("client NewPeerConnection: %v", err)
+	}
+	defer clientPC.Close()
+	if _, err := clientPC.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio); err != nil {
+		t.Fatalf("AddTransceiverFromKind: %v", err)
+	}
+	offer, err := clientPC.CreateOffer(nil)
+	if err != nil {
+		t.Fatalf("CreateOffer: %v", err)
+	}
+
+	// The client is in the channel before it ever offers (joining a channel
+	// before pressing Join Voice).
+	v.JoinChannel("c1", 7)
+	if _, err := v.HandleOffer("c1", offer.SDP, nil); err != nil {
+		t.Fatalf("HandleOffer: %v", err)
+	}
+	if ch, ok := r.ChannelOf("c1"); !ok || ch != 7 {
+		t.Fatalf("ChannelOf after HandleOffer = %d/%t, want 7/true", ch, ok)
+	}
+	if pubTrackFor(r, "c1", "c2") == nil || pubTrackFor(r, "c2", "c1") == nil {
+		t.Fatal("no per-publisher track pair after HandleOffer")
+	}
+
+	// A re-offer rebuilds the peer connection; membership and tracks survive.
+	if _, err := v.HandleOffer("c1", offer.SDP, nil); err != nil {
+		t.Fatalf("re-offer HandleOffer: %v", err)
+	}
+	if ch, ok := r.ChannelOf("c1"); !ok || ch != 7 {
+		t.Fatalf("ChannelOf after re-offer = %d/%t, want 7/true", ch, ok)
+	}
+	if pubTrackFor(r, "c1", "c2") == nil || pubTrackFor(r, "c2", "c1") == nil {
+		t.Fatal("re-offer lost the per-publisher track pair")
+	}
+
+	// ClosePeer still tears membership down.
+	if err := v.ClosePeer("c1"); err != nil {
+		t.Fatalf("ClosePeer: %v", err)
+	}
+	if _, ok := r.ChannelOf("c1"); ok {
+		t.Fatal("ClosePeer left channel membership behind")
+	}
+}
+
+// TestVoiceHandleOfferConcurrentMove verifies a move that lands while a
+// re-offer rebuilds the peer connection survives the rebuild: membership is
+// the control server's, so the rebuild must never restore the channel the
+// client occupied when its offer arrived.
+func TestVoiceHandleOfferConcurrentMove(t *testing.T) {
+	e, err := New(testLogger(), nil, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
+	r := NewRouter(nil)
+	v := NewVoice(e, r, testLogger())
+
+	// A second member, so the rebuild has publisher pairs to tear down (that
+	// teardown is where a concurrent move interleaves).
+	attachFakePeer(t, e, r, "c2")
+	r.JoinChannel(7, "c2")
+
+	clientPC := newClientPC(t)
+	offer, err := clientPC.CreateOffer(nil)
+	if err != nil {
+		t.Fatalf("CreateOffer: %v", err)
+	}
+
+	v.JoinChannel("c1", 7)
+	if _, err := v.HandleOffer("c1", offer.SDP, nil); err != nil {
+		t.Fatalf("HandleOffer: %v", err)
+	}
+
+	// An admin MoveClient lands mid-rebuild: the renegotiation hook fires from
+	// inside the peer teardown, so moving the client there reproduces the race
+	// deterministically.
+	var moved sync.Once
+	r.SetRenegotiateHook(func(string) {
+		moved.Do(func() { r.JoinChannel(9, "c1") })
+	})
+
+	if _, err := v.HandleOffer("c1", offer.SDP, nil); err != nil {
+		t.Fatalf("re-offer HandleOffer: %v", err)
+	}
+	if ch, ok := r.ChannelOf("c1"); !ok || ch != 9 {
+		t.Fatalf("ChannelOf after a move during the re-offer = %d/%t, want 9/true", ch, ok)
+	}
+	r.mu.RLock()
+	stale := r.members[7]["c1"]
+	r.mu.RUnlock()
+	if stale {
+		t.Fatal("re-offer left the client in the channel it was moved out of")
 	}
 }
 

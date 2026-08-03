@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -156,16 +157,62 @@ func (s *Store) UnassignServerGroup(ctx context.Context, groupID, userID int64) 
 // previous membership on that channel is replaced; the table's PK covers the
 // group ID and cannot express that with ON CONFLICT alone.
 func (s *Store) AssignChannelGroup(ctx context.Context, groupID, userID, channelID int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning channel group assignment: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := assignChannelGroupTx(ctx, tx, groupID, userID, channelID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing channel group assignment: %w", err)
+	}
+	return nil
+}
+
+func assignChannelGroupTx(ctx context.Context, tx *sql.Tx, groupID, userID, channelID int64) error {
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+		fmt.Sprintf("channel-group:%d:%d", userID, channelID)); err != nil {
+		return fmt.Errorf("locking channel group membership: %w", err)
+	}
 	const del = `DELETE FROM channel_group_members WHERE user_id = $1 AND channel_id = $2`
-	if _, err := s.db.ExecContext(ctx, del, userID, channelID); err != nil {
+	if _, err := tx.ExecContext(ctx, del, userID, channelID); err != nil {
 		return fmt.Errorf("replacing channel group membership: %w", err)
 	}
 	const ins = `INSERT INTO channel_group_members (user_id, channel_id, channel_group_id)
 	          VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`
-	if _, err := s.db.ExecContext(ctx, ins, userID, channelID, groupID); err != nil {
+	if _, err := tx.ExecContext(ctx, ins, userID, channelID, groupID); err != nil {
 		return fmt.Errorf("assigning channel group: %w", err)
 	}
 	return nil
+}
+
+// ApplyChannelGroupAutoAssignment selects the highest-priority enabled rule
+// for a subscribed channel and atomically replaces the user's channel group.
+func (s *Store) ApplyChannelGroupAutoAssignment(ctx context.Context, userID, channelID int64) (int64, bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, false, fmt.Errorf("beginning channel-group auto assignment: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	const rule = `SELECT channel_group_id FROM channel_group_auto_rules
+	              WHERE channel_id = $1 AND enabled
+	              ORDER BY priority DESC, id LIMIT 1`
+	var groupID int64
+	if err := tx.QueryRowContext(ctx, rule, channelID).Scan(&groupID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("looking up channel-group auto rule: %w", err)
+	}
+	if err := assignChannelGroupTx(ctx, tx, groupID, userID, channelID); err != nil {
+		return 0, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, false, fmt.Errorf("committing channel-group auto assignment: %w", err)
+	}
+	return groupID, true, nil
 }
 
 // UnassignChannelGroup removes a user from a channel group on a channel.
@@ -233,6 +280,39 @@ func (s *Store) SetGroupIcon(ctx context.Context, groupID int64, icon string) er
 	const q = `UPDATE server_groups SET icon = $1 WHERE id = $2`
 	if _, err := s.db.ExecContext(ctx, q, icon, groupID); err != nil {
 		return fmt.Errorf("setting group icon: %w", err)
+	}
+	return nil
+}
+
+// SetGroupCosmetics updates a server group's colour, hoisting and sort order
+// (178/179). A nil field is left unchanged so a dialog may send only what the
+// operator touched; colour/hoist exist only on server groups.
+func (s *Store) SetGroupCosmetics(ctx context.Context, groupID int64, color *string, hoist *bool, sortID *int) error {
+	sets := make([]string, 0, 3)
+	args := make([]any, 0, 4)
+	if color != nil {
+		args = append(args, *color)
+		sets = append(sets, fmt.Sprintf("color = $%d", len(args)))
+	}
+	if hoist != nil {
+		args = append(args, *hoist)
+		sets = append(sets, fmt.Sprintf("hoist = $%d", len(args)))
+	}
+	if sortID != nil {
+		args = append(args, *sortID)
+		sets = append(sets, fmt.Sprintf("sort_id = $%d", len(args)))
+	}
+	if len(sets) == 0 {
+		return errors.New("no cosmetic fields to set")
+	}
+	args = append(args, groupID)
+	q := fmt.Sprintf(`UPDATE server_groups SET %s WHERE id = $%d`, strings.Join(sets, ", "), len(args))
+	res, err := s.db.ExecContext(ctx, q, args...)
+	if err != nil {
+		return fmt.Errorf("setting group cosmetics: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return errors.New("group not found")
 	}
 	return nil
 }
@@ -331,13 +411,18 @@ type PermTarget struct {
 	ChannelID int64
 }
 
+type permissionExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
 // upsertPermissionRow finds or creates the permissions row for the exact
 // (key, value, grant, skip, negate) tuple and returns its id.
-func (s *Store) upsertPermissionRow(ctx context.Context, key string, value, grant int, skip, negate bool) (int64, error) {
+func upsertPermissionRow(ctx context.Context, db permissionExecutor, key string, value, grant int, skip, negate bool) (int64, error) {
 	const sel = `SELECT id FROM permissions
 	             WHERE permission_key = $1 AND value = $2 AND grant_value = $3 AND skip_flag = $4 AND negate_flag = $5`
 	var id int64
-	err := s.db.QueryRowContext(ctx, sel, key, value, grant, skip, negate).Scan(&id)
+	err := db.QueryRowContext(ctx, sel, key, value, grant, skip, negate).Scan(&id)
 	if err == nil {
 		return id, nil
 	}
@@ -346,7 +431,7 @@ func (s *Store) upsertPermissionRow(ctx context.Context, key string, value, gran
 	}
 	const ins = `INSERT INTO permissions (permission_key, value, grant_value, skip_flag, negate_flag)
 	             VALUES ($1, $2, $3, $4, $5) RETURNING id`
-	if err := s.db.QueryRowContext(ctx, ins, key, value, grant, skip, negate).Scan(&id); err != nil {
+	if err := db.QueryRowContext(ctx, ins, key, value, grant, skip, negate).Scan(&id); err != nil {
 		return 0, fmt.Errorf("creating permission row: %w", err)
 	}
 	return id, nil
@@ -355,7 +440,11 @@ func (s *Store) upsertPermissionRow(ctx context.Context, key string, value, gran
 // SetPermission writes a permission for a target on a tier: existing entries
 // for the same key on the same target are replaced.
 func (s *Store) SetPermission(ctx context.Context, tier PermTier, target PermTarget, key string, value, grant int, skip, negate bool) error {
-	permID, err := s.upsertPermissionRow(ctx, key, value, grant, skip, negate)
+	return setPermissionWith(ctx, s.db, tier, target, key, value, grant, skip, negate)
+}
+
+func setPermissionWith(ctx context.Context, db permissionExecutor, tier PermTier, target PermTarget, key string, value, grant int, skip, negate bool) error {
+	permID, err := upsertPermissionRow(ctx, db, key, value, grant, skip, negate)
 	if err != nil {
 		return err
 	}
@@ -394,10 +483,10 @@ func (s *Store) SetPermission(ctx context.Context, tier PermTier, target PermTar
 		return fmt.Errorf("unknown permission tier %q", tier)
 	}
 
-	if _, err := s.db.ExecContext(ctx, del, delArgs...); err != nil {
+	if _, err := db.ExecContext(ctx, del, delArgs...); err != nil {
 		return fmt.Errorf("replacing %s permission: %w", tier, err)
 	}
-	if _, err := s.db.ExecContext(ctx, ins, insArgs...); err != nil {
+	if _, err := db.ExecContext(ctx, ins, insArgs...); err != nil {
 		return fmt.Errorf("setting %s permission: %w", tier, err)
 	}
 	return nil
@@ -455,6 +544,10 @@ func (s *Store) ListPermissions(ctx context.Context, tier PermTier, target PermT
 
 // UnsetPermission removes a permission entry for a target on a tier.
 func (s *Store) UnsetPermission(ctx context.Context, tier PermTier, target PermTarget, key string) error {
+	return unsetPermissionWith(ctx, s.db, tier, target, key)
+}
+
+func unsetPermissionWith(ctx context.Context, db permissionExecutor, tier PermTier, target PermTarget, key string) error {
 	var del string
 	var args []any
 	switch tier {
@@ -476,8 +569,33 @@ func (s *Store) UnsetPermission(ctx context.Context, tier PermTier, target PermT
 	default:
 		return fmt.Errorf("unknown permission tier %q", tier)
 	}
-	if _, err := s.db.ExecContext(ctx, del, args...); err != nil {
+	if _, err := db.ExecContext(ctx, del, args...); err != nil {
 		return fmt.Errorf("unsetting %s permission: %w", tier, err)
+	}
+	return nil
+}
+
+// CopyPermissions atomically removes destination-only keys and writes the
+// source entries. Callers perform authorization before entering this store
+// operation; the transaction guarantees Replace cannot leave a partial copy.
+func (s *Store) CopyPermissions(ctx context.Context, tier PermTier, target PermTarget, remove []string, entries []PermEntry) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning permission copy: %w", err)
+	}
+	defer tx.Rollback()
+	for _, key := range remove {
+		if err := unsetPermissionWith(ctx, tx, tier, target, key); err != nil {
+			return err
+		}
+	}
+	for _, entry := range entries {
+		if err := setPermissionWith(ctx, tx, tier, target, entry.Key, entry.Value, entry.Grant, entry.Skip, entry.Negate); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing permission copy: %w", err)
 	}
 	return nil
 }
@@ -532,4 +650,40 @@ func (s *Store) AuditList(ctx context.Context, beforeID int64, limit int) ([]Aud
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// CompressPermissionAudit replaces permission mutation rows older than the
+// cutoff with daily action/target counts in one transaction. It returns the
+// number of detailed rows removed.
+func (s *Store) CompressPermissionAudit(ctx context.Context, cutoff time.Time) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("beginning audit compression: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	const auditCompressionLock int64 = 0x564F494358415544
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, auditCompressionLock); err != nil {
+		return 0, fmt.Errorf("locking audit compression: %w", err)
+	}
+	const aggregate = `INSERT INTO audit_log_daily (day, action, target, event_count)
+	                   SELECT created_at::date, action, target, COUNT(*)
+	                   FROM audit_log
+	                   WHERE created_at < $1 AND (action LIKE 'perm_%' OR action LIKE '%group%')
+	                   GROUP BY created_at::date, action, target
+	                   ON CONFLICT (day, action, target) DO UPDATE
+	                   SET event_count = audit_log_daily.event_count + EXCLUDED.event_count`
+	if _, err := tx.ExecContext(ctx, aggregate, cutoff); err != nil {
+		return 0, fmt.Errorf("aggregating audit log: %w", err)
+	}
+	const remove = `DELETE FROM audit_log
+	                WHERE created_at < $1 AND (action LIKE 'perm_%' OR action LIKE '%group%')`
+	res, err := tx.ExecContext(ctx, remove, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("removing compressed audit rows: %w", err)
+	}
+	count, _ := res.RowsAffected()
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("committing audit compression: %w", err)
+	}
+	return count, nil
 }

@@ -1,6 +1,6 @@
 // audio.js — voice UX helpers: mic level meter, loopback mic test, VAD
-// calibration, PTT release delay, remote-chain limiter/normalizer, and the
-// per-user volume/mute registry.
+// calibration, PTT release delay, the channel capture profile, remote-chain
+// limiter/per-user normalizer, and the per-user volume/mute registry.
 const V = () => window.__voicx;
 
 // ---------------------------------------------------------------------------
@@ -137,6 +137,119 @@ export function pttRelease(wantActive, apply) {
 }
 
 // ---------------------------------------------------------------------------
+// Channel capture profile (25) — a music channel is published as high-bitrate
+// stereo Opus, so capturing it mono through the browser's speech DSP
+// (echo cancellation / noise suppression / AGC) destroys exactly what the
+// mode exists for. Ordinary channels keep the user's own capture settings.
+// ---------------------------------------------------------------------------
+
+// MUSIC_MIN_BITRATE mirrors the server's musicMinBitrate: stereo at or above
+// it is a music channel (the same rule that bypasses the talk gate).
+export const MUSIC_MIN_BITRATE = 96000;
+
+// isMusicChannel reads the audio profile off a channel snapshot entry. An
+// explicit profile published by the server wins; otherwise the server's own
+// stereo+bitrate rule is re-derived. Both spellings are accepted so a json
+// tag on the server's channel struct cannot silently drop the profile.
+export function isMusicChannel(ch) {
+    if (!ch) return false;
+    const profile = ch.AudioProfile ?? ch.audio_profile;
+    if (typeof profile === "string" && profile !== "") {
+        return profile === "music" || profile === "broadcast";
+    }
+    const flag = ch.IsMusic ?? ch.is_music;
+    if (typeof flag === "boolean") return flag;
+    const stereo = ch.OpusStereo ?? ch.opus_stereo;
+    const bitrate = ch.OpusBitrate ?? ch.opus_bitrate ?? 0;
+    return !!stereo && bitrate >= MUSIC_MIN_BITRATE;
+}
+
+// captureConstraints builds the getUserMedia audio constraints for the
+// channel: music channels force stereo with the browser's processing off,
+// every other channel uses the user's settings unchanged.
+export function captureConstraints(ch) {
+    const s = V().state.settings || {};
+    const device = s.capture_device_id ? { deviceId: { exact: s.capture_device_id } } : {};
+    if (isMusicChannel(ch)) {
+        return {
+            ...device,
+            channelCount: 2,
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+        };
+    }
+    return {
+        ...device,
+        echoCancellation: s.echo_cancellation !== false,
+        noiseSuppression: s.noise_suppression !== false,
+    };
+}
+
+// trackProfiles remembers which profile a live capture track was taken with;
+// a track we never saw captured counts as "voice" (the settings profile).
+const trackProfiles = new WeakMap();
+let recapturing = false; // one getUserMedia swap at a time
+
+function profileOf(ch) {
+    return isMusicChannel(ch) ? "music" : "voice";
+}
+
+// markCaptureProfile records the profile a caller captured a track with, so
+// applyCaptureProfile does not re-capture a track that already matches.
+export function markCaptureProfile(track, ch) {
+    if (track) trackProfiles.set(track, profileOf(ch));
+}
+
+// applyCaptureProfile re-captures the microphone and swaps the sender's track
+// when the joined channel's profile differs from the live track's — entering a
+// music channel switches to stereo/no-DSP, leaving one restores the user's
+// settings. Returns {track, changed}; on any failure the working track is
+// kept. The caller must restart anything holding the old track (mic meter,
+// VAD monitor) and re-apply mute/PTT state when changed is true.
+export async function applyCaptureProfile(pc, stream, ch) {
+    const cur = stream?.getAudioTracks()[0] || null;
+    if (!cur) return { track: null, changed: false };
+    const want = profileOf(ch);
+    if ((trackProfiles.get(cur) || "voice") === want) return { track: cur, changed: false };
+    // a move and a channel_updated can land together: a second capture while
+    // the first is still in flight would swap the sender's track twice.
+    if (recapturing) return { track: cur, changed: false };
+    recapturing = true;
+    try {
+        let fresh = null;
+        try {
+            fresh = await navigator.mediaDevices.getUserMedia({ audio: captureConstraints(ch) });
+        } catch {
+            return { track: cur, changed: false };
+        }
+        const next = fresh.getAudioTracks()[0];
+        if (!next) {
+            fresh.getTracks().forEach((t) => t.stop());
+            return { track: cur, changed: false };
+        }
+        trackProfiles.set(next, want);
+        next.enabled = cur.enabled;
+        next.contentHint = want === "music" ? "music" : "speech";
+        const sender = pc?.getSenders().find((s) => s.track && s.track.kind === "audio") || null;
+        if (sender) {
+            try {
+                await sender.replaceTrack(next);
+            } catch {
+                next.stop();
+                return { track: cur, changed: false };
+            }
+        }
+        cur.stop();
+        stream.removeTrack(cur);
+        stream.addTrack(next);
+        return { track: next, changed: true };
+    } finally {
+        recapturing = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Per-user volume (1) & local mute (2) — registry keyed by unique ID,
 // persisted in settings. Applied to per-user gain nodes in remote chains.
 // The server emits one audio track per publisher (track ID = publisher client
@@ -173,7 +286,9 @@ export async function setUserMuted(uid, muted) {
 
 async function saveAll(s) {
     const err = await window.go.main.App.SaveSettings(s);
-    if (!err) V().state.settings = s;
+    // (282) re-read rather than caching the copy we sent: the Go side owns
+    // fields the frontend never has (recents, what's-new marker).
+    if (!err) V().state.settings = await window.go.main.App.GetSettings();
 }
 
 // userNodes maps uniqueID -> {gain: GainNode, mute: GainNode}.
@@ -215,9 +330,10 @@ function duckMultiplier(uid) {
 export function applyUserAudio(uid) {
     const n = userNodes.get(uid);
     if (!n) return;
-    const duckMult = duckMultiplier(uid);
-    n.gain.gain.value = (isUserMuted(uid) ? 0 : getUserVolume(uid)) * duckMult;
-    n.mute.gain.value = (isUserMuted(uid) ? 0 : 1) * duckMult;
+    // gain and mute are in series, so the duck factor belongs on exactly one
+    // of them — applying it to both squares it (14: -24 dB, not -12 dB).
+    n.gain.gain.value = (isUserMuted(uid) ? 0 : getUserVolume(uid)) * duckMultiplier(uid);
+    n.mute.gain.value = isUserMuted(uid) ? 0 : 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -251,4 +367,50 @@ export function makeNormalizer(ctx, analyser) {
         }
     };
     return { gain, tick };
+}
+
+// userNorms maps a chain key (the remote track ID) -> {analyser, gain, tick}.
+// One 100 ms ticker drives every publisher's normalizer.
+const userNorms = new Map();
+let normTimer = null;
+
+// attachUserNormalizer inserts one publisher's normalizer directly behind its
+// source and returns the node to continue the chain from. It sits before the
+// per-user volume/mute nodes: normalizing after them would fight the volume
+// slider back up to the target. Returns src unchanged when the optional
+// gain_normalize setting is off.
+export function attachUserNormalizer(ctx, key, src) {
+    detachUserNormalizer(key);
+    if (!V().state.settings?.gain_normalize) return src;
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    src.connect(analyser); // tap only: the analyser feeds nothing onward
+    const { gain, tick } = makeNormalizer(ctx, analyser);
+    src.connect(gain);
+    userNorms.set(key, { analyser, gain, tick });
+    if (!normTimer) normTimer = setInterval(tickUserNormalizers, 100);
+    return gain;
+}
+
+function tickUserNormalizers() {
+    for (const n of userNorms.values()) n.tick();
+}
+
+export function detachUserNormalizer(key) {
+    const n = userNorms.get(key);
+    if (!n) return;
+    userNorms.delete(key);
+    try {
+        n.gain.disconnect();
+        n.analyser.disconnect();
+    } catch { /* already disconnected */ }
+    if (userNorms.size === 0 && normTimer) {
+        clearInterval(normTimer);
+        normTimer = null;
+    }
+}
+
+// detachAllUserNormalizers stops the ticker when voice ends.
+export function detachAllUserNormalizers() {
+    for (const key of [...userNorms.keys()]) detachUserNormalizer(key);
 }

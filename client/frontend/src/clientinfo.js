@@ -68,7 +68,7 @@ function openContextMenu(x, y, client) {
             return;
         }
         $("chat-scope").value = "direct";
-        $("chat-target").classList.remove("hidden");
+        V().setDirectTargetVisible(true);
         $("chat-target").value = client.unique_id;
         $("chat-text").focus();
     };
@@ -175,10 +175,28 @@ function openBatchMenu(x, y, clientIDs) {
     document.body.appendChild(menuEl);
 }
 
+// inboundAudioByPublisher maps a publisher's client ID -> its inbound-rtp
+// audio stat. The SFU gives every publisher its own MediaStream and sets the
+// track ID to the publisher's client ID, so a stat is attributable via
+// trackIdentifier (or the legacy "track" stat it references) (57).
+function inboundAudioByPublisher(stats) {
+    const byID = new Map();
+    stats.forEach((r) => byID.set(r.id, r));
+    const map = new Map();
+    stats.forEach((r) => {
+        if (r.type !== "inbound-rtp") return;
+        if (r.kind !== "audio" && r.mediaType !== "audio") return;
+        const tid = r.trackIdentifier || (r.trackId ? byID.get(r.trackId)?.trackIdentifier : "");
+        if (tid) map.set(String(tid), r);
+    });
+    return map;
+}
+
 // refreshVoiceStats fills the Voice section from RTCPeerConnection.getStats()
-// (inbound/outbound RTP). Aggregate over the shared track today; per-user
-// breakdown lands with per-publisher tracks.
-async function refreshVoiceStats(overlay) {
+// for the ONE client the dialog was opened for (57): the receive stream
+// published by that client, or — when the dialog is our own — the outgoing
+// stream as the server's RTCP receiver reports describe it.
+async function refreshVoiceStats(overlay, client) {
     const { state } = V();
     const setVal = (f, text, cls) => {
         const el = overlay.querySelector(`[data-f="${f}"]`);
@@ -187,43 +205,97 @@ async function refreshVoiceStats(overlay) {
             if (cls) el.className = "ci-val " + cls;
         }
     };
-    if (!state.pc) {
-        setVal("loss", "— (no voice)");
+    const blank = (loss) => {
+        setVal("loss", loss);
         setVal("jitter", "—");
         setVal("jbd", "—");
+        setVal("conceal", "—");
         setVal("packets", "—");
         setVal("level", "—");
+    };
+    if (!state.pc) {
+        blank("— (no voice)");
         return;
     }
     try {
         const stats = await state.pc.getStats();
-        let inbound = null, outbound = null;
-        stats.forEach((r) => {
-            if (r.type === "inbound-rtp" && (r.kind === "audio" || r.mediaType === "audio") && !inbound) inbound = r;
-            if (r.type === "outbound-rtp" && (r.kind === "audio" || r.mediaType === "audio") && !outbound) outbound = r;
-        });
-        if (inbound) {
-            const lost = inbound.packetsLost || 0;
-            const recv = inbound.packetsReceived || 0;
-            const total = lost + recv;
-            const pct = total > 0 ? (lost / total * 100).toFixed(1) : "0.0";
-            setVal("loss", pct + "%");
-            setVal("jitter", ((inbound.jitter || 0) * 1000).toFixed(1) + " ms");
-            const jbd = inbound.jitterBufferDelay ?? inbound.jitterBuffer?.delay;
-            setVal("jbd", jbd != null ? (jbd * 1000).toFixed(0) + " ms" : "—");
-            setVal("packets", recv + " recv / " + lost + " lost");
+        if (client.client_id === state.myClientID) {
+            refreshOwnVoiceStats(stats, setVal, blank);
+            return;
+        }
+        const byPub = inboundAudioByPublisher(stats);
+        let inbound = byPub.get(String(client.client_id));
+        // fall back to the track registry: a reconnect can leave the dialog's
+        // client ID stale while the attributed track is still live.
+        if (!inbound && client.unique_id) {
+            for (const [trackID, u] of state.trackUsers || []) {
+                if (u.unique_id === client.unique_id && byPub.has(String(trackID))) {
+                    inbound = byPub.get(String(trackID));
+                    break;
+                }
+            }
+        }
+        if (!inbound) {
+            blank("— no stream from this user");
+            return;
+        }
+        const lost = inbound.packetsLost || 0;
+        const recv = inbound.packetsReceived || 0;
+        const total = lost + recv;
+        setVal("loss", (total > 0 ? (lost / total * 100).toFixed(1) : "0.0") + " %");
+        setVal("jitter", ((inbound.jitter || 0) * 1000).toFixed(1) + " ms");
+        // (58) jitterBufferDelay/jitterBufferTargetDelay are CUMULATIVE sums of
+        // seconds: the average delay is the sum over jitterBufferEmittedCount.
+        const emitted = inbound.jitterBufferEmittedCount || 0;
+        if (inbound.jitterBufferDelay != null && emitted > 0) {
+            let txt = (inbound.jitterBufferDelay / emitted * 1000).toFixed(0) + " ms avg";
+            if (inbound.jitterBufferTargetDelay != null) {
+                txt += " (target " + (inbound.jitterBufferTargetDelay / emitted * 1000).toFixed(0) + " ms)";
+            }
+            setVal("jbd", txt);
         } else {
-            setVal("loss", "—");
-            setVal("jitter", "—");
             setVal("jbd", "—");
-            setVal("packets", "—");
         }
-        if (outbound && outbound.audioLevel != null) {
-            setVal("level", (outbound.audioLevel * 100).toFixed(0) + "%");
-        } else {
-            setVal("level", "—");
-        }
+        // (58) concealment is what the loss actually cost: samples the jitter
+        // buffer had to invent.
+        const samples = inbound.totalSamplesReceived || 0;
+        setVal("conceal", samples > 0
+            ? ((inbound.concealedSamples || 0) / samples * 100).toFixed(2) + " % (" + (inbound.concealmentEvents || 0) + " events)"
+            : "—");
+        setVal("packets", recv + " recv / " + lost + " lost");
+        setVal("level", inbound.audioLevel != null ? (inbound.audioLevel * 100).toFixed(0) + " %" : "—");
     } catch { /* stats unavailable */ }
+}
+
+// refreshOwnVoiceStats fills the Voice section for our own row: there is no
+// inbound stream for oneself, so loss/jitter come from the server's receiver
+// reports (remote-inbound-rtp) and the level from the local media source.
+function refreshOwnVoiceStats(stats, setVal, blank) {
+    let outbound = null, remoteIn = null, source = null;
+    stats.forEach((r) => {
+        const audio = r.kind === "audio" || r.mediaType === "audio";
+        if (r.type === "outbound-rtp" && audio && !outbound) outbound = r;
+        if (r.type === "remote-inbound-rtp" && audio && !remoteIn) remoteIn = r;
+        if (r.type === "media-source" && audio && !source) source = r;
+    });
+    if (!outbound && !source) {
+        blank("— not publishing");
+        return;
+    }
+    if (remoteIn) {
+        const lost = remoteIn.packetsLost || 0;
+        const sent = outbound?.packetsSent || 0;
+        setVal("loss", sent > 0 ? (lost / sent * 100).toFixed(1) + " % (reported by server)" : "—");
+        setVal("jitter", ((remoteIn.jitter || 0) * 1000).toFixed(1) + " ms");
+    } else {
+        setVal("loss", "— (no receiver report yet)");
+        setVal("jitter", "—");
+    }
+    setVal("jbd", "— (outgoing)");
+    setVal("conceal", "— (outgoing)");
+    setVal("packets", (outbound?.packetsSent || 0) + " sent");
+    const level = source?.audioLevel ?? outbound?.audioLevel;
+    setVal("level", level != null ? (level * 100).toFixed(0) + " %" : "—");
 }
 
 // --- Client Info dialog --------------------------------------------------------
@@ -244,8 +316,6 @@ function humanDuration(sec) {
     if (m > 0) return `${m}m ${s}s`;
     return `${s}s`;
 }
-
-let refreshTimer = null;
 
 function openClientInfo(client) {
     const overlay = document.createElement("div");
@@ -275,6 +345,7 @@ function openClientInfo(client) {
                 <div class="ci-label">Packet loss</div><div class="ci-val" data-f="loss"></div>
                 <div class="ci-label">Jitter</div><div class="ci-val" data-f="jitter"></div>
                 <div class="ci-label">Jitter buffer</div><div class="ci-val" data-f="jbd"></div>
+                <div class="ci-label">Concealment</div><div class="ci-val" data-f="conceal"></div>
                 <div class="ci-label">Packets</div><div class="ci-val" data-f="packets"></div>
                 <div class="ci-label">Audio level</div><div class="ci-val" data-f="level"></div>
             </div>
@@ -339,10 +410,11 @@ function openClientInfo(client) {
         setVal("bin", humanBytes(info.bytes_in));
         setVal("bout", humanBytes(info.bytes_out));
 
-        // (57/58) Voice stats from getStats() — refreshed with the dialog.
-        refreshVoiceStats(overlay);
+        // (57/58) Voice stats from getStats(), scoped to this dialog's client.
+        refreshVoiceStats(overlay, client);
     };
 
+    let refreshTimer = null;
     const close = () => {
         if (refreshTimer) {
             clearInterval(refreshTimer);
@@ -440,6 +512,8 @@ const QUALITY_PRESETS = {
 
 function openChannelMenu(x, y, channel) {
     closeMenu();
+    const isCurrent = channel.ChannelID === V().state.myChannelID;
+    const isSubscribed = !!window.__voicxChat?.isSubscribed?.(channel.ChannelID);
     // (320) recent channels for quick rejoin.
     const recent = (V().recentChannels ? V().recentChannels() : [])
         .map((id) => V().state.channels.find((c) => c.ChannelID === id))
@@ -449,6 +523,9 @@ function openChannelMenu(x, y, channel) {
     menuEl = document.createElement("div");
     menuEl.className = "ctx-menu";
     menuEl.innerHTML = `
+        <a data-act="open-chat">Open chat tab</a>
+        <a data-act="subscription" class="${isCurrent ? "disabled" : ""}">${isCurrent ? "✓ Joined (always subscribed)" : isSubscribed ? "✓ Unsubscribe" : "Subscribe"}</a>
+        <div class="ctx-divider"></div>
         <a data-act="edit">Edit channel</a>
         <a data-act="notify">Notifications…</a>
         <a data-act="create-sub">Create sub-channel…</a>
@@ -460,6 +537,14 @@ function openChannelMenu(x, y, channel) {
     menuEl.style.left = Math.min(x, window.innerWidth - 240) + "px";
     menuEl.style.top = Math.min(y, window.innerHeight - 260) + "px";
     menuEl.onclick = (e) => e.stopPropagation();
+    menuEl.querySelector('[data-act="open-chat"]').onclick = () => {
+        closeMenu();
+        window.__voicxChat?.openChannelTab?.(channel.ChannelID);
+    };
+    menuEl.querySelector('[data-act="subscription"]').onclick = () => {
+        closeMenu();
+        if (!isCurrent) window.__voicxChat?.setChannelSubscription?.(channel.ChannelID, !isSubscribed);
+    };
     menuEl.querySelector('[data-act="edit"]').onclick = () => {
         closeMenu();
         openChannelEdit(channel);
@@ -661,6 +746,23 @@ function matchPreset(bitrate, fec, dtx, stereo) {
     return "custom";
 }
 
+// subtreeOf returns a channel and every descendant of it (168): a channel
+// cannot become its own ancestor.
+function subtreeOf(channelID) {
+    const out = new Set([channelID]);
+    let grew = true;
+    while (grew) {
+        grew = false;
+        for (const c of V().state.channels) {
+            if (!out.has(c.ChannelID) && out.has(c.ParentID || 0)) {
+                out.add(c.ChannelID);
+                grew = true;
+            }
+        }
+    }
+    return out;
+}
+
 function openChannelEdit(channel) {
     const overlay = document.createElement("div");
     overlay.className = "dlg-overlay";
@@ -681,6 +783,8 @@ function openChannelEdit(channel) {
             <textarea class="dlg-input ce-desc" rows="2"></textarea>
             <label class="dlg-label">Max clients (0 = unlimited)</label>
             <input type="number" class="dlg-input ce-maxclients" min="0" />
+            <label class="dlg-label">Slow mode seconds (0 = off)</label>
+            <input type="number" class="dlg-input ce-slowmode" min="0" title="minimum seconds between messages; holders of b_chat_slowmode_bypass are exempt" />
             <label class="dlg-label">Quality preset</label>
             <select class="dlg-input ce-preset">
                 <option value="voice">${QUALITY_PRESETS.voice.label}</option>
@@ -695,6 +799,15 @@ function openChannelEdit(channel) {
                 <label><input type="checkbox" class="ce-dtx" /> DTX</label>
                 <label><input type="checkbox" class="ce-stereo" /> Stereo</label>
             </div>
+            <label class="dlg-label">Needed join power (0 = open to everyone)</label>
+            <input type="number" class="dlg-input ce-joinpower" min="0" title="a client needs i_channel_join_power at or above this to join; you cannot raise it above your own join power (160)" />
+            <label class="dlg-label">Parent channel (168)</label>
+            <select class="dlg-input ce-parent">
+                <option value="0">— top level —</option>
+            </select>
+            <label class="dlg-label">Sort index (163; lower sorts first among siblings)</label>
+            <input type="number" class="dlg-input ce-order" />
+            <label class="dlg-label"><input type="checkbox" class="ce-inherit" /> inherit the parent's channel permissions and join power (157)</label>
             <label class="dlg-label">Channel icon</label>
             <div class="ce-icon-row">
                 <button class="icon-btn ce-icon-upload" title="Upload icon (compressed, max 1024px)">⬆ Upload…</button>
@@ -713,6 +826,7 @@ function openChannelEdit(channel) {
     q(".ce-topic").value = channel.Topic || "";
     q(".ce-desc").value = channel.Description || "";
     q(".ce-maxclients").value = channel.MaxClients || 0;
+    q(".ce-slowmode").value = channel.SlowModeSeconds || 0;
     // OpusBitrate 0 means the server default (32000); show the effective value.
     q(".ce-bitrate").value = channel.OpusBitrate || 32000;
     q(".ce-fec").checked = !!channel.OpusFEC;
@@ -720,6 +834,23 @@ function openChannelEdit(channel) {
     q(".ce-stereo").checked = !!channel.OpusStereo;
     q(".ce-preset").value = matchPreset(
         channel.OpusBitrate || 32000, !!channel.OpusFEC, !!channel.OpusDTX, !!channel.OpusStereo);
+
+    // (160/163/168/157) tree fields. The parent list omits the channel itself
+    // and its subtree: the server refuses a cycle, and offering one is a
+    // guaranteed error dialog.
+    q(".ce-joinpower").value = channel.NeededJoinPower || 0;
+    q(".ce-order").value = channel.OrderIndex || 0;
+    q(".ce-inherit").checked = !!channel.InheritPermissions;
+    const banned = subtreeOf(channel.ChannelID);
+    const parentSel = q(".ce-parent");
+    for (const c of V().state.channels) {
+        if (banned.has(c.ChannelID)) continue;
+        const opt = document.createElement("option");
+        opt.value = c.ChannelID;
+        opt.textContent = "# " + c.Name;
+        parentSel.appendChild(opt);
+    }
+    parentSel.value = String(channel.ParentID || 0);
 
     q(".ce-preset").onchange = () => {
         const p = QUALITY_PRESETS[q(".ce-preset").value];
@@ -770,9 +901,29 @@ function openChannelEdit(channel) {
             q(".ce-fec").checked,
             q(".ce-dtx").checked,
             q(".ce-stereo").checked,
-            q(".ce-desc").value);
+            q(".ce-desc").value,
+            parseInt(q(".ce-slowmode").value, 10) || 0);
+
+        // Only the tree fields the user actually moved are sent: a parent_id
+        // on the wire drops the server's whole permission cache, so an
+        // untouched re-parent must not ride along with a topic edit.
+        const joinPower = parseInt(q(".ce-joinpower").value, 10) || 0;
+        const orderIndex = parseInt(q(".ce-order").value, 10) || 0;
+        const parentID = parseInt(parentSel.value, 10) || 0;
+        const inherit = q(".ce-inherit").checked;
+        const fields = [];
+        if (joinPower !== (channel.NeededJoinPower || 0)) fields.push("join_power");
+        if (orderIndex !== (channel.OrderIndex || 0)) fields.push("order");
+        if (parentID !== (channel.ParentID || 0)) fields.push("parent");
+        if (inherit !== !!channel.InheritPermissions) fields.push("inherit");
+        let treeErr = "";
+        if (fields.length) {
+            treeErr = await window.go.main.App.ChannelEditTree(
+                channel.ChannelID, fields.join(","), joinPower, orderIndex, parentID, inherit);
+        }
         overlay.remove();
         if (err) V().sysMsg("channel edit failed: " + err);
+        if (treeErr) V().sysMsg("channel edit failed: " + treeErr);
         // On success the server broadcasts channel_updated, which refreshes
         // the tree (main.js).
     };

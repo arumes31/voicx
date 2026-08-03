@@ -48,8 +48,13 @@ func TestAddRemoveClient(t *testing.T) {
 			if !ok {
 				t.Fatalf("GetClient(%q) not found after AddClient", tc.c.ClientID)
 			}
-			if got != tc.c {
-				t.Fatalf("GetClient returned different pointer")
+			if got.ClientID != tc.c.ClientID || got.UniqueID != tc.c.UniqueID || got.Nickname != tc.c.Nickname {
+				t.Fatalf("GetClient returned wrong snapshot: %+v", got)
+			}
+			got.Nickname = "mutated snapshot"
+			again, _ := m.GetClient(tc.c.ClientID)
+			if again.Nickname != tc.c.Nickname {
+				t.Fatal("mutating GetClient snapshot changed manager state")
 			}
 		})
 	}
@@ -72,6 +77,49 @@ func TestAddRemoveClient(t *testing.T) {
 
 	// Removing an unknown client is a no-op (no panic).
 	m.RemoveClient("does-not-exist")
+}
+
+func TestChannelSubscriptionsStayConsistentAcrossRemoval(t *testing.T) {
+	m := newTestManager(t)
+	m.AddClient(&Client{ClientID: "a", UniqueID: "u-a", Nickname: "Alice"})
+	m.AddClient(&Client{ClientID: "b", UniqueID: "u-b", Nickname: "Bob"})
+	m.AddChannel(&Channel{ChannelID: 10, Name: "Ten"})
+	m.AddChannel(&Channel{ChannelID: 20, Name: "Twenty"})
+
+	// Unknown targets are ignored and duplicate requests are idempotent.
+	m.Subscribe("a", []int64{20, 10, 20, 999})
+	m.Subscribe("b", []int64{20})
+	if got := m.Subscriptions("a"); len(got) != 2 || got[0] != 10 || got[1] != 20 {
+		t.Fatalf("Subscriptions(a) = %v, want [10 20]", got)
+	}
+	if got := len(m.ChannelSubscribers(20)); got != 2 {
+		t.Fatalf("ChannelSubscribers(20) len = %d, want 2", got)
+	}
+
+	m.Unsubscribe("a", []int64{10})
+	if m.IsSubscribed("a", 10) {
+		t.Fatal("client a still subscribed to channel 10")
+	}
+
+	// Removing a channel drops both forward and reverse entries.
+	m.RemoveChannel(20)
+	if got := m.Subscriptions("a"); len(got) != 0 {
+		t.Fatalf("Subscriptions(a) after channel removal = %v, want empty", got)
+	}
+	if got := m.Subscriptions("b"); len(got) != 0 {
+		t.Fatalf("Subscriptions(b) after channel removal = %v, want empty", got)
+	}
+	if got := len(m.ChannelSubscribers(20)); got != 0 {
+		t.Fatalf("ChannelSubscribers(20) after removal len = %d, want 0", got)
+	}
+
+	// Removing a client also removes it from the reverse index.
+	m.AddChannel(&Channel{ChannelID: 30, Name: "Thirty"})
+	m.Subscribe("a", []int64{30})
+	m.RemoveClient("a")
+	if got := len(m.ChannelSubscribers(30)); got != 0 {
+		t.Fatalf("ChannelSubscribers(30) after client removal len = %d, want 0", got)
+	}
 }
 
 func TestAddRemoveChannel(t *testing.T) {

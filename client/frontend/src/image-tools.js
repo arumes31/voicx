@@ -64,7 +64,10 @@ export async function pickAvatar() {
 }
 
 // pickIcon opens the picker and returns a compressed image (274): downscale
-// to maxDim, JPEG q0.85 (animated formats pass through, 269).
+// to maxDim, JPEG q0.85 (animated formats pass through, 269). A single pass at
+// a fixed quality still leaves a detailed photo over the server's 256 KiB cap
+// and the upload comes back rejected, so keep re-encoding cheaper until it
+// fits, then shrink the canvas if quality alone is not enough.
 export async function pickIcon(maxDim = 1024, quality = 0.85) {
     const file = await pickFile();
     if (!file) return null;
@@ -76,21 +79,40 @@ export async function pickIcon(maxDim = 1024, quality = 0.85) {
     }
     try {
         const { img, url } = await loadImage(file);
-        const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
-        const out = document.createElement("canvas");
-        out.width = Math.max(1, Math.round(img.width * scale));
-        out.height = Math.max(1, Math.round(img.height * scale));
-        const ctx = out.getContext("2d");
-        ctx.fillStyle = "#0b0f14"; // JPEG has no alpha: flatten onto ink navy
-        ctx.fillRect(0, 0, out.width, out.height);
-        ctx.drawImage(img, 0, 0, out.width, out.height);
+        let dim = maxDim;
+        let best = null;
+        for (let attempt = 0; attempt < 4; attempt++) {
+            const scale = Math.min(1, dim / Math.max(img.width, img.height));
+            const out = document.createElement("canvas");
+            out.width = Math.max(1, Math.round(img.width * scale));
+            out.height = Math.max(1, Math.round(img.height * scale));
+            const ctx = out.getContext("2d");
+            ctx.fillStyle = "#0b0f14"; // JPEG has no alpha: flatten onto ink navy
+            ctx.fillRect(0, 0, out.width, out.height);
+            ctx.drawImage(img, 0, 0, out.width, out.height);
+            for (let q = quality; q >= 0.4; q -= 0.15) {
+                best = out.toDataURL("image/jpeg", q).split(",")[1];
+                // base64 inflates by 4/3; compare the decoded length.
+                if (base64Bytes(best) <= MAX_UPLOAD) {
+                    URL.revokeObjectURL(url);
+                    return { dataBase64: best, contentType: "image/jpeg" };
+                }
+            }
+            dim = Math.max(128, Math.round(dim / 2));
+        }
         URL.revokeObjectURL(url);
-        const dataUrl = out.toDataURL("image/jpeg", quality);
-        return { dataBase64: dataUrl.split(",")[1], contentType: "image/jpeg" };
+        V().toast("image could not be compressed under 256 KiB", "warn");
+        return null;
     } catch {
         V().toast("cannot read image", "warn");
         return null;
     }
+}
+
+// base64Bytes returns the decoded byte length of a base64 payload.
+function base64Bytes(b64) {
+    const padding = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
+    return Math.floor(b64.length * 3 / 4) - padding;
 }
 
 // cropDialog shows the 256x256 preview/crop editor (268): zoom slider and

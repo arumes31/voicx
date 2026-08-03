@@ -3,11 +3,18 @@
 // fans incoming RTP packets out to the appropriate subscribers.
 //
 // Design notes:
-//   - The SFU never decodes or re-encodes media: packets are forwarded as-is
-//     (headers included) to each subscriber's per-publisher output track.
-//     Each (subscriber, publisher) pair has dedicated audio/video tracks
-//     whose track ID carries the publisher's client ID, so clients can map
-//     incoming tracks to publishers via the MSID track ID.
+//   - The SFU never decodes or re-encodes media, and never copies a payload
+//     (436). One ReadRTP produces one *rtp.Packet, and that SAME packet is
+//     handed to every TrackWriter: pion's TrackLocalStaticRTP.WriteRTP
+//     value-copies the rtp.Header into a pooled packet and rewrites
+//     Header.SSRC / Header.PayloadType per binding — each output track has its
+//     own SSRC and negotiated payload type — while the payload slice stays
+//     SHARED with the packet the read loop owns. So headers are rewritten, not
+//     forwarded as-is, and the payload is never cloned or re-marshaled on the
+//     hot path.
+//     Each (subscriber, publisher) pair has dedicated output tracks, one per
+//     media SLOT the publisher occupies (see slotTrackID / slotStreamID), so
+//     clients can map an incoming track to (publisher, slot) via the MSID.
 //   - The forwarding core works against small interfaces (TrackReader /
 //     TrackWriter) so it is testable without real peer connections, DTLS, or
 //     ICE. *webrtc.TrackRemote satisfies TrackReader and
@@ -18,6 +25,7 @@ package webrtc
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -36,6 +44,13 @@ type TrackReader interface {
 
 // TrackWriter is the subset of *webrtc.TrackLocalStaticRTP the router writes
 // to.
+//
+// ALIASING CONTRACT (436): the router fans ONE packet out to every writer
+// without cloning it, and pkt.Payload aliases the read loop's receive buffer.
+// An implementation therefore MUST NOT mutate pkt or its Payload, and MUST NOT
+// retain either past the WriteRTP call — the next ReadRTP invalidates them and
+// the writers that follow would see the damage. Recorder taps included: a tap
+// that wants the bytes later has to copy them itself.
 type TrackWriter interface {
 	WriteRTP(pkt *rtp.Packet) error
 }
@@ -64,15 +79,82 @@ type whisperConfig struct {
 	channels map[int64]bool
 }
 
-// pubTrack is one publisher's media as seen by one subscriber: a dedicated
-// audio and video output track (per-publisher SFU model). The track ID
-// carries the publisher's client ID so clients can map track -> publisher
-// via the MSID track ID.
+// Media slots. A publisher may publish more than one track of a kind, so a
+// track alone does not say what it carries: the slot does. Screen audio has
+// to reach subscribers as a track of its own instead of being muxed into the
+// microphone track (70), and a second shared surface has to be tellable from
+// the camera (68). Slot names are unique across kinds, so a slot name alone
+// determines the media kind.
+const (
+	// SlotMic is the default audio slot: the publisher's microphone. An
+	// audio track with no declaration lands here.
+	SlotMic = "mic"
+	// SlotCam is the default video slot: the publisher's camera or, while
+	// sharing, the primary shared surface (the client swaps the sender's
+	// track, which does not change the slot). A video track with no
+	// declaration lands here.
+	SlotCam = "cam"
+	// SlotScreenAudio is the extra audio slot carrying the system/application
+	// audio captured alongside a screen share (70).
+	SlotScreenAudio = "screenaudio"
+	// SlotScreen is the extra video slot carrying a second shared surface
+	// (68).
+	SlotScreen = "screen"
+)
+
+// slotKinds maps every known slot to its media kind. A slot outside this map
+// is rejected outright: an inbound track the router cannot place must be
+// dropped, never merged into another slot's output track (70).
+var slotKinds = map[string]webrtc.RTPCodecType{
+	SlotMic:         webrtc.RTPCodecTypeAudio,
+	SlotCam:         webrtc.RTPCodecTypeVideo,
+	SlotScreenAudio: webrtc.RTPCodecTypeAudio,
+	SlotScreen:      webrtc.RTPCodecTypeVideo,
+}
+
+// slotSep separates the publisher ID from the slot name in the MSID track and
+// stream IDs of non-default slots. It is a legal SDP token character and never
+// occurs in a client ID, so clients can split on it without ambiguity.
+const slotSep = "|"
+
+// isDefaultSlot reports whether slot is the one an undeclared track of its
+// kind lands in. Default slots keep the bare publisher ID as their MSID track
+// ID, so the original contract (track ID == publisher client ID) still holds
+// for microphone audio and primary video.
+func isDefaultSlot(slot string) bool {
+	return slot == SlotMic || slot == SlotCam
+}
+
+// defaultSlot returns the slot an undeclared inbound track of the given kind
+// occupies.
+func defaultSlot(kind webrtc.RTPCodecType) string {
+	if kind == webrtc.RTPCodecTypeVideo {
+		return SlotCam
+	}
+	return SlotMic
+}
+
+// pubSlot is one output track (and its sender) for a single (subscriber,
+// publisher, slot) triple.
+type pubSlot struct {
+	track  *webrtc.TrackLocalStaticRTP
+	sender *webrtc.RTPSender
+}
+
+// pubTrack is one publisher's media as seen by one subscriber: one output
+// track per slot the publisher occupies. The default slots always exist;
+// extra slots appear when the publisher declares them (see SetTrackSlots).
 type pubTrack struct {
-	audio       *webrtc.TrackLocalStaticRTP
-	audioSender *webrtc.RTPSender
-	video       *webrtc.TrackLocalStaticRTP
-	videoSender *webrtc.RTPSender
+	audio map[string]*pubSlot // slot -> output track
+	video map[string]*pubSlot // slot -> output track
+}
+
+// slots returns the slot map holding a media kind.
+func (p *pubTrack) slots(kind webrtc.RTPCodecType) map[string]*pubSlot {
+	if kind == webrtc.RTPCodecTypeVideo {
+		return p.video
+	}
+	return p.audio
 }
 
 // Router tracks channel membership, per-publisher output tracks, simulcast
@@ -80,9 +162,9 @@ type pubTrack struct {
 // peers. It is safe for concurrent use.
 //
 // PER-PUBLISHER MODEL (wave 2a): each subscriber gets one
-// TrackLocalStaticRTP per publisher (audio and video), bound 1:1 so the
-// client can map track -> publisher via the MSID track ID (the publisher's
-// client ID). When membership changes, the server renegotiates with affected
+// TrackLocalStaticRTP per (publisher, slot), bound 1:1 so the client can map
+// track -> (publisher, slot) via the MSID (see slotTrackID). When membership
+// or a publisher's slot set changes, the server renegotiates with affected
 // subscribers (see voice.go renegotiation orchestration).
 type Router struct {
 	logger *zap.Logger
@@ -95,13 +177,30 @@ type Router struct {
 	outputs      map[string]TrackWriter            // tap clientID -> audio output track (recorder taps only)
 	videoOutputs map[string]TrackWriter            // tap clientID -> video output track (taps only)
 	rtcpWriters  map[string]RTCPWriter             // clientID -> RTCP destination (its peer connection)
-	videoSources map[string]map[string]uint32      // publisherID -> RID -> SSRC (RID "" = non-simulcast)
-	layerPrefs   map[string]string                 // subscriberID -> preferred RID ("f"/"h"/"q")
-	whispers     map[string]*whisperConfig         // clientID -> whisper settings
+	// videoSources maps publisherID -> slot -> RID -> SSRC (RID "" =
+	// non-simulcast). It is keyed by slot as well because two video slots of
+	// the same publisher have independent RID/SSRC spaces.
+	videoSources map[string]map[string]map[string]uint32
+	layerPrefs   map[string]string         // subscriberID -> preferred RID ("f"/"h"/"q")
+	keyframeLast map[uint32]time.Time      // media SSRC -> last forwarded PLI/FIR
+	whispers     map[string]*whisperConfig // clientID -> whisper settings
 	// whisperPairs tracks publisher tracks created solely to serve an active
 	// whisper (publisherID -> subscriberID), so they can be torn down when
 	// the whisper ends without touching channel-justified pairs.
 	whisperPairs map[string]map[string]bool
+
+	// trackSlots maps a publisher's inbound tracks to slots: publisherID ->
+	// MSID track ID -> slot. Declared by the client alongside its SDP offer;
+	// an undeclared track takes its kind's default slot (70).
+	trackSlots map[string]map[string]string
+	// slotClaims records which inbound track currently owns each of a
+	// publisher's slots (publisherID -> claim key -> token). A second track
+	// claiming a live slot is refused, so two sources can never be
+	// interleaved into one output track (70).
+	slotClaims map[string]map[string]uint64
+	// slotEpoch issues claim tokens; a stale read loop may only release the
+	// claim it made itself.
+	slotEpoch uint64
 
 	// canTalk gates outgoing audio per client (talk power); nil allows all.
 	// canVideo gates outgoing video per client (video publish permission);
@@ -145,10 +244,13 @@ func NewRouter(logger *zap.Logger) *Router {
 		outputs:      make(map[string]TrackWriter),
 		videoOutputs: make(map[string]TrackWriter),
 		rtcpWriters:  make(map[string]RTCPWriter),
-		videoSources: make(map[string]map[string]uint32),
+		videoSources: make(map[string]map[string]map[string]uint32),
 		layerPrefs:   make(map[string]string),
+		keyframeLast: make(map[uint32]time.Time),
 		whispers:     make(map[string]*whisperConfig),
 		whisperPairs: make(map[string]map[string]bool),
+		trackSlots:   make(map[string]map[string]string),
+		slotClaims:   make(map[string]map[string]uint64),
 	}
 }
 
@@ -273,21 +375,16 @@ func (r *Router) JoinChannel(channelID int64, clientID string) {
 	}
 
 	// A new video subscriber joining mid-stream needs a keyframe before it
-	// can decode; collect the publishers in the channel to PLI (the RTCP
-	// writes happen after unlock).
-	var keyframeTargets []string
-	for publisherID := range r.videoSources {
-		if publisherID != clientID && set[publisherID] {
-			keyframeTargets = append(keyframeTargets, publisherID)
-		}
-	}
+	// can decode; collect the publishing slots in the channel to PLI (the
+	// RTCP writes happen after unlock).
+	keyframeTargets := r.videoPublishersLocked(channelID, clientID)
 	pref := r.layerPrefLocked(clientID)
 	members := len(set)
 	hook := r.onRenegotiate
 	r.mu.Unlock()
 
-	for _, publisherID := range keyframeTargets {
-		r.RequestKeyframe(publisherID, pref)
+	for _, ref := range keyframeTargets {
+		r.RequestKeyframe(ref.publisher, ref.slot, pref)
 	}
 	if hook != nil {
 		for sub := range renegotiate {
@@ -360,11 +457,122 @@ func (r *Router) removePairsLocked(channelID int64, clientID string) map[string]
 	return out
 }
 
-// addPublisherLocked creates the per-publisher tracks for (subscriber,
-// publisher) if the subscriber has a peer connection and the pair does not
-// exist yet. Self pairs (subscriber == publisher) are only created by the
-// echo-channel path; all other callers exclude them. It returns true when
-// tracks were added. Callers must hold mu.
+// publisherStreamID returns the MSID stream ID for a publisher's tracks. It
+// must differ per publisher: with one shared stream ID the browser groups every
+// publisher into a single MediaStream, and a MediaStreamAudioSourceNode binds
+// only that stream's first audio track, so every per-user gain/mute chain ends
+// up fed by the same speaker (1, 2, 61).
+func publisherStreamID(publisherID string) string {
+	return "voicx-" + publisherID
+}
+
+// slotTrackID returns the MSID track ID a subscriber sees for one of a
+// publisher's slots.
+func slotTrackID(publisherID, slot string) string {
+	if isDefaultSlot(slot) {
+		return publisherID
+	}
+	return publisherID + slotSep + slot
+}
+
+// slotStreamID returns the MSID stream ID for one of a publisher's slots.
+// Every slot is its own MediaStream: a MediaStreamAudioSourceNode binds a
+// stream's FIRST audio track only, so sharing a stream between the microphone
+// and screen audio would feed both through one gain chain (1, 2, 61, 70).
+func slotStreamID(publisherID, slot string) string {
+	if isDefaultSlot(slot) {
+		return publisherStreamID(publisherID)
+	}
+	return publisherStreamID(publisherID) + slotSep + slot
+}
+
+// publisherSlotsLocked lists the slots a publisher currently occupies: the
+// two default slots plus every extra slot it declared, in a stable order.
+// Callers must hold mu.
+func (r *Router) publisherSlotsLocked(publisherID string) []string {
+	extra := make([]string, 0, 2)
+	seen := make(map[string]bool, 2)
+	for _, slot := range r.trackSlots[publisherID] {
+		if _, ok := slotKinds[slot]; !ok || isDefaultSlot(slot) || seen[slot] {
+			continue
+		}
+		seen[slot] = true
+		extra = append(extra, slot)
+	}
+	sort.Strings(extra)
+	return append([]string{SlotMic, SlotCam}, extra...)
+}
+
+// addSlotLocked creates the (subscriber, publisher, slot) output track if it
+// does not exist yet. It returns true when a track was added. Callers must
+// hold mu.
+func (r *Router) addSlotLocked(pc *PeerConnectionWrapper, subscriberID, publisherID string, t *pubTrack, slot string) bool {
+	kind, ok := slotKinds[slot]
+	if !ok {
+		return false
+	}
+	set := t.slots(kind)
+	if _, exists := set[slot]; exists {
+		return false
+	}
+
+	codec := webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2}
+	if kind == webrtc.RTPCodecTypeVideo {
+		codec = webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000}
+	}
+	track, err := webrtc.NewTrackLocalStaticRTP(codec, slotTrackID(publisherID, slot), slotStreamID(publisherID, slot))
+	if err != nil {
+		r.logger.Warn("router: create output track failed",
+			zap.String("subscriber_id", subscriberID), zap.String("publisher_id", publisherID),
+			zap.String("slot", slot), zap.Error(err))
+		return false
+	}
+	sender, err := pc.AddTrack(track)
+	if err != nil {
+		r.logger.Warn("router: add output track failed",
+			zap.String("subscriber_id", subscriberID), zap.String("publisher_id", publisherID),
+			zap.String("slot", slot), zap.Error(err))
+		return false
+	}
+	set[slot] = &pubSlot{track: track, sender: sender}
+
+	// RTCP coming back from the subscriber only reaches the interceptor chain
+	// when the sender is READ: without this loop NACKs never trigger a
+	// retransmission (inflating the loss the client info dialog reports, 57)
+	// and a subscriber's PLI/FIR never reaches the publisher.
+	go r.rtcpRelayLoop(subscriberID, sender)
+	r.logger.Debug("router: publisher track added",
+		zap.String("subscriber_id", subscriberID),
+		zap.String("publisher_id", publisherID),
+		zap.String("slot", slot),
+	)
+	return true
+}
+
+// removeSlotLocked tears down one (subscriber, publisher, slot) output track.
+// It returns true when a track was removed. Callers must hold mu.
+func (r *Router) removeSlotLocked(pc *PeerConnectionWrapper, t *pubTrack, slot string) bool {
+	kind, ok := slotKinds[slot]
+	if !ok {
+		return false
+	}
+	set := t.slots(kind)
+	s, exists := set[slot]
+	if !exists {
+		return false
+	}
+	if pc != nil && s.sender != nil {
+		_ = pc.pc.RemoveTrack(s.sender)
+	}
+	delete(set, slot)
+	return true
+}
+
+// addPublisherLocked creates the per-publisher output tracks for (subscriber,
+// publisher) — one per slot the publisher occupies — if the subscriber has a
+// peer connection and they do not exist yet. Self pairs (subscriber ==
+// publisher) are only created by the echo-channel path; all other callers
+// exclude them. It returns true when tracks were added. Callers must hold mu.
 func (r *Router) addPublisherLocked(subscriberID, publisherID string) bool {
 	pc, ok := r.pubPeers[subscriberID]
 	if !ok {
@@ -375,55 +583,30 @@ func (r *Router) addPublisherLocked(subscriberID, publisherID string) bool {
 		tracks = make(map[string]*pubTrack)
 		r.pubTracks[subscriberID] = tracks
 	}
-	if _, exists := tracks[publisherID]; exists {
-		return false
+	t, existed := tracks[publisherID]
+	if !existed {
+		t = &pubTrack{audio: make(map[string]*pubSlot), video: make(map[string]*pubSlot)}
+		tracks[publisherID] = t
 	}
 
-	audioTrack, err := webrtc.NewTrackLocalStaticRTP(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2},
-		publisherID, "voicx",
-	)
-	if err != nil {
-		r.logger.Warn("router: create audio track failed",
-			zap.String("subscriber_id", subscriberID), zap.String("publisher_id", publisherID), zap.Error(err))
-		return false
+	changed := false
+	for _, slot := range r.publisherSlotsLocked(publisherID) {
+		if r.addSlotLocked(pc, subscriberID, publisherID, t, slot) {
+			changed = true
+		}
 	}
-	audioSender, err := pc.AddTrack(audioTrack)
-	if err != nil {
-		r.logger.Warn("router: add audio track failed",
-			zap.String("subscriber_id", subscriberID), zap.String("publisher_id", publisherID), zap.Error(err))
-		return false
+	if !existed && !changed {
+		// Track creation failed outright; do not leave an empty pair behind.
+		delete(tracks, publisherID)
+		if len(tracks) == 0 {
+			delete(r.pubTracks, subscriberID)
+		}
 	}
-
-	videoTrack, err := webrtc.NewTrackLocalStaticRTP(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000},
-		publisherID, "voicx",
-	)
-	if err != nil {
-		r.logger.Warn("router: create video track failed",
-			zap.String("subscriber_id", subscriberID), zap.String("publisher_id", publisherID), zap.Error(err))
-		return false
-	}
-	videoSender, err := pc.AddTrack(videoTrack)
-	if err != nil {
-		r.logger.Warn("router: add video track failed",
-			zap.String("subscriber_id", subscriberID), zap.String("publisher_id", publisherID), zap.Error(err))
-		return false
-	}
-
-	tracks[publisherID] = &pubTrack{
-		audio: audioTrack, audioSender: audioSender,
-		video: videoTrack, videoSender: videoSender,
-	}
-	r.logger.Debug("router: publisher track added",
-		zap.String("subscriber_id", subscriberID),
-		zap.String("publisher_id", publisherID),
-	)
-	return true
+	return changed
 }
 
-// removePublisherLocked tears down the (subscriber, publisher) tracks. It
-// returns true when tracks were removed. Callers must hold mu.
+// removePublisherLocked tears down every (subscriber, publisher) output
+// track. It returns true when tracks were removed. Callers must hold mu.
 func (r *Router) removePublisherLocked(subscriberID, publisherID string) bool {
 	tracks, ok := r.pubTracks[subscriberID]
 	if !ok {
@@ -433,12 +616,10 @@ func (r *Router) removePublisherLocked(subscriberID, publisherID string) bool {
 	if !exists {
 		return false
 	}
-	if pc, ok := r.pubPeers[subscriberID]; ok {
-		if t.audioSender != nil {
-			_ = pc.pc.RemoveTrack(t.audioSender)
-		}
-		if t.videoSender != nil {
-			_ = pc.pc.RemoveTrack(t.videoSender)
+	pc := r.pubPeers[subscriberID]
+	for _, set := range []map[string]*pubSlot{t.audio, t.video} {
+		for slot := range set {
+			r.removeSlotLocked(pc, t, slot)
 		}
 	}
 	delete(tracks, publisherID)
@@ -452,9 +633,145 @@ func (r *Router) removePublisherLocked(subscriberID, publisherID string) bool {
 	return true
 }
 
+// SetTrackSlots records which slot each of a publisher's inbound tracks
+// occupies. slots is keyed by MSID track ID (as it appears in the client's
+// SDP offer) and REPLACES any previous declaration; an unlisted track takes
+// its kind's default slot. Extra output tracks are created for — or removed
+// from — every subscriber of the publisher, and those subscribers are
+// renegotiated. Unknown slot names are rejected: an inbound track the router
+// cannot place is dropped rather than merged into another slot (70).
+func (r *Router) SetTrackSlots(publisherID string, slots map[string]string) {
+	r.mu.Lock()
+	before := r.publisherSlotsLocked(publisherID)
+
+	declared := make(map[string]string, len(slots))
+	for trackID, slot := range slots {
+		if _, ok := slotKinds[slot]; !ok {
+			r.logger.Warn("router: ignoring unknown track slot",
+				zap.String("publisher_id", publisherID),
+				zap.String("track_id", trackID),
+				zap.String("slot", slot),
+			)
+			continue
+		}
+		declared[trackID] = slot
+	}
+	if len(declared) == 0 {
+		delete(r.trackSlots, publisherID)
+	} else {
+		r.trackSlots[publisherID] = declared
+	}
+	after := r.publisherSlotsLocked(publisherID)
+
+	added, removed := slotDiff(before, after)
+	renegotiate := make(map[string]bool)
+	if len(added) > 0 || len(removed) > 0 {
+		for sub, tracks := range r.pubTracks {
+			t, ok := tracks[publisherID]
+			if !ok {
+				continue
+			}
+			pc := r.pubPeers[sub]
+			for _, slot := range added {
+				if pc != nil && r.addSlotLocked(pc, sub, publisherID, t, slot) {
+					renegotiate[sub] = true
+				}
+			}
+			for _, slot := range removed {
+				if r.removeSlotLocked(pc, t, slot) {
+					renegotiate[sub] = true
+				}
+			}
+		}
+	}
+	hook := r.onRenegotiate
+	r.mu.Unlock()
+
+	if hook != nil {
+		for sub := range renegotiate {
+			hook(sub)
+		}
+	}
+}
+
+// slotDiff reports the slots present in after but not before, and vice versa.
+func slotDiff(before, after []string) (added, removed []string) {
+	had := make(map[string]bool, len(before))
+	for _, slot := range before {
+		had[slot] = true
+	}
+	has := make(map[string]bool, len(after))
+	for _, slot := range after {
+		has[slot] = true
+		if !had[slot] {
+			added = append(added, slot)
+		}
+	}
+	for _, slot := range before {
+		if !has[slot] {
+			removed = append(removed, slot)
+		}
+	}
+	return added, removed
+}
+
+// slotFor resolves the slot an inbound track occupies from the publisher's
+// declaration, falling back to the kind's default slot. A declaration naming
+// a slot of the wrong media kind is ignored.
+func (r *Router) slotFor(clientID, trackID string, kind webrtc.RTPCodecType) string {
+	r.mu.RLock()
+	slot := r.trackSlots[clientID][trackID]
+	r.mu.RUnlock()
+	if k, ok := slotKinds[slot]; ok && k == kind {
+		return slot
+	}
+	return defaultSlot(kind)
+}
+
+// claimSlot binds an inbound track to one of a publisher's slots for the
+// lifetime of its read loop. A slot carries exactly one source: a second
+// track claiming a live slot is refused, so an unexpected extra track is
+// dropped instead of being interleaved into the first track's output stream
+// (70). key is the slot for audio and slot+RID for video, whose simulcast
+// layers are separate inbound tracks of the same slot.
+func (r *Router) claimSlot(clientID, key string) (uint64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	claims, ok := r.slotClaims[clientID]
+	if !ok {
+		claims = make(map[string]uint64)
+		r.slotClaims[clientID] = claims
+	}
+	if _, taken := claims[key]; taken {
+		return 0, false
+	}
+	r.slotEpoch++
+	claims[key] = r.slotEpoch
+	return r.slotEpoch, true
+}
+
+// releaseSlot frees a claim made by claimSlot. The token stops a read loop
+// that outlived a peer rebuild from releasing the claim of the track that
+// replaced it.
+func (r *Router) releaseSlot(clientID, key string, token uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	claims, ok := r.slotClaims[clientID]
+	if !ok || claims[key] != token {
+		return
+	}
+	delete(claims, key)
+	if len(claims) == 0 {
+		delete(r.slotClaims, clientID)
+	}
+}
+
 // EnsurePublishers creates all missing publisher tracks between clientID and
-// the other members of its channel. It is called when a peer connection
-// attaches (the initial SDP answer then already contains all tracks).
+// the other members of its channel (plus the echo channel's self pair), and
+// asks the channel's video publishers for a keyframe (a freshly attached peer
+// decodes nothing until it gets one).
+// It is called when a peer connection attaches (the initial SDP answer then
+// already contains all tracks).
 func (r *Router) EnsurePublishers(clientID string) {
 	r.mu.Lock()
 	channelID, ok := r.clientChan[clientID]
@@ -474,9 +791,21 @@ func (r *Router) EnsurePublishers(clientID string) {
 			changed = true
 		}
 	}
+	// Echo channel (15): the self pair dies with the old peer connection, so a
+	// rebuild has to recreate it or the client stops hearing itself.
+	if channelID == r.echoChannel && r.echoChannel != 0 {
+		if r.addPublisherLocked(clientID, clientID) {
+			changed = true
+		}
+	}
+	keyframeTargets := r.videoPublishersLocked(channelID, clientID)
+	pref := r.layerPrefLocked(clientID)
 	hook := r.onRenegotiate
 	r.mu.Unlock()
 
+	for _, ref := range keyframeTargets {
+		r.RequestKeyframe(ref.publisher, ref.slot, pref)
+	}
 	if changed && hook != nil {
 		hook(clientID)
 	}
@@ -568,6 +897,29 @@ func (r *Router) SetWhisper(clientID string, clients []string, channels []int64,
 	)
 }
 
+// WhisperTargets returns the client IDs an ACTIVE whisper by clientID reaches
+// right now (nil when the client is not whispering). The control server needs
+// it to tell the RECEIVING side that a transmission was a whisper and who sent
+// it — a whisper is otherwise indistinguishable from ordinary channel audio
+// once it leaves the router (32/33).
+func (r *Router) WhisperTargets(clientID string) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	cfg, ok := r.whispers[clientID]
+	if !ok || !cfg.active {
+		return nil
+	}
+	targets := r.whisperTargetsLocked(clientID, cfg)
+	if len(targets) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(targets))
+	for id := range targets {
+		out = append(out, id)
+	}
+	return out
+}
+
 // whisperTargetsLocked computes the subscriber IDs a whisper configuration
 // targets (listed clients plus members of the listed channels), excluding
 // the whisperer itself. Callers must hold at least a read lock.
@@ -612,11 +964,12 @@ func (r *Router) AttachPeer(clientID string, pc *PeerConnectionWrapper) error {
 	r.mu.Unlock()
 
 	pc.OnTrack(func(remote *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		slot := r.slotFor(clientID, remote.ID(), remote.Kind())
 		switch remote.Kind() {
 		case webrtc.RTPCodecTypeAudio:
-			go r.ReadLoop(clientID, remote, audioLevelExtID(receiver))
+			go r.ReadLoop(clientID, slot, remote, audioLevelExtID(receiver))
 		case webrtc.RTPCodecTypeVideo:
-			go r.ReadVideoLoop(clientID, remote)
+			go r.ReadVideoLoop(clientID, slot, remote)
 		default:
 			r.logger.Debug("router: ignoring unknown track kind",
 				zap.String("client_id", clientID),
@@ -633,6 +986,21 @@ func (r *Router) AttachPeer(clientID string, pc *PeerConnectionWrapper) error {
 // tracks in both directions, tap outputs, RTCP writer, video sources, layer
 // preference, whisper configuration, and channel membership.
 func (r *Router) DetachPeer(clientID string) {
+	r.detachPeer(clientID, true)
+}
+
+// DetachPeerKeepChannel is DetachPeer without the channel leave, for peer
+// rebuilds (re-offer / ICE restart). Channel membership belongs to the control
+// server: leaving and re-joining it here would silently undo a move that lands
+// during the rebuild, leaving the router routing the client to the audio of
+// the channel it just left (59). The client's slot declarations also survive,
+// because they describe the offer that triggers the rebuild (70).
+func (r *Router) DetachPeerKeepChannel(clientID string) {
+	r.detachPeer(clientID, false)
+}
+
+// detachPeer implements DetachPeer / DetachPeerKeepChannel.
+func (r *Router) detachPeer(clientID string, leaveChannel bool) {
 	r.mu.Lock()
 	delete(r.pubPeers, clientID)
 	delete(r.outputs, clientID)
@@ -648,6 +1016,12 @@ func (r *Router) DetachPeer(clientID string) {
 	}
 	delete(r.layerPrefs, clientID)
 	delete(r.videoSources, clientID)
+	// The inbound tracks die with the peer connection, so their slots are
+	// free again even if the read loops have not noticed yet.
+	delete(r.slotClaims, clientID)
+	if leaveChannel {
+		delete(r.trackSlots, clientID)
+	}
 	// Remove pairs where clientID is the subscriber.
 	delete(r.pubTracks, clientID)
 	// Remove pairs where clientID is the publisher.
@@ -671,31 +1045,43 @@ func (r *Router) DetachPeer(clientID string) {
 			hook(sub)
 		}
 	}
-	if ok {
+	if ok && leaveChannel {
 		r.LeaveChannel(channelID, clientID)
 	}
 }
 
 // ForwardRTP fans pkt out to the appropriate subscribers of senderID: the
 // whisper targets when the sender is whispering, otherwise the other members
-// of the sender's current channel. Each subscriber receives the packet on
-// its dedicated per-publisher track for senderID; taps (e.g. recorders)
+// of the sender's current channel. Each subscriber receives the packet on its
+// dedicated (publisher, slot) track; a packet whose slot has no output track
+// is dropped rather than written somewhere else (70). Taps (e.g. recorders)
 // receive it on their single output track. The sender never receives its own
 // audio. It returns the number of successful writes.
-func (r *Router) ForwardRTP(senderID string, pkt *rtp.Packet) int {
+//
+// pkt is passed to every writer unchanged and uncloned (see TrackWriter's
+// aliasing contract). The two slices built here — targetSubscribersLocked's
+// result and the writers slice — are the only remaining per-packet
+// allocations on the audio hot path (436).
+func (r *Router) ForwardRTP(senderID, slot string, pkt *rtp.Packet) int {
 	r.mu.RLock()
 	subs := r.targetSubscribersLocked(senderID)
 	writers := make([]TrackWriter, 0, len(subs)+1)
 	for _, sub := range subs {
 		if tracks, ok := r.pubTracks[sub]; ok {
-			if t, ok := tracks[senderID]; ok && t.audio != nil {
-				writers = append(writers, t.audio)
+			if t, ok := tracks[senderID]; ok {
+				if s, ok := t.audio[slot]; ok {
+					writers = append(writers, s.track)
+				}
 			}
 		}
 	}
-	// Taps receive everything from the channel.
-	if w, ok := r.outputs[r.senderTapID(senderID)]; ok {
-		writers = append(writers, w)
+	// Taps receive everything from the channel, but they have a single audio
+	// output track: only the microphone slot may ride it, or the recording
+	// would be two sources muxed into one SSRC (70).
+	if slot == SlotMic {
+		if w, ok := r.outputs[r.senderTapID(senderID)]; ok {
+			writers = append(writers, w)
+		}
 	}
 	r.mu.RUnlock()
 
@@ -778,17 +1164,65 @@ func (r *Router) targetSubscribersLocked(senderID string) []string {
 }
 
 // ReadLoop reads RTP packets from an incoming audio track until the track
-// ends or errors, feeding the VAD and forwarding each packet. extID is the
-// negotiated ssrc-audio-level header extension ID, or 0 when the extension
-// was not negotiated (VAD disabled).
-func (r *Router) ReadLoop(clientID string, track TrackReader, extID uint8) {
+// ends or errors, feeding the VAD and forwarding each packet on the given
+// slot. extID is the negotiated ssrc-audio-level header extension ID, or 0
+// when the extension was not negotiated (VAD disabled).
+func (r *Router) ReadLoop(clientID, slot string, track TrackReader, extID uint8) {
+	token, claimed := r.claimSlot(clientID, slot)
+	if !claimed {
+		r.logger.Warn("router: dropping audio track, slot already in use",
+			zap.String("client_id", clientID),
+			zap.String("slot", slot),
+		)
+		return
+	}
+	defer r.releaseSlot(clientID, slot, token)
+
+	if slot != SlotMic {
+		// Screen audio must not drive the speaking indicator, so it runs
+		// without VAD — which is also the only thing that re-evaluates the
+		// talk gate, hence the one-shot check here (70).
+		if !r.allowTalk(clientID) {
+			r.mu.RLock()
+			music := r.isMusicChannelLocked(clientID)
+			r.mu.RUnlock()
+			if !music {
+				r.logger.Info("router: audio publish denied",
+					zap.String("client_id", clientID),
+					zap.String("slot", slot),
+				)
+				return
+			}
+		}
+		extID = 0
+	}
+
 	v := &vad{}
 	muted := false
 
+	var nonMicPkts uint64
 	for {
 		pkt, _, err := track.ReadRTP()
 		if err != nil {
 			break
+		}
+
+		if slot != SlotMic {
+			nonMicPkts++
+			if nonMicPkts%50 == 0 {
+				if !r.allowTalk(clientID) {
+					r.mu.RLock()
+					music := r.isMusicChannelLocked(clientID)
+					r.mu.RUnlock()
+					if !music {
+						r.logger.Info("router: audio publish revoked",
+							zap.String("client_id", clientID),
+							zap.String("slot", slot),
+						)
+						break
+					}
+				}
+			}
 		}
 
 		if extID != 0 {
@@ -819,7 +1253,7 @@ func (r *Router) ReadLoop(clientID string, track TrackReader, extID uint8) {
 		if muted {
 			continue
 		}
-		r.ForwardRTP(clientID, pkt)
+		r.ForwardRTP(clientID, slot, pkt)
 	}
 
 	// Track ended: make sure the client does not stay marked as speaking.
@@ -977,11 +1411,12 @@ func (r *Router) senderVideoTapID(senderID string) string {
 }
 
 // ReadVideoLoop reads RTP packets from an incoming video track until the
-// track ends or errors and forwards each packet. Video from clients without
-// publish permission is dropped (the gate is evaluated once at track start).
-// The track's RID (empty for non-simulcast) is registered so subscribers can
-// select layers and PLIs can be routed back to this publisher.
-func (r *Router) ReadVideoLoop(clientID string, track VideoTrackReader) {
+// track ends or errors and forwards each packet on the given slot. Video from
+// clients without publish permission is dropped (the gate is evaluated once
+// at track start). The track's RID (empty for non-simulcast) is registered
+// under the slot so subscribers can select layers and PLIs can be routed back
+// to this publisher.
+func (r *Router) ReadVideoLoop(clientID, slot string, track VideoTrackReader) {
 	if !r.allowVideo(clientID) {
 		r.logger.Info("router: video publish denied",
 			zap.String("client_id", clientID),
@@ -991,20 +1426,48 @@ func (r *Router) ReadVideoLoop(clientID string, track VideoTrackReader) {
 
 	rid := track.RID()
 	ssrc := uint32(track.SSRC())
+	// Simulcast layers are separate inbound tracks of the SAME slot, so the
+	// RID is part of the claim key (70).
+	claimKey := slot + slotSep + rid
+	token, claimed := r.claimSlot(clientID, claimKey)
+	if !claimed {
+		r.logger.Warn("router: dropping video track, slot layer already in use",
+			zap.String("client_id", clientID),
+			zap.String("slot", slot),
+			zap.String("rid", rid),
+		)
+		return
+	}
+	defer r.releaseSlot(clientID, claimKey, token)
+
 	r.mu.Lock()
-	src, ok := r.videoSources[clientID]
+	bySlot, ok := r.videoSources[clientID]
+	if !ok {
+		bySlot = make(map[string]map[string]uint32)
+		r.videoSources[clientID] = bySlot
+	}
+	src, ok := bySlot[slot]
 	if !ok {
 		src = make(map[string]uint32)
-		r.videoSources[clientID] = src
+		bySlot[slot] = src
 	}
 	src[rid] = ssrc
 	r.mu.Unlock()
 
 	defer func() {
 		r.mu.Lock()
-		delete(src, rid)
-		if len(src) == 0 {
-			delete(r.videoSources, clientID)
+		// Re-look up: a peer rebuild may have replaced these maps, and this
+		// loop must not unregister the layer that succeeded it.
+		if bySlot := r.videoSources[clientID]; bySlot != nil {
+			if src := bySlot[slot]; src[rid] == ssrc {
+				delete(src, rid)
+				if len(src) == 0 {
+					delete(bySlot, slot)
+				}
+			}
+			if len(bySlot) == 0 {
+				delete(r.videoSources, clientID)
+			}
 		}
 		r.mu.Unlock()
 	}()
@@ -1014,31 +1477,42 @@ func (r *Router) ReadVideoLoop(clientID string, track VideoTrackReader) {
 		if err != nil {
 			return
 		}
-		r.ForwardVideo(clientID, rid, pkt)
+		r.ForwardVideo(clientID, slot, rid, pkt)
 	}
 }
 
 // ForwardVideo fans a video packet out to the appropriate subscribers
-// (channel members or whisper targets, sender excluded) on their
-// per-publisher tracks for senderID, filtered by each subscriber's simulcast
-// layer preference. Taps receive it on their single output track. It returns
-// the number of successful writes.
-func (r *Router) ForwardVideo(senderID, rid string, pkt *rtp.Packet) int {
+// (channel members or whisper targets, sender excluded) on their (publisher,
+// slot) tracks for senderID, filtered by each subscriber's simulcast layer
+// preference. A packet whose slot has no output track is dropped rather than
+// written somewhere else (70). Taps receive it on their single output track.
+// It returns the number of successful writes.
+//
+// Like ForwardRTP, pkt reaches every writer unchanged and uncloned (see
+// TrackWriter's aliasing contract), and the subscriber and accepted slices are
+// the only remaining per-packet allocations on the video hot path (436).
+func (r *Router) ForwardVideo(senderID, slot, rid string, pkt *rtp.Packet) int {
 	r.mu.RLock()
 	subs := r.targetSubscribersLocked(senderID)
 	accepted := make([]TrackWriter, 0, len(subs)+1)
 	for _, sub := range subs {
-		if !r.acceptLayerLocked(sub, senderID, rid) {
+		if !r.acceptLayerLocked(sub, senderID, slot, rid) {
 			continue
 		}
 		if tracks, ok := r.pubTracks[sub]; ok {
-			if t, ok := tracks[senderID]; ok && t.video != nil {
-				accepted = append(accepted, t.video)
+			if t, ok := tracks[senderID]; ok {
+				if s, ok := t.video[slot]; ok {
+					accepted = append(accepted, s.track)
+				}
 			}
 		}
 	}
-	if w, ok := r.videoOutputs[r.senderVideoTapID(senderID)]; ok {
-		accepted = append(accepted, w)
+	// A tap has one video output track, so only the primary video slot may
+	// ride it (see ForwardRTP).
+	if slot == SlotCam {
+		if w, ok := r.videoOutputs[r.senderVideoTapID(senderID)]; ok {
+			accepted = append(accepted, w)
+		}
 	}
 	r.mu.RUnlock()
 
@@ -1079,20 +1553,38 @@ func (r *Router) SetVideoQuality(clientID, quality string) error {
 	r.mu.Lock()
 	r.layerPrefs[clientID] = rid
 	channelID, inChannel := r.clientChan[clientID]
-	var publishers []string
+	var publishers []videoSourceRef
 	if inChannel {
-		for publisherID := range r.videoSources {
-			if publisherID != clientID && r.members[channelID][publisherID] {
-				publishers = append(publishers, publisherID)
-			}
-		}
+		publishers = r.videoPublishersLocked(channelID, clientID)
 	}
 	r.mu.Unlock()
 
-	for _, publisherID := range publishers {
-		r.RequestKeyframe(publisherID, rid)
+	for _, ref := range publishers {
+		r.RequestKeyframe(ref.publisher, ref.slot, rid)
 	}
 	return nil
+}
+
+// videoSourceRef names one video-publishing slot of one publisher.
+type videoSourceRef struct {
+	publisher string
+	slot      string
+}
+
+// videoPublishersLocked lists the video slots currently published by the
+// members of channelID, excluding exclude. Callers must hold at least a read
+// lock.
+func (r *Router) videoPublishersLocked(channelID int64, exclude string) []videoSourceRef {
+	var out []videoSourceRef
+	for publisherID, bySlot := range r.videoSources {
+		if publisherID == exclude || !r.members[channelID][publisherID] {
+			continue
+		}
+		for slot := range bySlot {
+			out = append(out, videoSourceRef{publisher: publisherID, slot: slot})
+		}
+	}
+	return out
 }
 
 // layerPrefLocked returns the subscriber's preferred RID, defaulting to "h"
@@ -1118,11 +1610,11 @@ func layerFallback(pref string) []string {
 	}
 }
 
-// acceptLayerLocked reports whether a packet from publisher carrying the
-// given RID should be forwarded to subscriber. Callers must hold at least a
-// read lock.
-func (r *Router) acceptLayerLocked(subscriber, publisher, rid string) bool {
-	src := r.videoSources[publisher]
+// acceptLayerLocked reports whether a packet from one of publisher's video
+// slots carrying the given RID should be forwarded to subscriber. Callers
+// must hold at least a read lock.
+func (r *Router) acceptLayerLocked(subscriber, publisher, slot, rid string) bool {
+	src := r.videoSources[publisher][slot]
 	// Unknown publisher or non-simulcast (no RIDs published): accept all.
 	if len(src) == 0 {
 		return true
@@ -1139,14 +1631,14 @@ func (r *Router) acceptLayerLocked(subscriber, publisher, rid string) bool {
 }
 
 // RequestKeyframe sends a Picture Loss Indication to the publisher's peer
-// connection for the given layer's SSRC (or any known SSRC of the publisher
+// connection for the given slot's layer SSRC (or any known SSRC of that slot
 // when the layer is unknown). It is a no-op when the publisher is unknown or
 // has no RTCP writer.
-func (r *Router) RequestKeyframe(publisherID, rid string) {
+func (r *Router) RequestKeyframe(publisherID, slot, rid string) {
 	r.mu.RLock()
 	w := r.rtcpWriters[publisherID]
 	var ssrc uint32
-	if src, ok := r.videoSources[publisherID]; ok {
+	if src, ok := r.videoSources[publisherID][slot]; ok {
 		if s, ok := src[rid]; ok {
 			ssrc = s
 		} else {
@@ -1158,7 +1650,7 @@ func (r *Router) RequestKeyframe(publisherID, rid string) {
 	}
 	r.mu.RUnlock()
 
-	if w == nil {
+	if w == nil || ssrc == 0 || !r.allowKeyframeRequest(ssrc, time.Now()) {
 		return
 	}
 	if err := w.WriteRTCP([]rtcp.Packet{
@@ -1171,9 +1663,11 @@ func (r *Router) RequestKeyframe(publisherID, rid string) {
 	}
 }
 
-// rtcpRelayLoop reads RTCP from a subscriber's video sender and relays
+// rtcpRelayLoop drains RTCP from one of a subscriber's senders and relays
 // keyframe requests (PLI/FIR) to the publisher that owns the referenced SSRC.
-// It exits when the sender errors (peer connection closed).
+// Draining is the point even for audio senders: the read is what feeds the
+// interceptor chain (NACK responder, receiver-report bookkeeping). It exits
+// when the sender errors (track removed or peer connection closed).
 func (r *Router) rtcpRelayLoop(clientID string, sender *webrtc.RTPSender) {
 	for {
 		pkts, _, err := sender.ReadRTCP()
@@ -1196,18 +1690,20 @@ func (r *Router) rtcpRelayLoop(clientID string, sender *webrtc.RTPSender) {
 func (r *Router) relayKeyframeRequest(mediaSSRC uint32) {
 	r.mu.RLock()
 	var owner string
-	for publisherID, src := range r.videoSources {
-		for _, ssrc := range src {
-			if ssrc == mediaSSRC {
-				owner = publisherID
-				break
+	for publisherID, bySlot := range r.videoSources {
+		for _, src := range bySlot {
+			for _, ssrc := range src {
+				if ssrc == mediaSSRC {
+					owner = publisherID
+					break
+				}
 			}
 		}
 	}
 	w := r.rtcpWriters[owner]
 	r.mu.RUnlock()
 
-	if owner == "" || w == nil {
+	if owner == "" || w == nil || !r.allowKeyframeRequest(mediaSSRC, time.Now()) {
 		return
 	}
 	if err := w.WriteRTCP([]rtcp.Packet{
@@ -1218,6 +1714,21 @@ func (r *Router) relayKeyframeRequest(mediaSSRC uint32) {
 			zap.Error(err),
 		)
 	}
+}
+
+// keyframeRequestWindow coalesces simultaneous subscriber PLIs/FIRs. One
+// upstream keyframe repairs every subscriber on a source; forwarding the
+// entire burst only causes avoidable publisher encoder spikes.
+const keyframeRequestWindow = time.Second
+
+func (r *Router) allowKeyframeRequest(ssrc uint32, now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if last := r.keyframeLast[ssrc]; !last.IsZero() && now.Sub(last) < keyframeRequestWindow {
+		return false
+	}
+	r.keyframeLast[ssrc] = now
+	return true
 }
 
 // allowVideo evaluates the video-publish gate for clientID, defaulting to

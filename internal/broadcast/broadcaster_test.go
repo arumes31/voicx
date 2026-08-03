@@ -64,7 +64,7 @@ func TestBroadcastSnapshotDeliversToAll(t *testing.T) {
 	ch1, _ := b.Register("c1")
 	ch2, _ := b.Register("c2")
 
-	b.BroadcastSnapshot()
+	b.BroadcastSnapshot(false, "")
 
 	for i, ch := range []<-chan []byte{ch1, ch2} {
 		select {
@@ -75,6 +75,29 @@ func TestBroadcastSnapshotDeliversToAll(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatalf("client %d did not receive snapshot", i)
 		}
+	}
+}
+
+// TestBroadcastSnapshotHidesInvisible verifies the viewer/admin flags reach
+// BuildSnapshot: a fan-out must not leak invisible users (381).
+func TestBroadcastSnapshotHidesInvisible(t *testing.T) {
+	b, sm := newTestBroadcaster(t)
+	defer b.Close()
+
+	sm.AddChannel(&state.Channel{ChannelID: 1, Name: "root", CreatedAt: time.Now()})
+	sm.AddClient(&state.Client{ClientID: "g1", UniqueID: "ghost-uid", Nickname: "Ghost", Status: "invisible", ConnectedAt: time.Now()})
+	_ = sm.JoinChannel("g1", 1)
+
+	ch, _ := b.Register("c1")
+	b.BroadcastSnapshot(false, "")
+
+	select {
+	case msg := <-ch:
+		if strings.Contains(string(msg), "Ghost") {
+			t.Fatalf("invisible user leaked into the fan-out snapshot: %s", string(msg))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("did not receive snapshot")
 	}
 }
 

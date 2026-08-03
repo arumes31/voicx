@@ -13,6 +13,8 @@ export const MATRIX_EVENTS = [
     ["mention", "mention"],
     ["keyword", "keyword highlight"],
     ["dm", "direct message"],
+    ["channel_message", "channel message"],
+    ["whisper", "voice whisper"],
     ["poke", "poke"],
     ["join_leave", "join/leave (your channel)"],
     ["buddy_online", "watched contact online"],
@@ -21,12 +23,26 @@ export const MATRIX_EVENTS = [
     ["channel_watch", "channel watch"],
 ];
 
-// matrixRow returns the effective outputs for an event (defaults: all on
-// except native for chatty events).
+// TOAST_CATEGORY maps a matrix event to the toast category the toast filter
+// keys on. Only join/leave is "social" — the notify_join_leave toggle must
+// not swallow mentions, DMs, pokes, kicks or announcements.
+const TOAST_CATEGORY = {
+    join_leave: "social",
+};
+
+// defaultMatrixRow is the fallback output set for an event (defaults: all on
+// except native for chatty events). (32) whisper defaults to sound + flash +
+// native: an incoming voice whisper is addressed at you personally. (385) the
+// settings grid seeds unset rows from here, so the checkboxes a user sees are
+// the ones dispatch actually uses.
+export function defaultMatrixRow(event) {
+    const direct = event === "mention" || event === "poke" || event === "dm" || event === "whisper";
+    return { toast: true, sound: true, flash: event !== "join_leave" && event !== "buddy_online", native: direct };
+}
+
+// matrixRow returns the effective outputs for an event.
 function matrixRow(event) {
-    const m = V().state.settings?.notify_matrix?.[event];
-    if (m) return m;
-    return { toast: true, sound: true, flash: event !== "join_leave" && event !== "buddy_online", native: event === "mention" || event === "poke" || event === "dm" };
+    return V().state.settings?.notify_matrix?.[event] || defaultMatrixRow(event);
 }
 
 // channelKey builds the per-channel override key ("addr#channelID").
@@ -70,7 +86,7 @@ export function notify(event, text, ctx = {}) {
     if (window.__voicxPolish?.dndActive?.()) return;
     if (!overrideAllows(ctx.channelID, ctx.className || "messages", true)) return;
     const row = matrixRow(event);
-    if (row.toast) V().toast(text, ctx.kind || "info", ctx.category || "social");
+    if (row.toast) V().toast(text, ctx.kind || "info", ctx.category || TOAST_CATEGORY[event] || "alert");
     if (row.sound && !ctx.noSound) playEventSound(event);
     if (row.flash) App().FlashWindow();
     if (row.native && !document.hasFocus()) App().Notify("voicx " + event, text.slice(0, 200));
@@ -141,22 +157,128 @@ export function matchKeyword(text) {
 // Channel watch (389)
 // ---------------------------------------------------------------------------
 
-let watchCounts = new Map(); // channelID -> last seen user count
+let watchCounts = new Map(); // override key -> last seen user count
 
 // checkChannelWatch fires when a watched channel crosses 0→threshold.
 export function checkChannelWatch() {
+    const addr = V().state.lastConnect?.addr || "";
     const overrides = V().state.settings?.channel_notify || {};
     for (const [key, ov] of Object.entries(overrides)) {
         if (!ov.watch_threshold) continue;
-        const channelID = Number(key.split("#")[1]);
+        // keys are "addr#channelID": a threshold set on another server must not
+        // fire against a same-numbered channel here.
+        const cut = key.lastIndexOf("#");
+        if (cut < 0 || key.slice(0, cut) !== addr) continue;
+        const channelID = Number(key.slice(cut + 1));
         const count = V().state.clients.filter((c) => c.channel_id === channelID).length;
-        const prev = watchCounts.get(channelID) ?? count;
+        const prev = watchCounts.get(key) ?? count;
         if (prev < ov.watch_threshold && count >= ov.watch_threshold) {
             const ch = V().state.channels.find((c) => c.ChannelID === channelID);
-            notify("channel_watch", `#${ch ? ch.Name : channelID} now has ${count} user(s)`, { className: "joins", kind: "info" });
+            notify("channel_watch", `#${ch ? ch.Name : channelID} now has ${count} user(s)`, { channelID, className: "joins", kind: "info" });
         }
-        watchCounts.set(channelID, count);
+        watchCounts.set(key, count);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Server rules gate (216)
+// ---------------------------------------------------------------------------
+
+let rulesOverlay = null;
+let rulesHash = "";
+
+// resetServerRules removes a gate when its server tab is closed or switched
+// away from. If the newly active tab also has pending rules, its journaled
+// server_rules frame immediately creates the correct gate again.
+export function resetServerRules() {
+    if (rulesOverlay) rulesOverlay.remove();
+    rulesOverlay = null;
+    rulesHash = "";
+}
+
+export function showServerRules(json) {
+    let rules;
+    try {
+        rules = typeof json === "string" ? JSON.parse(json) : json;
+    } catch {
+        V().toast("server sent malformed rules", "warn");
+        return;
+    }
+    if (!rules?.text || !rules?.hash) {
+        resetServerRules(); // an empty ServerRules frame is the accept ack
+        return;
+    }
+
+    // The rules gate owns the first-join decision. Do not leave a lower-priority
+    // startup reminder hidden underneath it.
+    document.querySelector(".alpha-notice")?.remove();
+    document.querySelector(".identity-backup-nag")?.remove();
+    resetServerRules();
+    rulesHash = rules.hash;
+
+    const overlay = document.createElement("div");
+    overlay.className = "dlg-overlay server-rules-gate";
+    overlay.dataset.blocking = "true";
+    const dlg = document.createElement("div");
+    dlg.className = "dlg dlg-wide";
+    const title = document.createElement("h3");
+    title.textContent = "Server rules";
+    const intro = document.createElement("p");
+    intro.className = "dlg-text";
+    intro.textContent = "You must accept these rules before joining channels or using chat.";
+    const body = document.createElement("div");
+    body.className = "dlg-text server-rules-text";
+    body.textContent = rules.text; // operator text is data, never HTML
+    const status = document.createElement("div");
+    status.className = "set-hint";
+    const buttons = document.createElement("div");
+    buttons.className = "dlg-buttons";
+    const decline = document.createElement("button");
+    decline.className = "dlg-cancel";
+    decline.textContent = "Decline and disconnect";
+    const accept = document.createElement("button");
+    accept.className = "dlg-ok";
+    accept.textContent = "Accept";
+    buttons.appendChild(decline);
+    buttons.appendChild(accept);
+    dlg.appendChild(title);
+    dlg.appendChild(intro);
+    dlg.appendChild(body);
+    dlg.appendChild(status);
+    dlg.appendChild(buttons);
+    overlay.appendChild(dlg);
+    document.body.appendChild(overlay);
+    rulesOverlay = overlay;
+
+    decline.onclick = async () => {
+        decline.disabled = true;
+        accept.disabled = true;
+        status.textContent = "disconnecting…";
+        await App().Disconnect();
+        resetServerRules();
+    };
+    accept.onclick = async () => {
+        decline.disabled = true;
+        accept.disabled = true;
+        status.textContent = "recording acceptance…";
+        const acceptedHash = rulesHash;
+        const err = await App().AcceptServerRules(acceptedHash);
+        if (err) {
+            status.textContent = err;
+            decline.disabled = false;
+            accept.disabled = false;
+            return;
+        }
+        // Success is acknowledged by an empty ServerRules frame. A timeout
+        // keeps a dropped response from stranding the user behind dead buttons.
+        setTimeout(() => {
+            if (rulesOverlay === overlay && rulesHash === acceptedHash) {
+                status.textContent = "no response from server — try again";
+                decline.disabled = false;
+                accept.disabled = false;
+            }
+        }, 10000);
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -167,8 +289,9 @@ export function maybeAlphaNotice(force = false) {
     const s = V().state.settings;
     const ver = V().state.clientVersion || "";
     if (!s || !ver || (!force && s.alpha_dismissed === ver)) return;
+    if (document.querySelector(".server-rules-gate")) return;
     const overlay = document.createElement("div");
-    overlay.className = "dlg-overlay";
+    overlay.className = "dlg-overlay alpha-notice";
     overlay.innerHTML = `
         <div class="dlg">
             <h3>voicx is alpha software</h3>
@@ -189,12 +312,71 @@ export function maybeAlphaNotice(force = false) {
     document.body.appendChild(overlay);
 }
 
+// ---------------------------------------------------------------------------
+// Identity backup reminder (353)
+// ---------------------------------------------------------------------------
+
+// backupNagSnoozed is deliberately session-scoped and NOT persisted: an
+// identity that was never exported dies with the machine, so "Later" only
+// silences the reminder until the next start — it comes back until an export
+// actually happened.
+let backupNagSnoozed = false;
+
+// maybeIdentityBackupNag prompts to export the active identity while it has
+// never been backed up (353).
+export async function maybeIdentityBackupNag(force = false) {
+    if (backupNagSnoozed && !force) return;
+    if (document.querySelector(".server-rules-gate")) return;
+    if (document.querySelector(".identity-backup-nag")) return;
+    let pending = false;
+    try {
+        pending = await App().IdentityBackupPending();
+    } catch {
+        return;
+    }
+    if (!pending) return;
+    const overlay = document.createElement("div");
+    overlay.className = "dlg-overlay identity-backup-nag";
+    overlay.innerHTML = `
+        <div class="dlg">
+            <h3>Back up your identity</h3>
+            <div class="dlg-text">
+                <p>Your identity key has never been exported. It <b>is</b> your account on every
+                server you have joined — if this machine dies, no one can restore it for you.</p>
+                <p>Export it once and keep the file somewhere safe.</p>
+            </div>
+            <div class="dlg-buttons">
+                <button class="dlg-ok">Export now…</button>
+                <button class="dlg-cancel">Later</button>
+            </div>
+        </div>`;
+    overlay.querySelector(".dlg-ok").onclick = async () => {
+        const err = await App().ExportIdentity("");
+        if (err) {
+            V().toast("export failed: " + err, "warn");
+            return;
+        }
+        overlay.remove();
+        if (await App().IdentityBackupPending()) V().toast("identity not exported yet", "warn");
+        else V().toast("identity exported — keep the file safe");
+    };
+    overlay.querySelector(".dlg-cancel").onclick = () => {
+        backupNagSnoozed = true;
+        overlay.remove();
+    };
+    document.body.appendChild(overlay);
+}
+
 export function initNotifications() {
     window.__voicxNotify = {
         notify, checkBuddyOnline, resetBuddyWatch, matchKeyword,
         checkChannelWatch, channelOverride, saveChannelOverride, maybeAlphaNotice,
+        maybeIdentityBackupNag, resetServerRules,
     };
+    window.runtime.EventsOn("server_rules", showServerRules);
     const badge = document.getElementById("alpha-badge");
     if (badge) badge.onclick = () => maybeAlphaNotice(true);
     setTimeout(() => maybeAlphaNotice(false), 1200);
+    // (353) after the alpha notice so two modals never stack on first run.
+    setTimeout(() => maybeIdentityBackupNag(false), 3000);
 }

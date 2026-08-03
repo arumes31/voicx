@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1.6
 # =============================================================================
-# voicx - TeamSpeak-like voice/video server (Phase 1 base image)
+# voicx - voice/video server (Phase 1 base image)
 # =============================================================================
 # Multi-stage build:
-#   1. builder  - compiles a static Go binary from golang:1.22-alpine
+#   1. builder  - compiles a static Go binary from golang:1.26-alpine
 #   2. runtime  - minimal alpine:3.20 image running as a non-root user
 #
 # NOTE on CGO: Phase 1 keeps CGO_ENABLED=0 to produce a fully static binary
@@ -15,7 +15,7 @@
 # -----------------------------------------------------------------------------
 # Builder stage
 # -----------------------------------------------------------------------------
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 # Version metadata: .git is excluded from the build context (see
 # .dockerignore), so it is injected via --build-arg (from Makefile/compose).
@@ -82,16 +82,17 @@ COPY --from=builder /out/voicx /out/voicx
 USER 10001:10001
 
 # Expose the service ports:
-#   9987/udp   - voice transport (TeamSpeak-compatible default)
-#   10011/tcp  - ServerQuery / control (TeamSpeak-compatible default)
-#   10012/tcp  - ServerQuery admin/bot text protocol
-#   30033/tcp  - file transfer (token-authorized)
-#   50051/tcp  - gRPC signaling/control (reserved; listener arrives in a later phase)
-#   9090/tcp   - health/readiness HTTP endpoint (/healthz, /readyz)
-EXPOSE 9987/udp 10011/tcp 10012/tcp 30033/tcp 50051/tcp 9090/tcp
+#   12333/tcp  - TLS control channel
+#   12334/udp  - UDP keepalive/media support
+#   12335/tcp  - ServerQuery admin/bot text protocol
+#   12336/tcp  - file transfer (token-authorized)
+#   12337/tcp  - health/readiness HTTP endpoint (/healthz, /readyz)
+#   12338/tcp  - gRPC signaling/control (loopback-only by default)
+#   12339/tcp  - ServerQuery over SSH (disabled by default)
+EXPOSE 12333/tcp 12334/udp 12335/tcp 12336/tcp 12337/tcp 12338/tcp 12339/tcp
 
 # Liveness probe against the health endpoint.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget -qO- http://127.0.0.1:9090/healthz || exit 1
+    CMD wget -qO- http://127.0.0.1:12337/healthz || exit 1
 
 ENTRYPOINT ["/out/voicx"]

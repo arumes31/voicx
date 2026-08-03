@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,9 +45,9 @@ type connManager struct {
 
 	// tabID identifies the owning server tab (281). Empty means the legacy
 	// single-connection manager (tests, headless tools): events go out under
-	// their plain names. Tabbed managers route through tabSink, which
-	// forwards active-tab events under their plain names and journals
-	// background-tab events for replay on tab switch.
+	// their plain names. Tabbed managers route through tabSink, which journals
+	// state events for replay and also forwards active-tab events under their
+	// plain names.
 	tabID string
 
 	mu       sync.Mutex
@@ -56,11 +57,14 @@ type connManager struct {
 	uniqueID string
 	nickname string
 	isAdmin  bool
+	isGuest  bool
 	closed   bool
 	// lastSnapshot/lastChannelList cache the latest state frames so a tab
 	// switch can replay them (281).
 	lastSnapshot    string
 	lastChannelList string
+	// lastSubscriptions is the newest authoritative subscription set (312).
+	lastSubscriptions string
 	// iceServers are the ICE servers delivered by the server in the
 	// AuthResponse (nil = use client defaults).
 	iceServers []netproto.ICEServer
@@ -107,6 +111,17 @@ func newConnManager(wailsCtx context.Context) *connManager {
 		pubKeys:   newPubKeyCache(),
 		scopeKeys: newScopeKeyStore(),
 	}
+}
+
+// appOf returns the App this manager belongs to, or nil for a test or
+// headless manager. The tab sink is the only back-channel a connManager has,
+// and read-state pushes (121) arrive on the read loop but have to land in the
+// App's settings.
+func (m *connManager) appOf() *App {
+	if s, ok := m.sink.(tabSink); ok {
+		return s.app
+	}
+	return nil
 }
 
 // identity returns the client's key pair, loading or generating it lazily.
@@ -199,25 +214,32 @@ func (m *connManager) connect(addr, nickname, password, serverPassword string) s
 		return err.Error()
 	}
 
+	// The X25519 key rides along with auth so the server can seal the global
+	// chat generation and the MOTD into the AuthResponse itself (133).
+	encPub := m.x25519PublicB64()
+
 	if password != "" {
 		return m.connectWith(addr, netproto.Authenticate{
-			Username:       nickname, // unique ID or nickname; the server resolves both
-			Password:       password,
-			ServerPassword: serverPassword,
-			PublicKey:      id.PublicKey,
+			Username:        nickname, // unique ID or nickname; the server resolves both
+			Password:        password,
+			ServerPassword:  serverPassword,
+			PublicKey:       id.PublicKey,
+			X25519PublicKey: encPub,
 		}, nil)
 	}
 
-	// Guest login with the client's own identity (key-derived unique ID).
+	// Guest login with the client's own identity (key-derived unique ID). The
+	// Ed25519 key is supplied by the signer callback, not here.
 	uid, err := id.uniqueID()
 	if err != nil {
 		return err.Error()
 	}
 	return m.connectWith(addr, netproto.Authenticate{
-		Username:       uid,
-		Anonymous:      true,
-		Nickname:       nickname,
-		ServerPassword: serverPassword,
+		Username:        uid,
+		Anonymous:       true,
+		Nickname:        nickname,
+		ServerPassword:  serverPassword,
+		X25519PublicKey: encPub,
 	}, func(challenge []byte) ([]byte, string, error) {
 		sig, err := auth.SignChallenge(id.PrivateKey, challenge)
 		return sig, id.PublicKey, err
@@ -268,9 +290,10 @@ func (m *connManager) connectWith(addr string, authMsg netproto.Authenticate, si
 				return err.Error()
 			}
 			if err := m.writeConn(conn, netproto.MsgAuthSignature, netproto.AuthSignature{
-				UniqueID:  authMsg.Username,
-				PublicKey: pub,
-				Signature: sig,
+				UniqueID:        authMsg.Username,
+				PublicKey:       pub,
+				Signature:       sig,
+				X25519PublicKey: authMsg.X25519PublicKey,
 			}); err != nil {
 				_ = conn.Close()
 				return err.Error()
@@ -292,6 +315,13 @@ func (m *connManager) connectWith(addr string, authMsg netproto.Authenticate, si
 		return "authentication failed"
 	}
 
+	// The global generation and the MOTD sealed under it are resolved BEFORE
+	// this returns, so App.MOTD() stays a correct one-shot read with no event
+	// and no re-render path (133). installCurrentKeys takes m.mu via
+	// identity(), so it must run outside the state lock below.
+	m.installCurrentKeys(0, resp.ChatKeys)
+	motd := m.openMOTD(resp)
+
 	m.mu.Lock()
 	m.conn = conn
 	m.addr = addr
@@ -299,8 +329,9 @@ func (m *connManager) connectWith(addr string, authMsg netproto.Authenticate, si
 	m.uniqueID = resp.UniqueID
 	m.nickname = resp.Nickname
 	m.isAdmin = resp.IsAdmin
+	m.isGuest = authMsg.Anonymous
 	m.iceServers = resp.ICEServers
-	m.motd = resp.MOTD
+	m.motd = motd
 	m.closed = false
 	m.mu.Unlock()
 
@@ -310,21 +341,74 @@ func (m *connManager) connectWith(addr string, authMsg netproto.Authenticate, si
 		m.emit("servererror", "e2e key publish failed: "+err.Error())
 	}
 
-	go m.readLoop(conn)
+	// Publishing the E2EE key above triggers the server to answer with sealed
+	// scope keys on the read loop below. Account reconnect and state
+	// synchronization are driven by server broadcasts upon authentication.
+
+	// recover is per-goroutine: the read loop needs its own guard (331).
+	go guardCrash("readLoop", func() {
+		defer func() {
+			if r := recover(); r != nil {
+				m.mu.Lock()
+				owned := (m.conn == conn)
+				intentional := m.closed
+				if owned {
+					m.disconnectLocked()
+				}
+				m.mu.Unlock()
+				if owned {
+					if !intentional {
+						m.emit("disconnected", "")
+					}
+				} else {
+					_ = conn.Close()
+				}
+				panic(r)
+			}
+		}()
+		m.readLoop(conn)
+	})
 	return ""
+}
+
+// openMOTD unseals the AuthResponse MOTD with the global generation that came
+// with it. A sealed MOTD the client cannot open resolves to "" — the raw
+// ciphertext must never reach the banner.
+func (m *connManager) openMOTD(resp netproto.AuthResponse) string {
+	if !resp.MOTDEnc {
+		return resp.MOTD
+	}
+	key, ok := m.scopeKeys.get(0, resp.MOTDKeyID)
+	if !ok {
+		return ""
+	}
+	plain, err := openScope(resp.MOTD, key)
+	if err != nil {
+		return ""
+	}
+	return plain
+}
+
+// disconnectLocked closes the connection while m.mu is held.
+func (m *connManager) disconnectLocked() {
+	m.iceServers = nil
+	m.motd = ""
+	// (312) subscriptions are per connection and the server forgets them on
+	// disconnect, so keeping the cached set would show tabs that no longer
+	// receive anything.
+	m.lastSubscriptions = ""
+	if m.conn != nil {
+		m.closed = true
+		_ = m.conn.Close()
+		m.conn = nil
+	}
 }
 
 // disconnect closes the connection, if any.
 func (m *connManager) disconnect() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.iceServers = nil
-	m.motd = ""
-	if m.conn != nil {
-		m.closed = true
-		_ = m.conn.Close()
-		m.conn = nil
-	}
+	m.disconnectLocked()
 }
 
 // iceServersSnapshot returns the ICE servers the server provided at connect
@@ -356,6 +440,15 @@ func (m *connManager) isAdminSnapshot() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.isAdmin
+}
+
+// isGuestSnapshot reports whether the current session authenticated through
+// the anonymous guest flow. Guest identities can be stable, so the unique ID
+// alone is not a reliable way for the frontend to distinguish an account.
+func (m *connManager) isGuestSnapshot() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.isGuest
 }
 
 // connected reports whether a live connection exists.
@@ -433,6 +526,13 @@ func (m *connManager) request(send, reply netproto.MessageType, msg any, timeout
 	}
 	select {
 	case f := <-ch:
+		if f.Type == uint16(netproto.MsgError) {
+			var e netproto.Error
+			if err := netproto.Decode(f, &e); err == nil {
+				return nil, fmt.Errorf("%s", e.Message)
+			}
+			return nil, fmt.Errorf("server error")
+		}
 		return f, nil
 	case <-time.After(timeout):
 		return nil, fmt.Errorf("timeout waiting for %s", reply)
@@ -482,13 +582,31 @@ func (m *connManager) dispatch(f *netproto.Frame) {
 		m.mu.Unlock()
 		m.emit("snapshot", string(f.Payload))
 	case netproto.MsgEvent:
-		// Encrypted chat is decrypted in the backend (4b); DMs decrypt
-		// asynchronously and re-emit (maybeDecryptChat returns "" then).
-		if out := m.maybeDecryptChat(string(f.Payload)); out != "" {
+		// Sealed payloads (chat bodies, edits, announcements) are opened in
+		// the backend; DMs decrypt asynchronously and re-emit, which is what
+		// the empty return means.
+		if out := m.maybeDecryptEvent(string(f.Payload)); out != "" {
+			m.applySessionEvent(out)
 			m.emit("event", out)
 		}
 	case netproto.MsgChannelKey:
 		m.handleChannelKey(f)
+	case netproto.MsgChatKeyBundle:
+		// Answer to a pull (99/100). Archival generations only: they never
+		// advance the send key, and a waiter in awaitScopeText wakes on the
+		// install.
+		m.handleChatKeyBundle(f)
+	case netproto.MsgSubscriptionState:
+		// (312) always the authoritative full set, so it is cached and
+		// replayed verbatim on a tab switch like the other state frames.
+		m.mu.Lock()
+		m.lastSubscriptions = string(f.Payload)
+		m.mu.Unlock()
+		m.emit("subscriptions", string(f.Payload))
+	case netproto.MsgServerRules:
+		// (216) The webview owns the blocking prompt, but the frame stays a
+		// typed backend event so operator text is never interpreted as markup.
+		m.emit("server_rules", string(f.Payload))
 	case netproto.MsgChannelList:
 		m.mu.Lock()
 		m.lastChannelList = string(f.Payload)
@@ -500,9 +618,31 @@ func (m *connManager) dispatch(f *netproto.Frame) {
 		m.emit("offer", string(f.Payload))
 	case netproto.MsgAvatarData:
 		m.emit("avatar", string(f.Payload))
+	case netproto.MsgPermsInvalid:
+		// (151) the server pushes this instead of the client re-resolving on a
+		// timer; the reason distinguishes a cosmetics change from a grant change.
+		var pi netproto.PermsInvalid
+		if err := netproto.Decode(f, &pi); err == nil {
+			m.emit("perms_invalid", pi.Reason)
+		}
 	case netproto.MsgError:
+		m.mu.Lock()
+		for _, waiter := range m.pending {
+			select {
+			case waiter <- f:
+			default:
+			}
+		}
+		m.mu.Unlock()
+
 		var e netproto.Error
 		if err := netproto.Decode(f, &e); err == nil {
+			// Capability probes (121 read state) are sent speculatively, so an
+			// older server answering "unknown message type" is an expected
+			// negative, not something to show the user.
+			if strings.Contains(e.Message, "unknown message type") {
+				return
+			}
 			m.emit("servererror", fmt.Sprintf("%d: %s", e.Code, e.Message))
 		}
 	case netproto.MsgPong, netproto.MsgChatBroadcast, netproto.MsgAuthResponse:
@@ -514,6 +654,30 @@ func (m *connManager) dispatch(f *netproto.Frame) {
 	default:
 		// Unknown frame: ignore.
 	}
+}
+
+// applySessionEvent keeps the bound session flags aligned with grants that
+// take effect after authentication. In particular, a guest token redemption
+// promotes the identity and an admin token changes IsAdmin immediately.
+func (m *connManager) applySessionEvent(raw string) {
+	var env struct {
+		Type string `json:"type"`
+		Data struct {
+			GroupID  int64 `json:"group_id"`
+			Promoted bool  `json:"promoted"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(raw), &env); err != nil || env.Type != "token_used" {
+		return
+	}
+	m.mu.Lock()
+	if env.Data.Promoted {
+		m.isGuest = false
+	}
+	if env.Data.GroupID == 0 {
+		m.isAdmin = true
+	}
+	m.mu.Unlock()
 }
 
 // emit sends a backend event to the sink.

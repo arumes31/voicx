@@ -1,0 +1,39 @@
+name: golangci-lint
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+
+jobs:
+  golangci:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: golangci-lint (root)
+        uses: golangci/golangci-lint-action@v6
+        with:
+          install-mode: goinstall
+          working-directory: .
+
+      - name: prepare embedded frontend for client lint
+        run: |
+          mkdir -p client/frontend/dist
+          touch client/frontend/dist/.lint-placeholder
+
+      - name: install linux client dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxtst-dev libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev
+
+      - name: golangci-lint (client)
+        uses: golangci/golangci-lint-action@v6
+        with:
+          install-mode: goinstall
+          working-directory: client

@@ -91,14 +91,19 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.ServerName != "voicx" {
 		t.Errorf("ServerName = %q, want %q", cfg.ServerName, "voicx")
 	}
-	if cfg.TCPAddr != ":10011" {
-		t.Errorf("TCPAddr = %q, want %q", cfg.TCPAddr, ":10011")
+	if cfg.TCPAddr != DefaultTCPAddr {
+		t.Errorf("TCPAddr = %q, want %q", cfg.TCPAddr, DefaultTCPAddr)
 	}
-	if cfg.UDPAddr != ":9987" {
-		t.Errorf("UDPAddr = %q, want %q", cfg.UDPAddr, ":9987")
+	if cfg.UDPAddr != DefaultUDPAddr {
+		t.Errorf("UDPAddr = %q, want %q", cfg.UDPAddr, DefaultUDPAddr)
 	}
-	if cfg.GRPCAddr != ":50051" {
-		t.Errorf("GRPCAddr = %q, want %q", cfg.GRPCAddr, ":50051")
+	if cfg.GRPCAddr != DefaultGRPCAddr {
+		t.Errorf("GRPCAddr = %q, want %q", cfg.GRPCAddr, DefaultGRPCAddr)
+	}
+	if cfg.HealthAddr != DefaultHealthAddr || cfg.QueryAddr != DefaultQueryAddr ||
+		cfg.QuerySSHAddr != DefaultQuerySSHAddr || cfg.FileAddr != DefaultFileAddr {
+		t.Errorf("remaining listener defaults = health %q, query %q, query SSH %q, file %q",
+			cfg.HealthAddr, cfg.QueryAddr, cfg.QuerySSHAddr, cfg.FileAddr)
 	}
 	if cfg.MaxClients != 1024 {
 		t.Errorf("MaxClients = %d, want 1024", cfg.MaxClients)
@@ -111,6 +116,33 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if len(cfg.WebRTC.ICEServers) == 0 {
 		t.Error("WebRTC.ICEServers is empty, want default STUN server")
+	}
+}
+
+func TestLoadRejectsInvalidFileQuietHours(t *testing.T) {
+	for _, tc := range []struct {
+		name, env, value string
+	}{
+		{"start below range", "VOICX_FILE_QUIET_HOURS_START", "-1"},
+		{"start above range", "VOICX_FILE_QUIET_HOURS_START", "24"},
+		{"end below range", "VOICX_FILE_QUIET_HOURS_END", "-1"},
+		{"end above range", "VOICX_FILE_QUIET_HOURS_END", "24"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			wd, err := os.Getwd()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Chdir(wd) })
+			if err := os.Chdir(dir); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv(tc.env, tc.value)
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load accepted %s=%s", tc.env, tc.value)
+			}
+		})
 	}
 }
 
@@ -179,9 +211,9 @@ func TestSummary(t *testing.T) {
 		ServerName:  "voicx",
 		LogLevel:    "info",
 		DevMode:     true,
-		TCPAddr:     ":10011",
-		UDPAddr:     ":9987",
-		GRPCAddr:    ":50051",
+		TCPAddr:     DefaultTCPAddr,
+		UDPAddr:     DefaultUDPAddr,
+		GRPCAddr:    DefaultGRPCAddr,
 		DatabaseURL: "postgres://localhost",
 		RedisAddr:   "localhost:6379",
 		MaxClients:  1024,

@@ -3,6 +3,8 @@
 // zen mode (341), idle video pause (342), screen-reader labels + live
 // announcements (343), notification center (346), DND (347/348), and tree
 // virtualization (349).
+import { setIdleQualityOverride } from "./video.js";
+
 const V = () => window.__voicx;
 const App = () => window.go.main.App;
 
@@ -13,14 +15,19 @@ const App = () => window.go.main.App;
 function initResizablePanes() {
     const sidebar = document.getElementById("sidebar");
     const details = document.getElementById("details");
+    const body = document.getElementById("app-body");
     const s = V().state.settings || {};
+
+    const setPaneWidth = (field, width) => {
+        const variable = field === "sidebar_width" ? "--sidebar-width" : "--details-width";
+        if (width > 120) body.style.setProperty(variable, width + "px");
+        else body.style.removeProperty(variable);
+    };
 
     const apply = () => {
         const w = V().state.settings || {};
-        if (w.sidebar_width > 120) sidebar.style.width = w.sidebar_width + "px";
-        else sidebar.style.width = "";
-        if (w.details_width > 120) details.style.width = w.details_width + "px";
-        else details.style.width = "";
+        setPaneWidth("sidebar_width", w.sidebar_width);
+        setPaneWidth("details_width", w.details_width);
     };
 
     const makeHandle = (el, field, invert) => {
@@ -34,7 +41,7 @@ function initResizablePanes() {
             startW = el.getBoundingClientRect().width;
             const onMove = (ev) => {
                 const w = Math.max(160, Math.min(560, startW + (invert ? startX - ev.clientX : ev.clientX - startX)));
-                el.style.width = w + "px";
+                setPaneWidth(field, w);
                 (V().state.settings ||= {})[field] = Math.round(w);
             };
             const onUp = () => {
@@ -64,13 +71,25 @@ function initResizablePanes() {
 // ---------------------------------------------------------------------------
 
 let chatPop = null;
+let chatHome = null; // {wrapMarker, inputMarker}: where the panes dock back
 
 function toggleChatPopout() {
     if (chatPop) {
+        const wrap = document.getElementById("chat-wrap");
+        const inputRow = document.getElementById("chat-input-row");
+        // The panes live inside the popout: dock them before removing it, or
+        // remove() takes the whole chat pane with it.
+        if (chatHome?.wrapMarker?.parentNode) {
+            chatHome.wrapMarker.parentNode.replaceChild(wrap, chatHome.wrapMarker);
+        }
+        if (chatHome?.inputMarker?.parentNode) {
+            chatHome.inputMarker.parentNode.replaceChild(inputRow, chatHome.inputMarker);
+        }
         chatPop.remove();
         chatPop = null;
-        document.getElementById("chat-wrap").classList.remove("hidden");
-        document.getElementById("chat-input-row").classList.remove("hidden");
+        chatHome = null;
+        wrap.classList.remove("hidden");
+        inputRow.classList.remove("hidden");
         return;
     }
     chatPop = document.createElement("div");
@@ -78,6 +97,11 @@ function toggleChatPopout() {
     chatPop.innerHTML = `<div class="chat-pop-head">chat — drag me <button class="icon-btn chat-pop-close">✕</button></div>`;
     const wrap = document.getElementById("chat-wrap");
     const inputRow = document.getElementById("chat-input-row");
+    const wrapMarker = document.createComment("chat-wrap-marker");
+    const inputMarker = document.createComment("chat-input-row-marker");
+    wrap.parentNode.replaceChild(wrapMarker, wrap);
+    inputRow.parentNode.replaceChild(inputMarker, inputRow);
+    chatHome = { wrapMarker, inputMarker };
     chatPop.appendChild(wrap);
     chatPop.appendChild(inputRow);
     wrap.classList.remove("hidden");
@@ -134,7 +158,7 @@ function initIdleVideoPause() {
         idleVideoTimer = setTimeout(() => {
             idleVideoPaused = true;
             document.querySelectorAll("#video-grid video, #remote-video").forEach((v) => v.pause());
-            if (V().state.pc) App().SetVideoQuality("low");
+            if (V().state.pc) setIdleQualityOverride(true);
         }, 60000);
     });
     window.addEventListener("focus", () => {
@@ -145,7 +169,7 @@ function initIdleVideoPause() {
         if (idleVideoPaused) {
             idleVideoPaused = false;
             document.querySelectorAll("#video-grid video, #remote-video").forEach((v) => v.play().catch(() => {}));
-            App().SetVideoQuality(V().state.settings?.low_bandwidth ? "low" : "high");
+            setIdleQualityOverride(false); // video.js re-applies the user's pref
         }
     });
 }
@@ -153,6 +177,28 @@ function initIdleVideoPause() {
 // ---------------------------------------------------------------------------
 // Screen reader (343)
 // ---------------------------------------------------------------------------
+
+// trapFocus keeps Tab inside a modal (298). Dialogs are appended to <body>
+// over the app rather than replacing it, so without a trap the second Tab
+// walks out of the dialog into the tree and chat behind it.
+function trapFocus(overlay) {
+    const focusables = () => [...overlay.querySelectorAll(
+        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')]
+        .filter((el) => !el.disabled && el.offsetParent !== null);
+    // Only claim focus when the dialog did not already place it itself.
+    if (!overlay.contains(document.activeElement)) focusables()[0]?.focus();
+    overlay.addEventListener("keydown", (e) => {
+        if (e.key !== "Tab") return;
+        const items = focusables();
+        if (items.length === 0) return;
+        e.preventDefault();
+        const idx = items.indexOf(document.activeElement);
+        const next = e.shiftKey
+            ? (idx <= 0 ? items.length - 1 : idx - 1)
+            : (idx < 0 || idx === items.length - 1 ? 0 : idx + 1);
+        items[next].focus();
+    });
+}
 
 function initA11y() {
     const tree = document.getElementById("channel-tree");
@@ -171,6 +217,7 @@ function initA11y() {
                         dlg.setAttribute("role", "dialog");
                         dlg.setAttribute("aria-modal", "true");
                     }
+                    trapFocus(node); // (298)
                 }
             }
         }

@@ -33,6 +33,7 @@ type permChecker struct {
 	resolver *permissions.Resolver
 	tp       permissions.TieredPermissions
 	admin    bool
+	guest    bool
 }
 
 // permCheckerFor loads the client's tiered permissions (in the context of the
@@ -54,6 +55,7 @@ func (s *TCPServer) permCheckerFor(ctx context.Context, client *Client) (*permCh
 			resolver: s.deps.Resolver,
 			tp:       tp,
 			admin:    false,
+			guest:    true,
 		}, nil
 	}
 	var channelID int64
@@ -140,6 +142,9 @@ func (p *permChecker) talkAllowed() bool {
 // whisperAllowed reports whether the client may configure a whisper list.
 // Same semantics as talkAllowed with i_client_whisper_power.
 func (p *permChecker) whisperAllowed() bool {
+	if p.guest {
+		return false
+	}
 	return p.notNegated(permissions.PermissionKeyClientWhisperPower)
 }
 
@@ -163,7 +168,23 @@ func (p *permChecker) videoPublishAllowed() bool {
 // ftUploadAllowed reports whether the client may upload files. An unset
 // i_ft_file_upload_power means allowed (TS3 default); a negated entry denies.
 func (p *permChecker) ftUploadAllowed() bool {
+	if p.guest {
+		return false
+	}
 	return p.notNegated(permissions.PermissionKeyFTFileUploadPower)
+}
+
+// allowedByDefault resolves an open-default boolean: unset allows, while an
+// explicit zero or negate denies.
+func (p *permChecker) allowedByDefault(key permissions.PermissionKey) bool {
+	if p.admin {
+		return true
+	}
+	perm, _, err := p.resolver.Resolve(p.tp, key)
+	if errors.Is(err, permissions.ErrPermissionNotSet) {
+		return true
+	}
+	return err == nil && !perm.Negate && perm.Value != 0
 }
 
 // ftDownloadAllowed reports whether the client may download or list files.

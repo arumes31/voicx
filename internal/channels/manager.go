@@ -28,6 +28,18 @@ var ErrChannelNotFound = errors.New("channel not found")
 // ErrInvalidSpec is returned when a ChannelSpec fails validation.
 var ErrInvalidSpec = errors.New("invalid channel spec")
 
+// ErrInvalidMove is returned when a re-parent would corrupt the tree (168):
+// a channel may not become its own parent or descend from itself.
+var ErrInvalidMove = errors.New("invalid channel move")
+
+// ChannelAdminGroupName is the channel group a channel's creator is assigned
+// to on that channel (156). The group is seeded by the group bootstrap; when
+// it does not exist the assignment is skipped.
+const ChannelAdminGroupName = "Channel Admin"
+
+// maxChannelDepth caps the recursive ancestor walk used by the cycle guard.
+const maxChannelDepth = 64
+
 // cleanupTimer wraps a *time.Timer used to schedule the deletion of an empty
 // temporary channel. The timer is stored so it can be cancelled (e.g. when a
 // client joins the channel before the grace period elapses).
@@ -69,13 +81,26 @@ func New(s *store.Store, sm *state.Manager, logger *zap.Logger) *ChannelManager 
 	}
 }
 
-// cleanupDelay returns the configured cleanup delay, defaulting to
-// DefaultCleanupDelay when unset.
-func (m *ChannelManager) cleanupDelay() time.Duration {
+// cleanupDelayLocked returns the configured cleanup delay, defaulting to
+// DefaultCleanupDelay when unset. The caller must hold m.mu.
+func (m *ChannelManager) cleanupDelayLocked() time.Duration {
 	if m.CleanupDelay <= 0 {
 		return DefaultCleanupDelay
 	}
 	return m.CleanupDelay
+}
+
+// SetCleanupDelay sets the grace period an empty temporary channel survives
+// before deletion (165), so a brief gap between the last leave and the next
+// join does not destroy the channel. A non-positive value restores the
+// default. Timers already scheduled keep their old delay.
+func (m *ChannelManager) SetCleanupDelay(d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if d <= 0 {
+		d = DefaultCleanupDelay
+	}
+	m.CleanupDelay = d
 }
 
 // CreateChannel validates the spec, hashes the password if non-empty, inserts
@@ -166,6 +191,9 @@ func (m *ChannelManager) CreateChannel(ctx context.Context, spec ChannelSpec) (i
 		OpusStereo:      spec.OpusStereo,
 	})
 
+	// The creator administers what they created (156).
+	m.assignChannelAdmin(ctx, spec.CreatedBy, channelID)
+
 	m.logger.Info("channel created",
 		zap.Int64("channel_id", channelID),
 		zap.String("name", spec.Name),
@@ -194,7 +222,7 @@ func (m *ChannelManager) LoadIntoState(ctx context.Context) (int, error) {
 	          order_index, channel_type, COALESCE(max_clients, 0), created_at,
 	          COALESCE(password_hash, ''), COALESCE(needed_join_power, 0),
 	          opus_bitrate, opus_fec, opus_dtx, opus_stereo, slow_mode_seconds,
-	          COALESCE(description, '')
+	          COALESCE(description, ''), inherit_permissions
 	          FROM channels ORDER BY id`
 	rows, err := m.store.DB().QueryContext(ctx, q)
 	if err != nil {
@@ -210,7 +238,7 @@ func (m *ChannelManager) LoadIntoState(ctx context.Context) (int, error) {
 			&ch.OrderIndex, &channelType, &ch.MaxClients, &ch.CreatedAt,
 			&ch.PasswordHash, &ch.NeededJoinPower,
 			&ch.OpusBitrate, &ch.OpusFEC, &ch.OpusDTX, &ch.OpusStereo, &ch.SlowModeSeconds,
-			&ch.Description); err != nil {
+			&ch.Description, &ch.InheritPermissions); err != nil {
 			return count, fmt.Errorf("scanning channel row: %w", err)
 		}
 		ch.ChannelType = int(channelType)
@@ -323,7 +351,9 @@ func (m *ChannelManager) UpdateChannel(ctx context.Context, channelID int64, upd
 	if upd.MaxClients != nil && *upd.MaxClients < 0 {
 		return fmt.Errorf("%w: max clients must be >= 0", ErrInvalidSpec)
 	}
-
+	if upd.NeededJoinPower != nil && *upd.NeededJoinPower < 0 {
+		return fmt.Errorf("%w: needed join power must be >= 0", ErrInvalidSpec)
+	}
 	// Build the SET clause from the non-nil fields only.
 	var sets []string
 	var args []any
@@ -362,19 +392,52 @@ func (m *ChannelManager) UpdateChannel(ctx context.Context, channelID int64, upd
 	if upd.Description != nil {
 		add("description", *upd.Description)
 	}
+	if upd.NeededJoinPower != nil {
+		add("needed_join_power", *upd.NeededJoinPower)
+	}
+	if upd.OrderIndex != nil {
+		add("order_index", *upd.OrderIndex)
+	}
+	if upd.ParentID != nil {
+		if *upd.ParentID == 0 {
+			add("parent_id", nil)
+		} else {
+			add("parent_id", *upd.ParentID)
+		}
+	}
+	if upd.InheritPermissions != nil {
+		add("inherit_permissions", *upd.InheritPermissions)
+	}
 	if len(sets) == 0 {
 		return nil // nothing to do
+	}
+
+	tx, err := m.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning channel update: %w", err)
+	}
+	defer tx.Rollback()
+	// Validate and write under the same transaction. validateMoveTx locks the
+	// moved channel and each prospective ancestor before reading its parent, so
+	// a concurrent move cannot validate against a stale chain.
+	if upd.ParentID != nil {
+		if err := m.validateMoveTx(ctx, tx, channelID, *upd.ParentID); err != nil {
+			return err
+		}
 	}
 
 	args = append(args, channelID)
 	q := fmt.Sprintf("UPDATE channels SET %s WHERE id = $%d",
 		strings.Join(sets, ", "), len(args))
-	res, err := m.store.DB().ExecContext(ctx, q, args...)
+	res, err := tx.ExecContext(ctx, q, args...)
 	if err != nil {
 		return fmt.Errorf("updating channel: %w", err)
 	}
 	if rows, _ := res.RowsAffected(); rows == 0 {
 		return ErrChannelNotFound
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing channel update: %w", err)
 	}
 
 	// Mirror the change into the in-memory state.
@@ -402,6 +465,18 @@ func (m *ChannelManager) UpdateChannel(ctx context.Context, channelID int64, upd
 		}
 		if upd.Description != nil {
 			ch.Description = *upd.Description
+		}
+		if upd.NeededJoinPower != nil {
+			ch.NeededJoinPower = *upd.NeededJoinPower
+		}
+		if upd.OrderIndex != nil {
+			ch.OrderIndex = *upd.OrderIndex
+		}
+		if upd.ParentID != nil {
+			ch.ParentID = *upd.ParentID
+		}
+		if upd.InheritPermissions != nil {
+			ch.InheritPermissions = *upd.InheritPermissions
 		}
 	}
 
@@ -447,7 +522,7 @@ func (m *ChannelManager) StartCleanupWatcher(channelID int64) {
 		delete(m.timers, channelID)
 	}
 
-	delay := m.cleanupDelay()
+	delay := m.cleanupDelayLocked()
 	t := time.AfterFunc(delay, func() {
 		m.cleanupCallback(channelID)
 	})
@@ -530,6 +605,76 @@ func (m *ChannelManager) CleanupTimersCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.timers)
+}
+
+// validateMoveTx checks that channelID may be re-parented under newParentID
+// (168). Parent 0 (root) is always legal; otherwise the parent must exist, and
+// must not be the channel itself or one of its descendants — a cycle would cut
+// the subtree out of the tree and out of the join-power inheritance chain.
+func (m *ChannelManager) validateMoveTx(ctx context.Context, tx *sql.Tx, channelID, newParentID int64) error {
+	var lockedID int64
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM channels WHERE id = $1 FOR UPDATE`, channelID).Scan(&lockedID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrChannelNotFound
+		}
+		return fmt.Errorf("locking channel: %w", err)
+	}
+	if newParentID == 0 {
+		return nil
+	}
+
+	current := newParentID
+	for depth := 0; ; depth++ {
+		if current == channelID {
+			return fmt.Errorf("%w: channel %d is an ancestor of %d", ErrInvalidMove, channelID, newParentID)
+		}
+		var parent sql.NullInt64
+		err := tx.QueryRowContext(ctx, `SELECT parent_id FROM channels WHERE id = $1 FOR UPDATE`, current).Scan(&parent)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) && depth == 0 {
+				return fmt.Errorf("%w: parent channel %d does not exist", ErrInvalidMove, newParentID)
+			}
+			return fmt.Errorf("checking channel ancestry: %w", err)
+		}
+		if depth >= maxChannelDepth {
+			return fmt.Errorf("%w: parent ancestry exceeds maximum depth %d", ErrInvalidMove, maxChannelDepth)
+		}
+		if !parent.Valid || parent.Int64 == 0 {
+			return nil
+		}
+		current = parent.Int64
+	}
+}
+
+// assignChannelAdmin gives the channel's creator the channel-admin group on
+// the channel they just created (156). A missing group or a failed assignment
+// is logged and ignored: channel creation must not fail because the group
+// bootstrap has not seeded ChannelAdminGroupName.
+func (m *ChannelManager) assignChannelAdmin(ctx context.Context, userID, channelID int64) {
+	if userID == 0 || m.store == nil {
+		return
+	}
+	g, err := m.store.FindGroupByName(ctx, "channel", ChannelAdminGroupName)
+	if err != nil || g == nil {
+		m.logger.Debug("channel admin group unavailable, skipping auto-assign",
+			zap.Int64("channel_id", channelID),
+			zap.Error(err),
+		)
+		return
+	}
+	if err := m.store.AssignChannelGroup(ctx, g.ID, userID, channelID); err != nil {
+		m.logger.Warn("channel admin auto-assign failed",
+			zap.Int64("channel_id", channelID),
+			zap.Int64("user_id", userID),
+			zap.Error(err),
+		)
+		return
+	}
+	m.logger.Info("channel admin assigned to creator",
+		zap.Int64("channel_id", channelID),
+		zap.Int64("user_id", userID),
+		zap.Int64("channel_group_id", g.ID),
+	)
 }
 
 // channelExists reports whether a channel with the given ID exists in the

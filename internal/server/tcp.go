@@ -23,6 +23,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"voicx/internal/chatcrypto"
 	"voicx/internal/config"
 	"voicx/internal/metrics"
 	"voicx/internal/netproto"
@@ -37,6 +38,7 @@ const (
 	errCodePermissionDenied = 4 // caller lacks the required permission
 	errCodeUnavailable      = 5 // backend dependency unavailable
 	errCodeNotFound         = 6 // referenced entity not found
+	errCodeConflict         = 7 // optimistic concurrency precondition failed
 )
 
 // Client represents a single connected control-channel client.
@@ -50,6 +52,10 @@ type Client struct {
 	mu     sync.RWMutex
 	authed bool
 	admin  bool
+	// rulesPending gates a session that still owes the operator's rules an
+	// answer (215). It is per connection, not per account, because a guest
+	// has no users row to record an acceptance against.
+	rulesPending bool
 
 	// Activity and connection stats (Client Info dialog).
 	lastActive time.Time // last received frame
@@ -65,6 +71,12 @@ type Client struct {
 	challengeUID  string
 	challengeNick string
 	challengeExp  time.Time
+
+	// x25519Key is the encryption key presented at authenticate time so the
+	// server can seal the global generation and the MOTD into the auth
+	// response (133). The identity PublicKey is Ed25519 and cannot be sealed
+	// to, hence the separate field.
+	x25519Key string
 
 	wmu sync.Mutex // serializes frame writes to Conn
 }
@@ -94,11 +106,34 @@ func (c *Client) setIdentity(uniqueID, nickname string, userID int64, admin bool
 	c.authed = true
 }
 
+// promote records the durable identity created by a guest token redemption.
+func (c *Client) promote(userID int64, admin bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.UserID = userID
+	c.admin = c.admin || admin
+}
+
 // uniqueID returns the client's authenticated unique ID ("" before auth).
 func (c *Client) uniqueID() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.UniqueID
+}
+
+// setX25519 records the encryption key presented at authenticate time.
+func (c *Client) setX25519(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.x25519Key = key
+}
+
+// x25519 returns the encryption key presented at authenticate time ("" for
+// clients that supplied none).
+func (c *Client) x25519() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.x25519Key
 }
 
 // noteReceived records inbound activity for the Client Info stats.
@@ -107,6 +142,12 @@ func (c *Client) noteReceived(payloadBytes int) {
 	defer c.mu.Unlock()
 	c.lastActive = time.Now()
 	c.bytesIn += int64(payloadBytes)
+}
+
+func (c *Client) lastActivity() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lastActive
 }
 
 // noteSent records outbound payload bytes for the Client Info stats.
@@ -203,24 +244,44 @@ func (c *Client) takeChallenge(uniqueID string) ([]byte, string, bool) {
 
 // TCPServer accepts and serves control-channel connections.
 type TCPServer struct {
-	cfg    *config.Config
-	logger *zap.Logger
-	deps   *Deps
+	cfg      *config.Config
+	logger   *zap.Logger
+	deps     *Deps
+	configMu sync.RWMutex
 
 	listener net.Listener
 
 	// tlsFingerprint is the SHA-256 fingerprint of the control-channel
-	// certificate (empty when TLS is disabled). Set in Start.
+	// certificate (empty when TLS is disabled). Set in Start, or earlier by
+	// UseTLSMaterial.
 	tlsFingerprint string
 
-	// chatKeys manages the per-scope chat encryption keys (wave 4b).
+	// tlsCert is the control-channel certificate when the caller supplied it
+	// up front. The file-transfer port must present the SAME certificate, so
+	// the binary generates it once and hands it to both rather than letting
+	// two racing tlscert.Ensure calls mint two self-signed certs.
+	tlsCert    *tls.Certificate
+	tlsCertSet bool
+
+	// chatKeys manages the per-scope chat encryption keys and their
+	// persisted generations (91).
 	chatKeys *chatKeyManager
 
+	// rotPending coalesces channel key rotations inside
+	// chat_key_rotate_min_seconds so a flapping client cannot mint one
+	// persisted generation per reconnect.
+	rotMu      sync.Mutex
+	rotPending map[int64]bool
+
 	// Chat infrastructure (wave 5a): rate limiter, spam tracker, slow-mode
-	// tracker.
-	chatRate *chatRateLimiter
-	chatSpam *spamTracker
-	chatSlow *slowTracker
+	// tracker, and the memoised runtime moderation lists (117/118).
+	chatRate    *chatRateLimiter
+	chatSpam    *spamTracker
+	chatSlow    *slowTracker
+	typingRate  *typingTracker
+	chatFilters *chatFilterCache
+
+	permWriteMu sync.Mutex
 
 	mu      sync.RWMutex
 	clients map[string]*Client
@@ -237,17 +298,26 @@ type TCPServer struct {
 // Shutdown is always safe to call. deps may be nil; handlers that need a
 // missing dependency reply with an "unavailable" error.
 func New(cfg *config.Config, logger *zap.Logger, deps *Deps) *TCPServer {
+	var scopeKeys ScopeKeyStore
+	var kek *chatcrypto.KEKRing
+	if deps != nil {
+		scopeKeys, kek = deps.ScopeKeys, deps.ChatKEK
+	}
 	s := &TCPServer{
-		cfg:       cfg,
-		logger:    logger,
-		deps:      deps,
-		clients:   make(map[string]*Client),
-		stopCh:    make(chan struct{}),
-		startedAt: time.Now(),
-		chatKeys:  newChatKeyManager(),
-		chatRate:  newChatRateLimiter(cfg.ChatRateMsgs, time.Duration(cfg.ChatRateWindowSeconds)*time.Second),
-		chatSpam:  newSpamTracker(),
-		chatSlow:  newSlowTracker(),
+		cfg:        cfg,
+		logger:     logger,
+		deps:       deps,
+		clients:    make(map[string]*Client),
+		stopCh:     make(chan struct{}),
+		startedAt:  time.Now(),
+		chatKeys:   newChatKeyManager(scopeKeys, kek, logger),
+		rotPending: make(map[int64]bool),
+		chatRate:   newChatRateLimiter(cfg.ChatRateMsgs, time.Duration(cfg.ChatRateWindowSeconds)*time.Second),
+		chatSpam:   newSpamTracker(),
+		chatSlow:   newSlowTracker(),
+		typingRate: newTypingTracker(),
+
+		chatFilters: &chatFilterCache{},
 	}
 	// Install the voice pipeline callbacks (talk/video permission gates,
 	// speaking-state announcements, and renegotiation offer delivery).
@@ -275,11 +345,20 @@ func (s *TCPServer) Start(ctx context.Context) error {
 		return fmt.Errorf("tcp listen on %s: %w", s.cfg.TCPAddr, err)
 	}
 	if s.cfg.TLSEnabled {
-		cert, fp, err := tlscert.Ensure(s.cfg.TLSDir, s.cfg.TLSCertFile, s.cfg.TLSKeyFile,
-			[]string{"localhost", s.cfg.ServerName})
-		if err != nil {
-			_ = ln.Close()
-			return fmt.Errorf("preparing control-channel TLS: %w", err)
+		var (
+			cert tls.Certificate
+			fp   string
+		)
+		if s.tlsCertSet {
+			cert, fp = *s.tlsCert, s.tlsFingerprint
+		} else {
+			c, f, err := tlscert.Ensure(s.cfg.TLSDir, s.cfg.TLSCertFile, s.cfg.TLSKeyFile,
+				[]string{"localhost", s.cfg.ServerName})
+			if err != nil {
+				_ = ln.Close()
+				return fmt.Errorf("preparing control-channel TLS: %w", err)
+			}
+			cert, fp = c, f
 		}
 		s.tlsFingerprint = fp
 		ln = tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
@@ -322,6 +401,22 @@ func (s *TCPServer) Start(ctx context.Context) error {
 // certificate, or "" when TLS is disabled.
 func (s *TCPServer) TLSFingerprint() string {
 	return s.tlsFingerprint
+}
+
+// UseTLSMaterial installs the control-channel certificate instead of letting
+// Start mint its own. The file-transfer port presents the same certificate,
+// and two independent tlscert.Ensure calls on a fresh install would race to
+// create two different self-signed certs. Call before Start.
+func (s *TCPServer) UseTLSMaterial(cert tls.Certificate, fingerprint string) {
+	s.tlsCert, s.tlsFingerprint, s.tlsCertSet = &cert, fingerprint, true
+}
+
+// EnsureGlobalScopeKey mints the global chat generation at boot. Global is a
+// fixed, known scope, so minting it eagerly is safe and removes the only
+// legitimate lazy mint from a hot path (91).
+func (s *TCPServer) EnsureGlobalScopeKey(ctx context.Context) error {
+	_, _, err := s.chatKeys.EnsureScope(ctx, globalChatScope)
+	return err
 }
 
 // Shutdown stops accepting new connections and closes the listener. Existing
@@ -417,6 +512,9 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 	if !client.isAuthed() && mt != netproto.MsgAuthenticate && mt != netproto.MsgAuthSignature && mt != netproto.MsgPing {
 		return s.sendError(client, errCodeNotAuthenticated, "not authenticated")
 	}
+	if client.rulesBlocked() && !allowedWhileRulesPending[mt] {
+		return s.sendError(client, errCodePermissionDenied, "accept the server rules before continuing")
+	}
 
 	switch mt {
 	case netproto.MsgAuthenticate:
@@ -469,6 +567,10 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 		return s.handleServerIconSet(ctx, client, f)
 	case netproto.MsgServerIconGet:
 		return s.handleServerIconGet(ctx, client, f)
+	case netproto.MsgServerBannerSet:
+		return s.handleServerBannerSet(ctx, client, f)
+	case netproto.MsgServerBannerGet:
+		return s.handleServerBannerGet(ctx, client, f)
 	case netproto.MsgSetStatus:
 		return s.handleSetStatus(ctx, client, f)
 	case netproto.MsgPoke:
@@ -481,6 +583,8 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 		return s.handleAvatarGet(ctx, client, f)
 	case netproto.MsgChannelIconSet:
 		return s.handleChannelIconSet(ctx, client, f)
+	case netproto.MsgChannelIconGet:
+		return s.handleChannelIconGet(ctx, client, f)
 	case netproto.MsgTokenUse:
 		return s.handleTokenUse(ctx, client, f)
 	case netproto.MsgComplaint:
@@ -503,8 +607,14 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 		return s.handleChatPin(ctx, client, f)
 	case netproto.MsgChatPins:
 		return s.handleChatPins(ctx, client, f)
+	case netproto.MsgChatKeyRequest:
+		return s.handleChatKeyRequest(ctx, client, f)
 	case netproto.MsgChatReact:
 		return s.handleChatReact(ctx, client, f)
+	case netproto.MsgChatFilterGet:
+		return s.handleChatFilterGet(ctx, client, f)
+	case netproto.MsgChatFilterSet:
+		return s.handleChatFilterSet(ctx, client, f)
 	case netproto.MsgTyping:
 		return s.handleTyping(ctx, client, f)
 	case netproto.MsgChatDelivered:
@@ -517,6 +627,18 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 		return s.handleEmojiList(ctx, client, f)
 	case netproto.MsgEmojiGet:
 		return s.handleEmojiGet(ctx, client, f)
+	case netproto.MsgEmojiDelete:
+		return s.handleEmojiDelete(ctx, client, f)
+	case netproto.MsgEmojiRename:
+		return s.handleEmojiRename(ctx, client, f)
+	case netproto.MsgServerConfigQuery:
+		return s.handleServerConfigQuery(ctx, client, f)
+	case netproto.MsgServerConfigSet:
+		return s.handleServerConfigSet(ctx, client, f)
+	case netproto.MsgPreKeyPublish:
+		return s.handlePreKeyPublish(ctx, client, f)
+	case netproto.MsgPreKeyQuery:
+		return s.handlePreKeyQuery(ctx, client, f)
 	case netproto.MsgClientInfoQuery:
 		return s.handleClientInfoQuery(ctx, client, f)
 	case netproto.MsgGroupList:
@@ -553,6 +675,24 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 		return s.handleBanList(ctx, client, f)
 	case netproto.MsgBanRemove:
 		return s.handleBanRemove(ctx, client, f)
+	case netproto.MsgGroupEdit:
+		return s.handleGroupEdit(ctx, client, f)
+	case netproto.MsgPermCopy:
+		return s.handlePermCopy(ctx, client, f)
+	case netproto.MsgComplaintList:
+		return s.handleComplaintList(ctx, client, f)
+	case netproto.MsgComplaintClear:
+		return s.handleComplaintClear(ctx, client, f)
+	case netproto.MsgTokenList:
+		return s.handleTokenList(ctx, client, f)
+	case netproto.MsgTokenAdd:
+		return s.handleTokenAdd(ctx, client, f)
+	case netproto.MsgTokenDelete:
+		return s.handleTokenDelete(ctx, client, f)
+	case netproto.MsgServerRulesAccept:
+		return s.handleServerRulesAccept(ctx, client, f)
+	case netproto.MsgChannelSubscribe:
+		return s.handleChannelSubscribe(ctx, client, f)
 	case netproto.MsgPing:
 		return s.handlePing(ctx, client, f)
 	case netproto.MsgPong:
@@ -567,6 +707,14 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 	}
 }
 
+// allowedWhileRulesPending is deliberately small: central dispatch denies new
+// message types by default until the client accepts the current rules.
+var allowedWhileRulesPending = map[netproto.MessageType]bool{
+	netproto.MsgServerRulesAccept: true,
+	netproto.MsgPing:              true,
+	netproto.MsgPong:              true,
+}
+
 // pingLoop sends a server-initiated Ping every 15s until stopped; matching
 // Pongs feed the client's smoothed RTT.
 func (s *TCPServer) pingLoop(client *Client, stop chan struct{}) {
@@ -579,6 +727,14 @@ func (s *TCPServer) pingLoop(client *Client, stop chan struct{}) {
 		case <-s.stopCh:
 			return
 		case <-ticker.C:
+			s.configMu.RLock()
+			timeout := s.cfg.ClientTimeoutSeconds
+			s.configMu.RUnlock()
+			last := client.lastActivity()
+			if timeout > 0 && !last.IsZero() && time.Since(last) > time.Duration(timeout)*time.Second {
+				_ = client.Conn.Close()
+				return
+			}
 			client.notePingSent()
 			if err := s.writeMessage(client, netproto.MsgPing, netproto.Ping{}); err != nil {
 				return
@@ -631,7 +787,7 @@ func (s *TCPServer) onDisconnect(client *Client) {
 
 	// Rotate the chat key of the channel the client left (4b).
 	if channelID != 0 {
-		s.rotateScopeKey(channelID)
+		s.rotateScopeKey(context.Background(), channelID)
 	}
 
 	// Tear down the client's voice session (peer connection, router state).

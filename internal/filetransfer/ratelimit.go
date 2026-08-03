@@ -19,6 +19,28 @@ type rateLimiter struct {
 	last   time.Time
 }
 
+// inQuietHours reports whether hour falls inside the [start, end) window
+// (276). Equal bounds disable the window; a start after the end wraps past
+// midnight, which is the shape an overnight window actually has (22 -> 6).
+func inQuietHours(hour, start, end int) bool {
+	if start == end || start < 0 || start > 23 || end < 0 || end > 23 {
+		return false
+	}
+	if start < end {
+		return hour >= start && hour < end
+	}
+	return hour >= start || hour < end
+}
+
+// limiterFor returns the limiter a transfer starting now should use: the
+// configured cap, or an unlimited one inside the quiet-hours window (276).
+func (s *Server) limiterFor(now time.Time) *rateLimiter {
+	if inQuietHours(now.Hour(), s.cfg.QuietHoursStart, s.cfg.QuietHoursEnd) {
+		return newRateLimiter(0)
+	}
+	return newRateLimiter(s.cfg.MaxKBps)
+}
+
 // newRateLimiter returns a limiter for the given KiB/s cap. kbps <= 0 means
 // unlimited (wait never blocks).
 func newRateLimiter(kbps int) *rateLimiter {

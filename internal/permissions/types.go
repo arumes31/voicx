@@ -66,18 +66,26 @@ const (
 	PermissionKeyClientWhisperPower       PermissionKey = "i_client_whisper_power"
 	PermissionKeyClientNeededWhisperPower PermissionKey = "i_client_needed_whisper_power"
 	PermissionKeyClientVideoPublish       PermissionKey = "b_client_video_publish"
-	PermissionKeyClientPrioritySpeaker    PermissionKey = "b_client_priority_speaker"
-	PermissionKeyClientIgnoreAntiflood    PermissionKey = "b_client_ignore_antiflood"
-	PermissionKeyClientRequestTalker      PermissionKey = "b_client_request_talker"
+	// ScreenShare1080p gates shares above 720p. It is intentionally
+	// allow-on-unset for backwards compatibility; an explicit deny caps 720p.
+	PermissionKeyClientScreenShare1080p PermissionKey = "b_client_issue_screenshare_1080p"
+	PermissionKeyClientPrioritySpeaker  PermissionKey = "b_client_priority_speaker"
+	PermissionKeyClientIgnoreAntiflood  PermissionKey = "b_client_ignore_antiflood"
+	PermissionKeyClientRequestTalker    PermissionKey = "b_client_request_talker"
 
 	// --- File transfer ---
 	PermissionKeyFTFileUploadPower         PermissionKey = "i_ft_file_upload_power"
 	PermissionKeyFTNeededFileUploadPower   PermissionKey = "i_ft_needed_file_upload_power"
 	PermissionKeyFTFileDownloadPower       PermissionKey = "i_ft_file_download_power"
 	PermissionKeyFTNeededFileDownloadPower PermissionKey = "i_ft_needed_file_download_power"
+	// PermissionKeyFTUploadQuotaMB caps how many MiB one client may store
+	// server-wide (266). Unset or 0 is unlimited, and admins are never
+	// capped; the highest tier wins, so a group can lift a stricter default.
+	PermissionKeyFTUploadQuotaMB PermissionKey = "i_ft_quota_mb_upload_per_client"
 	// PermissionKeyFTFileDelete allows deleting/renaming other users' files
 	// (263); uploaders may always manage their own files.
-	PermissionKeyFTFileDelete PermissionKey = "b_ft_delete"
+	PermissionKeyFTFileDelete       PermissionKey = "b_ft_delete"
+	PermissionKeyClientAvatarUpload PermissionKey = "b_client_avatar_upload"
 
 	// --- Poke ---
 	PermissionKeyClientPokePower       PermissionKey = "i_client_poke_power"
@@ -89,8 +97,9 @@ const (
 	PermissionKeyClientRemoteAddressView PermissionKey = "b_client_remoteaddress_view"
 
 	// --- Permission management ---
-	PermissionKeyPermissionModifyPower  PermissionKey = "b_permission_modify_power"
-	PermissionKeyPermissionModifyPowerI PermissionKey = "i_permission_modify_power"
+	PermissionKeyPermissionModifyPower       PermissionKey = "b_permission_modify_power"
+	PermissionKeyPermissionModifyPowerI      PermissionKey = "i_permission_modify_power"
+	PermissionKeyPermissionModifyPowerIgnore PermissionKey = "b_permission_modify_power_ignore"
 
 	// --- Virtual server ---
 	PermissionKeyVirtualserverSelect             PermissionKey = "b_virtualserver_select"
@@ -107,6 +116,19 @@ const (
 	PermissionKeyChatMentionAll     PermissionKey = "b_chat_mention_all"
 	PermissionKeyChatSlowmodeBypass PermissionKey = "b_chat_slowmode_bypass"
 	PermissionKeyEmojiManage        PermissionKey = "b_emoji_manage"
+	// PermissionKeyChatFilterManage gates reading AND writing the runtime
+	// word/link moderation lists (117/118): the word list tells an evader
+	// exactly what to avoid, so the read is as sensitive as the write.
+	PermissionKeyChatFilterManage PermissionKey = "b_chat_filter_manage"
+
+	// --- Accounts ---
+	// PermissionKeyClientIsBot marks an account as a bot (180): the client
+	// paints a bot badge and the flood gates are relaxed for it. It lives
+	// here rather than in a users column so it is assignable to a whole
+	// "Bots" server group, revocable without an account migration, audited
+	// and grant-capped like every other write. Guests can never hold it —
+	// resolution needs a users row.
+	PermissionKeyClientIsBot PermissionKey = "b_client_is_bot"
 
 	// --- Group & permission management (wave 6a) ---
 	PermissionKeyServerGroupManage  PermissionKey = "b_server_group_manage"

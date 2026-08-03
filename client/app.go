@@ -27,6 +27,8 @@ type App struct {
 	tabsMu   sync.Mutex
 	activeID string
 	settings Settings
+	// settingsMu guards settings fields accessed by background goroutines.
+	settingsMu sync.Mutex
 	// settingsPath overrides the settings file location (tests; empty =
 	// default UserConfigDir path).
 	settingsPath string
@@ -35,6 +37,18 @@ type App struct {
 
 	hkMu    sync.Mutex
 	hotkeys map[string]*hotkeyReg
+
+	// opacityMu serialises OS-level setWindowOpacity calls so the background
+	// watcher and SetWindowOpacity cannot interleave and leave persisted vs.
+	// visible opacity divergent (292).
+	opacityMu sync.Mutex
+
+	// readMu guards settings.LastReadChannels: server pushes from the read
+	// loop race the frontend's own mark-read calls (121).
+	readMu sync.Mutex
+	// dmMu serialises the local DM logs — every append rewrites a whole
+	// file, so two concurrent DMs with one peer would otherwise lose one (122).
+	dmMu sync.Mutex
 }
 
 // NewApp creates a new App.
@@ -63,13 +77,88 @@ func (a *App) startup(ctx context.Context) {
 	if a.settings.AlwaysOnTop {
 		wailsRuntime.WindowSetAlwaysOnTop(ctx, true)
 	}
+	// recover is per-goroutine (331).
+	go guardCrash("window-watch", a.windowWatch)
+}
+
+// windowWatch restores the persisted opacity once the native window exists
+// (292) and polls the minimised state (288). Wails v2 emits no minimize
+// event, but WindowIsMinimised is a live query, so acting on the rising edge
+// is what puts a minimised window in the tray instead of the taskbar.
+func (a *App) windowWatch() {
+	tick := time.NewTicker(400 * time.Millisecond)
+	defer tick.Stop()
+	applied := false
+	wasMin := false
+	for range tick.C {
+		if a.ctx == nil {
+			continue
+		}
+		// (292) the layered-window call needs an HWND, which only exists once
+		// the window is up; the first success ends the retry.
+		a.settingsMu.Lock()
+		opacity := a.settings.WindowOpacity
+		minimizeToTray := a.settings.MinimizeToTray
+		a.settingsMu.Unlock()
+		if !applied {
+			a.opacityMu.Lock()
+			err := setWindowOpacity(opacity)
+			a.opacityMu.Unlock()
+			if err == nil {
+				applied = true
+			}
+		}
+		min := wailsRuntime.WindowIsMinimised(a.ctx)
+		if min && !wasMin && minimizeToTray {
+			// unminimise before hiding: a window hidden while minimised comes
+			// back minimised when the tray shows it again.
+			wailsRuntime.WindowUnminimise(a.ctx)
+			wailsRuntime.WindowHide(a.ctx)
+			trayMarkHidden()
+			min = false
+		}
+		wasMin = min
+	}
+}
+
+// SetWindowOpacity sets the window transparency in percent (292) and persists
+// it. The value is clamped so the window can never be made invisible and
+// therefore unclickable.
+func (a *App) SetWindowOpacity(pct int) string {
+	if pct < 20 {
+		pct = 20
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	a.settingsMu.Lock()
+	a.settings.WindowOpacity = pct
+	if err := a.saveLocked(); err != nil {
+		a.settingsMu.Unlock()
+		return err.Error()
+	}
+	a.settingsMu.Unlock()
+	a.opacityMu.Lock()
+	err := setWindowOpacity(pct)
+	a.opacityMu.Unlock()
+	if err != nil {
+		return err.Error()
+	}
+	return ""
 }
 
 // shutdown is called when the app closes.
 func (a *App) shutdown(_ context.Context) {
+	a.hkMu.Lock()
+	for action, reg := range a.hotkeys {
+		reg.stop()
+		delete(a.hotkeys, action)
+	}
+	a.hkMu.Unlock()
 	for _, ts := range a.tabsRegistry() {
 		ts.cm.disconnect()
 	}
+	closeDailyLogs()
 }
 
 // Connect dials the server and authenticates. nickname is the account
@@ -175,10 +264,34 @@ func (a *App) MOTD() string {
 	return a.cmLoad().motdSnapshot()
 }
 
+// AcceptServerRules accepts exactly the rules revision displayed by the
+// blocking first-join prompt (216). The server answers with another
+// ServerRules frame: an empty payload closes the gate, while changed rules
+// replace the prompt and require a fresh click.
+func (a *App) AcceptServerRules(hash string) string {
+	if hash == "" {
+		return "rules hash is required"
+	}
+	m := a.cmLoad()
+	if m == nil {
+		return "not connected"
+	}
+	if err := m.write(netproto.MsgServerRulesAccept, netproto.ServerRulesAccept{Hash: hash}); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
 // ClientID returns the server-assigned client ID of the current connection
 // ("" when not connected).
 func (a *App) ClientID() string {
-	return a.cmLoad().clientIDSnapshot()
+	// the tab-switch identity refresh (281) can reach this while no manager is
+	// stored, and clientIDSnapshot takes its mutex before reading.
+	m := a.cmLoad()
+	if m == nil {
+		return ""
+	}
+	return m.clientIDSnapshot()
 }
 
 // SetPrioritySpeaker toggles the calling client's priority-speaker flag
@@ -194,7 +307,7 @@ func (a *App) SetPrioritySpeaker(active bool) string {
 // ChannelEdit edits a channel's settings (gated server-side by
 // b_channel_modify). The dialog always sends the full form, so every field
 // is set explicitly. It returns "" on success or the failure reason.
-func (a *App) ChannelEdit(channelID int64, topic string, maxClients int, opusBitrate int, opusFEC bool, opusDTX bool, opusStereo bool, description string) string {
+func (a *App) ChannelEdit(channelID int64, topic string, maxClients int, opusBitrate int, opusFEC bool, opusDTX bool, opusStereo bool, description string, slowModeSeconds int) string {
 	if err := a.cmLoad().write(netproto.MsgChannelEdit, netproto.ChannelEdit{
 		ChannelID:   channelID,
 		Topic:       &topic,
@@ -204,6 +317,9 @@ func (a *App) ChannelEdit(channelID int64, topic string, maxClients int, opusBit
 		OpusDTX:     &opusDTX,
 		OpusStereo:  &opusStereo,
 		Description: &description,
+		// (114) the dialog always sends the full form, so 0 means "off"
+		// rather than "unchanged".
+		SlowModeSeconds: &slowModeSeconds,
 	}); err != nil {
 		return err.Error()
 	}
@@ -215,12 +331,24 @@ func (a *App) ChannelEdit(channelID int64, topic string, maxClients int, opusBit
 // encrypted in the backend (4b): DMs are true E2EE (nacl/box), channel and
 // global use the server-distributed scope keys (secretbox).
 func (a *App) SendChat(scope, target, text string) string {
+	return a.sendChat(scope, target, text, 0)
+}
+
+// SendChatReply sends a channel/global reply with an explicit parent id.
+func (a *App) SendChatReply(scope, target, text string, replyToID int64) string {
+	return a.sendChat(scope, target, text, replyToID)
+}
+
+func (a *App) sendChat(scope, target, text string, replyToID int64) string {
 	if text == "" {
 		return "empty message"
 	}
 	msg, err := a.cmLoad().encryptChat(scope, target, text)
 	if err != nil {
 		return "encryption failed: " + err.Error()
+	}
+	if scope != "direct" {
+		msg.ReplyToID = replyToID
 	}
 	if err := a.cmLoad().write(netproto.MsgChatSend, msg); err != nil {
 		return err.Error()
@@ -255,9 +383,14 @@ func (a *App) GetPermissions() ([]netproto.PermissionEntry, error) {
 }
 
 // WebRTCOffer sends the browser's SDP offer and returns the server's answer.
-func (a *App) WebRTCOffer(sdp string) (string, error) {
+// tracks declares which slot every outbound track occupies (70): the router
+// carries one source per slot, so an undeclared second audio track would
+// contend with the microphone for the default slot and one of them would be
+// dropped. The declaration REPLACES the previous one, so every offer must
+// carry the complete list.
+func (a *App) WebRTCOffer(sdp string, tracks []netproto.TrackSlot) (string, error) {
 	f, err := a.cmLoad().request(netproto.MsgWebRTCOffer, netproto.MsgWebRTCAnswer,
-		netproto.WebRTCOffer{SDP: sdp}, 10*time.Second)
+		netproto.WebRTCOffer{SDP: sdp, Tracks: tracks}, 10*time.Second)
 	if err != nil {
 		return "", err
 	}
@@ -284,7 +417,20 @@ func (a *App) SendICECandidate(candidate, sdpMid string, sdpMLineIndex uint16) {
 
 // SetScreenShare declares screen-share state to the channel.
 func (a *App) SetScreenShare(active bool) string {
-	if err := a.cmLoad().write(netproto.MsgScreenShare, netproto.ScreenShare{Active: active}); err != nil {
+	return a.SetScreenShareQuality(active, 0)
+}
+
+// SetScreenShareQuality declares state plus the requested capture height so
+// the server can apply the granular 1080p permission.
+func (a *App) SetScreenShareQuality(active bool, maxHeight int) string {
+	// the voice teardown declares "not sharing" while disconnecting, and a
+	// tab switch stores a nil manager: write takes its mutex before looking
+	// at the connection, so a nil manager panics rather than erroring.
+	m := a.cmLoad()
+	if m == nil {
+		return "not connected"
+	}
+	if err := m.write(netproto.MsgScreenShare, netproto.ScreenShare{Active: active, MaxHeight: maxHeight}); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -293,7 +439,11 @@ func (a *App) SetScreenShare(active bool) string {
 // SetVideoQuality requests a simulcast layer for the video this client
 // receives: "high", "mid", or "low" (server maps to RID f/h/q).
 func (a *App) SetVideoQuality(quality string) string {
-	if err := a.cmLoad().write(netproto.MsgVideoQuality, netproto.VideoQuality{Quality: quality}); err != nil {
+	m := a.cmLoad()
+	if m == nil {
+		return "not connected"
+	}
+	if err := m.write(netproto.MsgVideoQuality, netproto.VideoQuality{Quality: quality}); err != nil {
 		return err.Error()
 	}
 	return ""

@@ -432,6 +432,8 @@ func TestOnClientJoinedChannel_CancelsCleanup(t *testing.T) {
 // TestClose_CancelsAllTimers verifies that Close cancels all pending timers.
 func TestClose_CancelsAllTimers(t *testing.T) {
 	mgr, s, sm := testEnv(t)
+	const closeCleanupDelay = 2 * time.Second
+	mgr.SetCleanupDelay(closeCleanupDelay)
 	userID := createTestUser(t, s)
 
 	// Create several temporary channels (each starts a cleanup timer).
@@ -459,7 +461,7 @@ func TestClose_CancelsAllTimers(t *testing.T) {
 
 	// Wait past the cleanup delay; channels must still exist because Close
 	// cancelled the timers.
-	time.Sleep(testCleanupDelay * 3)
+	time.Sleep(closeCleanupDelay + 100*time.Millisecond)
 	for _, id := range ids {
 		if !channelExistsInDB(t, s, id) {
 			t.Fatalf("channel %d was deleted despite Close", id)
@@ -557,6 +559,10 @@ func insertChannelRow(t *testing.T, s *store.Store, name string, parentID int64,
 // it, matching the temp-cleanup semantics).
 func TestLoadIntoState(t *testing.T) {
 	mgr, s, sm := testEnv(t)
+
+	if _, err := s.DB().Exec("DELETE FROM channels"); err != nil {
+		t.Fatalf("failed to clean channels table: %v", err)
+	}
 
 	rootID := insertChannelRow(t, s, "LoadRoot", 0, ChannelTypePermanent, 10)
 	childID := insertChannelRow(t, s, "LoadChild", rootID, ChannelTypeSemiPermanent, 0)

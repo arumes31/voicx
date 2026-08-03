@@ -7,6 +7,7 @@
 package main
 
 import (
+	"strings"
 	"time"
 
 	"voicx/internal/netproto"
@@ -16,6 +17,13 @@ import (
 // show/hide admin-only UI).
 func (a *App) IsAdmin() bool {
 	return a.cmLoad() != nil && a.cmLoad().isAdminSnapshot()
+}
+
+// IsGuest reports whether the active connection is an anonymous guest
+// session. The frontend uses this to stop account-only actions before they
+// reach the server.
+func (a *App) IsGuest() bool {
+	return a.cmLoad() != nil && a.cmLoad().isGuestSnapshot()
 }
 
 // --- group list / CRUD -------------------------------------------------------
@@ -38,6 +46,23 @@ func (a *App) GroupList(groupType string) (netproto.GroupListResponse, error) {
 func (a *App) GroupCreate(groupType, name string, sortID int) (netproto.GroupListResponse, error) {
 	f, err := a.cmLoad().request(netproto.MsgGroupCreate, netproto.MsgGroupListResponse,
 		netproto.GroupCreate{Type: groupType, Name: name, SortID: sortID}, 5*time.Second)
+	if err != nil {
+		return netproto.GroupListResponse{}, err
+	}
+	var resp netproto.GroupListResponse
+	if err := decodeJSON(f, &resp); err != nil {
+		return netproto.GroupListResponse{}, err
+	}
+	return resp, nil
+}
+
+// GroupEdit writes a server group's cosmetics and returns the refreshed group
+// list (178 colour, 179 hoisting). The dialog always submits the full form, so
+// all three fields are sent explicitly; an empty colour clears back to the
+// theme default. The server rejects anything but "#rrggbb" or "".
+func (a *App) GroupEdit(groupID int64, color string, hoist bool, sortID int) (netproto.GroupListResponse, error) {
+	f, err := a.cmLoad().request(netproto.MsgGroupEdit, netproto.MsgGroupListResponse,
+		netproto.GroupEdit{GroupID: groupID, Color: &color, Hoist: &hoist, SortID: &sortID}, 5*time.Second)
 	if err != nil {
 		return netproto.GroupListResponse{}, err
 	}
@@ -166,6 +191,21 @@ func (a *App) PermTemplateApply(template, tier string, groupID int64, uniqueID s
 	return ""
 }
 
+// PermCopy copies a target's permission entries onto another target (141).
+// Kinds are "servergroup" | "channelgroup" | "client"; ids are decimal group
+// ids or a unique ID for "client". replace makes the result an exact copy
+// rather than a merge. The server caps the copy in both directions, so a
+// denial is expected UX and arrives via the servererror event.
+func (a *App) PermCopy(fromKind, fromID, toKind, toID string, channelID int64, replace bool) string {
+	if err := a.cmLoad().write(netproto.MsgPermCopy, netproto.PermCopy{
+		FromKind: fromKind, FromID: fromID, ToKind: toKind, ToID: toID,
+		ChannelID: channelID, Replace: replace,
+	}); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
 // PermList returns a target's current permission entries (editor read path).
 func (a *App) PermList(tier string, groupID int64, uniqueID string, channelID int64) (netproto.PermListResponse, error) {
 	f, err := a.cmLoad().request(netproto.MsgPermList, netproto.MsgPermListResponse,
@@ -255,8 +295,39 @@ func (a *App) CreateChannel(name, topic string, parentID int64, channelType, max
 	if err := a.cmLoad().write(netproto.MsgCreateChannel, netproto.CreateChannel{
 		Name: name, Topic: topic, ParentID: parentID, Type: channelType,
 		MaxClients: maxClients, Password: password, NeededJoinPower: neededJoinPower,
-		OpusBitrate: opusBitrate, OpusFEC: opusFEC, OpusDTX: opusDTX, OpusStereo: opusStereo,
+		OpusBitrate: opusBitrate, OpusFEC: &opusFEC, OpusDTX: &opusDTX, OpusStereo: &opusStereo,
 	}); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+// ChannelEditTree writes the four channel fields the edit dialog gained:
+// needed join power (160), sort index (163), parent (168) and the sub-channel
+// permission inheritance toggle (157). fields is a comma-separated subset of
+// "join_power,order,parent,inherit" naming which arguments to honour —
+// omitting a field leaves it unchanged, which matters because a parent_id of
+// 0 is the valid "move to root" value and re-parenting drops the server's
+// whole permission cache. Errors (invalid re-parent, join power above the
+// caller's own) surface via the servererror event.
+func (a *App) ChannelEditTree(channelID int64, fields string, neededJoinPower, orderIndex int, parentID int64, inheritPermissions bool) string {
+	msg := netproto.ChannelEdit{ChannelID: channelID}
+	for _, f := range strings.Split(fields, ",") {
+		switch strings.TrimSpace(f) {
+		case "join_power":
+			msg.NeededJoinPower = &neededJoinPower
+		case "order":
+			msg.OrderIndex = &orderIndex
+		case "parent":
+			msg.ParentID = &parentID
+		case "inherit":
+			msg.InheritPermissions = &inheritPermissions
+		}
+	}
+	if msg.NeededJoinPower == nil && msg.OrderIndex == nil && msg.ParentID == nil && msg.InheritPermissions == nil {
+		return ""
+	}
+	if err := a.cmLoad().write(netproto.MsgChannelEdit, msg); err != nil {
 		return err.Error()
 	}
 	return ""

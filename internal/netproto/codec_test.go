@@ -1,57 +1,158 @@
 package netproto
 
 import (
+	"fmt"
+	"reflect"
 	"testing"
 )
 
-// TestMessageTypeString covers the String names of all defined message types.
 func TestMessageTypeString(t *testing.T) {
-	cases := []struct {
-		mt   MessageType
-		want string
-	}{
-		{MsgAuthenticate, "Authenticate"},
-		{MsgAuthResponse, "AuthResponse"},
-		{MsgCreateChannel, "CreateChannel"},
-		{MsgChannelList, "ChannelList"},
-		{MsgChatSend, "ChatSend"},
-		{MsgChatBroadcast, "ChatBroadcast"},
-		{MsgError, "Error"},
-		{MsgPing, "Ping"},
-		{MsgPong, "Pong"},
-		{MsgJoinChannel, "JoinChannel"},
-		{MsgDeleteChannel, "DeleteChannel"},
-		{MsgMoveClient, "MoveClient"},
-		{MsgKickClient, "KickClient"},
-		{MsgSnapshot, "Snapshot"},
-		{MsgEvent, "Event"},
-		{MsgAuthChallenge, "AuthChallenge"},
-		{MsgAuthSignature, "AuthSignature"},
-		{MsgWebRTCOffer, "WebRTCOffer"},
-		{MsgWebRTCAnswer, "WebRTCAnswer"},
-		{MsgICECandidate, "ICECandidate"},
-		{MsgWhisperSet, "WhisperSet"},
-		{MsgPositionUpdate, "PositionUpdate"},
-		{MsgVideoQuality, "VideoQuality"},
-		{MsgRecordingControl, "RecordingControl"},
-		{MsgFileTransferInit, "FileTransferInit"},
-		{MsgFileTransferInitResponse, "FileTransferInitResponse"},
-		{MsgFileList, "FileList"},
-		{MsgFileListResponse, "FileListResponse"},
-		{MsgAvatarSet, "AvatarSet"},
-		{MsgAvatarGet, "AvatarGet"},
-		{MsgAvatarData, "AvatarData"},
-		{MsgChannelIconSet, "ChannelIconSet"},
-		{MsgTokenUse, "TokenUse"},
-		{MsgComplaint, "Complaint"},
-		{MsgScreenShare, "ScreenShare"},
-		{MsgClientInfoQuery, "ClientInfoQuery"},
-		{MsgClientInfoResponse, "ClientInfoResponse"},
-		{MessageType(999), "Unknown(999)"},
+	names := []string{
+		"Authenticate",
+		"AuthResponse",
+		"CreateChannel",
+		"ChannelList",
+		"ChatSend",
+		"ChatBroadcast",
+		"Error",
+		"Ping",
+		"Pong",
+		"JoinChannel",
+		"DeleteChannel",
+		"MoveClient",
+		"KickClient",
+		"Snapshot",
+		"Event",
+		"AuthChallenge",
+		"AuthSignature",
+		"WebRTCOffer",
+		"WebRTCAnswer",
+		"ICECandidate",
+		"WhisperSet",
+		"PositionUpdate",
+		"VideoQuality",
+		"RecordingControl",
+		"FileTransferInit",
+		"FileTransferInitResponse",
+		"FileList",
+		"FileListResponse",
+		"AvatarSet",
+		"AvatarGet",
+		"AvatarData",
+		"ChannelIconSet",
+		"TokenUse",
+		"Complaint",
+		"ScreenShare",
+		"PermissionsQuery",
+		"PermissionsResponse",
+		"ClientInfoQuery",
+		"ClientInfoResponse",
+		"ChannelEdit",
+		"PrioritySpeaker",
+		"KeyPublish",
+		"KeyRequest",
+		"KeyResponse",
+		"ChannelKey",
+		"ChatHistory",
+		"ChatHistoryResponse",
+		"ChatEdit",
+		"ChatDelete",
+		"ChatPin",
+		"ChatPins",
+		"ChatPinsResponse",
+		"Typing",
+		"ChatDelivered",
+		"ChatRead",
+		"EmojiUpload",
+		"EmojiList",
+		"EmojiListResponse",
+		"ChatReact",
+		"EmojiGet",
+		"EmojiData",
+		"GroupList",
+		"GroupListResponse",
+		"GroupCreate",
+		"GroupRename",
+		"GroupDelete",
+		"GroupAssign",
+		"GroupUnassign",
+		"PermSet",
+		"PermUnset",
+		"PermTemplateApply",
+		"PermTrace",
+		"PermTraceResponse",
+		"AuditLog",
+		"AuditLogResponse",
+		"GroupIconSet",
+		"GroupIconGet",
+		"GroupIconData",
+		"GroupMembers",
+		"GroupMembersResponse",
+		"BanList",
+		"BanListResponse",
+		"BanRemove",
+		"PermList",
+		"PermListResponse",
+		"FileDelete",
+		"FileRename",
+		"FileVersions",
+		"FileVersionsResponse",
+		"FileLink",
+		"FileLinkResponse",
+		"ServerIconSet",
+		"ServerIconGet",
+		"ServerIconData",
+		"SetStatus",
+		"Poke",
+		"ServerInfoQuery",
+		"ServerInfoResponse",
+		"ChatKeyRequest",
+		"ChatKeyBundle",
+		"ChatFilterGet",
+		"ChatFilterSet",
+		"ChatFilterResponse",
+		"GroupEdit",
+		"PermCopy",
+		"PermsInvalid",
+		"ComplaintList",
+		"Complaints",
+		"ComplaintClear",
+		"TokenList",
+		"Tokens",
+		"TokenAdd",
+		"TokenDelete",
+		"ChannelIconGet",
+		"ChannelIconData",
+		"ServerBannerSet",
+		"ServerBannerGet",
+		"ServerBannerData",
+		"EmojiDelete",
+		"EmojiRename",
+		"ServerRules",
+		"ServerRulesAccept",
+		"ChannelSubscribe",
+		"SubscriptionState",
+		"ServerConfigQuery",
+		"ServerConfigSet",
+		"ServerConfigResponse",
+		"PreKeyPublish",
+		"PreKeyQuery",
+		"PreKeyBundle",
 	}
-	for _, tc := range cases {
-		if got := tc.mt.String(); got != tc.want {
-			t.Errorf("MessageType(%d).String() = %q, want %q", uint16(tc.mt), got, tc.want)
+
+	for i, want := range names {
+		messageType := MessageType(i + 1)
+		t.Run(want, func(t *testing.T) {
+			if got := messageType.String(); got != want {
+				t.Errorf("MessageType(%d).String() = %q, want %q", messageType, got, want)
+			}
+		})
+	}
+
+	for _, messageType := range []MessageType{0, MessageType(len(names) + 1), 999, ^MessageType(0)} {
+		want := "Unknown(" + fmt.Sprint(uint16(messageType)) + ")"
+		if got := messageType.String(); got != want {
+			t.Errorf("MessageType(%d).String() = %q, want %q", messageType, got, want)
 		}
 	}
 }
@@ -80,13 +181,13 @@ func TestCodecRoundTrip(t *testing.T) {
 
 	t.Run("AuthResponseWithICEServers", func(t *testing.T) {
 		in := AuthResponse{OK: true, ClientID: "c-1", ICEServers: []ICEServer{
-			{URLs: []string{"stun:stun.example.com:3478"}},
-			{URLs: []string{"turn:turn.example.com:3478"}, Username: "123:uid", Credential: "cred"},
+			{URLs: []string{"stun:stun.example.com:12340"}},
+			{URLs: []string{"turn:turn.example.com:12340"}, Username: "123:uid", Credential: "cred"},
 		}}
 		var out AuthResponse
 		roundTrip(t, MsgAuthResponse, in, &out)
 		if len(out.ICEServers) != 2 ||
-			out.ICEServers[0].URLs[0] != "stun:stun.example.com:3478" ||
+			out.ICEServers[0].URLs[0] != "stun:stun.example.com:12340" ||
 			out.ICEServers[1].Username != "123:uid" || out.ICEServers[1].Credential != "cred" {
 			t.Errorf("got %+v, want %+v", out, in)
 		}
@@ -176,10 +277,13 @@ func TestCodecRoundTrip(t *testing.T) {
 	})
 
 	t.Run("WebRTCOffer", func(t *testing.T) {
-		in := WebRTCOffer{SDP: "v=0\r\no=- 1 1 IN IP4 0.0.0.0"}
+		in := WebRTCOffer{
+			SDP:    "v=0\r\no=- 1 1 IN IP4 0.0.0.0",
+			Tracks: []TrackSlot{{TrackID: "t-1", Slot: "mic"}, {TrackID: "t-2", Slot: "screenaudio"}},
+		}
 		var out WebRTCOffer
 		roundTrip(t, MsgWebRTCOffer, in, &out)
-		if out != in {
+		if !reflect.DeepEqual(out, in) {
 			t.Errorf("got %+v, want %+v", out, in)
 		}
 	})
@@ -194,7 +298,7 @@ func TestCodecRoundTrip(t *testing.T) {
 	})
 
 	t.Run("ICECandidate", func(t *testing.T) {
-		in := ICECandidate{Candidate: "candidate:1 1 udp 2130706431 127.0.0.1 9987 typ host", SDPMid: "0", SDPMLineIndex: 0}
+		in := ICECandidate{Candidate: "candidate:1 1 udp 2130706431 127.0.0.1 12334 typ host", SDPMid: "0", SDPMLineIndex: 0}
 		var out ICECandidate
 		roundTrip(t, MsgICECandidate, in, &out)
 		if out != in {
@@ -248,7 +352,7 @@ func TestCodecRoundTrip(t *testing.T) {
 	})
 
 	t.Run("FileTransferInitResponse", func(t *testing.T) {
-		in := FileTransferInitResponse{TransferID: "tid", Token: "tok", Port: 30033}
+		in := FileTransferInitResponse{TransferID: "tid", Token: "tok", Port: 12336}
 		var out FileTransferInitResponse
 		roundTrip(t, MsgFileTransferInitResponse, in, &out)
 		if out != in {

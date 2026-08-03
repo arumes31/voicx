@@ -42,6 +42,47 @@ function highlight(escaped) {
         .replace(/(\/\/[^\n]*|\/\*[\s\S]*?\*\/)/g, `<span class="tk-com">$1</span>`);
 }
 
+function detectLanguage(code) {
+    if (/^\s*(package\s+\w+|func\s+\w+|go\s+func|type\s+\w+\s+struct)\b/m.test(code)) return "go";
+    if (/\b(const|let|var)\s+\w+\s*=|=>|\b(document|window)\./.test(code)) return "javascript";
+    if (/^\s*(def|class|from\s+\w+\s+import|import\s+\w+)\b/m.test(code)) return "python";
+    if (/^\s*(SELECT|INSERT|UPDATE|DELETE|CREATE\s+TABLE)\b/im.test(code)) return "sql";
+    if (/^\s*[.#]?[\w-]+\s*\{[^}]*:[^}]*\}/m.test(code)) return "css";
+    if (/^\s*[<{][\s\S]*[>}]\s*$/.test(code)) return "markup";
+    return "plain";
+}
+
+function tableCells(line) {
+    return line.trim().replace(/^\||\|$/g, "").split("|").map((cell) => cell.trim());
+}
+
+function renderTables(text) {
+    const lines = text.split(/\r?\n/);
+    const out = [];
+    for (let i = 0; i < lines.length; i++) {
+        const header = tableCells(lines[i]);
+        const separator = i + 1 < lines.length ? tableCells(lines[i + 1]) : [];
+        const isTable = lines[i].includes("|") && header.length > 1 && separator.length === header.length &&
+            separator.every((cell) => /^:?-+:?$/.test(cell));
+        if (!isTable) {
+            out.push(lines[i]);
+            continue;
+        }
+        let html = `<div class="md-table-wrap"><table class="md-table"><thead><tr>${header.map((cell) => `<th>${cell}</th>`).join("")}</tr></thead><tbody>`;
+        i += 2;
+        while (i < lines.length && lines[i].includes("|")) {
+            const cells = tableCells(lines[i]);
+            if (cells.length !== header.length) break;
+            html += `<tr>${cells.map((cell) => `<td>${cell}</td>`).join("")}</tr>`;
+            i++;
+        }
+        html += "</tbody></table></div>";
+        out.push(html);
+        i--;
+    }
+    return out.join("\n");
+}
+
 // renderMarkdown converts user text to a safe HTML string. Links are
 // rendered as <a class="md-link" data-url="...">; opening happens via click
 // delegation (runtime.BrowserOpenURL) wired up in chat-ui.js — never via a
@@ -56,8 +97,10 @@ export function renderMarkdown(text) {
 
     let t = String(text);
     // Fenced code blocks (```lang\n...```) first — their content is opaque.
-    t = t.replace(/```(\w*)\r?\n?([\s\S]*?)(?:```|$)/g, (_m, _lang, code) =>
-        push(`<pre class="md-pre"><code>${highlight(escapeHTML(code.replace(/\n$/, "")))}</code></pre>`));
+    t = t.replace(/```(\w*)\r?\n?([\s\S]*?)(?:```|$)/g, (_m, lang, code) => {
+        const language = (lang || detectLanguage(code)).toLowerCase();
+        return push(`<pre class="md-pre language-${escapeHTML(language)}"><code>${highlight(escapeHTML(code.replace(/\n$/, "")))}</code></pre>`);
+    });
     // Inline code spans.
     t = t.replace(/`([^`\n]+)`/g, (_m, code) =>
         push(`<code class="md-code">${escapeHTML(code)}</code>`));
@@ -76,6 +119,8 @@ export function renderMarkdown(text) {
         (u) => `<a href="#" class="md-link" data-url="${u}" title="${u}">${u}</a>`);
     // :shortcode: emoji (95).
     t = t.replace(/:([a-z0-9_+-]+):/gi, (m, name) => EMOJI[name.toLowerCase()] || m);
+    t = renderTables(t);
+    t = t.replace(/\n?(<div class="md-table-wrap">[\s\S]*?<\/table><\/div>)\n?/g, "$1");
     t = t.replace(/\n/g, "<br>");
     // Restore stashed code.
     t = t.replace(/\u0001(\d+)\u0002/g, (_m, i) => stash[Number(i)]);

@@ -115,7 +115,9 @@ async function saveSettings(patch) {
         V().toast("save failed: " + err, "warn");
         return false;
     }
-    V().state.settings = s;
+    // (282) the blob we sent is a copy taken before the save: re-read the
+    // merged truth so Go-owned fields (recents) written meanwhile survive.
+    V().state.settings = await window.go.main.App.GetSettings();
     return true;
 }
 
@@ -141,6 +143,10 @@ async function connectBookmark(b) {
     $("login-serverpw").value = "";
     state.lastConnect = null;
     V().showLogin();
+    // (334) the override is what gets sent as the login nickname, so the
+    // connect must carry the bookmark name to stay identifiable. Stashed
+    // after showLogin, which drops the previous login's stash.
+    state.pendingBookmark = { name: b.name, addr: b.addr };
     toast("bookmark loaded — enter password to connect");
 }
 
@@ -350,7 +356,16 @@ export function initMenu() {
                 head.textContent = folder;
                 bookmarkList.appendChild(head);
             }
-            bookmarkList.appendChild(menuAction(b.name, () => connectBookmark(b)));
+            const item = menuAction(b.name, () => connectBookmark(b));
+            if (b.color) {
+                // (284) same swatch the tab bar uses, so a bookmark reads the
+                // same in the menu as it does once connected.
+                const dot = document.createElement("span");
+                dot.className = "srv-tab-dot";
+                dot.style.background = b.color;
+                item.prepend(dot);
+            }
+            bookmarkList.appendChild(item);
         }
     };
     const bookmarks = buildMenu(t("menu.bookmarks"), [
@@ -395,7 +410,7 @@ export function initMenu() {
     const permissions = buildMenu(t("menu.permissions"), [
         menuAction(t("menu.viewMyPerms"), () => {
             V().refreshPermissions();
-            $("details").scrollIntoView({ behavior: "smooth" });
+            V().setDetailsOpen(true);
         }),
         menuAction(t("menu.permManager"), () => {
             if (!V().state.myClientID) return V().toast("not connected", "warn");
@@ -415,6 +430,21 @@ export function initMenu() {
             if (!V().state.myClientID) return V().toast("not connected", "warn");
             window.__voicxPerms.openBanList();
         }),
+        menuAction("Chat filters…", () => {
+            if (!V().state.myClientID) return V().toast("not connected", "warn");
+            window.__voicxPerms.openChatFilters();
+        }),
+        // (173) complaint review, gated the same way as the audit viewer.
+        menuAction("Complaints…", () => {
+            if (!V().state.myClientID) return V().toast("not connected", "warn");
+            window.__voicxPerms.openComplaints();
+        }),
+        // (174/175/176) privilege key management and handoff.
+        menuAction("Privilege keys…", () => {
+            if (!V().state.myClientID) return V().toast("not connected", "warn");
+            window.__voicxPerms.openTokenManager();
+        }),
+        menuAction("Use a privilege key…", () => window.__voicxPerms.openTokenRedeem()),
         divider(),
         menuAction(t("menu.debugConsole"), () => {
             if (!V().state.myClientID) return V().toast("not connected", "warn");
@@ -428,6 +458,10 @@ export function initMenu() {
 
     // View menu: window/integration toggles (wave 8a/8c).
     const view = buildMenu(t("menu.view"), [
+        menuAction("Toggle details", () => {
+            V().setDetailsOpen(document.body.classList.contains("details-collapsed"));
+        }),
+        divider(),
         menuAction(t("menu.compact"), () => V().toggleCompact()),
         menuAction(t("menu.zen"), () => window.__voicxPolish.toggleZen()),
         menuAction("Pop out chat", () => window.__voicxPolish.toggleChatPopout()),
@@ -482,6 +516,7 @@ async function setTheme(theme) {
         V().toast("save failed: " + err, "warn");
         return;
     }
-    V().state.settings = s;
+    // (282) same as saveSettings: the merged blob is the authoritative cache.
+    V().state.settings = await window.go.main.App.GetSettings();
     V().applyAppearance();
 }

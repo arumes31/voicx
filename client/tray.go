@@ -2,10 +2,9 @@
 // getlantern/systray — the one new client dependency this wave, justified
 // because Wails v2 has no tray API.
 //
-// Threading: systray.Run must own the calling goroutine's message loop; on
-// macOS that must be the process main thread, on Windows any single
-// dedicated goroutine works. main() therefore runs systray on the main
-// thread and wails.Run in a goroutine — the order that is safe on both.
+// Threading is selected by the platform-specific desktop runner. On macOS
+// systray must own the process main thread; on Windows it runs on a dedicated,
+// locked OS thread so Wails/WebView2 can own the initial COM thread.
 package main
 
 import (
@@ -37,11 +36,16 @@ type tray struct {
 	miDeafen   *systray.MenuItem
 }
 
-// initTray starts the tray on the calling goroutine (blocks until quit).
-// onReady wires the menu after the app started.
-func initTray(a *App) {
+// initTray starts the tray on the calling goroutine and blocks until quit.
+// When ready is non-nil it is closed after the tray menu is fully wired.
+func initTray(a *App, ready chan<- struct{}) {
 	trayCtl = &tray{app: a, visible: true}
-	systray.Run(trayCtl.onReady, func() { log.Printf("tray exit") })
+	systray.Run(func() {
+		trayCtl.onReady()
+		if ready != nil {
+			close(ready)
+		}
+	}, func() { log.Printf("tray exit") })
 }
 
 // onReady builds the tray menu (called on the systray thread).
@@ -56,7 +60,8 @@ func (t *tray) onReady() {
 	miDisconnect := systray.AddMenuItem("Disconnect", "disconnect the active server tab")
 	miQuit := systray.AddMenuItem("Quit", "quit voicx")
 
-	go func() {
+	// recover is per-goroutine: the menu event loop needs its own guard (331).
+	go guardCrash("tray", func() {
 		for {
 			select {
 			case <-t.miShowHide.ClickedCh:
@@ -74,7 +79,7 @@ func (t *tray) onReady() {
 				}
 			}
 		}
-	}()
+	})
 }
 
 // toggleWindow shows or hides the main window (287).
@@ -92,6 +97,21 @@ func (t *tray) toggleWindow() {
 	} else {
 		wailsRuntime.WindowHide(t.app.ctx)
 		t.miShowHide.SetTitle("Show voicx")
+	}
+}
+
+// trayMarkHidden records that the window was hidden by something other than
+// the tray menu (288 minimize-to-tray), so the next menu click shows it again
+// instead of hiding an already-hidden window.
+func trayMarkHidden() {
+	if trayCtl == nil {
+		return
+	}
+	trayCtl.mu.Lock()
+	trayCtl.visible = false
+	trayCtl.mu.Unlock()
+	if trayCtl.miShowHide != nil {
+		trayCtl.miShowHide.SetTitle("Show voicx")
 	}
 }
 
@@ -171,6 +191,19 @@ func trayClearMentions() {
 	trayCtl.mentions = 0
 	trayCtl.mu.Unlock()
 	trayCtl.updateTitle()
+}
+
+// TrayMention bumps the tray badge for a mention that arrived in the ACTIVE
+// tab (290). Background tabs are counted by the event relay, which never sees
+// the active tab's frames, so the frontend has to report those itself.
+func (a *App) TrayMention() {
+	trayAddMention()
+}
+
+// TrayClearMentions resets the tray badge (290), e.g. once the window is
+// focused again and the user has necessarily seen the messages.
+func (a *App) TrayClearMentions() {
+	trayClearMentions()
 }
 
 // trayIcon builds a minimal 16x16 32bpp ICO at runtime (signal-green square

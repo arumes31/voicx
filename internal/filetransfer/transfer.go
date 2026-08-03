@@ -53,7 +53,7 @@ func (s *Server) serve(ctx context.Context, conn net.Conn) {
 	if tr.Direction == "upload" {
 		err = s.receiveUpload(ctx, conn, tr)
 	} else {
-		err = s.sendDownload(conn, tr)
+		err = s.sendDownload(conn, tr, init.Offset)
 	}
 	if s.OnTransferComplete != nil {
 		result := "ok"
@@ -97,7 +97,7 @@ func (s *Server) receiveUpload(ctx context.Context, conn net.Conn, tr *transfer)
 	}
 
 	h := sha256.New()
-	limiter := newRateLimiter(s.cfg.MaxKBps)
+	limiter := s.limiterFor(time.Now())
 	var received int64
 
 	for {
@@ -159,18 +159,32 @@ const maxFileVersions = 3
 
 // finalizeUpload places a verified upload: it rotates the replaced file into
 // <name>.v1..v3 (264), hard-links to an identical existing blob when one
-// exists (275 dedup), and records the row.
+// exists (275 dedup), and records the row. A ".vcx" upload is flagged
+// (91-135) so the file browser can refuse to hand out a blob it has no key
+// for, and its name must be the truncated digest of the ciphertext: that is
+// what makes the name unforgeable, so an upload cannot displace the blob an
+// older message still points at.
 func (s *Server) finalizeUpload(ctx context.Context, tr *transfer, tmpPath, finalPath string, size int64, sum string) error {
+	encrypted := isEncryptedAttachment(tr.Name)
+	if encrypted && tr.Name != sum[:encryptedNameLen]+encryptedSuffix {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("encrypted attachment name is not its content digest")
+	}
+
 	// Identical re-upload of the current file: keep the blob, refresh the row.
 	if cur, err := s.store.GetFile(ctx, tr.ChannelID, tr.Folder, tr.Name); err == nil && cur.SHA256 == sum {
 		_ = os.Remove(tmpPath)
 		return s.store.AddFile(ctx, store.FileRecord{
 			ChannelID: tr.ChannelID, Folder: tr.Folder, Name: tr.Name,
-			Size: size, SHA256: sum, Uploader: tr.Uploader,
+			Size: size, SHA256: sum, Uploader: tr.Uploader, Encrypted: encrypted,
 		})
 	}
 
-	s.rotateVersions(ctx, tr)
+	// Content-derived .vcx names never collide, so rotation can only burn four
+	// store lookups on a guaranteed miss for them (91-135).
+	if !encrypted {
+		s.rotateVersions(ctx, tr)
+	}
 
 	// Dedup (275): point at an identical existing blob instead of storing a
 	// second copy.
@@ -189,7 +203,7 @@ func (s *Server) finalizeUpload(ctx context.Context, tr *transfer, tmpPath, fina
 	}
 	return s.store.AddFile(ctx, store.FileRecord{
 		ChannelID: tr.ChannelID, Folder: tr.Folder, Name: tr.Name,
-		Size: size, SHA256: sum, Uploader: tr.Uploader,
+		Size: size, SHA256: sum, Uploader: tr.Uploader, Encrypted: encrypted,
 	})
 }
 
@@ -224,8 +238,11 @@ func (s *Server) rotateVersions(ctx context.Context, tr *transfer) {
 }
 
 // sendDownload streams the file in chunk frames followed by the digest
-// frame carrying its SHA-256.
-func (s *Server) sendDownload(conn net.Conn, tr *transfer) error {
+// frame carrying its SHA-256. offset > 0 resumes an interrupted download
+// (259): the prefix the client already holds is folded into the hash but not
+// re-sent, so the digest still covers the whole file and a resumed download
+// is verified exactly as strictly as a fresh one.
+func (s *Server) sendDownload(conn net.Conn, tr *transfer, offset int64) error {
 	f, err := os.Open(s.filePath(tr.ChannelID, tr.Folder, tr.Name))
 	if err != nil {
 		return fmt.Errorf("opening file: %w", err)
@@ -233,7 +250,15 @@ func (s *Server) sendDownload(conn net.Conn, tr *transfer) error {
 	defer f.Close()
 
 	h := sha256.New()
-	limiter := newRateLimiter(s.cfg.MaxKBps)
+	if offset > 0 {
+		if offset > tr.Size {
+			return fmt.Errorf("resume offset %d is past the end of %s (%d bytes)", offset, tr.Name, tr.Size)
+		}
+		if _, err := io.CopyN(h, f, offset); err != nil {
+			return fmt.Errorf("hashing resumed prefix: %w", err)
+		}
+	}
+	limiter := s.limiterFor(time.Now())
 	buf := make([]byte, chunkSize)
 
 	for {
@@ -263,6 +288,7 @@ func (s *Server) sendDownload(conn net.Conn, tr *transfer) error {
 		zap.String("transfer_id", tr.ID),
 		zap.Int64("channel_id", tr.ChannelID),
 		zap.String("name", tr.Name),
+		zap.Int64("resume_offset", offset),
 	)
 	return nil
 }

@@ -51,3 +51,30 @@ func TestReadyzNilProbe(t *testing.T) {
 		t.Fatalf("/readyz (nil probe) status = %d, want 200", rec.Code)
 	}
 }
+
+func TestSchemaVersionHandlerMethodAndLoopbackRestriction(t *testing.T) {
+	handler := SchemaVersionHandler(func(context.Context) (string, error) { return "022", nil })
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/schema/version", nil)
+	request.RemoteAddr = "127.0.0.1:1234"
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusMethodNotAllowed || recorder.Header().Get("Allow") != http.MethodGet {
+		t.Fatalf("POST status/Allow = %d/%q", recorder.Code, recorder.Header().Get("Allow"))
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/api/v1/schema/version", nil)
+	request.RemoteAddr = "192.0.2.10:1234"
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("remote GET status = %d, want 403", recorder.Code)
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/api/v1/schema/version", nil)
+	request.RemoteAddr = "[::1]:1234"
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("loopback GET status = %d, want 200", recorder.Code)
+	}
+}

@@ -45,3 +45,12 @@ func TestParseHotkeySpec(t *testing.T) {
 		t.Errorf("Ctrl+M parsed badly: mods=%v key=%v", mods, key)
 	}
 }
+
+func TestValidateHotkeySpecAllowsUnbound(t *testing.T) {
+	if err := validateHotkeySpec(""); err != nil {
+		t.Fatalf("empty hotkey should unbind: %v", err)
+	}
+	if err := validateHotkeySpec("not-a-key"); err == nil {
+		t.Fatal("invalid non-empty hotkey accepted")
+	}
+}

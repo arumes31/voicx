@@ -6,10 +6,12 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -66,10 +68,19 @@ func (k *knownServers) verify(addr, fp string) trustStatus {
 	if !ok {
 		return trustUnknown
 	}
-	if known != fp {
+	if !secureEqualFold(known, fp) {
 		return trustMismatch
 	}
 	return trustOK
+}
+
+// secureEqualFold compares normalized fingerprints without a data-dependent
+// early exit. Fingerprints, transfer tokens, and authentication material must
+// not use ordinary string equality in verification paths.
+func secureEqualFold(a, b string) bool {
+	a = strings.ToLower(a)
+	b = strings.ToLower(b)
+	return len(a) == len(b) && subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
 // trust pins fp for addr and persists the store.

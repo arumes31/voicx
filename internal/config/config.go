@@ -14,29 +14,53 @@ import (
 //  2. config.yaml at the project root (if present)
 //  3. the defaults defined in Load().
 type Config struct {
-	ServerName         string `mapstructure:"server_name"`
-	ServerPassword     string `mapstructure:"server_password"`
-	LogLevel           string `mapstructure:"log_level"`
-	DevMode            bool   `mapstructure:"dev_mode"`
-	TCPAddr            string `mapstructure:"tcp_addr"`
-	UDPAddr            string `mapstructure:"udp_addr"`
-	GRPCAddr           string `mapstructure:"grpc_addr"`
-	HealthAddr         string `mapstructure:"health_addr"`
-	QueryAddr          string `mapstructure:"query_addr"`
+	ServerName     string `mapstructure:"server_name"`
+	ServerPassword string `mapstructure:"server_password"`
+	LogLevel       string `mapstructure:"log_level"`
+	DevMode        bool   `mapstructure:"dev_mode"`
+	TCPAddr        string `mapstructure:"tcp_addr"`
+	UDPAddr        string `mapstructure:"udp_addr"`
+	GRPCAddr       string `mapstructure:"grpc_addr"`
+	HealthAddr     string `mapstructure:"health_addr"`
+	QueryAddr      string `mapstructure:"query_addr"`
+	// ServerQuery over SSH (224): the same command set and the same
+	// credentials as QueryAddr, wrapped in an SSH transport. Off by default.
+	// QuerySSHHostKey is generated on first start and must persist, or every
+	// client reports a changed host identity after a restart.
+	QuerySSHEnabled    bool   `mapstructure:"query_ssh_enabled"`
+	QuerySSHAddr       string `mapstructure:"query_ssh_addr"`
+	QuerySSHHostKey    string `mapstructure:"query_ssh_host_key"`
 	FileAddr           string `mapstructure:"file_addr"`
 	FileRoot           string `mapstructure:"file_root"`
 	FileMaxKBps        int    `mapstructure:"file_max_kbps"`
 	FileChannelQuotaMB int64  `mapstructure:"file_channel_quota_mb"`
 	FileMaxSizeMB      int64  `mapstructure:"file_max_size_mb"`
-	DatabaseURL        string `mapstructure:"database_url"`
-	RedisAddr          string `mapstructure:"redis_addr"`
-	RedisPassword      string `mapstructure:"redis_password"`
-	RedisEnabled       bool   `mapstructure:"redis_enabled"`
-	MaxClients         int    `mapstructure:"max_clients"`
+	// Quiet hours lift file_max_kbps between these local hours (276), so
+	// backups and big uploads run at full speed when nobody is listening.
+	// Both are 0-23; equal values disable the window. A start after the end
+	// wraps past midnight (22 -> 6).
+	FileQuietHoursStart  int    `mapstructure:"file_quiet_hours_start"`
+	FileQuietHoursEnd    int    `mapstructure:"file_quiet_hours_end"`
+	DatabaseURL          string `mapstructure:"database_url"`
+	PIIKeyFile           string `mapstructure:"pii_key_file"`
+	RedisAddr            string `mapstructure:"redis_addr"`
+	RedisPassword        string `mapstructure:"redis_password"`
+	RedisEnabled         bool   `mapstructure:"redis_enabled"`
+	MaxClients           int    `mapstructure:"max_clients"`
+	ClientTimeoutSeconds int    `mapstructure:"client_timeout_seconds"`
+	DefaultOpusBitrate   int    `mapstructure:"default_opus_bitrate"`
+	DefaultOpusFEC       bool   `mapstructure:"default_opus_fec"`
+	DefaultOpusDTX       bool   `mapstructure:"default_opus_dtx"`
+	DefaultOpusStereo    bool   `mapstructure:"default_opus_stereo"`
 	// EchoChannelName is the name of the loopback test channel: the server
 	// ensures it exists at startup, and publishers in it hear their own audio
 	// routed back (the echo channel is the only channel with self-fan-out).
 	EchoChannelName string `mapstructure:"echo_channel_name"`
+
+	// ChannelTempLifetimeSeconds is the grace period an empty temporary
+	// channel survives before it is deleted (165). Zero or negative falls
+	// back to channels.DefaultCleanupDelay.
+	ChannelTempLifetimeSeconds int `mapstructure:"channel_temp_lifetime_seconds"`
 
 	// TLS protects the TCP control channel (wave 4a). Enabled by default;
 	// when CertFile/KeyFile are empty a self-signed ECDSA P-256 certificate
@@ -47,21 +71,55 @@ type Config struct {
 	TLSCertFile string `mapstructure:"tls_cert_file"`
 	TLSKeyFile  string `mapstructure:"tls_key_file"`
 
-	// ChatAllowPlaintext permits unencrypted chat messages (wave 4b dev
-	// escape hatch; default false — chat payloads are encrypted).
+	// ChatAllowPlaintext permits unencrypted chat SENDS (dev escape hatch;
+	// default false). It never affects storage, relay, history or MOTD — the
+	// server seals before storing and before broadcasting regardless (91).
 	ChatAllowPlaintext bool `mapstructure:"chat_allow_plaintext"`
+
+	// Chat encryption at rest (91). ChatMasterKeyFile holds the key-encryption
+	// key that wraps every stored scope generation; it lives OUTSIDE the
+	// database and must be backed up with it — losing it destroys all channel
+	// and global history irreversibly. VOICX_CHAT_MASTER_KEY overrides it.
+	// ChatLegacyHistory selects what the one-time backfill does with pre-012
+	// plaintext rows: "encrypt" (default, sealed in place) or "purge".
+	// ChatKeyRotateMinSecs coalesces channel key rotations so a flapping
+	// client cannot mint one persisted generation per reconnect.
+	// ChatSearchMaxMessages caps the client-side search scan (110).
+	ChatMasterKeyFile     string `mapstructure:"chat_master_key_file"`
+	ChatLegacyHistory     string `mapstructure:"chat_legacy_history"`
+	ChatKeyRotateMinSecs  int    `mapstructure:"chat_key_rotate_min_seconds"`
+	ChatSearchMaxMessages int    `mapstructure:"chat_search_max_messages"`
+
+	// FileTLSEnabled wraps the file-transfer data port in TLS with the SAME
+	// certificate as the control channel. false is a dev-only escape hatch.
+	FileTLSEnabled bool `mapstructure:"file_tls_enabled"`
+
+	// ServerInfoMOTD includes the MOTD in the server-info reply (313) as
+	// PLAINTEXT. Off by default: the reply is authenticated-only and the
+	// sealed MOTD already rides the AuthResponse, so serving it again in the
+	// clear would be the one path that escapes ciphertext-at-rest (91-135).
+	// Enable only for a deliberately public, non-sensitive MOTD.
+	ServerInfoMOTD bool `mapstructure:"server_info_motd"`
 
 	// DefaultGroupsEnabled auto-creates the Guest/Member server groups and
 	// auto-assigns them (143/144). Guests virtually hold the Guest group's
 	// permissions; registered users get Member at first login.
 	DefaultGroupsEnabled bool `mapstructure:"default_groups_enabled"`
 
-	// Chat moderation/limits (wave 5a). MaxLength is in plaintext characters
+	// Chat moderation/limits (wave 5a). MaxLength is in UTF-8 bytes
 	// post-decrypt. RateMsgs/RateWindowSeconds is a per-user token bucket.
-	// WordFilter/LinkBlacklist/LinkWhitelist are comma-separated,
-	// case-insensitive substrings; a non-empty whitelist means ONLY those
-	// domains may be linked. Filters apply to channel/global scopes only
-	// (DMs are E2EE and exempt).
+	//
+	// WordFilter/LinkBlacklist/LinkWhitelist are comma-separated and
+	// case-insensitive. WordFilter entries are SUBSTRINGS of the message; the
+	// link lists are HOSTS compared against the hostname of each http(s) URL
+	// in the message (exact or subdomain), and a non-empty whitelist means
+	// ONLY those hosts may be linked. Filters apply to channel/global scopes
+	// only (DMs are E2EE and exempt).
+	//
+	// These three are BOOT DEFAULTS only (117/118): they apply until an
+	// operator stores a runtime override through MsgChatFilterSet, after which
+	// the persisted chat_filters server setting wins and editing config.yaml
+	// has no effect. Restarting does not restore them.
 	ChatMaxLength         int    `mapstructure:"chat_max_length"`
 	ChatRateMsgs          int    `mapstructure:"chat_rate_msgs"`
 	ChatRateWindowSeconds int    `mapstructure:"chat_rate_window_seconds"`
@@ -116,7 +174,7 @@ type TURNConfig struct {
 	// Realm is the TURN realm (informational; must match the coturn realm).
 	Realm string `mapstructure:"realm"`
 	// URIs are the TURN server URIs given to clients, e.g.
-	// ["turn:turn.example.com:3478?transport=udp", "turn:...?transport=tcp"].
+	// ["turn:turn.example.com:12340?transport=udp", "turn:...?transport=tcp"].
 	URIs []string `mapstructure:"uris"`
 	// CredentialsTTL is how long minted credentials stay valid.
 	CredentialsTTL time.Duration `mapstructure:"credentials_ttl"`
@@ -145,22 +203,29 @@ func Load() (*Config, error) {
 	v.SetDefault("server_password", "")
 	v.SetDefault("log_level", "info")
 	v.SetDefault("dev_mode", true)
-	v.SetDefault("tcp_addr", ":10011")
-	v.SetDefault("udp_addr", ":9987")
-	v.SetDefault("grpc_addr", ":50051")
-	v.SetDefault("health_addr", ":9090")
-	v.SetDefault("query_addr", ":10012")
-	v.SetDefault("file_addr", ":30033")
+	v.SetDefault("tcp_addr", DefaultTCPAddr)
+	v.SetDefault("udp_addr", DefaultUDPAddr)
+	v.SetDefault("grpc_addr", DefaultGRPCAddr)
+	v.SetDefault("health_addr", DefaultHealthAddr)
+	v.SetDefault("query_addr", DefaultQueryAddr)
+	v.SetDefault("query_ssh_enabled", false)
+	v.SetDefault("query_ssh_addr", DefaultQuerySSHAddr)
+	v.SetDefault("query_ssh_host_key", "./data/keys/query_ssh_host.key")
+	v.SetDefault("file_addr", DefaultFileAddr)
 	v.SetDefault("file_root", "./data/files")
 	v.SetDefault("file_max_kbps", 0)
 	v.SetDefault("file_channel_quota_mb", 0)
 	v.SetDefault("file_max_size_mb", 100)
+	v.SetDefault("file_quiet_hours_start", 0)
+	v.SetDefault("file_quiet_hours_end", 0)
 	v.SetDefault("database_url", "postgres://voicx:voicx@localhost:5432/voicx?sslmode=disable")
 	v.SetDefault("redis_addr", "localhost:6379")
 	v.SetDefault("redis_password", "")
 	v.SetDefault("redis_enabled", true)
 	v.SetDefault("max_clients", 1024)
 	v.SetDefault("echo_channel_name", "Echo Test")
+	// 60s matches channels.DefaultCleanupDelay (165).
+	v.SetDefault("channel_temp_lifetime_seconds", 60)
 
 	// TLS defaults: on, self-signed cert under ./data/tls (the Docker image
 	// points tls_dir at the /data volume).
@@ -169,8 +234,20 @@ func Load() (*Config, error) {
 	v.SetDefault("tls_cert_file", "")
 	v.SetDefault("tls_key_file", "")
 	v.SetDefault("chat_allow_plaintext", false)
+	v.SetDefault("chat_master_key_file", "./data/keys/chat_master.key")
+	v.SetDefault("pii_key_file", "./data/keys/pii.key")
+	v.SetDefault("chat_legacy_history", "encrypt")
+	v.SetDefault("chat_key_rotate_min_seconds", 60)
+	v.SetDefault("chat_search_max_messages", 2000)
+	v.SetDefault("file_tls_enabled", true)
+	v.SetDefault("server_info_motd", false)
 	v.SetDefault("default_groups_enabled", true)
-	v.SetDefault("chat_max_length", 2000)
+	v.SetDefault("chat_max_length", 4096)
+	v.SetDefault("client_timeout_seconds", 90)
+	v.SetDefault("default_opus_bitrate", 32000)
+	v.SetDefault("default_opus_fec", true)
+	v.SetDefault("default_opus_dtx", false)
+	v.SetDefault("default_opus_stereo", false)
 	v.SetDefault("chat_rate_msgs", 5)
 	v.SetDefault("chat_rate_window_seconds", 3)
 	v.SetDefault("chat_word_filter", "")
@@ -226,6 +303,20 @@ func Load() (*Config, error) {
 	if err := v.Unmarshal(cfg); err != nil {
 		return nil, fmt.Errorf("unmarshalling config: %w", err)
 	}
+
+	switch strings.ToLower(cfg.ChatLegacyHistory) {
+	case "encrypt", "purge":
+		cfg.ChatLegacyHistory = strings.ToLower(cfg.ChatLegacyHistory)
+	default:
+		return nil, fmt.Errorf("invalid chat_legacy_history %q: must be \"encrypt\" or \"purge\"", cfg.ChatLegacyHistory)
+	}
+	if cfg.FileQuietHoursStart < 0 || cfg.FileQuietHoursStart > 23 {
+		return nil, fmt.Errorf("invalid file_quiet_hours_start %d: must be 0..23", cfg.FileQuietHoursStart)
+	}
+	if cfg.FileQuietHoursEnd < 0 || cfg.FileQuietHoursEnd > 23 {
+		return nil, fmt.Errorf("invalid file_quiet_hours_end %d: must be 0..23", cfg.FileQuietHoursEnd)
+	}
+
 	return cfg, nil
 }
 

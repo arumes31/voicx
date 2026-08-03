@@ -5,10 +5,18 @@ package main
 
 import (
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
+
+// allowDefaultSettingsPath gates the fallback to the real
+// <UserConfigDir>/voicx/settings.json when an App carries no settingsPath.
+// Tests clear it (see main_test.go) so no App built without one can write
+// over the developer's real bookmarks.
+var allowDefaultSettingsPath = true
 
 // Bookmark is a saved server (address + nickname; never passwords).
 type Bookmark struct {
@@ -83,8 +91,18 @@ type HotkeyProfile struct {
 	Deafen       string `json:"deafen_toggle,omitempty"`
 }
 
+// settingsVersion is the generation of the settings file. Bump it whenever a
+// serialized default changes, and add the repair to migrateSettings:
+// loading merges the file ONTO the defaults, so a field an older client always
+// wrote wins over the new default unless it is explicitly repaired.
+const settingsVersion = 5
+
 // Settings holds all user preferences.
 type Settings struct {
+	// SettingsVersion is the generation this file was written by (0 = before
+	// versioning). See migrateSettings.
+	SettingsVersion int `json:"settings_version"`
+
 	Bookmarks []Bookmark     `json:"bookmarks"`
 	Recents   []RecentServer `json:"recents"` // (282) last 10 servers
 
@@ -98,6 +116,7 @@ type Settings struct {
 	UserCSS        string `json:"user_css"`         // (296) scoped overrides
 	UIFont         string `json:"ui_font"`          // (297) "outfit" | "sora" | "jetbrains"
 	UIFontSize     int    `json:"ui_font_size"`     // (297) base px, default 14
+	WindowOpacity  int    `json:"window_opacity"`   // (292) 20..100 percent, default 100
 
 	// Accessibility & polish (wave 8c).
 	Language       string `json:"language"`         // (336) "system" | "en" | "de"
@@ -138,10 +157,11 @@ type Settings struct {
 	LogServerChat  bool `json:"log_server_chat"`
 
 	// Notifications.
-	NotifyJoinLeave  bool `json:"notify_join_leave"`
-	NotifyConnection bool `json:"notify_connection"`
-	PlaySounds       bool `json:"play_sounds"`
-	WhisperSound     bool `json:"whisper_sound"`
+	NotifyJoinLeave       bool   `json:"notify_join_leave"`
+	NotifyConnection      bool   `json:"notify_connection"`
+	PlaySounds            bool   `json:"play_sounds"`
+	WhisperSound          bool   `json:"whisper_sound"`
+	ChatNotificationLevel string `json:"chat_notification_level"` // direct | channel_mentions | role_mentions | all
 
 	// Whisper lists (re-applied on connect and via the Whisper settings page).
 	WhisperClients  []string `json:"whisper_clients"`
@@ -171,7 +191,8 @@ type Settings struct {
 	LowBandwidth bool `json:"low_bandwidth"` // (88) low-bandwidth mode
 
 	// Security (wave 4a).
-	AllowPlaintext bool `json:"allow_plaintext"` // allow plaintext control connections (dev servers)
+	AllowPlaintext bool              `json:"allow_plaintext"`         // allow plaintext control connections (dev servers)
+	E2EEVerified   map[string]string `json:"e2ee_verified,omitempty"` // uniqueID -> verified safety number
 
 	// Chat display (wave 5b).
 	ChatTimestamps        string           `json:"chat_timestamps"`        // "absolute" | "relative" | "off"
@@ -189,8 +210,16 @@ type Settings struct {
 	UserNotes       map[string]string  `json:"user_notes,omitempty"`      // (315) uniqueID -> local note
 	RecentChannels  map[string][]int64 `json:"recent_channels,omitempty"` // (320) server addr -> last 5 channel IDs
 	AutoAwayMinutes int                `json:"auto_away_minutes"`         // (308) 0 = off, default 15
+	AutoAwayMessage string             `json:"auto_away_message"`         // (390) status line other clients see while idle
 	OnboardingDone  bool               `json:"onboarding_done"`           // (329)
 	LastSeenVersion string             `json:"last_seen_version"`         // (330) what's-new tracking
+
+	// Identity (wave 9).
+	ActiveIdentity string `json:"active_identity,omitempty"` // (351) identity file stem in identities/
+	// (354) "" or "auto" = protect the private key with the OS key store when
+	// one is available, "off" = always plaintext. "" deliberately means auto
+	// so a settings file predating the option keeps the protected default.
+	IdentityKeyProtection string `json:"identity_key_protection,omitempty"`
 
 	// Notifications (wave 9).
 	NotifyMatrix   map[string]NotifyChannels  `json:"notify_matrix,omitempty"`  // (385) event -> outputs
@@ -203,33 +232,41 @@ type Settings struct {
 // DefaultSettings returns the defaults used when no settings file exists.
 func DefaultSettings() Settings {
 	return Settings{
-		ActivationMode:     "ptt",
-		VADThreshold:       50,
-		EchoCancellation:   true,
-		NoiseSuppression:   true,
-		Volume:             100,
-		HotkeyPTT:          "Space",
-		HotkeyMute:         "Ctrl+M",
-		HotkeyQuickConnect: "Ctrl+Shift+C",
-		HotkeyZen:          "Ctrl+Shift+Z",
-		IdleVideoPause:     true,
-		Theme:              "dark",
-		UIFont:             "outfit",
-		UIFontSize:         14,
-		ChatMaxLines:       200,
-		NotifyJoinLeave:    true,
-		NotifyConnection:   true,
-		WhisperSound:       true,
-		UpdatesAutoCheck:   true,
+		SettingsVersion:       settingsVersion,
+		PlaySounds:            true,
+		ActivationMode:        "ptt",
+		VADThreshold:          50,
+		EchoCancellation:      true,
+		NoiseSuppression:      true,
+		Volume:                100,
+		HotkeyPTT:             "",
+		HotkeyMute:            "Ctrl+M",
+		HotkeyQuickConnect:    "Ctrl+Shift+C",
+		HotkeyZen:             "Ctrl+Shift+Z",
+		IdleVideoPause:        true,
+		Theme:                 "dark",
+		UIFont:                "outfit",
+		UIFontSize:            14,
+		WindowOpacity:         100,
+		ChatMaxLines:          200,
+		NotifyJoinLeave:       true,
+		NotifyConnection:      true,
+		WhisperSound:          true,
+		ChatNotificationLevel: "all",
+		UpdatesAutoCheck:      true,
 
 		PTTReleaseDelayMs: 0,
 		WarnMutedTalking:  true,
 		WarnEmptyChannel:  true,
 		SoundPack:         "soft",
 		SoundVolume:       100,
+		// (385) one entry per notification-matrix event plus the local
+		// mic/voice ones, so every matrix row has a togglable sound.
 		EventSounds: map[string]bool{
-			"join": true, "leave": true, "mention": true, "dm": true,
-			"whisper": true, "poke": true, "mic_on": true, "mic_off": true,
+			"join": true, "leave": true, "join_leave": true, "mention": true,
+			"keyword": true, "dm": true, "whisper": true, "poke": true,
+			"buddy_online": true, "kick": true, "announcement": true,
+			"channel_watch": true, "mic_on": true, "mic_off": true,
 		},
 		WhisperReplyHotkey: "Ctrl+R",
 		VoiceLimiter:       true,
@@ -241,7 +278,31 @@ func DefaultSettings() Settings {
 		SysJoinLeave:       true,
 		SysKick:            true,
 		AutoAwayMinutes:    15,
+		AutoAwayMessage:    defaultAutoAwayMessage,
 	}
+}
+
+// defaultAutoAwayMessage is the status line other clients see while the user
+// is idle (390). It is a non-zero default, so migrateSettings repairs it.
+const defaultAutoAwayMessage = "auto-away"
+
+// autoAwaySentinel is what the idle timer passes to SetStatus. It marks the
+// call as automatic so the configured away message can be substituted; a
+// status the user set by hand keeps the text they typed (390).
+const autoAwaySentinel = "auto-away"
+
+// autoAwayMessage returns the status text to publish when the idle timer
+// fires (390), clamped to the server's status-message limit.
+func (a *App) autoAwayMessage() string {
+	msg := strings.TrimSpace(a.settings.AutoAwayMessage)
+	if msg == "" {
+		msg = defaultAutoAwayMessage
+	}
+	runes := []rune(msg)
+	if len(runes) > 200 {
+		msg = string(runes[:200])
+	}
+	return msg
 }
 
 // settingsPath returns the default settings file location.
@@ -266,6 +327,38 @@ func loadSettingsAt(path string) Settings {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return DefaultSettings()
 	}
+	return migrateSettings(s)
+}
+
+// migrateSettings repairs a file written by an older client. A field the older
+// client always serialised takes precedence over its new default, so changed
+// defaults have to be repaired explicitly here when appropriate.
+func migrateSettings(s Settings) Settings {
+	if s.SettingsVersion < 1 {
+		// Every client before the master sound gate wrote play_sounds:false,
+		// which would now mute every notification sound (28).
+		s.PlaySounds = true
+	}
+	if s.SettingsVersion < 2 && s.AutoAwayMessage == "" {
+		// Files written before the custom away message always carried the
+		// empty string, which would publish a blank status line (390).
+		s.AutoAwayMessage = defaultAutoAwayMessage
+	}
+	if s.SettingsVersion < 3 && s.WindowOpacity == 0 {
+		// Files written before the opacity option carry no value, and 0 would
+		// clamp the window to the 20% floor at the next start (292).
+		s.WindowOpacity = 100
+	}
+	if s.SettingsVersion < 4 && s.ChatNotificationLevel == "" {
+		s.ChatNotificationLevel = "all"
+	}
+	if s.SettingsVersion < 5 && strings.EqualFold(strings.TrimSpace(s.HotkeyPTT), "Space") {
+		// Space used to be the implicit PTT default. RegisterHotKey consumes a
+		// registered key system-wide on Windows, so old untouched defaults made
+		// spaces unavailable in every application while voicx was running.
+		s.HotkeyPTT = ""
+	}
+	s.SettingsVersion = settingsVersion
 	return s
 }
 
@@ -290,20 +383,14 @@ func loadSettings() Settings {
 	return loadSettingsAt(path)
 }
 
-// saveSettings saves to the default path.
-func saveSettings(s Settings) error {
-	path, err := settingsPath()
-	if err != nil {
-		return err
-	}
-	return saveSettingsAt(path, s)
-}
-
 // settingsFile returns the effective settings path: the per-App override
 // (tests) or the default location.
 func (a *App) settingsFile() string {
 	if a.settingsPath != "" {
 		return a.settingsPath
+	}
+	if !allowDefaultSettingsPath {
+		return ""
 	}
 	path, err := settingsPath()
 	if err != nil {
@@ -314,6 +401,13 @@ func (a *App) settingsFile() string {
 
 // save persists the App's settings to its settings file.
 func (a *App) save() error {
+	a.settingsMu.Lock()
+	defer a.settingsMu.Unlock()
+	return a.saveLocked()
+}
+
+// saveLocked persists settings while settingsMu is held.
+func (a *App) saveLocked() error {
 	if path := a.settingsFile(); path != "" {
 		return saveSettingsAt(path, a.settings)
 	}
@@ -322,19 +416,47 @@ func (a *App) save() error {
 
 // GetSettings returns the current settings to the frontend.
 func (a *App) GetSettings() Settings {
+	a.settingsMu.Lock()
+	defer a.settingsMu.Unlock()
 	return a.settings
 }
 
+// emitSettingsUpdate hands the frontend the merged settings blob. Every field
+// the Go side writes on its own (282 recents, 330 what's-new marker) must be
+// announced through here; the frontend has no other way to learn of it before
+// the next restart.
+func (a *App) emitSettingsUpdate() {
+	a.emitPlain("settings_update", a.GetSettings())
+}
+
+// mergeGoOwned returns incoming with the fields the Go side maintains on its
+// own taken from cur. The frontend caches the whole settings blob and ships
+// it back on every save, so a copy taken before the Go side wrote them would
+// otherwise wipe them (282 recents, 330 what's-new marker).
+func mergeGoOwned(cur, incoming Settings) Settings {
+	incoming.Recents = cur.Recents
+	incoming.LastSeenVersion = cur.LastSeenVersion
+	// (351) the identity manager writes ActiveIdentity while the settings
+	// dialog is open, so a draft cloned before the switch would revert it and
+	// silently hand the next connect the previous account.
+	incoming.ActiveIdentity = cur.ActiveIdentity
+	// LastReadChannels is deliberately NOT listed: the frontend still owns it
+	// (121 has no server half yet). It has to move here the moment the Go side
+	// starts writing pointers, or one save discards them.
+	return incoming
+}
+
 // SaveSettings replaces and persists the settings. The frontend sends the
-// whole object; hotkey specs are validated and re-applied.
+// whole object (Go-owned fields are kept, see mergeGoOwned); hotkey specs
+// are validated and re-applied.
 func (a *App) SaveSettings(s Settings) string {
-	if _, _, err := parseHotkeySpec(s.HotkeyPTT); err != nil {
+	if err := validateHotkeySpec(s.HotkeyPTT); err != nil {
 		return "ptt hotkey: " + err.Error()
 	}
-	if _, _, err := parseHotkeySpec(s.HotkeyMute); err != nil {
+	if err := validateHotkeySpec(s.HotkeyMute); err != nil {
 		return "mute hotkey: " + err.Error()
 	}
-	if _, _, err := parseHotkeySpec(s.WhisperReplyHotkey); err != nil {
+	if err := validateHotkeySpec(s.WhisperReplyHotkey); err != nil {
 		return "whisper reply hotkey: " + err.Error()
 	}
 	if s.ChatMaxLines < 1 {
@@ -343,10 +465,19 @@ func (a *App) SaveSettings(s Settings) string {
 	if s.Volume < 0 || s.Volume > 200 {
 		return "volume must be 0..200"
 	}
-	a.settings = s
-	if err := a.save(); err != nil {
+	switch s.ChatNotificationLevel {
+	case "direct", "channel_mentions", "role_mentions", "all":
+	default:
+		return "invalid chat notification level"
+	}
+	a.settingsMu.Lock()
+	a.settings = mergeGoOwned(a.settings, s)
+	err := a.saveLocked()
+	a.settingsMu.Unlock()
+	if err != nil {
 		return err.Error()
 	}
+	a.emitSettingsUpdate()
 	a.applyHotkey("ptt", s.HotkeyPTT)
 	a.applyHotkey("mute_toggle", s.HotkeyMute)
 	a.applyHotkey("deafen_toggle", s.HotkeyDeafen)
@@ -374,5 +505,9 @@ func (a *App) RecordRecent(addr, nickname string) {
 		out = out[:10]
 	}
 	a.settings.Recents = out
-	_ = saveSettings(a.settings)
+	if err := a.save(); err != nil {
+		log.Printf("saving settings recents failed: %v", err)
+		return
+	}
+	a.emitSettingsUpdate()
 }

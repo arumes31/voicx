@@ -128,6 +128,43 @@ const (
 	MsgPoke               MessageType = 96 // client -> server: poke a client
 	MsgServerInfoQuery    MessageType = 97 // client -> server: request public server info
 	MsgServerInfoResponse MessageType = 98 // server -> client: public server info
+
+	MsgChatKeyRequest MessageType = 99  // client -> server: request specific scope key generations
+	MsgChatKeyBundle  MessageType = 100 // server -> client: sealed generations (+ refusals)
+
+	MsgChatFilterGet      MessageType = 101 // client -> server: read the runtime chat moderation lists
+	MsgChatFilterSet      MessageType = 102 // client -> server: replace the runtime chat moderation lists
+	MsgChatFilterResponse MessageType = 103 // server -> client: the moderation lists in force
+
+	MsgGroupEdit      MessageType = 104 // client -> server: edit a group's cosmetics (color/hoist/sort)
+	MsgPermCopy       MessageType = 105 // client -> server: copy permissions between targets
+	MsgPermsInvalid   MessageType = 106 // server -> client: your resolved permissions changed, refetch
+	MsgComplaintList  MessageType = 107 // client -> server: list complaints
+	MsgComplaints     MessageType = 108 // server -> client: complaint list
+	MsgComplaintClear MessageType = 109 // client -> server: delete complaints against a target
+	MsgTokenList      MessageType = 110 // client -> server: list privilege tokens
+	MsgTokens         MessageType = 111 // server -> client: privilege token list
+	MsgTokenAdd       MessageType = 112 // client -> server: create a privilege token
+	MsgTokenDelete    MessageType = 113 // client -> server: revoke a privilege token
+
+	MsgChannelIconGet  MessageType = 114 // client -> server: fetch a channel icon
+	MsgChannelIconData MessageType = 115 // server -> client: channel icon payload
+	MsgServerBannerSet MessageType = 116 // client -> server: upload the server banner (admin)
+	MsgServerBannerGet MessageType = 117 // client -> server: fetch the server banner
+	MsgServerBannerDat MessageType = 118 // server -> client: server banner payload
+	MsgEmojiDelete     MessageType = 119 // client -> server: delete a custom emoji
+	MsgEmojiRename     MessageType = 120 // client -> server: rename a custom emoji
+
+	MsgServerRules          MessageType = 121 // server -> client: rules text awaiting acceptance
+	MsgServerRulesAccept    MessageType = 122 // client -> server: accept the rules by hash
+	MsgChannelSubscribe     MessageType = 123 // client -> server: (un)subscribe to channels
+	MsgSubscriptionState    MessageType = 124 // server -> client: the authoritative subscription set
+	MsgServerConfigQuery    MessageType = 125 // admin -> server: get runtime voice/client settings
+	MsgServerConfigSet      MessageType = 126 // admin -> server: update runtime voice/client settings
+	MsgServerConfigResponse MessageType = 127 // server -> admin: effective settings
+	MsgPreKeyPublish        MessageType = 128 // client -> server: publish X3DH bundle and one-time keys
+	MsgPreKeyQuery          MessageType = 129 // client -> server: consume target's X3DH bundle
+	MsgPreKeyBundle         MessageType = 130 // server -> client: signed bundle plus optional one-time key
 )
 
 // String returns a human-readable name for the message type.
@@ -151,6 +188,18 @@ func (m MessageType) String() string {
 		return "Ping"
 	case MsgPong:
 		return "Pong"
+	case MsgServerConfigQuery:
+		return "ServerConfigQuery"
+	case MsgServerConfigSet:
+		return "ServerConfigSet"
+	case MsgServerConfigResponse:
+		return "ServerConfigResponse"
+	case MsgPreKeyPublish:
+		return "PreKeyPublish"
+	case MsgPreKeyQuery:
+		return "PreKeyQuery"
+	case MsgPreKeyBundle:
+		return "PreKeyBundle"
 	case MsgJoinChannel:
 		return "JoinChannel"
 	case MsgDeleteChannel:
@@ -329,6 +378,58 @@ func (m MessageType) String() string {
 		return "ServerInfoQuery"
 	case MsgServerInfoResponse:
 		return "ServerInfoResponse"
+	case MsgChatKeyRequest:
+		return "ChatKeyRequest"
+	case MsgChatKeyBundle:
+		return "ChatKeyBundle"
+	case MsgChatFilterGet:
+		return "ChatFilterGet"
+	case MsgChatFilterSet:
+		return "ChatFilterSet"
+	case MsgChatFilterResponse:
+		return "ChatFilterResponse"
+	case MsgGroupEdit:
+		return "GroupEdit"
+	case MsgPermCopy:
+		return "PermCopy"
+	case MsgPermsInvalid:
+		return "PermsInvalid"
+	case MsgComplaintList:
+		return "ComplaintList"
+	case MsgComplaints:
+		return "Complaints"
+	case MsgComplaintClear:
+		return "ComplaintClear"
+	case MsgTokenList:
+		return "TokenList"
+	case MsgTokens:
+		return "Tokens"
+	case MsgTokenAdd:
+		return "TokenAdd"
+	case MsgTokenDelete:
+		return "TokenDelete"
+	case MsgChannelIconGet:
+		return "ChannelIconGet"
+	case MsgChannelIconData:
+		return "ChannelIconData"
+	case MsgServerBannerSet:
+		return "ServerBannerSet"
+	case MsgServerBannerGet:
+		return "ServerBannerGet"
+	case MsgServerBannerDat:
+		return "ServerBannerData"
+	case MsgEmojiDelete:
+		return "EmojiDelete"
+	case MsgEmojiRename:
+		return "EmojiRename"
+	case MsgServerRules:
+		return "ServerRules"
+	case MsgServerRulesAccept:
+		return "ServerRulesAccept"
+	case MsgChannelSubscribe:
+		return "ChannelSubscribe"
+	case MsgSubscriptionState:
+		return "SubscriptionState"
 	default:
 		return fmt.Sprintf("Unknown(%d)", uint16(m))
 	}
@@ -359,6 +460,12 @@ type Authenticate struct {
 	Anonymous      bool   `json:"anonymous,omitempty"`
 	PublicKey      string `json:"public_key,omitempty"`
 	Token          string `json:"token,omitempty"`
+	// X25519PublicKey is the client's ENCRYPTION key (base64, 32 bytes) — the
+	// same value MsgKeyPublish carries. PublicKey above is the Ed25519
+	// identity key and cannot be sealed to, so this is supplied at auth time
+	// so the server can seal the global scope key and the MOTD into
+	// AuthResponse (133).
+	X25519PublicKey string `json:"x25519_public_key,omitempty"`
 }
 
 // AuthResponse is the server's reply to an Authenticate message.
@@ -376,8 +483,17 @@ type AuthResponse struct {
 	// channel certificate (empty when TLS is disabled). Clients use it for
 	// TOFU verification and display.
 	TLSFingerprint string `json:"tls_fingerprint,omitempty"`
-	// MOTD is the server's message of the day (empty when unset).
-	MOTD string `json:"motd,omitempty"`
+	// MOTD is the server's message of the day (empty when unset). When
+	// MOTDEnc is set it is SEALED under the global scope generation
+	// MOTDKeyID, and the client opens it with a key from ChatKeys below.
+	MOTD      string `json:"motd,omitempty"`
+	MOTDEnc   bool   `json:"motd_enc,omitempty"`
+	MOTDKeyID uint32 `json:"motd_key_id,omitempty"`
+	// ChatKeys carries the global scope generation (and nothing else) sealed
+	// to Authenticate.X25519PublicKey, so the client can open MOTD before
+	// Connect() returns — no new frame, no ordering rule, no race. Channel
+	// keys still arrive via MsgChannelKey after key publish.
+	ChatKeys []ChannelKey `json:"chat_keys,omitempty"`
 	// IsAdmin reports whether the authenticated user is a server admin
 	// (users.is_admin). Clients use it to show/hide admin-only UI.
 	IsAdmin bool `json:"is_admin,omitempty"`
@@ -406,6 +522,10 @@ type AuthSignature struct {
 	UniqueID  string `json:"unique_id"`
 	PublicKey string `json:"public_key,omitempty"`
 	Signature []byte `json:"signature"`
+	// X25519PublicKey mirrors Authenticate.X25519PublicKey. The guest/challenge
+	// path leaves Authenticate.PublicKey empty and supplies its identity key
+	// here, so the encryption key has to be carried here too (133).
+	X25519PublicKey string `json:"x25519_public_key,omitempty"`
 }
 
 // CreateChannel requests the creation of a new channel. Type mirrors the
@@ -421,9 +541,9 @@ type CreateChannel struct {
 	Password        string `json:"password,omitempty"`
 	NeededJoinPower int    `json:"needed_join_power,omitempty"`
 	OpusBitrate     int    `json:"opus_bitrate,omitempty"`
-	OpusFEC         bool   `json:"opus_fec,omitempty"`
-	OpusDTX         bool   `json:"opus_dtx,omitempty"`
-	OpusStereo      bool   `json:"opus_stereo,omitempty"`
+	OpusFEC         *bool  `json:"opus_fec,omitempty"`
+	OpusDTX         *bool  `json:"opus_dtx,omitempty"`
+	OpusStereo      *bool  `json:"opus_stereo,omitempty"`
 }
 
 // ChannelEdit requests editing a channel's settings. Nil pointer fields are
@@ -438,6 +558,15 @@ type ChannelEdit struct {
 	OpusStereo      *bool   `json:"opus_stereo,omitempty"`
 	SlowModeSeconds *int    `json:"slow_mode_seconds,omitempty"`
 	Description     *string `json:"description,omitempty"`
+	// NeededJoinPower (160), OrderIndex (163 reordering) and ParentID (168
+	// re-parenting) were the shared gap that blocked all three items: the
+	// create dialog could set join power but nothing could ever edit it.
+	NeededJoinPower *int   `json:"needed_join_power,omitempty"`
+	OrderIndex      *int   `json:"order_index,omitempty"`
+	ParentID        *int64 `json:"parent_id,omitempty"`
+	// InheritPermissions toggles whether a sub-channel resolves its parent's
+	// channel permissions before its own (157).
+	InheritPermissions *bool `json:"inherit_permissions,omitempty"`
 }
 
 // PrioritySpeaker toggles the calling client's priority-speaker flag
@@ -475,6 +604,9 @@ type ChatSend struct {
 	Text       string `json:"text"`
 	Enc        bool   `json:"enc,omitempty"`
 	KeyID      uint32 `json:"key_id,omitempty"`
+	// ReplyToID references a stored message in the same channel/global scope.
+	// It is zero for a normal message and is never used for direct messages.
+	ReplyToID int64 `json:"reply_to_id,omitempty"`
 	// ClientMsgID is a client-generated reference echoed in the broadcast so
 	// DM delivery/read receipts (wave 5a) can reference the message without
 	// a database id (DMs are true E2EE and not stored server-side).
@@ -500,6 +632,8 @@ type ChatBroadcast struct {
 	// 0 for DMs). Mentions lists mentioned users' unique IDs. ClientMsgID
 	// echoes the sender's reference for receipts.
 	ID          int64    `json:"id,omitempty"`
+	ReplyToID   int64    `json:"reply_to_id,omitempty"`
+	Version     uint64   `json:"version,omitempty"`
 	Mentions    []string `json:"mentions,omitempty"`
 	ClientMsgID string   `json:"client_msg_id,omitempty"`
 }
@@ -550,6 +684,29 @@ type KickClient struct {
 // from the server it requests renegotiation.
 type WebRTCOffer struct {
 	SDP string `json:"sdp"`
+	// Tracks labels the offer's outbound tracks with the media slot each one
+	// occupies. It replaces the previous declaration on every offer; an
+	// omitted track takes its kind's default slot, so a client that never
+	// sends this field publishes exactly one microphone and one video track
+	// (70). Server -> client renegotiation offers never set it.
+	Tracks []TrackSlot `json:"tracks,omitempty"`
+}
+
+// TrackSlot names the media slot one outbound track of a WebRTC offer
+// occupies, so the server can route a publisher's SECOND audio or video track
+// separately instead of muxing it into the first (70).
+//
+// TrackID is the MediaStreamTrack.id as it appears in the offer's a=msid
+// line. Slot is one of "mic" (default audio: microphone), "cam" (default
+// video: camera or primary shared surface), "screenaudio" (system audio
+// captured with a screen share), or "screen" (a second shared surface).
+// A client publishing more than one track of a kind MUST declare them: an
+// unknown or missing slot puts the track in its kind's default slot, and a
+// slot carries exactly one source, so whichever track arrives first wins and
+// the other is dropped rather than muxed into it.
+type TrackSlot struct {
+	TrackID string `json:"track_id"`
+	Slot    string `json:"slot"`
 }
 
 // WebRTCAnswer carries an SDP answer to a previously received offer.
@@ -615,10 +772,17 @@ type FileTransferInitResponse struct {
 	TransferID string `json:"transfer_id"`
 	Token      string `json:"token"`
 	Port       int    `json:"port"`
+	// TLS reports that the file-transfer port requires a TLS handshake, and
+	// TLSFingerprint is the SHA-256 of its certificate — the SAME certificate
+	// as the control channel, so the client re-uses the pin it already holds.
+	// Without these an un-upgraded client hangs in a handshake instead of
+	// failing legibly.
+	TLS            bool   `json:"tls,omitempty"`
+	TLSFingerprint string `json:"tls_fingerprint,omitempty"`
 }
 
 // FileList requests the file listing of a channel. Folder selects a virtual
-// folder (” = root, wave 7); Path is the legacy alias ("" or "/" only).
+// folder ("" = root, wave 7); Path is the legacy alias ("" or "/" only).
 type FileList struct {
 	ChannelID int64  `json:"channel_id"`
 	Path      string `json:"path,omitempty"`
@@ -633,6 +797,10 @@ type FileEntry struct {
 	SHA256     string    `json:"sha256"`
 	Uploader   string    `json:"uploader,omitempty"`
 	UploadedAt time.Time `json:"uploaded_at"`
+	// Encrypted marks a client-sealed chat attachment (91-135). The browser
+	// infers it from the ".vcx" suffix today, which only works because the
+	// client also chooses the name — this makes it explicit.
+	Encrypted bool `json:"encrypted,omitempty"`
 }
 
 // FileListResponse carries a channel's file listing plus the quota state
@@ -659,6 +827,80 @@ type FileRename struct {
 	Name      string `json:"name"`
 	NewName   string `json:"new_name"`
 	NewFolder string `json:"new_folder,omitempty"`
+	// NewChannelID moves the file to another channel (262). 0 keeps it where
+	// it is; a move is permission-checked against BOTH channels.
+	NewChannelID int64 `json:"new_channel_id,omitempty"`
+}
+
+// ServerRules carries the operator's rules text awaiting acceptance (215).
+// Hash identifies the exact text: editing the rules changes it, which re-asks
+// everyone and makes a stale acceptance refusable.
+type ServerRules struct {
+	Text string `json:"text"`
+	Hash string `json:"hash"`
+}
+
+// ServerRulesAccept records that the caller accepted the rules they were
+// shown (215). A hash that is no longer current is refused, so the client
+// re-displays rather than silently accepting text the user never read.
+type ServerRulesAccept struct {
+	Hash string `json:"hash"`
+}
+
+// ChannelSubscribe (un)subscribes the caller from channels it is not in
+// (312), so their chat and presence still arrive. Gated by the subscriber's
+// i_channel_subscribe_power against each target's
+// i_channel_needed_subscribe_power.
+type ChannelSubscribe struct {
+	ChannelIDs []int64 `json:"channel_ids"`
+	Subscribe  bool    `json:"subscribe"`
+}
+
+// SubscriptionState is the AUTHORITATIVE set after any change (312). The
+// server always sends the whole set rather than a delta, so a client cannot
+// accumulate drift against it. The caller's own channel is always included
+// and cannot be unsubscribed.
+type SubscriptionState struct {
+	ChannelIDs []int64 `json:"channel_ids"`
+}
+
+// ChannelIconGet fetches a channel's icon (271). Without it the uploaded
+// image was write-only: nothing could ever read one back.
+type ChannelIconGet struct {
+	ChannelID int64 `json:"channel_id"`
+}
+
+// ChannelIconData carries a channel icon ("" data = no icon set).
+type ChannelIconData struct {
+	ChannelID   int64  `json:"channel_id"`
+	DataBase64  string `json:"data_base64"`
+	ContentType string `json:"content_type,omitempty"`
+}
+
+// ServerBannerSet uploads the server banner (270, admin only).
+type ServerBannerSet struct {
+	DataBase64 string `json:"data_base64"`
+}
+
+// ServerBannerGet requests the server banner.
+type ServerBannerGet struct{}
+
+// ServerBannerData carries the server banner ("" data = none set).
+type ServerBannerData struct {
+	DataBase64  string `json:"data_base64"`
+	ContentType string `json:"content_type,omitempty"`
+}
+
+// EmojiDelete removes a custom server emoji (272). Gated like upload.
+type EmojiDelete struct {
+	Name string `json:"name"`
+}
+
+// EmojiRename renames a custom server emoji (272). Messages already sent
+// keep the old shortcode, so a rename does not rewrite history.
+type EmojiRename struct {
+	Name    string `json:"name"`
+	NewName string `json:"new_name"`
 }
 
 // FileVersions lists the rotated old versions of a file (264).
@@ -734,6 +976,46 @@ type ServerInfoResponse struct {
 	MOTD           string `json:"motd,omitempty"`
 }
 
+type ServerConfigQuery struct{}
+
+type ServerConfig struct {
+	MaxClients           int  `json:"max_clients"`
+	ClientTimeoutSeconds int  `json:"client_timeout_seconds"`
+	OpusBitrate          int  `json:"opus_bitrate"`
+	OpusFEC              bool `json:"opus_fec"`
+	OpusDTX              bool `json:"opus_dtx"`
+	OpusStereo           bool `json:"opus_stereo"`
+}
+
+type OneTimePreKey struct {
+	KeyID     uint32 `json:"key_id"`
+	PublicKey []byte `json:"public_key"`
+}
+
+type PreKeyPublish struct {
+	IdentityDH     []byte          `json:"identity_dh"`
+	SigningPublic  []byte          `json:"signing_public"`
+	SignedPreKeyID uint32          `json:"signed_prekey_id"`
+	SignedPreKey   []byte          `json:"signed_prekey"`
+	Signature      []byte          `json:"signature"`
+	OneTimePreKeys []OneTimePreKey `json:"one_time_prekeys,omitempty"`
+}
+
+type PreKeyQuery struct {
+	UniqueID string `json:"unique_id"`
+}
+
+type PreKeyBundle struct {
+	UniqueID       string `json:"unique_id"`
+	IdentityDH     []byte `json:"identity_dh"`
+	SigningPublic  []byte `json:"signing_public"`
+	SignedPreKeyID uint32 `json:"signed_prekey_id"`
+	SignedPreKey   []byte `json:"signed_prekey"`
+	Signature      []byte `json:"signature"`
+	OneTimeKeyID   uint32 `json:"one_time_key_id,omitempty"`
+	OneTimePreKey  []byte `json:"one_time_prekey,omitempty"`
+}
+
 // AvatarSet uploads the client's avatar image (base64). Accepted image
 // types: PNG, JPEG, GIF, WebP; max 256 KiB after decoding.
 type AvatarSet struct {
@@ -776,7 +1058,8 @@ type Complaint struct {
 // ScreenShare declares whether the client's video track is a screen share
 // (relayed to channel members as a screenshare_changed event).
 type ScreenShare struct {
-	Active bool `json:"active"`
+	Active    bool `json:"active"`
+	MaxHeight int  `json:"max_height,omitempty"`
 }
 
 // KeyPublish publishes the client's X25519 public key (base64, 32 bytes) to
@@ -819,32 +1102,64 @@ type ChatHistory struct {
 	Limit     int   `json:"limit,omitempty"`
 }
 
-// ChatHistoryEntry is one stored message in a history page. Body is empty
-// for tombstoned (deleted) messages. Reactions maps emoji -> count.
+// ChatHistoryEntry is one stored message in a history page. Reactions maps
+// emoji -> count.
 type ChatHistoryEntry struct {
-	ID           int64          `json:"id"`
-	FromUniqueID string         `json:"from_unique_id"`
-	FromNickname string         `json:"from_nickname"`
-	Body         string         `json:"body"`
-	SentAt       int64          `json:"sent_at"` // unix seconds
-	EditedAt     int64          `json:"edited_at,omitempty"`
-	Deleted      bool           `json:"deleted,omitempty"`
-	Reactions    map[string]int `json:"reactions,omitempty"`
+	ID           int64  `json:"id"`
+	FromUniqueID string `json:"from_unique_id"`
+	FromNickname string `json:"from_nickname"`
+	ReplyToID    int64  `json:"reply_to_id,omitempty"`
+	Version      uint64 `json:"version"`
+
+	// BodyEnc is the stored ciphertext:
+	// base64(nonce[24] || secretbox(plain, scopeKey[KeyID])).
+	// The SERVER populates ONLY BodyEnc/KeyID and NEVER Body — including when
+	// chat_allow_plaintext is set. There is no server-controlled switch that
+	// makes history plaintext on the wire. Both are empty for tombstoned
+	// (deleted) messages.
+	BodyEnc string `json:"body_enc,omitempty"`
+	KeyID   uint32 `json:"key_id,omitempty"`
+
+	// Body is the DECRYPTED text. It is ALWAYS empty on the wire. The Wails
+	// Go layer fills it after unsealing, before the webview sees the entry. A
+	// non-empty Body arriving from a server is a protocol violation and the
+	// client replaces the entry with a refusal string.
+	Body string `json:"body,omitempty"`
+
+	// EncVerified is set by the CLIENT after it successfully opens BodyEnc.
+	// It never appears on the wire from a server. It exists so the renderer
+	// can draw the shield on a message replayed from history — without it a
+	// history message is visually indistinguishable from one the server
+	// handed over in the clear.
+	EncVerified bool `json:"enc_verified,omitempty"`
+
+	SentAt    int64          `json:"sent_at"` // unix seconds
+	EditedAt  int64          `json:"edited_at,omitempty"`
+	Deleted   bool           `json:"deleted,omitempty"`
+	Reactions map[string]int `json:"reactions,omitempty"`
 }
 
 // ChatHistoryResponse carries one history page (newest first).
 type ChatHistoryResponse struct {
 	ChannelID int64              `json:"channel_id"`
 	Messages  []ChatHistoryEntry `json:"messages"`
+	// Keys carries exactly the distinct generations this page references,
+	// sealed for the caller, so a page costs no extra round trips. Refused
+	// and Truncated mean what they mean in ChatKeyBundle and MUST NOT be
+	// conflated.
+	Keys      []ChannelKey `json:"keys,omitempty"`
+	Refused   []uint32     `json:"refused,omitempty"`
+	Truncated bool         `json:"truncated,omitempty"`
 }
 
 // ChatEdit edits the caller's own message. NewText is encrypted like a
 // normal message (the server decrypts before storing).
 type ChatEdit struct {
-	MessageID int64  `json:"message_id"`
-	NewText   string `json:"new_text"`
-	Enc       bool   `json:"enc,omitempty"`
-	KeyID     uint32 `json:"key_id,omitempty"`
+	MessageID       int64  `json:"message_id"`
+	NewText         string `json:"new_text"`
+	Enc             bool   `json:"enc,omitempty"`
+	KeyID           uint32 `json:"key_id,omitempty"`
+	ExpectedVersion uint64 `json:"expected_version,omitempty"`
 }
 
 // ChatDelete deletes a message (own, or any with b_chat_delete_any).
@@ -872,14 +1187,172 @@ type ChatPinEntry struct {
 	Message   *ChatHistoryEntry `json:"message,omitempty"`
 }
 
-// ChatPinsResponse carries a channel's pins.
+// ChatPinsResponse carries a channel's pins. ChatPinEntry embeds
+// *ChatHistoryEntry, so pinned bodies are ciphertext on the wire for the same
+// reason history bodies are; Keys/Refused/Truncated behave identically.
 type ChatPinsResponse struct {
 	ChannelID int64          `json:"channel_id"`
 	Pins      []ChatPinEntry `json:"pins"`
+	Keys      []ChannelKey   `json:"keys,omitempty"`
+	Refused   []uint32       `json:"refused,omitempty"`
+	Truncated bool           `json:"truncated,omitempty"`
+}
+
+// ChatKeyRequest asks for specific scope chat key generations the client is
+// missing: a live broadcast or chat_edited event referencing a generation it
+// never received. History and pins do NOT use this — they carry their keys
+// inline (ChatHistoryResponse.Keys), because a nested request/response would
+// serialise behind the client's process-global request mutex. KeyIDs is
+// capped at 64 per request; an empty list is rejected.
+type ChatKeyRequest struct {
+	ChannelID int64    `json:"channel_id"`
+	KeyIDs    []uint32 `json:"key_ids"`
+}
+
+// ChatKeyBundle answers a ChatKeyRequest. Keys holds the generations the
+// caller is entitled to, each sealed with box.SealAnonymous to the caller's
+// published X25519 key — the same envelope as ChannelKey.
+//
+// The three outcomes are distinct and MUST NOT be conflated by clients:
+//   - present in Keys      -> usable
+//   - present in Refused   -> permanently withheld (not a member, or unknown
+//     generation). Render "you do not have access".
+//   - absent from both, with Truncated set -> the server capped the response.
+//     Render "key unavailable" and re-request. Treating truncation as refusal
+//     turns a transient cap into a permanent "[missing key]".
+type ChatKeyBundle struct {
+	ChannelID int64        `json:"channel_id"`
+	Keys      []ChannelKey `json:"keys"`
+	Refused   []uint32     `json:"refused,omitempty"`
+	Truncated bool         `json:"truncated,omitempty"`
+}
+
+// ChatFilterGet requests the chat moderation lists currently in force
+// (117/118). Gated by b_chat_filter_manage; admins bypass.
+type ChatFilterGet struct{}
+
+// ChatFilterSet replaces the runtime chat moderation lists. A nil field is
+// left unchanged; a non-nil pointer to "" clears that list. Every set writes
+// all three lists, so the first one snapshots the config.yaml defaults into
+// the database and config stops being consulted (117/118).
+//
+// Each list is comma-separated. WordFilter entries are case-insensitive
+// SUBSTRINGS of the message; the link lists are HOSTS matched against the
+// hostname of each http(s) URL in the message (exact or subdomain).
+type ChatFilterSet struct {
+	WordFilter    *string `json:"word_filter,omitempty"`
+	LinkBlacklist *string `json:"link_blacklist,omitempty"`
+	LinkWhitelist *string `json:"link_whitelist,omitempty"`
+}
+
+// ChatFilterResponse carries the moderation lists in force. It answers both
+// ChatFilterGet and a successful ChatFilterSet.
+type ChatFilterResponse struct {
+	WordFilter    string `json:"word_filter"`
+	LinkBlacklist string `json:"link_blacklist"`
+	LinkWhitelist string `json:"link_whitelist"`
+	// FromConfig reports that no runtime override is stored yet, so these are
+	// the config.yaml values. It is false for every response to a set.
+	FromConfig bool `json:"from_config,omitempty"`
+}
+
+// GroupEdit changes a group's cosmetic fields (178 role colours, 179 hoisting).
+// The columns have existed since migration 009 but nothing could ever set them.
+// A nil field is left unchanged, so a dialog may send only what it edited.
+type GroupEdit struct {
+	GroupID int64   `json:"group_id"`
+	Color   *string `json:"color,omitempty"`   // "#rrggbb"; "" clears back to the theme default
+	Hoist   *bool   `json:"hoist,omitempty"`   // display the group in its own tree section
+	SortID  *int    `json:"sort_id,omitempty"` // lower sorts first; picks the nickname colour
+}
+
+// PermCopy copies permission entries between targets (141). Kind is
+// "servergroup" | "channelgroup" | "client"; ChannelID scopes a channel-group
+// or per-channel client copy. Replace clears the destination's own entries
+// first, so the copy is exact rather than a merge.
+type PermCopy struct {
+	FromKind  string `json:"from_kind"`
+	FromID    string `json:"from_id"`
+	ToKind    string `json:"to_kind"`
+	ToID      string `json:"to_id"`
+	ChannelID int64  `json:"channel_id,omitempty"`
+	Replace   bool   `json:"replace,omitempty"`
+}
+
+// PermsInvalid tells a client its resolved permissions changed and the cached
+// set must be refetched (151). It replaces the client's 5 s poll, so it has to
+// reach every client whose resolution could have moved — not just the caller.
+type PermsInvalid struct {
+	Reason string `json:"reason,omitempty"`
+}
+
+// ComplaintList requests the complaint list (173). Gated by b_complain_list.
+type ComplaintList struct{}
+
+// ComplaintEntry is one filed complaint.
+type ComplaintEntry struct {
+	TargetUniqueID string `json:"target_unique_id"`
+	TargetNickname string `json:"target_nickname,omitempty"`
+	FromUniqueID   string `json:"from_unique_id"`
+	FromNickname   string `json:"from_nickname,omitempty"`
+	Reason         string `json:"reason"`
+	CreatedAt      int64  `json:"created_at"` // unix seconds
+}
+
+// Complaints is the complaint list.
+type Complaints struct {
+	Entries []ComplaintEntry `json:"entries"`
+}
+
+// ComplaintClear deletes complaints against a target (173). FromUniqueID
+// empty clears every complaint against the target.
+type ComplaintClear struct {
+	TargetUniqueID string `json:"target_unique_id"`
+	FromUniqueID   string `json:"from_unique_id,omitempty"`
+}
+
+// TokenList requests the privilege tokens (174). Gated by
+// b_virtualserver_token_list.
+type TokenList struct{}
+
+// TokenEntry is one privilege key.
+type TokenEntry struct {
+	Token       string `json:"token"`
+	GroupID     int64  `json:"group_id"`
+	GroupName   string `json:"group_name,omitempty"`
+	ChannelID   int64  `json:"channel_id,omitempty"`
+	Description string `json:"description,omitempty"`
+	CreatedAt   int64  `json:"created_at"` // unix seconds
+	UsedBy      string `json:"used_by,omitempty"`
+}
+
+// Tokens is the privilege token list.
+type Tokens struct {
+	Entries []TokenEntry `json:"entries"`
+}
+
+// TokenAdd creates a privilege token (174). The server generates the token
+// string and returns the refreshed list.
+type TokenAdd struct {
+	GroupID     int64  `json:"group_id"`
+	ChannelID   int64  `json:"channel_id,omitempty"`
+	Description string `json:"description,omitempty"`
+}
+
+// TokenDelete revokes a privilege token (174).
+type TokenDelete struct {
+	Token string `json:"token"`
 }
 
 // Typing is a typing indicator. Exactly one of ChannelID / ToUniqueID is
-// set (channel scope or DM); neither set means global. Relayed, not stored.
+// set (channel scope or DM); neither set means global. Relayed, not stored —
+// there is no body, so it never enters the ciphertext-at-rest path (91).
+//
+// The relay emits a "typing" event whose data shape is fixed by the server
+// (see typingEvent): client_id, unique_id, nickname, channel_id. A channel
+// or global relay reaches the SENDER too, so receivers must drop their own
+// unique_id. A ToUniqueID naming an offline user, or a ChannelID the sender
+// is not currently in, is dropped without an error frame.
 type Typing struct {
 	ChannelID  int64  `json:"channel_id,omitempty"`
 	ToUniqueID string `json:"to_unique_id,omitempty"`
@@ -1164,17 +1637,27 @@ type PermissionsQuery struct{}
 
 // PermissionEntry describes one resolved permission.
 type PermissionEntry struct {
-	Key    string `json:"key"`
-	Value  int    `json:"value"`
-	Grant  int    `json:"grant"`
-	Skip   bool   `json:"skip,omitempty"`
-	Negate bool   `json:"negate,omitempty"`
+	Key        string `json:"key"`
+	Value      int    `json:"value"`
+	Grant      int    `json:"grant"`
+	Skip       bool   `json:"skip,omitempty"`
+	Negate     bool   `json:"negate,omitempty"`
+	SourceTier string `json:"source_tier,omitempty"`
+	Inherited  bool   `json:"inherited,omitempty"`
+}
+
+type PermissionConflict struct {
+	Key          string `json:"key"`
+	WinningTier  string `json:"winning_tier"`
+	ShadowedTier string `json:"shadowed_tier"`
+	Message      string `json:"message"`
 }
 
 // PermissionsResponse carries the caller's resolved permission set (one
 // entry per key present in any tier, with the winning tier's value).
 type PermissionsResponse struct {
-	Entries []PermissionEntry `json:"entries"`
+	Entries   []PermissionEntry    `json:"entries"`
+	Conflicts []PermissionConflict `json:"conflicts,omitempty"`
 }
 
 // ClientInfoQuery requests the connection info of an online client.

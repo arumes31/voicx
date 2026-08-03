@@ -43,15 +43,20 @@ func (f *fakeRTCPWriter) pliCount() int {
 	return n
 }
 
-// registerVideoSource registers a publisher's layer SSRC directly in the
-// router (mirroring what ReadVideoLoop does on track start).
-func registerVideoSource(r *Router, publisherID, rid string, ssrc uint32) {
+// registerVideoSource registers a publisher's layer SSRC for one video slot
+// directly in the router (mirroring what ReadVideoLoop does on track start).
+func registerVideoSource(r *Router, publisherID, slot, rid string, ssrc uint32) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	src, ok := r.videoSources[publisherID]
+	bySlot, ok := r.videoSources[publisherID]
+	if !ok {
+		bySlot = make(map[string]map[string]uint32)
+		r.videoSources[publisherID] = bySlot
+	}
+	src, ok := bySlot[slot]
 	if !ok {
 		src = make(map[string]uint32)
-		r.videoSources[publisherID] = src
+		bySlot[slot] = src
 	}
 	src[rid] = ssrc
 }
@@ -71,10 +76,10 @@ func TestForwardVideoFanout(t *testing.T) {
 	r.JoinChannel(1, "b")
 	r.JoinChannel(1, "c")
 	r.JoinChannel(1, "pub") // creates (b,pub) and (c,pub) video tracks
-	registerVideoSource(r, "pub", "", 9001)
+	registerVideoSource(r, "pub", SlotCam, "", 9001)
 
 	pkt := makeAudioPacket(t, 1, -1) // packet contents don't matter here
-	if sent := r.ForwardVideo("pub", "", pkt); sent != 2 {
+	if sent := r.ForwardVideo("pub", SlotCam, "", pkt); sent != 2 {
 		t.Fatalf("ForwardVideo sent = %d, want 2", sent)
 	}
 }
@@ -107,18 +112,18 @@ func TestSimulcastLayerSelection(t *testing.T) {
 	}
 
 	// Publisher sends all three layers.
-	registerVideoSource(r, "pub", "f", 9001)
-	registerVideoSource(r, "pub", "h", 9002)
-	registerVideoSource(r, "pub", "q", 9003)
+	registerVideoSource(r, "pub", SlotCam, "f", 9001)
+	registerVideoSource(r, "pub", SlotCam, "h", 9002)
+	registerVideoSource(r, "pub", SlotCam, "q", 9003)
 
 	pkt := makeAudioPacket(t, 1, -1)
-	if sent := r.ForwardVideo("pub", "f", pkt); sent != 1 {
+	if sent := r.ForwardVideo("pub", SlotCam, "f", pkt); sent != 1 {
 		t.Errorf("layer f sent = %d, want 1 (high subscriber only)", sent)
 	}
-	if sent := r.ForwardVideo("pub", "h", pkt); sent != 2 {
+	if sent := r.ForwardVideo("pub", SlotCam, "h", pkt); sent != 2 {
 		t.Errorf("layer h sent = %d, want 2 (mid + default-mid subscribers)", sent)
 	}
-	if sent := r.ForwardVideo("pub", "q", pkt); sent != 1 {
+	if sent := r.ForwardVideo("pub", SlotCam, "q", pkt); sent != 1 {
 		t.Errorf("layer q sent = %d, want 1 (low subscriber only)", sent)
 	}
 }
@@ -149,14 +154,14 @@ func TestSimulcastFallback(t *testing.T) {
 
 	// Publisher sends only the high layer: both subscribers fall back to it
 	// (mid chain h->q->f, low chain q->h->f, both end at f).
-	registerVideoSource(r, "pub", "f", 9001)
+	registerVideoSource(r, "pub", SlotCam, "f", 9001)
 
 	pkt := makeAudioPacket(t, 1, -1)
-	if sent := r.ForwardVideo("pub", "f", pkt); sent != 2 {
+	if sent := r.ForwardVideo("pub", SlotCam, "f", pkt); sent != 2 {
 		t.Errorf("layer f sent = %d, want 2 (both fall back to f)", sent)
 	}
 	// An unpublished layer is forwarded to nobody.
-	if sent := r.ForwardVideo("pub", "h", pkt); sent != 0 {
+	if sent := r.ForwardVideo("pub", SlotCam, "h", pkt); sent != 0 {
 		t.Errorf("layer h sent = %d, want 0 (not published)", sent)
 	}
 }
@@ -178,9 +183,9 @@ func TestNonSimulcastAcceptsAll(t *testing.T) {
 		t.Fatalf("SetVideoQuality: %v", err)
 	}
 
-	registerVideoSource(r, "pub", "", 9001) // no simulcast
+	registerVideoSource(r, "pub", SlotCam, "", 9001) // no simulcast
 	pkt := makeAudioPacket(t, 1, -1)
-	if sent := r.ForwardVideo("pub", "", pkt); sent != 1 {
+	if sent := r.ForwardVideo("pub", SlotCam, "", pkt); sent != 1 {
 		t.Fatalf("ForwardVideo sent = %d, want 1", sent)
 	}
 }
@@ -203,7 +208,7 @@ func TestKeyframeRequestOnJoin(t *testing.T) {
 	r.mu.Lock()
 	r.rtcpWriters["pub"] = pub
 	r.mu.Unlock()
-	registerVideoSource(r, "pub", "h", 9002)
+	registerVideoSource(r, "pub", SlotCam, "h", 9002)
 
 	// Publisher itself joining must not PLI; a new subscriber joining must.
 	r.JoinChannel(1, "viewer")
@@ -229,8 +234,8 @@ func TestKeyframeRequestOnQualityChange(t *testing.T) {
 	r.mu.Lock()
 	r.rtcpWriters["pub"] = pub
 	r.mu.Unlock()
-	registerVideoSource(r, "pub", "f", 9001)
-	registerVideoSource(r, "pub", "q", 9003)
+	registerVideoSource(r, "pub", SlotCam, "f", 9001)
+	registerVideoSource(r, "pub", SlotCam, "q", 9003)
 
 	before := pub.pliCount()
 	if err := r.SetVideoQuality("viewer", "low"); err != nil {
@@ -254,7 +259,7 @@ func TestRelayKeyframeRequest(t *testing.T) {
 	r.mu.Lock()
 	r.rtcpWriters["pub"] = pub
 	r.mu.Unlock()
-	registerVideoSource(r, "pub", "f", 9001)
+	registerVideoSource(r, "pub", SlotCam, "f", 9001)
 
 	r.relayKeyframeRequest(9001)
 	if got := pub.pliCount(); got != 1 {
@@ -287,7 +292,7 @@ func TestVideoPublishGate(t *testing.T) {
 		fakeTrackReader: fakeTrackReader{packets: []*rtp.Packet{makeAudioPacket(t, 1, -1)}},
 		ssrc:            9001,
 	}
-	r.ReadVideoLoop("denied", track)
+	r.ReadVideoLoop("denied", SlotCam, track)
 
 	if w.count() != 0 {
 		t.Fatalf("viewer received %d packets from denied publisher, want 0", w.count())

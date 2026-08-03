@@ -196,8 +196,9 @@ func (l *Loader) loadFromDB(ctx context.Context, userID int64, channelID int64) 
 	}
 	tp.Set(TierChannelSpecific, channelSpecificSet)
 
-	// 3b. Channel tier (permissions on the channel object itself, 009).
-	channelSet, err := l.loadChannelPermissions(ctx, channelID)
+	// 3b. Channel tier (permissions on the channel object itself, 009),
+	// merged over the inheritance chain (157).
+	channelSet, err := l.loadChannelPermissionChain(ctx, channelID)
 	if err != nil {
 		return TieredPermissions{}, fmt.Errorf("loading channel permissions for channel %d: %w", channelID, err)
 	}
@@ -360,6 +361,71 @@ func (l *Loader) loadChannelPermissions(ctx context.Context, channelID int64) (P
 		JOIN permissions p ON p.id = cp.permission_id
 		WHERE cp.channel_id = $1`
 	return l.loadPermissionRows(ctx, q, channelID)
+}
+
+// maxChannelDepth caps the inheritance walk so a hand-edited parent cycle in
+// the database cannot spin the recursive query forever.
+const maxChannelDepth = 64
+
+// loadChannelPermissionChain resolves the channel tier over the inheritance
+// chain (157): the channel's own entries plus, while inherit_permissions is
+// set, those of its ancestors. It is an OVERRIDE merge, not MergeSet's
+// max-within-a-tier merge — a nearer channel is the more specific statement
+// about the same key and must win outright, including when it grants less.
+func (l *Loader) loadChannelPermissionChain(ctx context.Context, channelID int64) (PermissionSet, error) {
+	chain, err := l.channelPermissionChain(ctx, channelID)
+	if err != nil {
+		return nil, err
+	}
+	// An unknown channel yields no rows; fall back to the plain lookup so the
+	// behaviour matches the pre-157 loader for ids the channels table lacks.
+	if len(chain) == 0 {
+		return l.loadChannelPermissions(ctx, channelID)
+	}
+
+	merged := NewPermissionSet()
+	for _, id := range chain {
+		set, err := l.loadChannelPermissions(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		for key, p := range set {
+			if p == nil || merged.Has(key) {
+				continue
+			}
+			merged.Set(p)
+		}
+	}
+	return merged, nil
+}
+
+// channelPermissionChain returns channelID followed by the ancestors whose
+// permissions it inherits, NEAREST FIRST. The walk stops at the first channel
+// without inherit_permissions, so the default FALSE keeps a channel resolving
+// to itself alone (157).
+func (l *Loader) channelPermissionChain(ctx context.Context, channelID int64) ([]int64, error) {
+	const q = `WITH RECURSIVE chain(id, parent_id, inherit, depth) AS (
+			SELECT id, parent_id, inherit_permissions, 0 FROM channels WHERE id = $1
+			UNION ALL
+			SELECT c.id, c.parent_id, c.inherit_permissions, chain.depth + 1
+			FROM channels c JOIN chain ON c.id = chain.parent_id
+			WHERE chain.inherit AND chain.depth < $2
+		) SELECT id FROM chain ORDER BY depth`
+	rows, err := l.store.DB().QueryContext(ctx, q, channelID, maxChannelDepth)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // loadPermissionRows runs a query that returns the standard five

@@ -5,6 +5,24 @@ on:
   pull_request:
 
 jobs:
+  frontend-e2e:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: client/frontend/package-lock.json
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run build
+      - run: npm run test:unit
+      - run: npm run test:e2e
+
   test:
     runs-on: ubuntu-latest
     services:
@@ -32,6 +50,23 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: client/frontend/package-lock.json
+
+      - name: install linux client dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxtst-dev libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev xvfb
+
+      - name: build frontend assets
+        working-directory: client/frontend
+        run: |
+          npm ci
+          npm run build
+
       - name: gofmt check
         run: |
           fmt=$(gofmt -l .)
@@ -40,20 +75,57 @@ jobs:
           fi
 
       - name: vet
-        run: go vet ./...
+        run: |
+          go vet ./...
+          (cd client && go vet ./...)
 
       - name: build
-        run: go build ./...
+        run: |
+          go build ./...
+          (cd client && go build ./...)
 
-      - name: test
-        run: go test ./... -race -count=1
+      - name: test and enforce coverage
+        run: |
+          root_coverage="$RUNNER_TEMP/root-unit.out"
+          go test -race -count=1 -covermode=atomic -coverprofile="$root_coverage" ./internal/...
+          go test -race -count=1 . ./cmd/... ./v1
+          root_pct="$(go tool cover -func="$root_coverage" | awk '/^total:/ {gsub("%", "", $3); print $3}')"
+          awk -v got="$root_pct" 'BEGIN {
+            minimum = 70
+            if (got + 0 < minimum) {
+              printf "root internal coverage %.1f%% is below %.1f%%\n", got, minimum
+              exit 1
+            }
+          }'
+
+          client_coverage="$RUNNER_TEMP/client-unit.out"
+          (cd client && xvfb-run -a go test -race -count=1 -covermode=atomic -coverprofile="$client_coverage" ./...)
+          client_pct="$(cd client && go tool cover -func="$client_coverage" | awk '/^total:/ {gsub("%", "", $3); print $3}')"
+          awk -v got="$client_pct" 'BEGIN {
+            minimum = 50
+            if (got + 0 < minimum) {
+              printf "client coverage %.1f%% is below %.1f%%\n", got, minimum
+              exit 1
+            }
+          }'
+
+          printf "root internal coverage: %s%%\nclient coverage: %s%%\n" "$root_pct" "$client_pct"
         env:
           VOICX_TEST_DATABASE_URL: postgres://voicx:voicx@localhost:5432/voicx?sslmode=disable
           VOICX_REDIS_ADDR: localhost:6379
 
+      - name: upload coverage profiles
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage
+          path: |
+            ${{ runner.temp }}/root-unit.out
+            ${{ runner.temp }}/client-unit.out
+
   docker:
     needs: test
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -61,21 +133,45 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
-      - uses: docker/login-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@v6
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=schedule
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            ghcr.io/${{ github.repository }}:latest
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   release:
     needs: test
@@ -106,6 +202,7 @@ jobs:
         run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
 
       - name: build client (windows/amd64)
+        shell: bash
         working-directory: client
         run: |
           wails build -ldflags "-s -w \

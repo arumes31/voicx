@@ -24,7 +24,7 @@ VERSION_FLAGS = -ldflags="-s -w \
 	-X voicx/internal/version.Dirty=$(VOICX_DIRTY) \
 	-X voicx/internal/version.UpdateRepo=$(VOICX_UPDATE_REPO)"
 
-.PHONY: all build run migrate tidy test cover fmt vet docker-build docker-run docker-stop compose-up compose-down compose-logs clean help client-build
+.PHONY: all build run migrate proto tidy test cover fmt vet docker-build docker-run docker-stop compose-up compose-down compose-logs chaos chaos-webrtc profile-db query-load webrtc-load canary clean help client-build
 
 all: build
 
@@ -43,6 +43,10 @@ run:
 ## migrate: run database migrations (go run ./cmd/migrate)
 migrate:
 	$(GO) run ./cmd/migrate
+
+## proto: regenerate the gRPC stubs in ./v1 from proto/ (needs buf, 232)
+proto:
+	buf generate
 
 ## tidy: run go mod tidy
 tidy:
@@ -77,7 +81,7 @@ docker-build:
 
 ## docker-run: run the voicx:dev image with default ports published
 docker-run:
-	$(DOCKER) run --rm -p 9987:9987/udp -p 10011:10011 -p 30033:30033 -p 50051:50051 -p 9090:9090 $(IMAGE)
+	$(DOCKER) run --rm -p 12333:12333 -p 12334:12334/udp -p 12335:12335 -p 12336:12336 -p 12337:12337 $(IMAGE)
 
 ## docker-stop: stop and remove any running voicx containers
 docker-stop:
@@ -95,11 +99,36 @@ compose-down:
 compose-logs:
 	$(DOCKER) compose logs -f --tail=100
 
+## chaos: run the database chaos drill against the running compose stack (467)
+chaos:
+	./scripts/chaos-db.sh
+
+## chaos-webrtc: run the 100-client Opus profile through a toxic TURN/TCP relay (917)
+chaos-webrtc:
+	bash ./scripts/chaos-webrtc.sh
+
+## profile-db: EXPLAIN ANALYZE the hot chat and permission queries (701)
+profile-db:
+	psql "$(DATABASE_URL)" -v ON_ERROR_STOP=1 -f scripts/profile-hot-queries.sql
+
+## query-load: drive the ServerQuery listener at 5,000 requests/sec (934)
+query-load:
+	$(GO) run ./cmd/queryload -rate 5000
+
+## webrtc-load: simulate 100 authenticated Opus publishers against the SFU (916)
+webrtc-load:
+	$(GO) run ./cmd/loadtest -clients 100 -webrtc $(LOADTEST_ARGS)
+
+## canary: run encryption rotation and plaintext-leakage canaries (920)
+canary:
+	$(GO) test ./internal/server ./internal/e2ee -run 'Canary|Plaintext|Ratchet|X3DH|SkippedKey|SignedPreKey' -count=1
+
 ## clean: remove local build artifacts
 clean:
 	rm -rf bin out dist
 
 ## help: print this help
 help:
-	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make <target>\n\nTargets:\n"} \
-	/^[a-zA-Z_-]+:.*##/ { printf "  %-16s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+	@awk 'BEGIN {printf "\nUsage:\n  make <target>\n\nTargets:\n"} \
+	/^## [a-zA-Z_-]+:/ { line = substr($$0, 4); colon = index(line, ":"); \
+	  printf "  %-16s %s\n", substr(line, 1, colon - 1), substr(line, colon + 2) }' $(MAKEFILE_LIST)

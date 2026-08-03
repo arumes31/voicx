@@ -23,6 +23,14 @@ const (
 type initMsg struct {
 	Token      string `json:"token"`
 	TransferID string `json:"transfer_id"`
+	// Offset resumes an interrupted download (259): the server skips this
+	// many bytes before streaming. The digest frame still covers the WHOLE
+	// file, so a resuming client must fold the bytes it already holds into
+	// its own hash — that is what keeps the end-to-end integrity check
+	// meaningful across a resume. Uploads ignore it: an upload's .part file
+	// is discarded on failure, so there is nothing on the server to resume
+	// onto.
+	Offset int64 `json:"offset,omitempty"`
 }
 
 // digestMsg carries the SHA-256 (hex) of the transferred file.

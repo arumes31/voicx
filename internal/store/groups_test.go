@@ -6,7 +6,7 @@ package store
 import (
 	"context"
 	"fmt"
-	"os"
+	"sync"
 	"testing"
 	"time"
 )
@@ -15,11 +15,7 @@ import (
 // wave-6a tables/columns exist.
 func testDBStore(t *testing.T) *Store {
 	t.Helper()
-	url := os.Getenv("VOICX_TEST_DATABASE_URL")
-	if url == "" {
-		url = "postgres://voicx:voicx@127.0.0.1:55432/voicx?sslmode=disable"
-	}
-	s, err := New(url, testLogger(), 2, 1, time.Minute)
+	s, err := New(testDBURL(), testLogger(), 2, 1, time.Minute)
 	if err != nil {
 		t.Skipf("no database available (%v); skipping DB-backed test", err)
 	}
@@ -29,6 +25,60 @@ func testDBStore(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { s.Close() })
 	return s
+}
+
+// TestCompressPermissionAuditConcurrent tests concurrent audit compression.
+// Note: This test requires a dedicated isolated database/store so that
+// CompressPermissionAudit does not mutate unrelated audit history.
+func TestCompressPermissionAuditConcurrent(t *testing.T) {
+	s := testDBStore(t)
+	ctx := context.Background()
+
+	// Enforce isolation before inserting rows so CompressPermissionAudit
+	// cannot select or delete pre-existing matching rows outside this test.
+	if _, err := s.DB().ExecContext(ctx, `DELETE FROM audit_log WHERE created_at <= NOW()`); err != nil {
+		t.Fatalf("cleaning pre-existing audit_log: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `DELETE FROM audit_log_daily`); err != nil {
+		t.Fatalf("cleaning pre-existing audit_log_daily: %v", err)
+	}
+
+	target := fmt.Sprintf("concurrent-%d", time.Now().UnixNano())
+	const rows = 40
+	for i := 0; i < rows; i++ {
+		s.Audit(ctx, "test", "perm_set", target, "")
+	}
+	if _, err := s.DB().ExecContext(ctx, `UPDATE audit_log SET created_at=NOW()-INTERVAL '2 days' WHERE target=$1`, target); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = s.DB().ExecContext(context.Background(), `DELETE FROM audit_log WHERE target=$1`, target)
+		_, _ = s.DB().ExecContext(context.Background(), `DELETE FROM audit_log_daily WHERE target=$1`, target)
+	})
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := s.CompressPermissionAudit(ctx, time.Now())
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var count int
+	if err := s.DB().QueryRowContext(ctx, `SELECT COALESCE(SUM(event_count), 0) FROM audit_log_daily WHERE target=$1`, target).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != rows {
+		t.Fatalf("compressed event count = %d, want %d", count, rows)
+	}
 }
 
 // seedTestUser inserts a throwaway user row and removes it (cascading) at
@@ -329,5 +379,51 @@ func TestGroupMembersDB(t *testing.T) {
 	}
 	if len(members) != 1 || members[0].UniqueID != "w6atest_"+suffix || members[0].ExpiresAt == nil {
 		t.Fatalf("members = %+v", members)
+	}
+}
+
+// TestGroupCosmeticsDB covers the colour/hoist/sort setter (178/179): a nil
+// field must leave the stored column alone, so a dialog can send only what the
+// operator touched.
+func TestGroupCosmeticsDB(t *testing.T) {
+	s := testDBStore(t)
+	ctx := context.Background()
+	suffix := fmt.Sprint(time.Now().UnixNano())
+
+	gid, err := s.CreateGroup(ctx, "server", "cosmetics_"+suffix, 1)
+	if err != nil {
+		t.Fatalf("CreateGroup: %v", err)
+	}
+	t.Cleanup(func() { _ = s.DeleteGroup(ctx, "server", gid, true) })
+
+	color, hoist, sortID := "#a1b2c3", true, 7
+	if err := s.SetGroupCosmetics(ctx, gid, &color, &hoist, &sortID); err != nil {
+		t.Fatalf("SetGroupCosmetics: %v", err)
+	}
+	g, err := s.GetGroup(ctx, "server", gid)
+	if err != nil || g == nil {
+		t.Fatalf("GetGroup: %v %+v", err, g)
+	}
+	if g.Color != color || !g.Hoist || g.SortID != 7 {
+		t.Fatalf("group after full edit = %+v", g)
+	}
+
+	// Partial edit: only the hoist changes.
+	off := false
+	if err := s.SetGroupCosmetics(ctx, gid, nil, &off, nil); err != nil {
+		t.Fatalf("SetGroupCosmetics partial: %v", err)
+	}
+	if g, err = s.GetGroup(ctx, "server", gid); err != nil || g == nil {
+		t.Fatalf("GetGroup: %v %+v", err, g)
+	}
+	if g.Color != color || g.Hoist || g.SortID != 7 {
+		t.Fatalf("group after partial edit = %+v", g)
+	}
+
+	if err := s.SetGroupCosmetics(ctx, gid, nil, nil, nil); err == nil {
+		t.Fatalf("SetGroupCosmetics with no fields returned nil error")
+	}
+	if err := s.SetGroupCosmetics(ctx, 0, &color, nil, nil); err == nil {
+		t.Fatalf("SetGroupCosmetics on a missing group returned nil error")
 	}
 }

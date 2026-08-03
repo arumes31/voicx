@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -42,9 +44,13 @@ func (s *TCPServer) handleKeyPublish(ctx context.Context, client *Client, f *net
 	}
 
 	// Key delivery: global scope + the client's current channel (if any).
-	s.deliverScopeKey(client, globalChatScope)
+	if err := s.deliverScopeKey(ctx, client, globalChatScope); err != nil {
+		return fmt.Errorf("delivering global scope key: %w", err)
+	}
 	if sc, ok := s.deps.State.GetClient(client.ID); ok && sc.ChannelID != 0 {
-		s.deliverScopeKey(client, sc.ChannelID)
+		if err := s.deliverScopeKey(ctx, client, sc.ChannelID); err != nil {
+			return fmt.Errorf("delivering channel scope key: %w", err)
+		}
 	}
 	return nil
 }
@@ -85,44 +91,184 @@ func (s *TCPServer) handleKeyRequest(_ context.Context, client *Client, f *netpr
 
 // deliverScopeKey seals the scope's current chat key for the client and
 // sends it. Clients without a published key (old clients) are skipped.
-func (s *TCPServer) deliverScopeKey(client *Client, scope int64) {
-	if s.deps == nil || s.deps.State == nil || s.chatKeys == nil {
-		return
+//
+// This is one of the three authorised minting sites: the caller has already
+// established that the client belongs to the scope, so a first generation may
+// be created here.
+func (s *TCPServer) deliverScopeKey(ctx context.Context, client *Client, scope int64) error {
+	if s.deps == nil || s.deps.State == nil || s.chatKeys == nil || !s.chatKeys.configured() {
+		return nil
 	}
 	sc, ok := s.deps.State.GetClient(client.ID)
 	if !ok || sc.E2EPublicKey == "" {
-		return
+		return nil
 	}
-	ck, err := s.chatKeys.sealFor(scope, sc.E2EPublicKey)
+	gen, _, err := s.chatKeys.EnsureScope(ctx, scope)
+	if err != nil {
+		s.logger.Warn("ensuring chat key failed",
+			zap.String("client_id", client.ID),
+			zap.Int64("scope", scope),
+			zap.Error(err),
+		)
+		return err
+	}
+	ck, err := s.chatKeys.sealFor(ctx, scope, gen, sc.E2EPublicKey)
 	if err != nil {
 		s.logger.Warn("sealing chat key failed",
 			zap.String("client_id", client.ID),
 			zap.Int64("scope", scope),
 			zap.Error(err),
 		)
-		return
+		return err
 	}
 	if err := s.writeMessage(client, netproto.MsgChannelKey, ck); err != nil {
 		s.logger.Debug("delivering chat key failed",
 			zap.String("client_id", client.ID),
 			zap.Error(err),
 		)
+		return err
 	}
+	return nil
+}
+
+// scopeReadable reports whether the client may read a scope's messages: the
+// global scope is open to everyone, a channel to its current members and to
+// its entitled subscribers (312). A reader may fetch EVERY generation of that
+// scope — refusing older generations while still serving their rows would be
+// theatre.
+func (s *TCPServer) scopeReadable(ctx context.Context, client *Client, scope int64) bool {
+	if scope == globalChatScope {
+		return true
+	}
+	if s.deps == nil || s.deps.State == nil {
+		return false
+	}
+	channelID, _, ok := s.deps.State.ClientChannelState(client.ID)
+	if !ok {
+		return false
+	}
+	if channelID == scope {
+		return true
+	}
+	// (312) a subscriber already holds this scope's current generation, so
+	// withholding history and pins would only hide the scrollback it can
+	// decrypt while the live relay flows.
+	return s.deps.State.IsSubscribed(client.ID, scope) && s.subscribeAllowed(ctx, client, scope)
 }
 
 // rotateScopeKey rotates a channel's chat key (a member left) and
 // redistributes the new generation to the remaining members. The global
 // scope is NOT rotated (it would spam every client on every disconnect; the
 // global history trade-off is documented).
-func (s *TCPServer) rotateScopeKey(channelID int64) {
-	if channelID == 0 || s.deps == nil || s.deps.State == nil || s.chatKeys == nil {
+//
+// Leaves inside chat_key_rotate_min_seconds are coalesced into one rotation:
+// a client flapping on a bad link would otherwise mint one persisted
+// generation per reconnect.
+func (s *TCPServer) rotateScopeKey(ctx context.Context, channelID int64) {
+	if channelID == 0 || s.deps == nil || s.deps.State == nil || s.chatKeys == nil || !s.chatKeys.configured() {
 		return
 	}
-	s.chatKeys.rotate(channelID)
+	window := time.Duration(0)
+	if s.cfg != nil && s.cfg.ChatKeyRotateMinSecs > 0 {
+		window = time.Duration(s.cfg.ChatKeyRotateMinSecs) * time.Second
+	}
+	if window == 0 {
+		s.doRotateScopeKey(ctx, channelID)
+		return
+	}
+	s.rotMu.Lock()
+	if s.rotPending[channelID] {
+		// A timer is already armed for this scope; this leave rides along.
+		s.rotMu.Unlock()
+		return
+	}
+	if s.rotPending == nil {
+		s.rotPending = map[int64]bool{}
+	}
+	s.rotPending[channelID] = true
+	s.rotMu.Unlock()
+	time.AfterFunc(window, func() {
+		s.rotMu.Lock()
+		delete(s.rotPending, channelID)
+		s.rotMu.Unlock()
+		s.doRotateScopeKey(context.Background(), channelID)
+	})
+}
+
+// doRotateScopeKey performs one rotation and redistributes the result.
+// Redistribution happens strictly AFTER rotate returns: deliverScopeKey ->
+// sealFor -> at re-enters the scope entry's mutex.
+func (s *TCPServer) doRotateScopeKey(ctx context.Context, channelID int64) {
+	if _, _, err := s.chatKeys.rotate(ctx, channelID); err != nil {
+		// A stale key is far better than an unreadable channel.
+		s.logger.Warn("chat key rotation failed", zap.Int64("channel_id", channelID), zap.Error(err))
+		return
+	}
 	for _, member := range s.deps.State.ChannelMembers(channelID) {
 		if client, ok := s.clientByID(member.ClientID); ok {
-			s.deliverScopeKey(client, channelID)
+			if err := s.deliverScopeKey(ctx, client, channelID); err != nil {
+				s.logger.Warn("delivering rotated key to member failed",
+					zap.String("client_id", member.ClientID),
+					zap.Int64("channel_id", channelID),
+					zap.Error(err),
+				)
+			}
+		}
+	}
+	// (312) subscribers read this scope under the same generation, so leaving
+	// them out of the redistribution would strand every one of them on the
+	// retired key and turn their tab into a wall of ⚠ placeholders.
+	for _, client := range s.channelSubscribers(ctx, channelID) {
+		if err := s.deliverScopeKey(ctx, client, channelID); err != nil {
+			s.logger.Warn("delivering rotated key to subscriber failed",
+				zap.String("client_id", client.ID),
+				zap.Int64("channel_id", channelID),
+				zap.Error(err),
+			)
 		}
 	}
 	s.logger.Debug("chat key rotated", zap.Int64("channel_id", channelID))
+}
+
+// handleChatKeyRequest serves the generations a client missed on a live
+// broadcast or chat_edited event. It is cheap to send and expensive to answer
+// — one box.SealAnonymous plus a possible store read per requested id — so it
+// runs through the same per-user chat rate limiter as a send.
+func (s *TCPServer) handleChatKeyRequest(ctx context.Context, client *Client, f *netproto.Frame) error {
+	var msg netproto.ChatKeyRequest
+	if err := netproto.Decode(f, &msg); err != nil {
+		return s.sendError(client, errCodeMalformed, "malformed chat_key_request: "+err.Error())
+	}
+	if len(msg.KeyIDs) == 0 || len(msg.KeyIDs) > maxKeysPerResponse {
+		return s.sendError(client, errCodeMalformed, "key_ids count must be 1..64")
+	}
+	if s.chatRate != nil && !s.chatRate.allow(client.UniqueID, time.Now()) {
+		return s.sendError(client, errCodeMalformed, "chat rate limit exceeded — slow down")
+	}
+	if s.deps == nil || s.deps.State == nil || s.chatKeys == nil {
+		return s.sendError(client, errCodeUnavailable, "chat key manager unavailable")
+	}
+	sc, ok := s.deps.State.GetClient(client.ID)
+	if !ok || sc.E2EPublicKey == "" {
+		return s.sendError(client, errCodePermissionDenied, "e2e public key not published")
+	}
+	if !s.scopeReadable(ctx, client, msg.ChannelID) {
+		return s.writeMessage(client, netproto.MsgChatKeyBundle, netproto.ChatKeyBundle{
+			ChannelID: msg.ChannelID,
+			Refused:   msg.KeyIDs,
+		})
+	}
+	bundle := netproto.ChatKeyBundle{
+		ChannelID: msg.ChannelID,
+		Keys:      []netproto.ChannelKey{},
+	}
+	for _, id := range msg.KeyIDs {
+		ck, err := s.chatKeys.sealFor(ctx, msg.ChannelID, id, sc.E2EPublicKey)
+		if err != nil {
+			bundle.Refused = append(bundle.Refused, id)
+		} else {
+			bundle.Keys = append(bundle.Keys, *ck)
+		}
+	}
+	return s.writeMessage(client, netproto.MsgChatKeyBundle, bundle)
 }

@@ -3,6 +3,7 @@ package webrtc
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v3"
@@ -36,6 +37,17 @@ type PeerConnectionWrapper struct {
 
 	closeOnce sync.Once
 	closed    chan struct{}
+}
+
+// ReceiverReportStats is the loss/jitter/RTT view derived from RTCP Receiver
+// Reports generated and consumed by Pion's report interceptor.
+type ReceiverReportStats struct {
+	SSRC         uint32
+	Kind         string
+	PacketsLost  int32
+	FractionLost float64
+	Jitter       time.Duration
+	RTT          time.Duration
 }
 
 // newPeerConnectionWrapper constructs a wrapper around pc and starts the
@@ -189,6 +201,29 @@ func (w *PeerConnectionWrapper) AddTrack(track webrtc.TrackLocal) (*webrtc.RTPSe
 // requests). It satisfies the router's RTCPWriter interface.
 func (w *PeerConnectionWrapper) WriteRTCP(pkts []rtcp.Packet) error {
 	return w.pc.WriteRTCP(pkts)
+}
+
+// ReceiverReports returns the latest per-outbound-track RTCP measurements.
+// RegisterDefaultInterceptors owns report generation; this method exposes the
+// exact values received from the peer without maintaining a second estimator.
+func (w *PeerConnectionWrapper) ReceiverReports() []ReceiverReportStats {
+	report := w.pc.GetStats()
+	out := make([]ReceiverReportStats, 0)
+	for _, raw := range report {
+		stat, ok := raw.(webrtc.RemoteInboundRTPStreamStats)
+		if !ok {
+			continue
+		}
+		out = append(out, ReceiverReportStats{
+			SSRC:         uint32(stat.SSRC),
+			Kind:         stat.Kind,
+			PacketsLost:  stat.PacketsLost,
+			FractionLost: stat.FractionLost,
+			Jitter:       time.Duration(stat.Jitter * float64(time.Second)),
+			RTT:          time.Duration(stat.RoundTripTime * float64(time.Second)),
+		})
+	}
+	return out
 }
 
 // OnTrack registers the handler invoked when a remote track arrives.

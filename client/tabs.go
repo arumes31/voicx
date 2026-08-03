@@ -1,13 +1,13 @@
 // tabs.go implements multi-server tabs (281). Architecture (the low-churn
 // option): the App keeps one connManager per tab; the active tab's manager
 // is what all existing bindings talk to (a.cm), so the bound API stays
-// unchanged. Events from the ACTIVE tab go to the frontend under their
-// plain names (snapshot/event/channellist/...), so the frontend keeps its
-// single-state model. Events from BACKGROUND tabs are journaled in Go
-// (bounded, state-carrying frames only) and replayed as plain events when
-// their tab becomes active — after a "tab_reset" marker that tells the
-// frontend to clear its chat/tree state first. Background chat events only
-// bump the tab's unread/mention badges (emitted as "tab_update").
+// unchanged. State-carrying events from every tab are journaled in Go, while
+// events from the ACTIVE tab also go to the frontend under their plain names
+// (snapshot/event/channellist/...), so the frontend keeps its single-state
+// model. The bounded journal is replayed as plain events when a tab becomes
+// active — after a "tab_reset" marker that tells the frontend to clear its
+// chat/tree state first. Background chat events also bump the tab's
+// unread/mention badges (emitted as "tab_update").
 package main
 
 import (
@@ -67,17 +67,40 @@ func (s tabSink) Emit(name string, payload any) {
 	s.app.relayTabEvent(s.tabID, name, payload)
 }
 
-// relayTabEvent forwards active-tab events to the frontend and journals
-// background-tab events, updating badges.
+// relayTabEvent forwards active-tab events to the frontend and journals every
+// tab's state-carrying events. Active events must be journaled too: they are
+// the state that has to be replayed after switching away and back.
 func (a *App) relayTabEvent(tabID, name string, payload any) {
 	a.tabsMu.Lock()
 	active := a.activeID == tabID
 	ts := a.tabs[tabID]
+	mention := false
 	if name == "disconnected" && ts != nil {
 		ts.info.Connected = false
 	}
+	if ts != nil {
+		text, _ := payload.(string)
+		switch name {
+		case "snapshot":
+			ts.journal = ts.journal[:0]
+			ts.journal = append(ts.journal, journalEntry{name, text})
+		case "channellist", "subscriptions", "server_rules", "event":
+			ts.journal = append(ts.journal, journalEntry{name, text})
+			if len(ts.journal) > journalCap {
+				ts.journal = ts.journal[len(ts.journal)-journalCap:]
+			}
+			if !active && name == "event" {
+				mention = a.countBadge(ts, text)
+			}
+		}
+	}
 	a.tabsMu.Unlock()
 
+	if mention {
+		// (290) mention in a background tab: flash the taskbar + badge.
+		a.FlashWindow()
+		trayAddMention()
+	}
 	if active || ts == nil {
 		a.emitPlain(name, payload)
 		if name == "disconnected" {
@@ -85,26 +108,8 @@ func (a *App) relayTabEvent(tabID, name string, payload any) {
 		}
 		return
 	}
-
-	// Background tab: journal state-carrying frames for replay.
-	text, _ := payload.(string)
-	switch name {
-	case "snapshot":
-		ts.journal = ts.journal[:0]
-		ts.journal = append(ts.journal, journalEntry{name, text})
-	case "channellist", "event":
-		ts.journal = append(ts.journal, journalEntry{name, text})
-		if len(ts.journal) > journalCap {
-			ts.journal = ts.journal[len(ts.journal)-journalCap:]
-		}
-		if name == "event" {
-			a.countBadge(ts, text)
-		}
-	case "disconnected":
-		ts.info.Connected = false
-		a.emitTabsUpdate()
-		return
-	default:
+	if name != "snapshot" && name != "channellist" && name != "subscriptions" &&
+		name != "server_rules" && name != "event" && name != "disconnected" {
 		// ice/offer/avatar/servererror from background tabs: drop (voice is
 		// active-tab only this wave).
 		return
@@ -113,29 +118,30 @@ func (a *App) relayTabEvent(tabID, name string, payload any) {
 }
 
 // countBadge increments unread/mention counters for background chat events.
-func (a *App) countBadge(ts *tabState, eventJSON string) {
+func (a *App) countBadge(ts *tabState, eventJSON string) bool {
 	var env struct {
 		Type string          `json:"type"`
 		Data json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal([]byte(eventJSON), &env); err != nil || env.Type != "chat" {
-		return
+		return false
 	}
 	var chat struct {
 		From string `json:"from"`
 		Text string `json:"text"`
 	}
 	if err := json.Unmarshal(env.Data, &chat); err != nil {
-		return
+		return false
 	}
 	ts.info.Unread++
+	ts.cm.mu.Lock()
 	nick := ts.cm.nickname
+	ts.cm.mu.Unlock()
 	if nick != "" && strings.Contains(chat.Text, "@"+nick) {
 		ts.info.Mentions++
-		// (290) mention in a background tab: flash the taskbar + badge.
-		a.FlashWindow()
-		trayAddMention()
+		return true
 	}
+	return false
 }
 
 // emitPlain forwards an event to the Wails runtime under its plain name.
@@ -195,10 +201,12 @@ func (a *App) activate(tabID string) {
 	a.tabsMu.Lock()
 	ts := a.tabs[tabID]
 	a.activeID = tabID
+	var journal []journalEntry
 	if ts != nil {
 		a.cmStore(ts.cm)
 		ts.info.Unread = 0
 		ts.info.Mentions = 0
+		journal = append(journal, ts.journal...)
 	} else {
 		a.cmStore(nil)
 	}
@@ -209,7 +217,7 @@ func (a *App) activate(tabID string) {
 	trayClearMentions()
 	a.emitPlain("tab_reset", tabID)
 	if ts != nil {
-		for _, e := range ts.journal {
+		for _, e := range journal {
 			a.emitPlain(e.name, e.payload)
 		}
 	}
@@ -242,8 +250,17 @@ func (a *App) ListTabs() []TabInfo {
 }
 
 // ConnectTab connects to a server in a NEW tab and activates it. It returns
-// the tab ID on success or the failure reason (mirroring Connect).
+// the tab ID on success or the failure reason (mirroring Connect). The
+// bookmark this login came from is unknown here; see ConnectBookmarkTab.
 func (a *App) ConnectTab(addr, nickname, password, serverPassword string) string {
+	return a.ConnectBookmarkTab("", addr, nickname, password, serverPassword)
+}
+
+// ConnectBookmarkTab is ConnectTab with the originating bookmark's Name.
+// Bookmarks must be identified explicitly: a nickname override (334)
+// replaces the login nickname before connecting, so addr+nickname no longer
+// identifies the bookmark that per-server settings (300/335) belong to.
+func (a *App) ConnectBookmarkTab(bookmark, addr, nickname, password, serverPassword string) string {
 	if addr == "" || nickname == "" {
 		return "server address and nickname are required"
 	}
@@ -259,13 +276,19 @@ func (a *App) ConnectTab(addr, nickname, password, serverPassword string) string
 	}
 	ts.info.Addr = addr
 	ts.info.Nickname = nickname
-	a.onTabConnected(ts.cm, addr, nickname)
+	a.onTabConnected(ts.cm, bookmark, addr, nickname)
 	a.activate(id)
 	return ""
 }
 
 // ConnectGuestTab connects as a guest in a NEW tab (mirroring ConnectGuest).
 func (a *App) ConnectGuestTab(addr, nickname string) string {
+	return a.ConnectGuestBookmarkTab("", addr, nickname)
+}
+
+// ConnectGuestBookmarkTab is ConnectGuestTab with the originating bookmark's
+// Name (see ConnectBookmarkTab).
+func (a *App) ConnectGuestBookmarkTab(bookmark, addr, nickname string) string {
 	if addr == "" || nickname == "" {
 		return "server address and nickname are required"
 	}
@@ -276,33 +299,63 @@ func (a *App) ConnectGuestTab(addr, nickname string) string {
 	}
 	ts.info.Addr = addr
 	ts.info.Nickname = nickname
-	a.onTabConnected(ts.cm, addr, nickname)
+	a.onTabConnected(ts.cm, bookmark, addr, nickname)
 	a.activate(id)
 	return ""
 }
 
+// lookupBookmark resolves the bookmark a connection belongs to, by explicit
+// Name or (for callers that know no name) by the nickname that was sent as
+// the login nickname — the stored one or its override (334). Neither key is
+// unique: names are auto-generated ("nick @ addr"), freely editable, and
+// nothing rejects a duplicate, so both branches require agreement on addr AND
+// resolve only when exactly one bookmark matches. Guessing between candidates
+// applies a foreign hotkey profile (300) and uploads a foreign avatar
+// override (335) to the server.
+func (a *App) lookupBookmark(name, addr, nickname string) *Bookmark {
+	var match *Bookmark
+	for i := range a.settings.Bookmarks {
+		b := &a.settings.Bookmarks[i]
+		if b.Addr != addr {
+			continue
+		}
+		if name != "" {
+			if b.Name != name {
+				continue
+			}
+		} else if b.Nickname != nickname && b.NicknameOverride != nickname {
+			continue
+		}
+		if match != nil {
+			return nil // ambiguous: treat as a plain login
+		}
+		match = b
+	}
+	return match
+}
+
 // onTabConnected records the recents entry (282), applies the bookmark's
 // hotkey profile (300), and uploads the avatar override (335). cm is the
-// newly connected tab's manager (it is not active yet).
-func (a *App) onTabConnected(cm *connManager, addr, nickname string) {
+// newly connected tab's manager (it is not active yet); bookmark is the
+// originating bookmark's Name ("" = direct login).
+func (a *App) onTabConnected(cm *connManager, bookmark, addr, nickname string) {
 	a.RecordRecent(addr, nickname)
-	for _, b := range a.settings.Bookmarks {
-		if b.Addr == addr && b.Nickname == nickname {
-			if b.Profile != "" {
-				a.ApplyHotkeyProfile(b.Profile)
-			} else {
-				a.ApplyHotkeyProfile("default")
-			}
-			// (335) per-server avatar override: upload after connect.
-			if b.AvatarOverrideB64 != "" {
-				if err := cm.write(netproto.MsgAvatarSet, netproto.AvatarSet{DataBase64: b.AvatarOverrideB64}); err != nil {
-					log.Printf("avatar override upload failed: %v", err)
-				}
-			}
-			return
+	b := a.lookupBookmark(bookmark, addr, nickname)
+	if b == nil {
+		a.ApplyHotkeyProfile("default")
+		return
+	}
+	if b.Profile != "" {
+		a.ApplyHotkeyProfile(b.Profile)
+	} else {
+		a.ApplyHotkeyProfile("default")
+	}
+	// (335) per-server avatar override: upload after connect.
+	if b.AvatarOverrideB64 != "" {
+		if err := cm.write(netproto.MsgAvatarSet, netproto.AvatarSet{DataBase64: b.AvatarOverrideB64}); err != nil {
+			log.Printf("avatar override upload failed: %v", err)
 		}
 	}
-	a.ApplyHotkeyProfile("default")
 }
 
 // SetActiveTab switches the active tab (replays its journaled state).

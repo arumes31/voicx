@@ -1,0 +1,16 @@
+# buf.gen.yaml drives `buf generate` for the Go stubs (232). The plugins are
+# local binaries: install them with
+#   go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+#   go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+version: v2
+managed:
+  enabled: false
+plugins:
+  - local: protoc-gen-go
+    out: .
+    opt: module=voicx
+  - local: protoc-gen-go-grpc
+    out: .
+    opt: module=voicx
+inputs:
+  - directory: proto

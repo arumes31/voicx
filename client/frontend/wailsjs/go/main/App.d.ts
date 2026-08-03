@@ -3,6 +3,8 @@
 import {netproto} from '../models';
 import {main} from '../models';
 
+export function AcceptServerRules(arg1:string):Promise<string>;
+
 export function ApplyAndRestart():Promise<string>;
 
 export function ApplyHotkeyProfile(arg1:string):Promise<void>;
@@ -15,13 +17,23 @@ export function BanRemove(arg1:number):Promise<string>;
 
 export function CancelTransfer(arg1:string):Promise<void>;
 
-export function ChannelEdit(arg1:number,arg2:string,arg3:number,arg4:number,arg5:boolean,arg6:boolean,arg7:boolean,arg8:string):Promise<string>;
+export function ChannelEdit(arg1:number,arg2:string,arg3:number,arg4:number,arg5:boolean,arg6:boolean,arg7:boolean,arg8:string,arg9:number):Promise<string>;
+
+export function ChannelEditTree(arg1:number,arg2:string,arg3:number,arg4:number,arg5:number,arg6:boolean):Promise<string>;
+
+export function ChannelIconGet(arg1:number):Promise<netproto.ChannelIconData>;
 
 export function ChannelIconSet(arg1:number,arg2:string,arg3:number):Promise<string>;
 
 export function ChatDeleteMessage(arg1:number):Promise<string>;
 
-export function ChatEditMessage(arg1:number,arg2:number,arg3:string):Promise<string>;
+export function ChatEditMessage(arg1:number,arg2:number,arg3:string,arg4:number):Promise<string>;
+
+export function ChatExportHistory(arg1:number,arg2:number):Promise<main.ChatExportResult>;
+
+export function ChatFilterGet():Promise<netproto.ChatFilterResponse>;
+
+export function ChatFilterSet(arg1:string,arg2:string,arg3:string):Promise<netproto.ChatFilterResponse>;
 
 export function ChatHistory(arg1:number,arg2:number,arg3:number):Promise<netproto.ChatHistoryResponse>;
 
@@ -30,6 +42,8 @@ export function ChatPinMessage(arg1:number,arg2:number,arg3:boolean):Promise<str
 export function ChatPins(arg1:number):Promise<netproto.ChatPinsResponse>;
 
 export function ChatReact(arg1:number,arg2:string):Promise<string>;
+
+export function ChatSearch(arg1:number,arg2:string,arg3:number):Promise<main.ChatSearchResult>;
 
 export function CheckForUpdate():Promise<main.UpdateInfo>;
 
@@ -41,9 +55,17 @@ export function ClientVersionShort():Promise<string>;
 
 export function CloseTab(arg1:string):Promise<void>;
 
+export function ComplaintClear(arg1:string,arg2:string):Promise<netproto.Complaints>;
+
+export function ComplaintList():Promise<netproto.Complaints>;
+
 export function Connect(arg1:string,arg2:string,arg3:string,arg4:string):Promise<string>;
 
+export function ConnectBookmarkTab(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string):Promise<string>;
+
 export function ConnectGuest(arg1:string,arg2:string):Promise<string>;
+
+export function ConnectGuestBookmarkTab(arg1:string,arg2:string,arg3:string):Promise<string>;
 
 export function ConnectGuestTab(arg1:string,arg2:string):Promise<string>;
 
@@ -55,23 +77,53 @@ export function ConnectionSecurity():Promise<string>;
 
 export function CreateChannel(arg1:string,arg2:string,arg3:number,arg4:number,arg5:number,arg6:string,arg7:number,arg8:number,arg9:boolean,arg10:boolean,arg11:boolean):Promise<string>;
 
+export function CreateIdentity(arg1:string):Promise<string>;
+
+export function DMExportHistory(arg1:string):Promise<main.ChatExportResult>;
+
+export function DMHistoryAppend(arg1:string,arg2:string,arg3:main.DMEntry):Promise<string>;
+
+export function DMHistoryClear(arg1:string):Promise<string>;
+
+export function DMHistoryLoad(arg1:string):Promise<Array<main.DMEntry>>;
+
+export function DMHistoryPeers():Promise<Array<main.DMPeer>>;
+
+export function DMSearch(arg1:string,arg2:string,arg3:number):Promise<main.ChatSearchResult>;
+
 export function DeleteChannel(arg1:number):Promise<string>;
+
+export function DeleteIdentity(arg1:string,arg2:boolean):Promise<string>;
 
 export function Disconnect():Promise<void>;
 
 export function DownloadAndApply(arg1:main.UpdateInfo):Promise<string>;
 
+export function DownloadChatAttachment(arg1:number,arg2:string,arg3:string):Promise<string>;
+
 export function DownloadFile(arg1:number,arg2:string):Promise<string>;
 
-export function DownloadFileProgress(arg1:string,arg2:number,arg3:string,arg4:string,arg5:string):Promise<string>;
+export function DownloadFileProgress(arg1:string,arg2:number,arg3:string,arg4:string,arg5:string,arg6:number):Promise<string>;
+
+export function DownloadPath(arg1:string):Promise<string>;
+
+export function E2EEDiagnostics(arg1:string):Promise<main.E2EEDiagnostics>;
+
+export function EmojiDelete(arg1:string):Promise<string>;
 
 export function EmojiGet(arg1:string):Promise<netproto.EmojiData>;
 
 export function EmojiList():Promise<netproto.EmojiListResponse>;
 
+export function EmojiRename(arg1:string,arg2:string):Promise<string>;
+
+export function EmojiUpload(arg1:string,arg2:string):Promise<string>;
+
 export function ExportChat(arg1:string,arg2:string):Promise<string>;
 
-export function ExportIdentity():Promise<string>;
+export function ExportChatEncrypted(arg1:string,arg2:string,arg3:string):Promise<string>;
+
+export function ExportIdentity(arg1:string):Promise<string>;
 
 export function ExportLogs():Promise<string>;
 
@@ -81,7 +133,7 @@ export function FileLink(arg1:number,arg2:string,arg3:string):Promise<netproto.F
 
 export function FileList(arg1:number,arg2:string):Promise<netproto.FileListResponse>;
 
-export function FileRename(arg1:number,arg2:string,arg3:string,arg4:string,arg5:string):Promise<string>;
+export function FileRename(arg1:number,arg2:string,arg3:string,arg4:string,arg5:string,arg6:number):Promise<string>;
 
 export function FileVersions(arg1:number,arg2:string,arg3:string):Promise<netproto.FileVersionsResponse>;
 
@@ -95,6 +147,8 @@ export function GetICEServers():Promise<Array<netproto.ICEServer>>;
 
 export function GetPermissions():Promise<Array<netproto.PermissionEntry>>;
 
+export function GetServerConfig():Promise<netproto.ServerConfig>;
+
 export function GetSettings():Promise<main.Settings>;
 
 export function Greet(arg1:string):Promise<string>;
@@ -104,6 +158,8 @@ export function GroupAssign(arg1:string,arg2:number,arg3:string,arg4:number,arg5
 export function GroupCreate(arg1:string,arg2:string,arg3:number):Promise<netproto.GroupListResponse>;
 
 export function GroupDelete(arg1:string,arg2:number,arg3:boolean):Promise<string>;
+
+export function GroupEdit(arg1:number,arg2:string,arg3:boolean,arg4:number):Promise<netproto.GroupListResponse>;
 
 export function GroupIconGet(arg1:number):Promise<netproto.GroupIconData>;
 
@@ -117,19 +173,27 @@ export function GroupRename(arg1:string,arg2:number,arg3:string):Promise<string>
 
 export function GroupUnassign(arg1:string,arg2:number,arg3:string,arg4:number):Promise<string>;
 
+export function IdentityBackupPending():Promise<boolean>;
+
 export function IdentityInfo():Promise<main.identityInfo>;
 
 export function IdentityUID():Promise<string>;
 
 export function ImportIdentity():Promise<string>;
 
+export function ImproveIdentityLevel(arg1:string,arg2:number,arg3:number):Promise<main.IdentityLevelResult>;
+
 export function IsAdmin():Promise<boolean>;
+
+export function IsGuest():Promise<boolean>;
 
 export function JoinChannel(arg1:number):Promise<string>;
 
 export function KickClient(arg1:string,arg2:boolean,arg3:boolean,arg4:string,arg5:number):Promise<string>;
 
 export function LastCrash():Promise<string>;
+
+export function ListIdentities():Promise<Array<main.IdentityEntry>>;
 
 export function ListTabs():Promise<Array<main.TabInfo>>;
 
@@ -142,6 +206,8 @@ export function MoveClient(arg1:string,arg2:number):Promise<string>;
 export function Notify(arg1:string,arg2:string):Promise<string>;
 
 export function OpenLogFolder():Promise<string>;
+
+export function PermCopy(arg1:string,arg2:string,arg3:string,arg4:string,arg5:number,arg6:boolean):Promise<string>;
 
 export function PermList(arg1:string,arg2:number,arg3:string,arg4:number):Promise<netproto.PermListResponse>;
 
@@ -157,11 +223,15 @@ export function PickDownloadFolder():Promise<string>;
 
 export function PickSavePath(arg1:string):Promise<string>;
 
+export function PickUploadPaths():Promise<Array<string>>;
+
 export function Poke(arg1:string,arg2:string):Promise<string>;
 
 export function RecordRecent(arg1:string,arg2:string):Promise<void>;
 
 export function RegenerateIdentity():Promise<string>;
+
+export function RenameIdentity(arg1:string,arg2:string):Promise<string>;
 
 export function SaveSettings(arg1:main.Settings):Promise<string>;
 
@@ -171,9 +241,15 @@ export function SendChatDelivered(arg1:string,arg2:string):Promise<string>;
 
 export function SendChatRead(arg1:string,arg2:string):Promise<string>;
 
+export function SendChatReply(arg1:string,arg2:string,arg3:string,arg4:number):Promise<string>;
+
 export function SendICECandidate(arg1:string,arg2:string,arg3:number):Promise<void>;
 
 export function SendTyping(arg1:number,arg2:string):Promise<string>;
+
+export function ServerBannerGet():Promise<netproto.ServerBannerData>;
+
+export function ServerBannerSet(arg1:string):Promise<string>;
 
 export function ServerFingerprint():Promise<string>;
 
@@ -203,21 +279,51 @@ export function SetPrioritySpeaker(arg1:boolean):Promise<string>;
 
 export function SetScreenShare(arg1:boolean):Promise<string>;
 
+export function SetScreenShareQuality(arg1:boolean,arg2:number):Promise<string>;
+
+export function SetServerConfig(arg1:netproto.ServerConfig):Promise<netproto.ServerConfig>;
+
 export function SetStatus(arg1:string,arg2:string):Promise<string>;
 
 export function SetVideoQuality(arg1:string):Promise<string>;
 
+export function SetWindowOpacity(arg1:number):Promise<string>;
+
+export function SubscribeChannels(arg1:Array<number>,arg2:boolean):Promise<string>;
+
+export function Subscriptions():Promise<Array<number>>;
+
+export function SwitchIdentity(arg1:string):Promise<string>;
+
+export function SystemCPUPercent():Promise<number>;
+
+export function TokenAdd(arg1:number,arg2:number,arg3:string):Promise<netproto.Tokens>;
+
+export function TokenDelete(arg1:string):Promise<netproto.Tokens>;
+
+export function TokenList():Promise<netproto.Tokens>;
+
+export function TokenUse(arg1:string):Promise<string>;
+
+export function TrayClearMentions():Promise<void>;
+
+export function TrayMention():Promise<void>;
+
 export function TrustServerFingerprint(arg1:string,arg2:string):Promise<string>;
+
+export function UploadChatAttachment(arg1:number,arg2:string,arg3:string):Promise<string>;
 
 export function UploadFile(arg1:number,arg2:string,arg3:string):Promise<string>;
 
 export function UploadFileProgress(arg1:string,arg2:number,arg3:string,arg4:string,arg5:string):Promise<string>;
 
+export function UploadPathProgress(arg1:string,arg2:number,arg3:string,arg4:string):Promise<string>;
+
 export function VerifyFile(arg1:number,arg2:string,arg3:string,arg4:string):Promise<boolean>;
 
 export function WebRTCAnswer(arg1:string):Promise<void>;
 
-export function WebRTCOffer(arg1:string):Promise<string>;
+export function WebRTCOffer(arg1:string,arg2:Array<netproto.TrackSlot>):Promise<string>;
 
 export function WhatsNew():Promise<string>;
 

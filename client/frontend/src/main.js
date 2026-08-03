@@ -9,15 +9,17 @@ import { initMenu } from "./menu.js";
 import { initSettingsUI } from "./settings-ui.js";
 import { initClientInfo } from "./clientinfo.js";
 import { initUpdater } from "./updater.js";
-import { playEvent, beep, testAll } from "./sounds.js";
+import { playEvent, playChannelJoin, beep, testAll } from "./sounds.js";
 import {
-    startMicMeter, stopMicMeter, pttRelease, makeLimiter, makeNormalizer,
+    startMicMeter, stopMicMeter, pttRelease, makeLimiter,
     getUserVolume, isUserMuted, setUserMuted, registerUserChain, unregisterUserChain,
-    setDucking,
+    setDucking, attachUserNormalizer, detachUserNormalizer, detachAllUserNormalizers,
+    captureConstraints, markCaptureProfile, applyCaptureProfile,
 } from "./audio.js";
 import {
     initVideo, videoTrackAdded, videoTrackRemoved, videoSpeaking,
     videoRefreshNames, clearVideoGrid, shareToggle, setLowBandwidth, isLowBandwidth,
+    parseTrackID, SLOT_SCREEN_AUDIO, cameraToggle, resetCameraState, clearRegionBox, trackSlots,
 } from "./video.js";
 import * as chatUI from "./chat-ui.js";
 import { initPermsUI } from "./perms-ui.js";
@@ -35,13 +37,14 @@ window.__voicxChat = chatUI;
 const $ = (id) => document.getElementById(id);
 
 const state = {
-    channels: [],   // flat: {ChannelID, ParentID, Name, HasIcon, Topic, MaxClients, OpusBitrate, OpusFEC, OpusDTX, OpusStereo}
+    channels: [],   // flat: {ChannelID, ParentID, Name, HasIcon, Topic, MaxClients, OpusBitrate, OpusFEC, OpusDTX, OpusStereo, SlowModeSeconds}
     clients: [],    // flat: {client_id, unique_id, nickname, channel_id, is_speaking, priority_speaker}
     myClientID: "",
     myUniqueID: "",
     myNickname: "",
     myChannelID: 0,
     isAdmin: false,       // server admin flag from the auth response (6b UI gating)
+    isGuest: true,        // anonymous sessions cannot perform account-only actions
     myPerms: new Map(),   // own resolved permissions: key -> {value, grant, skip, negate}
     serverGroups: [],     // server group list (6b tree presentation)
     groupByUID: new Map(), // unique_id -> [group entries, sorted by sort_id]
@@ -60,10 +63,15 @@ const state = {
     multiSelect: new Set(),       // (306) ctrl/shift-selected client IDs
     myStatus: "",                 // (307) own presence status
     micState: "unknown", // ok | none | denied
+    lastWhispererUID: "", // (33) last user who whispered to me (voice or DM)
+    whisperArmed: false,  // (33) whisper-reply hotkey is overriding the whisper list
+    whisperPrev: null,    // (33) {clients, channels, active} the hotkey replaced
     avatars: new Map(),  // unique_id -> data url | null
     avatarPending: new Set(),
     settings: null,
-    lastConnect: null,   // {addr, nick, pw, spw} for reconnect-on-loss
+    lastConnect: null,   // {addr, nick, pw, spw, bookmark} for reconnect-on-loss
+    tabConnects: new Map(), // (281) tab ID -> its own lastConnect record
+    pendingBookmark: null, // (334) {name, addr} of the bookmark loaded into the login dialog
     reconnectAttempts: 0,
     reconnectTimer: null,
     vadMonitor: null,
@@ -71,6 +79,8 @@ const state = {
     trackUsers: new Map(), // media track ID -> {client_id, unique_id, nickname} (per-publisher tracks; wave-3 video tiles)
     shareStream: null,     // getDisplayMedia result while screen sharing
     shareAudioSender: null, // RTCRtpSender of the optional share system-audio track
+    shareAudioTransceiver: null, // its transceiver, reused by the next share in this session
+    regionBox: null,       // (71) crop target element, alive for the whole cropped share
 };
 
 // ---------------------------------------------------------------------------
@@ -82,7 +92,10 @@ const state = {
 // Toasts
 // ---------------------------------------------------------------------------
 
-function toast(text, kind = "info", category = "social") {
+// (385) "social" means join/leave only: the notify_join_leave toggle is
+// labelled "Toasts for join/leave", so untagged callers default to "alert"
+// and are never swallowed by it.
+function toast(text, kind = "info", category = "alert") {
     const s = state.settings;
     if (s) {
         if (category === "social" && !s.notify_join_leave) return;
@@ -171,6 +184,10 @@ function applyAppearance() {
 })();
 
 function showLogin() {
+    // (334) the dialog is retargetable, so a stash from an earlier bookmark
+    // must never identify the next login — a same-address login can be a
+    // different account (callers loading a bookmark stash after this call).
+    state.pendingBookmark = null;
     $("login-overlay").classList.remove("hidden");
     $("app").classList.add("hidden");
     $("conn-lock").classList.add("hidden");
@@ -184,8 +201,12 @@ async function connectFromLogin() {
     const pw = $("login-password").value;
     const spw = $("login-serverpw").value;
     $("login-error").textContent = "";
+    // (334) a nickname override replaces the login nickname, so addr+nickname
+    // no longer identifies the bookmark this login came from: forward the name
+    // the bookmark menu stashed, unless the dialog was retargeted since.
+    const bookmark = state.pendingBookmark?.addr === addr ? state.pendingBookmark.name : "";
     try {
-        const err = await window.go.main.App.Connect(addr, nick, pw, spw);
+        const err = await window.go.main.App.ConnectBookmarkTab(bookmark, addr, nick, pw, spw);
         if (err) {
             // (4a) TOFU fingerprint mismatch: prominent warning + explicit
             // trust action — never silently accepted.
@@ -197,7 +218,11 @@ async function connectFromLogin() {
             return;
         }
         state.myNickname = nick;
-        state.lastConnect = { addr, nick, pw, spw };
+        await rememberTabConnect({ addr, nick, pw, spw, bookmark });
+        // (334) consumed: lastConnect carries the name for reconnects from
+        // here on. Clearing only on success keeps the retry after a rejected
+        // password identifiable.
+        state.pendingBookmark = null;
         state.reconnectAttempts = 0;
         try {
             state.myClientID = await window.go.main.App.ClientID();
@@ -205,6 +230,10 @@ async function connectFromLogin() {
         try {
             state.isAdmin = await window.go.main.App.IsAdmin();
         } catch { state.isAdmin = false; }
+        try {
+            state.isGuest = await window.go.main.App.IsGuest();
+        } catch { state.isGuest = !pw; }
+        P()?.redeemPendingToken?.();
         $("conn-pill").textContent = addr;
         $("conn-pill").classList.add("up");
         $("conn-lock").classList.remove("hidden");
@@ -263,6 +292,17 @@ async function showFingerprintWarning(addr, detail) {
     document.body.appendChild(overlay);
 }
 
+// rememberTabConnect files the credential record under the tab it belongs to
+// (281): switching away and back must restore the record a reconnect needs,
+// and only the connect call knows the password.
+async function rememberTabConnect(c) {
+    state.lastConnect = c;
+    try {
+        const active = (await window.go.main.App.ListTabs()).find((t) => t.active);
+        if (active) state.tabConnects.set(active.id, c);
+    } catch { /* lastConnect alone still covers the single-tab case */ }
+}
+
 async function disconnect() {
     state.lastConnect = null; // intentional disconnect: no reconnect
     if (state.reconnectTimer) {
@@ -275,9 +315,17 @@ async function disconnect() {
 window.runtime.EventsOn("disconnected", () => {
     if (state.settings?.notify_connection !== false) toast("Connection lost", "warn", "conn");
     sysMsg("disconnected from server");
-    teardownVoice();
-    resetVoiceUI();
+    // (32/33) whisper state is per-connection: client IDs and the server-side
+    // whisper list do not survive a reconnect.
+    activeWhisperers.clear();
+    state.whisperArmed = false;
+    state.whisperPrev = null;
+    state.myChannelID = 0;
+    resetVoiceSession();
     stopQualitySampler();
+    state.selectedClientID = "";
+    state.isGuest = true;
+    setDetailsOpen(false);
     $("conn-pill").textContent = "offline";
     $("conn-pill").classList.remove("up");
 
@@ -299,14 +347,20 @@ window.runtime.EventsOn("disconnected", () => {
             clearInterval(tick);
             const c = state.lastConnect;
             if (!c) return;
-            const err = await window.go.main.App.Connect(c.addr, c.nick, c.pw, c.spw);
+            const err = await window.go.main.App.ConnectBookmarkTab(c.bookmark || "", c.addr, c.nick, c.pw, c.spw);
             if (err === "") {
+                // (281) the retry opened a NEW tab: the record has to move with it.
+                await rememberTabConnect(c);
                 try {
                     state.myClientID = await window.go.main.App.ClientID();
                 } catch { /* best-effort */ }
                 try {
                     state.isAdmin = await window.go.main.App.IsAdmin();
                 } catch { state.isAdmin = false; }
+                try {
+                    state.isGuest = await window.go.main.App.IsGuest();
+                } catch { state.isGuest = !c.pw; }
+                P()?.redeemPendingToken?.();
                 $("conn-pill").textContent = c.addr;
                 $("conn-pill").classList.add("up");
                 $("login-overlay").classList.add("hidden");
@@ -322,7 +376,15 @@ window.runtime.EventsOn("disconnected", () => {
     showLogin();
 });
 
-window.runtime.EventsOn("servererror", (msg) => sysMsg("server: " + msg));
+window.runtime.EventsOn("servererror", (msg) => {
+    const text = String(msg).replace(/^\d+:\s*/, "");
+    toast(text || "The server rejected that action", "warn");
+});
+
+// (282) the Go side maintains settings of its own (recents on every connect),
+// so the merged blob it pushes is the authoritative cache — without this the
+// recents list stays frozen at the value read once at startup.
+window.runtime.EventsOn("settings_update", (s) => { state.settings = s; });
 
 // (320) recordRecentChannel tracks the last 5 joined channels per server
 // address in settings (debounced persist).
@@ -409,25 +471,66 @@ function stopQualitySampler() {
 // Snapshot & events
 // ---------------------------------------------------------------------------
 
+// (307) client_id -> channel_id at the time of user_left: going invisible and
+// coming back is announced as leave+join, and user_joined has no channel.
+// Only a returning client consumes its entry and the snapshot arrives once at
+// login, so the map is capped: clients that leave for good would otherwise
+// accumulate for the whole session.
+const lastKnownChannel = new Map();
+const LAST_CHANNEL_MAX = 200;
+
 window.runtime.EventsOn("snapshot", (json) => {
     const snap = JSON.parse(json);
     // broadcast.ClientInfo does not serialize priority_speaker, so carry the
     // flags over from the previous state (they arrive via
     // priority_speaker_changed events).
     const prioByID = new Map(state.clients.filter((c) => c.priority_speaker).map((c) => [c.client_id, true]));
+    // (73) the same applies to the screen-share flag: it arrives only via
+    // screenshare_changed, so a snapshot would otherwise un-label live shares.
+    const shareByID = new Map(state.clients.filter((c) => c.sharing).map((c) => [c.client_id, true]));
     state.channels = [];
     state.clients = [];
+    lastKnownChannel.clear(); // the snapshot is authoritative
     for (const root of snap.root_channels || []) flattenChannel(root);
     for (const c of state.clients) {
         if (prioByID.has(c.client_id)) c.priority_speaker = true;
+        if (shareByID.has(c.client_id)) c.sharing = true;
     }
+    // Snapshot replay can beat the async ClientID lookup during a tab switch
+    // or reconnect. Reconcile here when the identity is already known; the
+    // identity completion path calls the same helper for the opposite order.
+    syncOwnChannel();
     // (317) blocked users are locally muted on sight; (318) contact nickname
     // history updates from presence; (383) buddy alerts; (389) channel watch.
     applyBlockAndContacts();
+    expandMyBranch(); // (302)
+    resolveTrackUsers();
+    videoRefreshNames(); // (61/73) tile labels follow the refreshed client list
     window.__voicxNotify?.checkBuddyOnline();
     window.__voicxNotify?.checkChannelWatch();
     renderTree();
 });
+
+// syncOwnChannel makes channel ownership independent of whether the snapshot
+// / user_moved event or the active-tab ClientID lookup finishes first.
+function syncOwnChannel() {
+    if (!state.myClientID) return;
+    const me = state.clients.find((c) => c.client_id === state.myClientID);
+    if (!me) return;
+    const channelID = Number(me.channel_id) || 0;
+    if (state.myChannelID === channelID) {
+        ensureVoiceForChannel();
+        return;
+    }
+    state.myChannelID = channelID;
+    if (channelID > 0) playChannelJoin();
+    expandMyBranch();
+    applyChannelAudio();
+    chatUI.onMyChannelChanged();
+    window.__voicxFiles?.onChannelChanged?.();
+    renderTree();
+    ensureVoiceForChannel();
+}
 
 // applyBlockAndContacts mutes blocked users locally and records contact
 // nickname history from the fresh snapshot (317/318). Settings persist is
@@ -468,7 +571,9 @@ function flattenChannel(node) {
         ParentID: node.ParentID,
         Name: node.Name,
         HasIcon: !!node.HasIcon,
-        HasPassword: !!node.HasPassword, // (304) lock icon
+        // (304) lock icon — the field is read under both spellings so a json
+        // tag on the server's Channel struct cannot silently drop the lock.
+        HasPassword: !!(node.has_password ?? node.HasPassword),
         ClientCount: node.ClientCount || 0, // (303) [n/max]
         Topic: node.Topic || "",
         Description: node.Description || "",
@@ -477,6 +582,15 @@ function flattenChannel(node) {
         OpusFEC: !!node.OpusFEC,
         OpusDTX: !!node.OpusDTX,
         OpusStereo: !!node.OpusStereo,
+        // (114) the snapshot marshals Go field names, so slow mode arrives as
+        // SlowModeSeconds. Dropping it here is why the client could never show
+        // or edit the rate limit it is subject to.
+        SlowModeSeconds: node.SlowModeSeconds || 0,
+        // (157/160/163) join power, manual sort index and permission
+        // inheritance: the edit dialog and drag-reordering both read them.
+        NeededJoinPower: node.NeededJoinPower || 0,
+        OrderIndex: node.OrderIndex || 0,
+        InheritPermissions: !!node.InheritPermissions,
     });
     for (const c of node.clients || []) state.clients.push(c);
     for (const child of node.children || []) flattenChannel(child);
@@ -496,21 +610,36 @@ window.runtime.EventsOn("event", (json) => {
     const env = JSON.parse(json);
     const d = env.data || {};
     switch (env.type) {
-        case "user_joined":
-            state.clients.push({ client_id: d.client_id, unique_id: d.unique_id, nickname: d.nickname, channel_id: 0, is_speaking: false });
+        case "user_joined": {
+            // (307) the server omits channel_id on user_joined, and an
+            // invisible→visible return is announced as leave+join: restore the
+            // channel remembered from the leave so the user is not stranded in
+            // channel 0 ("no channel") until the next user_moved.
+            const joinedChannel = d.channel_id ?? lastKnownChannel.get(d.client_id) ?? 0;
+            lastKnownChannel.delete(d.client_id);
+            state.clients.push({ client_id: d.client_id, unique_id: d.unique_id, nickname: d.nickname, channel_id: joinedChannel, is_speaking: false });
             if (d.client_id !== state.myClientID) {
                 chatUI.sysJoinLeave(d.nickname || d.unique_id || "someone", "joined"); // (130/131)
-                if (d.channel_id === state.myChannelID && state.myChannelID !== 0) {
+                if (joinedChannel === state.myChannelID && state.myChannelID !== 0) {
                     // (385) joins in my channel dispatch through the matrix.
                     window.__voicxNotify?.notify("join_leave", (d.nickname || "someone") + " joined your channel",
                         { channelID: state.myChannelID, className: "joins", kind: "info" });
                 }
             }
             break;
+        }
         case "user_left": {
             const was = state.clients.find((c) => c.client_id === d.client_id);
             state.clients = state.clients.filter((c) => c.client_id !== d.client_id);
+            activeWhisperers.delete(d.client_id); // (32) a re-join whispers afresh
             if (was) {
+                if (was.channel_id) {
+                    lastKnownChannel.set(d.client_id, was.channel_id);
+                    // insertion order: drop the oldest unclaimed entry first.
+                    while (lastKnownChannel.size > LAST_CHANNEL_MAX) {
+                        lastKnownChannel.delete(lastKnownChannel.keys().next().value);
+                    }
+                }
                 chatUI.sysJoinLeave(was.nickname || was.unique_id || "someone", "left"); // (130/131)
                 if (was.channel_id === state.myChannelID && state.myChannelID !== 0) {
                     window.__voicxNotify?.notify("join_leave", (was.nickname || "someone") + " left your channel",
@@ -525,11 +654,15 @@ window.runtime.EventsOn("event", (json) => {
             const c = state.clients.find((c) => c.client_id === d.client_id);
             if (c) c.channel_id = d.channel_id;
             if (d.client_id === state.myClientID) {
+                const previousChannelID = state.myChannelID;
                 state.myChannelID = d.channel_id;
+                if (d.channel_id > 0 && d.channel_id !== previousChannelID) playChannelJoin();
+                expandMyBranch(); // (302)
                 applyChannelAudio();
                 chatUI.onMyChannelChanged(); // (103/111) load history + header for the new channel
                 window.__voicxFiles?.onChannelChanged?.(); // (256) file browser follows the channel
                 recordRecentChannel(d.channel_id); // (320) recent channels
+                ensureVoiceForChannel();
             } else if (d.channel_id === state.myChannelID && state.myChannelID !== 0 && c) {
                 window.__voicxNotify?.notify("join_leave", (c.nickname || "someone") + " joined your channel",
                     { channelID: state.myChannelID, className: "joins", kind: "info" });
@@ -542,6 +675,7 @@ window.runtime.EventsOn("event", (json) => {
             break;
         case "channel_deleted":
             state.channels = state.channels.filter((c) => c.ChannelID !== d.channel_id);
+            chatUI.refreshHeader();
             break;
         case "channel_updated": {
             const ch = state.channels.find((c) => c.ChannelID === d.channel_id);
@@ -553,7 +687,15 @@ window.runtime.EventsOn("event", (json) => {
                 ch.OpusFEC = !!d.opus_fec;
                 ch.OpusDTX = !!d.opus_dtx;
                 ch.OpusStereo = !!d.opus_stereo;
+                ch.SlowModeSeconds = d.slow_mode_seconds || 0; // (114)
+                ch.NeededJoinPower = d.needed_join_power || 0; // (160)
+                ch.OrderIndex = d.order_index || 0;            // (163)
+                ch.InheritPermissions = !!d.inherit_permissions; // (157)
+                // a re-parent moves the row, so the cached ancestry has to
+                // follow it or the next edit dialog offers a stale parent.
+                ch.ParentID = d.parent_id || 0;
                 if (d.channel_id === state.myChannelID) applyChannelAudio();
+                chatUI.refreshHeader();
             }
             break;
         }
@@ -583,6 +725,13 @@ window.runtime.EventsOn("event", (json) => {
             window.__voicxNotify?.notify("poke",
                 `poke from ${d.from_nickname || "someone"}${d.message ? ": " + d.message : ""}`,
                 { className: "messages", kind: "warn" });
+            break;
+        // (32) directed whisper signal — the server sends it only to the
+        // targets of an active whisper, so its mere arrival means "whispered
+        // at me". speaking_changed's broadcast whisper flag cannot say that.
+        case "whisper":
+            setWhisperActive(d.from_client_id || "", d.from_unique_id || "",
+                d.from_nickname || "", !!d.speaking);
             break;
         case "speaking_changed": {
             const c = state.clients.find((c) => c.client_id === d.client_id);
@@ -614,6 +763,12 @@ window.runtime.EventsOn("event", (json) => {
         case "chat_reaction":
             chatUI.onChatReaction(d);
             return;
+        // (120) typing relay. Returns early like the other chat events: an
+        // indicator changes nothing in the tree and must not trigger a redraw
+        // of it on every keystroke of every user.
+        case "typing":
+            chatUI.onTyping(d);
+            return;
         case "dm_delivered":
             chatUI.onDelivered(d);
             return;
@@ -634,9 +789,16 @@ window.runtime.EventsOn("event", (json) => {
                 sysMsg("client " + d.client_id + " was kicked" + (d.reason ? " (" + d.reason + ")" : ""));
             }
             break;
-        case "screenshare_changed":
+        case "screenshare_changed": {
+            // (73) remember who is sharing: the grid labels those tiles, and
+            // the camera-off detector (61) must not mistake a still desktop
+            // for a switched-off camera.
+            const sharer = state.clients.find((c) => c.client_id === d.client_id);
+            if (sharer) sharer.sharing = !!d.active;
+            videoRefreshNames();
             sysMsg(clientName(d.client_id) + (d.active ? " started" : " stopped") + " screen sharing");
             break;
+        }
         case "avatar_changed":
             state.avatars.delete(d.unique_id);
             fetchAvatar(d.unique_id);
@@ -646,21 +808,25 @@ window.runtime.EventsOn("event", (json) => {
         // sections and the details-pane group chips.
         case "group_assigned":
             if (d.group_name) {
-                toast((d.by ? "you were " : "") + "added to group " + d.group_name, "info", "social");
+                toast((d.by ? "you were " : "") + "added to group " + d.group_name, "info", "alert");
             }
             P().refreshGroups().then(() => renderTree());
             break;
         case "group_unassigned":
             if (d.group_name) {
-                toast("removed from group " + d.group_name, "info", "social");
+                toast("removed from group " + d.group_name, "info", "alert");
             }
             P().refreshGroups().then(() => renderTree());
             break;
         case "group_expired":
-            toast("a timed group membership expired", "info", "social");
+            toast("a timed group membership expired", "info", "alert");
             P().refreshGroups().then(() => renderTree());
             break;
     }
+    resolveTrackUsers();
+    // (389) the snapshot arrives once at login, so only the live join/leave/
+    // move events can ever show a channel crossing its watch threshold.
+    window.__voicxNotify?.checkChannelWatch();
     renderTree();
     videoRefreshNames();
 });
@@ -669,7 +835,30 @@ window.runtime.EventsOn("event", (json) => {
 // Channel tree
 // ---------------------------------------------------------------------------
 
+// (303) recomputeClientCounts derives the [n/max] badge counts from the live
+// client list: the snapshot's ClientCount is a point-in-time value that
+// user_joined/left/moved never refresh. The hover card (8b) and windowed mode
+// (349) read the same field.
+function recomputeClientCounts() {
+    const counts = new Map();
+    for (const c of state.clients) counts.set(c.channel_id, (counts.get(c.channel_id) || 0) + 1);
+    for (const ch of state.channels) ch.ClientCount = counts.get(ch.ChannelID) || 0;
+}
+
+// (302) expandMyBranch un-collapses my channel and its ancestors: a move into
+// a branch the user collapsed earlier would otherwise hide the channel they
+// are actually in.
+function expandMyBranch() {
+    let id = state.myChannelID;
+    let guard = 0;
+    while (id && guard++ < 1000) {
+        state.collapsedChannels.delete(id);
+        id = state.channels.find((c) => c.ChannelID === id)?.ParentID || 0;
+    }
+}
+
 function renderTree() {
+    recomputeClientCounts();
     const root = $("channel-tree");
     root.innerHTML = "";
     // (179) Hoisted server groups render as their own sections above the
@@ -704,6 +893,11 @@ function renderTree() {
         if (!byParent.has(key)) byParent.set(key, []);
         byParent.get(key).push(ch);
     }
+    // (163) the manual sort index decides sibling order; sort is stable, so
+    // equal indices keep the order the snapshot delivered them in.
+    for (const list of byParent.values()) {
+        list.sort((a, b) => (a.OrderIndex || 0) - (b.OrderIndex || 0));
+    }
     // (319) live tree filter: matching channels/users stay; a channel stays
     // when it or a descendant or one of its users matches.
     if (state.treeFilter) {
@@ -723,14 +917,17 @@ function renderTree() {
         }
     }
     for (const ch of byParent.get(0) || []) renderChannel(root, ch, byParent, 0);
+    renderDirectTargets();
     renderClientCard();
     chatUI.refreshHeader(); // (111) topic/title follows tree + channel updates
 }
 
 function renderChannel(parentEl, ch, byParent, depth) {
+    const node = document.createElement("div");
+    node.className = "channel-node";
+    node.style.setProperty("--depth", depth);
     const el = document.createElement("div");
     el.className = "channel" + (ch.ChannelID === state.myChannelID ? " mine" : "");
-    el.style.setProperty("--depth", depth);
     el.dataset.chid = ch.ChannelID;
     el.tabIndex = 0; // (298) keyboard navigation
     el.setAttribute("role", "treeitem"); // (343)
@@ -768,9 +965,19 @@ function renderChannel(parentEl, ch, byParent, depth) {
         el.appendChild(badge);
     }
     el.onclick = () => window.go.main.App.JoinChannel(ch.ChannelID);
+    // (163) drag a channel onto another to take that channel's slot among its
+    // siblings. The header is separate from its member/child branch, so a
+    // member drag can never be relabelled as a channel drag.
+    el.draggable = true;
+    el.addEventListener("dragstart", (e) => {
+        if (e.target !== el) return;
+        e.dataTransfer.setData("text/voicx-chid", String(ch.ChannelID));
+        e.dataTransfer.effectAllowed = "move";
+    });
     // (305) drag users onto a channel to move them there.
     el.addEventListener("dragover", (e) => {
-        if (e.dataTransfer.types.includes("text/voicx-uid")) {
+        if (e.dataTransfer.types.includes("text/voicx-uid") ||
+            e.dataTransfer.types.includes("text/voicx-chid")) {
             e.preventDefault();
             el.classList.add("drop-active");
         }
@@ -778,7 +985,15 @@ function renderChannel(parentEl, ch, byParent, depth) {
     el.addEventListener("dragleave", () => el.classList.remove("drop-active"));
     el.addEventListener("drop", (e) => {
         e.preventDefault();
+        // sub-channels are nested inside their parent's element, so without
+        // this a drop on a child also fires every ancestor's handler.
+        e.stopPropagation();
         el.classList.remove("drop-active");
+        const chid = Number(e.dataTransfer.getData("text/voicx-chid"));
+        if (chid) {
+            reorderChannel(chid, ch);
+            return;
+        }
         const uid = e.dataTransfer.getData("text/voicx-uid");
         const target = state.clients.find((c) => c.unique_id === uid);
         if (!target) return;
@@ -788,7 +1003,8 @@ function renderChannel(parentEl, ch, byParent, depth) {
             window.go.main.App.MoveClient(target.client_id, ch.ChannelID);
         }
     });
-    parentEl.appendChild(el);
+    node.appendChild(el);
+    parentEl.appendChild(node);
 
     // (302) collapsed channels hide their members and children; (349) in
     // windowed mode every channel off my branch counts as collapsed unless
@@ -799,23 +1015,61 @@ function renderChannel(parentEl, ch, byParent, depth) {
             !state.expandedVirtual.has(ch.ChannelID);
     }
     if (!collapsed) {
-        for (const c of state.clients.filter((c) => c.channel_id === ch.ChannelID)) {
-            el.appendChild(clientRow(c));
+        const members = state.clients.filter((c) => c.channel_id === ch.ChannelID);
+        if (members.length > 0) {
+            const list = document.createElement("div");
+            list.className = "channel-members";
+            list.setAttribute("role", "group");
+            list.setAttribute("aria-label", ch.Name + " members");
+            for (const c of members) list.appendChild(clientRow(c));
+            node.appendChild(list);
         }
-        for (const child of byParent.get(ch.ChannelID) || []) renderChannel(el, child, byParent, depth + 1);
+        const children = byParent.get(ch.ChannelID) || [];
+        if (children.length > 0) {
+            const branch = document.createElement("div");
+            branch.className = "channel-children";
+            for (const child of children) renderChannel(branch, child, byParent, depth + 1);
+            node.appendChild(branch);
+        }
     }
+}
+
+// (163) reorderChannel puts the dragged channel strictly before or after the
+// drop target according to its current direction of travel. The named field
+// list is deliberate: parent_id
+// 0 is the legitimate "move to root" value and so has no sentinel, and a
+// re-parent drops the server's whole permission cache — so "parent" is only
+// named when the drop actually changes the parent.
+async function reorderChannel(draggedID, target) {
+    if (draggedID === target.ChannelID) return;
+    const dragged = state.channels.find((c) => c.ChannelID === draggedID);
+    if (!dragged) return;
+    const reparent = (dragged.ParentID || 0) !== (target.ParentID || 0);
+    const draggedPos = state.channels.findIndex((c) => c.ChannelID === draggedID);
+    const targetPos = state.channels.findIndex((c) => c.ChannelID === target.ChannelID);
+    const movingDown = draggedPos >= 0 && targetPos >= 0 && draggedPos < targetPos;
+    const targetOrder = target.OrderIndex || 0;
+    const order = movingDown ? targetOrder + 1 : targetOrder - 1;
+    const err = await window.go.main.App.ChannelEditTree(
+        draggedID, reparent ? "order,parent" : "order",
+        0, order, target.ParentID || 0, false);
+    if (err) toast("channel reorder failed: " + err, "warn");
 }
 
 function clientRow(c) {
     const row = document.createElement("div");
-    row.className = "client" + (c.is_speaking ? " speaking" : "") +
+    const speakingHere = state.myChannelID !== 0 && c.channel_id === state.myChannelID && c.is_speaking;
+    row.className = "client" + (speakingHere ? " speaking" : "") +
         (state.multiSelect.has(c.client_id) ? " selected" : "") +
         (c.status === "away" || c.status === "busy" || c.status === "invisible" ? " " + c.status : "");
     row.dataset.clid = c.client_id;
     row.tabIndex = 0; // (298) keyboard navigation
     row.setAttribute("role", "treeitem"); // (343)
     row.setAttribute("aria-label", (c.nickname || c.unique_id || "user") +
-        (c.status ? ", " + c.status : "") + (c.is_speaking ? ", speaking" : ""));
+        (c.status ? ", " + c.status : "") + (speakingHere ? ", speaking" : "") +
+        (c.priority_speaker ? ", priority speaker" : "") +
+        (c.client_id === state.myClientID && state.muted ? ", muted" : "") +
+        (c.client_id === state.myClientID && state.deafened ? ", deafened" : ""));
     // (140/305) users are draggable (group assign in the manager; move by
     // dropping onto a channel).
     if (c.unique_id) {
@@ -845,14 +1099,36 @@ function clientRow(c) {
     if (g) name.title = "group: " + g.name;
     row.appendChild(av);
     row.appendChild(name);
-    // (310) group icon next to the name when the primary group has one.
-    if (g && g.icon) {
+    // (310) group badge next to the name. Groups without an icon get a text
+    // chip in the group colour instead of nothing — colour and hoisting are
+    // settable on their own, so an icon is not what makes a group visible.
+    if (g) {
         const gi = document.createElement("span");
         gi.className = "group-icon";
-        P().groupIconURL(g.id).then((url) => {
-            if (url) gi.innerHTML = `<img src="${url}" alt="" title="${g.name}">`;
-        });
+        gi.title = "group: " + g.name;
+        if (g.icon) {
+            P().groupIconURL(g.id).then((url) => {
+                if (url) gi.innerHTML = `<img src="${url}" alt="">`;
+                else gi.textContent = g.name;
+            });
+        } else {
+            gi.classList.add("group-badge");
+            gi.textContent = g.name;
+            if (g.color) {
+                gi.style.color = g.color;
+                gi.style.borderColor = g.color;
+            }
+        }
         row.appendChild(gi);
+    }
+    // (307) priority speaker: the flag is broadcast for every client, so it
+    // belongs on their row and not only on my own voice-bar button.
+    if (c.priority_speaker) {
+        const pr = document.createElement("span");
+        pr.className = "status-icons";
+        pr.textContent = " ★";
+        pr.title = "priority speaker";
+        row.appendChild(pr);
     }
     // (307-309) presence status icons; (381) invisible marker (admin view).
     if (c.status === "away" || c.status === "busy" || c.status === "invisible") {
@@ -888,6 +1164,14 @@ function clientRow(c) {
         icons.title = "muted locally";
         row.appendChild(icons);
     }
+    if (speakingHere) {
+        const voice = document.createElement("span");
+        voice.className = "client-voice-state";
+        voice.title = "Talking in your channel";
+        voice.setAttribute("aria-label", "talking");
+        voice.innerHTML = "<i></i><i></i><i></i>";
+        row.appendChild(voice);
+    }
     row.onclick = (e) => {
         e.stopPropagation();
         // (306) ctrl/shift multi-select; plain click selects just this user.
@@ -906,6 +1190,7 @@ function clientRow(c) {
             state.multiSelect = new Set([c.client_id]);
         }
         state.selectedClientID = c.client_id;
+        setDetailsOpen(true);
         renderTree();
     };
     return row;
@@ -920,6 +1205,63 @@ function clientName(clientID) {
     const c = state.clients.find((c) => c.client_id === clientID);
     return c ? (c.nickname || c.unique_id) : clientID;
 }
+
+// uidName resolves a unique ID to a nickname (whisper targets are addressed by
+// unique ID, not client ID).
+function uidName(uniqueID) {
+    const c = state.clients.find((c) => c.unique_id === uniqueID);
+    return c ? (c.nickname || c.unique_id) : uniqueID;
+}
+
+// ---------------------------------------------------------------------------
+// Incoming voice whispers (32/33)
+// ---------------------------------------------------------------------------
+
+// activeWhisperers holds the senders currently whispering to me: the signal
+// repeats (it rides every speaking transition), so notifying on the rising
+// edge only keeps one burst to one sound + flash.
+const activeWhisperers = new Set();
+
+// setWhisperActive records a whisper start/stop from the server's receive-side
+// whisper signal and fires the notification on the rising edge (32).
+function setWhisperActive(clientID, uniqueID, nickname, active) {
+    const key = clientID || uniqueID;
+    if (!key) return;
+    if (clientID === state.myClientID || (uniqueID && uniqueID === state.myUniqueID)) return;
+    if (!active) {
+        activeWhisperers.delete(key);
+        return;
+    }
+    if (activeWhisperers.has(key)) return;
+    activeWhisperers.add(key);
+    onWhisperReceived(clientID, uniqueID, nickname);
+}
+
+// onWhisperReceived plays the whisper sound and flashes the taskbar through
+// the notification matrix (32), and remembers the sender so the whisper-reply
+// hotkey has a target (33).
+function onWhisperReceived(clientID, uniqueID, nickname) {
+    const c = state.clients.find((x) => x.client_id === clientID) ||
+        state.clients.find((x) => x.unique_id === uniqueID);
+    const uid = uniqueID || c?.unique_id || "";
+    // (317) blocked users stay silent here too.
+    if (uid && (state.settings?.blocked_users || []).includes(uid)) return;
+    if (uid) state.lastWhispererUID = uid;
+    const who = nickname || c?.nickname || uid || clientID || "someone";
+    trayMention();
+    window.__voicxNotify?.notify("whisper", who + " is whispering to you",
+        { uid, className: "messages", kind: "warn", noSound: !state.settings?.whisper_sound });
+}
+
+// (290) trayMention badges the tray for something directed at me in the ACTIVE
+// tab — the backend only counts background tabs, whose frames it relays. A
+// focused window means the user is already looking at it.
+function trayMention() {
+    if (document.hasFocus()) return;
+    window.go.main.App.TrayMention();
+}
+
+window.addEventListener("focus", () => window.go.main.App.TrayClearMentions());
 
 // ---------------------------------------------------------------------------
 // Avatars
@@ -984,6 +1326,26 @@ function renderClientCard() {
     }
 }
 
+// The inspector is contextual: keep the workspace wide until the user selects
+// somebody or explicitly asks for server/permission details. At narrower
+// widths CSS presents the same panel as a drawer instead of shrinking chat.
+function setDetailsOpen(open) {
+    const details = $("details");
+    const toggle = $("details-toggle");
+    document.body.classList.toggle("details-collapsed", !open);
+    details.setAttribute("aria-hidden", String(!open));
+    toggle.setAttribute("aria-expanded", String(open));
+}
+
+$("details-close").onclick = () => setDetailsOpen(false);
+$("details-toggle").onclick = () => setDetailsOpen(true);
+document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !document.body.classList.contains("details-collapsed") &&
+        !document.querySelector(".dlg-overlay")) {
+        setDetailsOpen(false);
+    }
+});
+
 // ---------------------------------------------------------------------------
 // Chat
 // ---------------------------------------------------------------------------
@@ -1013,6 +1375,7 @@ function addChat(d) {
             if (sender) state.lastWhispererUID = sender.unique_id;
         }
         // (385) DMs dispatch through the notification matrix.
+        trayMention(); // (290)
         window.__voicxNotify?.notify("dm", (d.from || "someone") + ": " + (d.text || "").slice(0, 80),
             { uid: d.from_unique_id, className: "messages", kind: "warn", noSound: !state.settings?.whisper_sound });
     }
@@ -1029,9 +1392,76 @@ function sysMsg(text) {
     log.scrollTop = log.scrollHeight;
 }
 
-$("chat-scope").onchange = () => {
-    $("chat-target").classList.toggle("hidden", $("chat-scope").value !== "direct");
+function setDirectTargetVisible(visible) {
+    $("chat-target-picker").classList.toggle("hidden", !visible);
+    if (visible) renderDirectTargets();
+    else hideDirectTargets();
+}
+
+function directTargetClients(filter = "") {
+    const needle = filter.trim().toLowerCase();
+    return state.clients
+        .filter((client) => client.client_id !== state.myClientID && client.unique_id)
+        .filter((client) => !needle || `${client.nickname || ""} ${client.unique_id}`.toLowerCase().includes(needle))
+        .sort((a, b) => {
+            const aHere = a.channel_id === state.myChannelID ? 0 : 1;
+            const bHere = b.channel_id === state.myChannelID ? 0 : 1;
+            return aHere - bHere || (a.nickname || a.unique_id).localeCompare(b.nickname || b.unique_id);
+        });
+}
+
+function hideDirectTargets() {
+    $("chat-target-options").classList.add("hidden");
+    $("chat-target").setAttribute("aria-expanded", "false");
+}
+
+function renderDirectTargets(show = false) {
+    const input = $("chat-target");
+    const options = $("chat-target-options");
+    const clients = directTargetClients(input.value);
+    options.innerHTML = "";
+    if (clients.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "target-empty";
+        empty.textContent = state.clients.length > 1 ? "No matching connected members" : "No other members connected";
+        options.appendChild(empty);
+    }
+    for (const client of clients) {
+        const option = document.createElement("button");
+        option.type = "button";
+        option.className = "target-option" + (client.channel_id === state.myChannelID ? " same-channel" : "");
+        option.setAttribute("role", "option");
+        const channel = state.channels.find((item) => item.ChannelID === client.channel_id);
+        option.innerHTML = `<span class="target-option-dot"></span><span class="target-option-copy"><strong></strong><small class="target-option-meta mono"></small></span><span class="target-option-channel"></span>`;
+        option.querySelector("strong").textContent = client.nickname || client.unique_id;
+        option.querySelector("small").textContent = client.unique_id;
+        option.querySelector(".target-option-channel").textContent = channel?.Name || "no channel";
+        option.onclick = () => {
+            input.value = client.unique_id;
+            hideDirectTargets();
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+            $("chat-text").focus();
+        };
+        options.appendChild(option);
+    }
+    if (show && !$("chat-target-picker").classList.contains("hidden")) {
+        options.classList.remove("hidden");
+        input.setAttribute("aria-expanded", "true");
+    }
+}
+
+$("chat-target").addEventListener("focus", () => renderDirectTargets(true));
+$("chat-target").addEventListener("input", () => renderDirectTargets(true));
+$("chat-target-toggle").onclick = () => {
+    const opening = $("chat-target-options").classList.contains("hidden");
+    renderDirectTargets(opening);
+    if (opening) $("chat-target").focus();
 };
+document.addEventListener("pointerdown", (event) => {
+    if (!event.target.closest("#chat-target-picker")) hideDirectTargets();
+});
+
+$("chat-scope").onchange = () => setDirectTargetVisible($("chat-scope").value === "direct");
 
 async function sendChat() {
     // Rich send flow (reply prefix, staged file uploads, DM tabs) is in
@@ -1046,28 +1476,59 @@ $("chat-text").addEventListener("keydown", (e) => { if (e.key === "Enter") sendC
 // Voice
 // ---------------------------------------------------------------------------
 
-$("voice-join").onclick = async () => {
-    if (state.pc) {
-        teardownVoice();
-        resetVoiceUI();
-        return;
-    }
-    try {
-        await startVoice();
-    } catch (e) {
-        sysMsg("voice failed: " + e);
-        teardownVoice();
-        resetVoiceUI();
-    }
-};
+let voiceSessionEpoch = 0;
+let voiceStartPromise = null;
 
+// Channel presence owns voice presence. There is deliberately no separate
+// join/leave voice control: a confirmed local channel move establishes the
+// session, while disconnecting or changing server tabs tears it down.
+function ensureVoiceForChannel() {
+    if (state.myChannelID <= 0) {
+        if (state.pc || state.localStream || voiceStartPromise) resetVoiceSession();
+        return Promise.resolve(false);
+    }
+    if (state.pc) {
+        setVoiceStatus("voice on");
+        return Promise.resolve(true);
+    }
+    if (voiceStartPromise) return voiceStartPromise;
+
+    const epoch = voiceSessionEpoch;
+    setVoiceStatus("voice connecting…");
+    voiceStartPromise = (async () => {
+        try {
+            return await startVoice(epoch);
+        } catch (e) {
+            // A tab switch intentionally invalidates the in-flight start; its
+            // replacement session is scheduled in finally without a warning.
+            if (epoch !== voiceSessionEpoch) return false;
+            sysMsg("voice failed: " + e);
+            toast("Voice could not start automatically", "warn", "conn");
+            teardownVoice();
+            resetVoiceUI();
+            setVoiceStatus("voice unavailable");
+            return false;
+        } finally {
+            voiceStartPromise = null;
+            if (epoch !== voiceSessionEpoch && state.myChannelID > 0 && !state.pc) {
+                queueMicrotask(() => ensureVoiceForChannel());
+            }
+        }
+    })();
+    return voiceStartPromise;
+}
+
+function resetVoiceSession() {
+    voiceSessionEpoch++;
+    teardownVoice();
+    resetVoiceUI();
+}
+
+// (25) Capture follows the joined channel's audio profile: a music channel is
+// captured stereo with the browser's speech DSP off, everything else uses the
+// user's own settings.
 function audioConstraints() {
-    const s = state.settings || {};
-    return {
-        echoCancellation: s.echo_cancellation !== false,
-        noiseSuppression: s.noise_suppression !== false,
-        ...(s.capture_device_id ? { deviceId: { exact: s.capture_device_id } } : {}),
-    };
+    return captureConstraints(state.channels.find((c) => c.ChannelID === state.myChannelID));
 }
 
 // (78) Camera frame rate from settings (15/30/60, default 30).
@@ -1076,30 +1537,54 @@ function videoConstraints() {
     return { width: 640, height: 360, frameRate: { ideal: fps } };
 }
 
-async function startVoice() {
-    let audioOK = true;
+async function startVoice(expectedEpoch = voiceSessionEpoch) {
+    // Capture degrades in steps — mic+camera, then mic only, then camera only.
+    // Either device may be absent, and a machine without a webcam must still
+    // get a full audio session; micErr stays null while the mic works.
+    let micErr = null;
     try {
         state.localStream = await navigator.mediaDevices.getUserMedia({
             audio: audioConstraints(),
             video: videoConstraints(),
         });
-    } catch (e) {
-        if (e.name === "NotFoundError" || e.name === "NotAllowedError") {
-            audioOK = false;
-            setMicState(e.name === "NotFoundError" ? "none" : "denied");
+    } catch {
+        try {
             state.localStream = await navigator.mediaDevices.getUserMedia({
-                video: videoConstraints(),
+                audio: audioConstraints(),
             });
-        } else {
-            throw e;
+        } catch (e) {
+            micErr = e;
+            try {
+                state.localStream = await navigator.mediaDevices.getUserMedia({
+                    video: videoConstraints(),
+                });
+            } catch (ve) {
+                throw new Error("no microphone or camera available (mic: " +
+                    (micErr.name || micErr) + ", camera: " + (ve.name || ve) + ")");
+            }
         }
     }
-    if (audioOK) setMicState("ok");
+    if (expectedEpoch !== voiceSessionEpoch || state.myChannelID <= 0) {
+        state.localStream?.getTracks().forEach((track) => track.stop());
+        state.localStream = null;
+        return false;
+    }
+    setMicState(micErr === null ? "ok" : micErr.name === "NotAllowedError" ? "denied" : "none");
+    // (25) record which profile this capture was taken with, so a later move
+    // only re-captures when the profile actually changes.
+    markCaptureProfile(state.localStream.getAudioTracks()[0],
+        state.channels.find((c) => c.ChannelID === state.myChannelID));
+    if (state.localStream.getVideoTracks().length === 0) {
+        sysMsg("no camera found; joined voice audio-only");
+    }
     // (78) contentHint tracks the configured frame rate.
     const camTrack = state.localStream.getVideoTracks()[0];
     if (camTrack) camTrack.contentHint = (state.settings?.camera_fps || 30) >= 60 ? "motion" : "detail";
-    $("local-video").srcObject = state.localStream;
-    $("local-video").classList.remove("hidden");
+    // the self-view is a fixed floating panel with a border: without a camera
+    // track it would just be an empty box over the UI (audio-only fallback).
+    $("local-video").srcObject = camTrack ? state.localStream : null;
+    $("local-video").classList.toggle("hidden", !camTrack);
+    resetCameraState(); // (85) a fresh session starts with the camera live
 
     // ICE servers delivered by the server at connect (STUN/TURN); an empty
     // list means "client defaults" (plain RTCPeerConnection).
@@ -1107,6 +1592,11 @@ async function startVoice() {
     try {
         iceServers = await window.go.main.App.GetICEServers();
     } catch { /* fall back to client defaults */ }
+    if (expectedEpoch !== voiceSessionEpoch || state.myChannelID <= 0) {
+        state.localStream?.getTracks().forEach((track) => track.stop());
+        state.localStream = null;
+        return false;
+    }
     const pc = iceServers && iceServers.length
         ? new RTCPeerConnection({ iceServers })
         : new RTCPeerConnection();
@@ -1144,29 +1634,40 @@ async function startVoice() {
     // backing off 1s, 2s, 5s, 15s before giving up with a warning toast.
     pc.oniceconnectionstatechange = () => onICEStateChange(pc);
     pc.ontrack = (e) => {
-        // The server assigns each per-publisher track an ID equal to the
-        // publisher's client ID (via the MSID track ID), so tracks can be
-        // attributed without SSRC mapping.
-        const publisher = state.clients.find((c) => String(c.client_id) === String(e.track.id)) || null;
+        // The server labels each track with its publisher and slot (see
+        // parseTrackID in video.js), so tracks are attributed without SSRC
+        // mapping and a publisher can own more than one of them.
+        const { clientID, slot } = parseTrackID(e.track.id);
+        const publisher = state.clients.find((c) => String(c.client_id) === clientID) || null;
         state.trackUsers.set(e.track.id, publisher
             ? { client_id: publisher.client_id, unique_id: publisher.unique_id, nickname: publisher.nickname }
-            : { client_id: e.track.id, unique_id: "", nickname: "" });
+            : { client_id: clientID, unique_id: "", nickname: "" });
         e.track.addEventListener("ended", () => state.trackUsers.delete(e.track.id));
         if (e.track.kind === "video") {
-            // (61) one grid tile per publisher video track; removed on ended.
+            // (61/73) one grid tile per publisher video slot; removed on ended.
             videoTrackAdded(e.track.id, e.streams[0], publisher);
             e.track.addEventListener("ended", () => videoTrackRemoved(e.track.id));
             return;
         }
+        if (slot === SLOT_SCREEN_AUDIO) {
+            // (70) a sharer's system audio is not a second microphone.
+            attachShareAudio(e.track, clientID, publisher);
+            return;
+        }
         // Audio: route through the WebAudio chain (per-user gain hook,
         // limiter, normalizer) instead of the video element.
-        attachRemoteAudio(e.streams[0], e.track, publisher);
+        attachRemoteAudio(e.track, publisher);
     };
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    const answerSDP = await window.go.main.App.WebRTCOffer(offer.sdp);
+    const answerSDP = await window.go.main.App.WebRTCOffer(offer.sdp, trackSlots());
     await pc.setRemoteDescription({ type: "answer", sdp: answerSDP });
+
+    if (expectedEpoch !== voiceSessionEpoch || state.pc !== pc || state.myChannelID <= 0) {
+        pc.close();
+        return false;
+    }
 
     applyChannelAudio();
     // (88) re-apply the persisted low-bandwidth mode to the fresh session.
@@ -1174,8 +1675,8 @@ async function startVoice() {
     startVoiceMonitor();
     startMicMeter(state.localStream);
     applyVoiceState();
-    $("voice-join").classList.add("active");
-    $("voice-status").textContent = "voice on";
+    setVoiceStatus("voice on");
+    return true;
 }
 
 // (24) applyChannelAudio applies the current channel's Opus settings to the
@@ -1195,8 +1696,11 @@ async function applyChannelAudio() {
             await sender.setParameters(p).catch(() => {});
         }
     }
-    const track = state.localStream?.getAudioTracks()[0];
-    if (track) track.contentHint = ch.OpusStereo ? "music" : "speech";
+    // (25) A move into or out of a music channel needs a fresh capture: the
+    // stereo/DSP constraints cannot be changed on a live track.
+    const { track, changed } = await applyCaptureProfile(state.pc, state.localStream, ch);
+    if (changed) startMicMeter(state.localStream);
+    if (track && !changed) track.contentHint = ch.OpusStereo ? "music" : "speech";
 }
 
 // (13/14) Priority-speaker ducking: while another priority speaker in my
@@ -1215,7 +1719,7 @@ function recomputeDucking() {
             clearTimeout(unduckTimer);
             unduckTimer = null;
         }
-        setDucking(true, prioAll.map((c) => c.unique_id));
+        applyDucking(true, prioAll.map((c) => c.unique_id));
         return;
     }
     if (unduckTimer) clearTimeout(unduckTimer);
@@ -1224,7 +1728,7 @@ function recomputeDucking() {
         const stillTalking = state.clients.some((c) =>
             c.channel_id === state.myChannelID && c.channel_id !== 0 &&
             c.priority_speaker && c.client_id !== state.myClientID && c.is_speaking);
-        if (!stillTalking) setDucking(false, []);
+        if (!stillTalking) applyDucking(false, []);
     }, 500);
 }
 
@@ -1268,7 +1772,7 @@ function resetICERestart() {
 function scheduleICERestart() {
     if (!state.pc) return;
     if (iceFailures >= ICE_BACKOFF_MS.length) {
-        toast("Voice connection unstable — rejoin voice if it does not recover", "warn", "conn");
+        toast("Voice connection unstable — reconnect if it does not recover", "warn", "conn");
         return;
     }
     const delay = ICE_BACKOFF_MS[iceFailures++];
@@ -1284,7 +1788,7 @@ function scheduleICERestart() {
         try {
             const offer = await pc.createOffer({ iceRestart: true });
             await pc.setLocalDescription(offer);
-            const answerSDP = await window.go.main.App.WebRTCOffer(offer.sdp);
+            const answerSDP = await window.go.main.App.WebRTCOffer(offer.sdp, trackSlots());
             await pc.setRemoteDescription({ type: "answer", sdp: answerSDP });
         } catch (e) {
             sysMsg("ice restart failed: " + e);
@@ -1305,7 +1809,7 @@ function teardownVoice() {
         clearTimeout(unduckTimer);
         unduckTimer = null;
     }
-    setDucking(false, []);
+    applyDucking(false, []);
     clearVideoGrid();
     if (state.shareStream) {
         state.shareStream.getTracks().forEach((t) => t.stop());
@@ -1315,19 +1819,38 @@ function teardownVoice() {
         window.go.main.App.SetScreenShare(false);
         $("voice-screen").classList.remove("active");
     }
+    // the transceiver belongs to the peer connection being closed: keeping the
+    // reference would make the next session's share replaceTrack a dead sender.
+    state.shareAudioTransceiver = null;
+    clearRegionBox(); // (71)
     detachRemoteAudio();
     if (state.pc) { state.pc.close(); state.pc = null; }
     if (state.localStream) {
         for (const t of state.localStream.getTracks()) t.stop();
         state.localStream = null;
     }
+    resetCameraState(); // (85)
     $("local-video").classList.add("hidden");
     $("remote-video").classList.add("hidden");
 }
 
+// voiceStatusBase is the plain voice on/off text. renderVoiceStatus appends the
+// whisper-reply marker (33): an armed reply reroutes every transmission, so it
+// must not be invisible.
+let voiceStatusBase = "voice off";
+
+function setVoiceStatus(text) {
+    voiceStatusBase = text;
+    renderVoiceStatus();
+}
+
+function renderVoiceStatus() {
+    $("voice-status").textContent = voiceStatusBase +
+        (state.whisperArmed ? " · whisper → " + uidName(state.lastWhispererUID) : "");
+}
+
 function resetVoiceUI() {
-    $("voice-join").classList.remove("active");
-    $("voice-status").textContent = "voice off";
+    setVoiceStatus("voice off");
     state.pttActive = false;
     $("ptt-btn").classList.remove("live");
     state.myPriority = false;
@@ -1479,7 +2002,7 @@ function warnMutedTalking() {
 function warnEmptyChannel() {
     if (Date.now() - lastEmptyWarn < 30000) return;
     lastEmptyWarn = Date.now();
-    toast("Nobody is in your channel", "info", "social");
+    toast("Nobody is in your channel", "info", "alert");
 }
 
 // Output settings: volume + sink for remote media elements.
@@ -1496,11 +2019,11 @@ function applyOutputSettings(el) {
 }
 
 // Remote audio WebAudio chain. One shared context carries every publisher:
-// per-track source -> per-user gain -> per-user mute -> master gain (volume)
-// -> [normalizer] -> [limiter] -> destination. Per-publisher tracks (track ID
-// = publisher client ID) make per-user volume/mute audible; the registry
-// itself lives in audio.js.
-const remoteChain = { ctx: null, master: null, interval: null };
+// per-track source -> [per-track normalizer] -> per-user gain -> per-user mute
+// -> master gain (volume) -> [limiter] -> destination. Per-publisher tracks
+// (track ID = publisher client ID) make per-user volume/mute/auto-level
+// audible; the registries themselves live in audio.js.
+const remoteChain = { ctx: null, master: null };
 // remoteTracks maps media track ID -> {src, gain, mute, uid} for per-track
 // teardown when a publisher leaves or voice is stopped.
 const remoteTracks = new Map();
@@ -1515,25 +2038,12 @@ function ensureRemoteChain() {
         remoteChain.master = master;
         master.gain.value = Math.min(2, (state.settings?.volume ?? 100) / 100);
 
-        let node = master;
-
-        // (53) gain normalization (optional).
-        if (state.settings?.gain_normalize) {
-            const analyser = ctx.createAnalyser();
-            analyser.fftSize = 512;
-            master.connect(analyser);
-            const norm = makeNormalizer(ctx, analyser);
-            master.disconnect();
-            master.connect(norm.gain);
-            node = norm.gain;
-            remoteChain.interval = setInterval(norm.tick, 100);
-        }
-
-        // (52) voice limiter/compressor (default on).
-        let out = node;
+        // (52) voice limiter/compressor (default on). Gain normalization (53)
+        // is per publisher and lives in attachRemoteAudio.
+        let out = master;
         if (state.settings?.voice_limiter !== false) {
             const comp = makeLimiter(ctx);
-            node.connect(comp);
+            master.connect(comp);
             out = comp;
         }
         out.connect(ctx.destination);
@@ -1553,15 +2063,24 @@ function ensureRemoteChain() {
 // attachRemoteAudio adds one publisher's audio track to the shared chain.
 // publisher is the resolved state.clients entry (or null when unknown); its
 // unique ID keys the per-user volume/mute registry from audio.js.
-function attachRemoteAudio(stream, track, publisher) {
+function attachRemoteAudio(track, publisher) {
     detachRemoteTrack(track.id); // re-attach after an ICE restart replaces the track
     if (!ensureRemoteChain()) return;
     try {
         const ctx = remoteChain.ctx;
-        const src = ctx.createMediaStreamSource(stream);
+        // a MediaStreamAudioSourceNode taps only the first audio track of the
+        // stream it is built from, so the per-user volume (1) and local mute
+        // (2) chains would all follow one publisher if several tracks share a
+        // stream: wrap this track alone.
+        const src = ctx.createMediaStreamSource(new MediaStream([track]));
         const gain = ctx.createGain();
         const mute = ctx.createGain();
-        src.connect(gain);
+        // (53) auto-level per publisher: keyed by track ID, inserted behind
+        // this publisher's source and returning src unchanged when the setting
+        // is off. A master-bus normalizer could not lift a quiet speaker out
+        // of a loud one.
+        const head = attachUserNormalizer(ctx, track.id, src);
+        head.connect(gain);
         gain.connect(mute);
         mute.connect(remoteChain.master);
 
@@ -1575,12 +2094,112 @@ function attachRemoteAudio(stream, track, publisher) {
     }
 }
 
+// resolveTrackUsers re-attributes tracks whose renegotiation arrived before
+// the publisher's user_joined event: at ontrack time the client list has no
+// entry yet, and without a second pass the per-user volume (1) and local mute
+// (2) chains are never registered for that publisher for the whole session.
+function resolveTrackUsers() {
+    for (const [trackID, u] of state.trackUsers) {
+        if (u.unique_id) continue;
+        const { clientID } = parseTrackID(trackID);
+        const publisher = state.clients.find((c) => String(c.client_id) === clientID);
+        if (!publisher) continue;
+        state.trackUsers.set(trackID, {
+            client_id: publisher.client_id, unique_id: publisher.unique_id, nickname: publisher.nickname,
+        });
+        const t = remoteTracks.get(trackID);
+        if (t && !t.uid && publisher.unique_id) {
+            t.uid = publisher.unique_id;
+            registerUserChain(publisher.unique_id, t.gain, t.mute);
+        }
+        // (14) the share chain needs the unique ID too, or its publisher can
+        // never be exempted from ducking.
+        const sa = shareAudio.get(clientID);
+        if (sa && !sa.uid && publisher.unique_id) {
+            sa.uid = publisher.unique_id;
+            applyShareAudio(clientID);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared system audio (70) — a screen share's audio arrives on its own slot
+// and gets its own chain, NOT the publisher's voice chain.
+//
+// Chosen behaviour: the per-user volume slider and local mute (1/2) are
+// controls for a PERSON's voice and only touch the microphone. A sharer's
+// system audio has its own mute + volume on the screen tile's context menu,
+// because the reason to mute someone is usually that they are noisy while you
+// are watching what they share — killing the show with the talker is wrong.
+// Priority-speaker ducking (14) does apply: it exists to make one voice
+// audible over everything else, program audio included. The two controls are
+// session-local; settings.user_volumes/muted_users stay the voice registry.
+// ---------------------------------------------------------------------------
+
+// shareAudio maps publisher client ID -> {trackID, src, gain, uid, volume, muted}.
+const shareAudio = new Map();
+
+// SHARE_DUCK_FACTOR must match audio.js's DUCK_FACTOR: these chains are not in
+// its per-user registry, so setDucking cannot reach them.
+const SHARE_DUCK_FACTOR = 0.25;
+let shareDuckActive = false;
+let shareDuckExempt = new Set();
+
+// applyDucking is setDucking plus the share chains it cannot see.
+function applyDucking(active, exceptUIDs) {
+    shareDuckActive = active;
+    shareDuckExempt = new Set(exceptUIDs || []);
+    setDucking(active, exceptUIDs);
+    for (const clid of shareAudio.keys()) applyShareAudio(clid);
+}
+
+function applyShareAudio(clientID) {
+    const n = shareAudio.get(String(clientID));
+    if (!n) return;
+    const duck = shareDuckActive && !shareDuckExempt.has(n.uid) ? SHARE_DUCK_FACTOR : 1;
+    n.gain.gain.value = (n.muted ? 0 : n.volume / 100) * duck;
+}
+
+function attachShareAudio(track, clientID, publisher) {
+    const clid = String(clientID);
+    detachShareAudio(clid); // re-attach after an ICE restart replaces the track
+    if (!ensureRemoteChain()) return;
+    try {
+        const ctx = remoteChain.ctx;
+        const src = ctx.createMediaStreamSource(new MediaStream([track]));
+        const gain = ctx.createGain();
+        src.connect(gain);
+        // no auto-level (53) on program audio: it would pump on music and
+        // game sound, which is not a quiet speaker that needs lifting.
+        gain.connect(remoteChain.master);
+        shareAudio.set(clid, {
+            trackID: track.id, src, gain, uid: publisher?.unique_id || "",
+            volume: 100, muted: false,
+        });
+        applyShareAudio(clid);
+        track.addEventListener("ended", () => detachShareAudio(clid));
+    } catch (e) {
+        sysMsg("shared audio chain failed: " + e);
+    }
+}
+
+function detachShareAudio(clientID) {
+    const n = shareAudio.get(String(clientID));
+    if (!n) return;
+    shareAudio.delete(String(clientID));
+    try {
+        n.gain.disconnect();
+        n.src.disconnect();
+    } catch { /* already disconnected */ }
+}
+
 // detachRemoteTrack removes one publisher's nodes from the shared chain.
 function detachRemoteTrack(trackID) {
     const t = remoteTracks.get(trackID);
     if (!t) return;
     remoteTracks.delete(trackID);
     if (t.uid) unregisterUserChain(t.uid);
+    detachUserNormalizer(trackID); // (53) no-op when normalization is off
     try {
         t.mute.disconnect();
         t.gain.disconnect();
@@ -1590,10 +2209,8 @@ function detachRemoteTrack(trackID) {
 
 function detachRemoteAudio() {
     for (const trackID of [...remoteTracks.keys()]) detachRemoteTrack(trackID);
-    if (remoteChain.interval) {
-        clearInterval(remoteChain.interval);
-        remoteChain.interval = null;
-    }
+    for (const clid of [...shareAudio.keys()]) detachShareAudio(clid); // (70)
+    detachAllUserNormalizers(); // (53) stops the shared auto-level ticker
     if (remoteChain.ctx) {
         remoteChain.ctx.close().catch(() => {});
         remoteChain.ctx = null;
@@ -1661,14 +2278,31 @@ window.runtime.EventsOn("hotkey", (action) => {
         window.__voicxPolish?.toggleZen();
         return;
     }
-    // (33) Whisper reply: activate whisper targeting the last whisperer.
+    // (33) Whisper reply: arm whisper at the last whisperer, re-press restores
+    // the whisper list it replaced (arming permanently would silently reroute
+    // every later transmission).
     if (action === "whisper_reply") {
-        if (state.lastWhispererUID) {
-            window.go.main.App.WhisperSet([state.lastWhispererUID], [], true);
-            sysMsg("whisper reply armed → " + clientName(state.lastWhispererUID) || state.lastWhispererUID);
-        } else {
-            toast("no whisper to reply to", "info", "social");
+        if (state.whisperArmed) {
+            const prev = state.whisperPrev || { clients: [], channels: [], active: false };
+            window.go.main.App.WhisperSet(prev.clients, prev.channels, prev.active);
+            state.whisperArmed = false;
+            state.whisperPrev = null;
+            renderVoiceStatus();
+            sysMsg("whisper reply disarmed");
+            return;
         }
+        if (!state.lastWhispererUID) {
+            toast("no whisper to reply to", "info", "alert");
+            return;
+        }
+        const s = state.settings || {};
+        state.whisperPrev = {
+            clients: s.whisper_clients || [], channels: s.whisper_channels || [], active: !!s.whisper_active,
+        };
+        window.go.main.App.WhisperSet([state.lastWhispererUID], [], true);
+        state.whisperArmed = true;
+        renderVoiceStatus();
+        sysMsg("whisper reply armed → " + uidName(state.lastWhispererUID));
         return;
     }
     if (document.hasFocus() && document.activeElement === $("chat-text")) return;
@@ -1694,6 +2328,11 @@ document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
         const dlg = [...document.querySelectorAll(".dlg-overlay")].pop();
         if (dlg) {
+            if (dlg.dataset.blocking === "true") {
+                e.preventDefault();
+                e.stopPropagation();
+                return;
+            }
             dlg.remove();
             e.stopPropagation();
             return;
@@ -1728,7 +2367,7 @@ window.runtime.EventsOn("hotkey_status", (st) => {
     if (st.registered) {
         el.textContent = "⌨ " + st.action;
         el.classList.remove("err");
-        el.title = st.action + " hotkey registered";
+        el.title = st.action + " hotkey active";
     } else {
         el.textContent = "⌨ off";
         el.classList.add("err");
@@ -1745,6 +2384,8 @@ function updateTalkBanner() {
 }
 
 // Screen share (69-72, 85) + low-bandwidth mode (88) — implemented in video.js.
+
+$("voice-video").onclick = () => cameraToggle();
 
 $("voice-screen").onclick = () => shareToggle();
 
@@ -1776,7 +2417,9 @@ async function refreshPermissions() {
         let html = `<table class="perm-grid"><thead><tr><th>key</th><th>value</th><th>flags</th></tr></thead><tbody>`;
         for (const e of entries) {
             const flags = [e.skip ? "skip" : "", e.negate ? "negate" : ""].filter(Boolean).join(",");
-            html += `<tr><td class="mono">${e.key}</td><td><span class="pill-val">${e.value}</span></td><td>${flags}</td></tr>`;
+            const inherited = e.inherited ? " inherited" : "";
+            const source = e.source_tier ? `effective from ${e.source_tier}${e.inherited ? " (inherited)" : ""}` : "effective permission";
+            html += `<tr class="${inherited}" title="${source}"><td class="mono">${e.key}</td><td><span class="pill-val">${e.value}</span></td><td>${flags}${e.source_tier ? ` · ${e.source_tier}` : ""}</td></tr>`;
         }
         area.innerHTML = html + "</tbody></table>";
     } catch {
@@ -1792,9 +2435,29 @@ window.__voicx = {
     state, $, toast, sysMsg, beep, showLogin, disconnect, sendChat, setPTT,
     setDeafened, refreshPermissions, applyVoiceState, applyOutputSettings,
     startVADMonitor: startVoiceMonitor, stopVADMonitor: stopVoiceMonitor,
-    connectFromLogin, renderTree,
+    connectFromLogin, renderTree, setDetailsOpen, setDirectTargetVisible,
     clientName, initials, fetchAvatar,
-    applyAppearance, toggleCompact, recentChannels,
+    applyAppearance, toggleCompact, recentChannels, syncOwnChannel,
+    ensureVoiceForChannel, resetVoiceSession,
+    // (70) shared system audio controls for the screen tile's context menu.
+    shareAudioCtl: {
+        get: (clientID) => {
+            const n = shareAudio.get(String(clientID));
+            return n ? { muted: n.muted, volume: n.volume } : null;
+        },
+        setMuted: (clientID, muted) => {
+            const n = shareAudio.get(String(clientID));
+            if (!n) return;
+            n.muted = !!muted;
+            applyShareAudio(clientID);
+        },
+        setVolume: (clientID, pct) => {
+            const n = shareAudio.get(String(clientID));
+            if (!n) return;
+            n.volume = Math.max(0, Math.min(200, pct | 0));
+            applyShareAudio(clientID);
+        },
+    },
 };
 
 initMenu();

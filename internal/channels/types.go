@@ -98,6 +98,14 @@ type ChannelUpdate struct {
 	OpusStereo      *bool
 	SlowModeSeconds *int
 	Description     *string
+	// NeededJoinPower (160), OrderIndex (163) and ParentID (168) are editable
+	// after creation; ParentID 0 moves the channel to the root.
+	NeededJoinPower *int
+	OrderIndex      *int
+	ParentID        *int64
+	// InheritPermissions toggles resolving the parent's channel permissions
+	// before the channel's own (157).
+	InheritPermissions *bool
 }
 
 // Validate checks the spec for obvious errors and returns a descriptive error

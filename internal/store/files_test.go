@@ -102,3 +102,67 @@ func TestFilesDB(t *testing.T) {
 		t.Fatalf("second delete = %v, want ErrFileNotFound", err)
 	}
 }
+
+// TestFileQuotaUsageDB covers the two quota axes (265/266). Dedup hard-links
+// identical blobs inside a channel, so the channel axis must charge a content
+// hash once however many rows point at it; across channels the blob really is
+// stored twice, so the uploader axis charges it twice.
+func TestFileQuotaUsageDB(t *testing.T) {
+	s := testDBStore(t)
+	ctx := context.Background()
+	suffix := fmt.Sprint(time.Now().UnixNano())
+
+	newChannel := func(name string) int64 {
+		t.Helper()
+		var id int64
+		if err := s.DB().QueryRowContext(ctx,
+			`INSERT INTO channels (name, channel_type, created_at) VALUES ($1, 2, NOW()) RETURNING id`,
+			name).Scan(&id); err != nil {
+			t.Fatalf("seeding channel: %v", err)
+		}
+		t.Cleanup(func() {
+			_, _ = s.DB().ExecContext(ctx, `DELETE FROM channels WHERE id = $1`, id)
+		})
+		return id
+	}
+	chA := newChannel("w7_quota_a_" + suffix)
+	chB := newChannel("w7_quota_b_" + suffix)
+
+	uploader := "quota-uid-" + suffix
+	add := func(channelID int64, folder, name, sha string, size int64, who string) {
+		t.Helper()
+		if err := s.AddFile(ctx, FileRecord{
+			ChannelID: channelID, Folder: folder, Name: name, Size: size, SHA256: sha, Uploader: who,
+		}); err != nil {
+			t.Fatalf("AddFile %s: %v", name, err)
+		}
+	}
+
+	// Two rows, one blob: the second is a hard link and costs no disk.
+	add(chA, "", "one.bin", "sha-dup-"+suffix, 1000, uploader)
+	add(chA, "copies", "two.bin", "sha-dup-"+suffix, 1000, uploader)
+	add(chA, "", "other.bin", "sha-other-"+suffix, 500, "someone-else")
+	// The same content in another channel is a separate blob.
+	add(chB, "", "three.bin", "sha-dup-"+suffix, 1000, uploader)
+
+	used, err := s.ChannelFileUsage(ctx, chA)
+	if err != nil {
+		t.Fatalf("ChannelFileUsage: %v", err)
+	}
+	if used != 1500 {
+		t.Errorf("channel usage = %d, want 1500 (deduped copy charged twice?)", used)
+	}
+
+	mine, err := s.UploaderFileUsage(ctx, uploader)
+	if err != nil {
+		t.Fatalf("UploaderFileUsage: %v", err)
+	}
+	if mine != 2000 {
+		t.Errorf("uploader usage = %d, want 2000 (one blob per channel)", mine)
+	}
+
+	none, err := s.UploaderFileUsage(ctx, "")
+	if err != nil || none != 0 {
+		t.Errorf("empty uploader usage = %d, err=%v, want 0", none, err)
+	}
+}

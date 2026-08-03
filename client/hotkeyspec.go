@@ -9,14 +9,6 @@ import (
 	"golang.design/x/hotkey"
 )
 
-// specModifiers maps modifier names to hotkey modifiers.
-var specModifiers = map[string]hotkey.Modifier{
-	"ctrl":  hotkey.ModCtrl,
-	"alt":   hotkey.ModAlt,
-	"shift": hotkey.ModShift,
-	"win":   hotkey.ModWin,
-}
-
 // specKeys maps key names to hotkey keys (only keys the hotkey package
 // defines on Windows are listed).
 var specKeys = map[string]hotkey.Key{
@@ -87,4 +79,15 @@ func parseHotkeySpec(spec string) ([]hotkey.Modifier, hotkey.Key, error) {
 		}
 	}
 	return nil, 0, fmt.Errorf("unsupported key %q", parts[len(parts)-1])
+}
+
+// validateHotkeySpec accepts an empty spec as an explicit unbind. Parsing
+// itself remains strict so callers that require a binding still get a useful
+// error for an empty value.
+func validateHotkeySpec(spec string) error {
+	if strings.TrimSpace(spec) == "" {
+		return nil
+	}
+	_, _, err := parseHotkeySpec(spec)
+	return err
 }

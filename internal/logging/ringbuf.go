@@ -14,10 +14,17 @@ import (
 // ringCapacity bounds the buffered lines.
 const ringCapacity = 500
 
-// ringBuf is a concurrency-safe bounded line buffer.
+// followBuffer is the per-follower queue depth. A follower that falls behind
+// loses lines rather than slowing the logger down.
+const followBuffer = 256
+
+// ringBuf is a concurrency-safe bounded line buffer with optional live
+// followers (223 `logview follow`).
 type ringBuf struct {
-	mu    sync.Mutex
-	lines []string
+	mu        sync.Mutex
+	lines     []string
+	nextSubID uint64
+	subs      map[uint64]chan string
 }
 
 // ringCore is a zapcore.Core that encodes entries to lines and appends them
@@ -69,9 +76,36 @@ func (c *ringCore) Write(ent zapcore.Entry, fields []zapcore.Field) error {
 		if len(c.buf.lines) > ringCapacity {
 			c.buf.lines = c.buf.lines[len(c.buf.lines)-ringCapacity:]
 		}
+		for _, sub := range c.buf.subs {
+			// Non-blocking: a stalled follower must never block a log write.
+			select {
+			case sub <- line:
+			default:
+			}
+		}
 		c.buf.mu.Unlock()
 	}
 	return c.Core.Write(ent, fields)
+}
+
+// Follow returns a channel of log lines emitted from now on, and a cancel
+// function that unregisters it (223). The channel is never closed by the
+// logger; the caller stops by calling cancel.
+func Follow() (<-chan string, func()) {
+	ch := make(chan string, followBuffer)
+	globalRing.mu.Lock()
+	if globalRing.subs == nil {
+		globalRing.subs = make(map[uint64]chan string)
+	}
+	globalRing.nextSubID++
+	id := globalRing.nextSubID
+	globalRing.subs[id] = ch
+	globalRing.mu.Unlock()
+	return ch, func() {
+		globalRing.mu.Lock()
+		delete(globalRing.subs, id)
+		globalRing.mu.Unlock()
+	}
 }
 
 // Recent returns the last n lines, newest last, optionally filtered to lines

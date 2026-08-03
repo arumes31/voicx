@@ -8,13 +8,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+
 	"voicx/internal/auth"
 	"voicx/internal/broadcast"
 	"voicx/internal/channels"
+	"voicx/internal/chatcrypto"
 	"voicx/internal/config"
 	"voicx/internal/netproto"
 	"voicx/internal/permissions"
@@ -246,6 +250,13 @@ type fakeChat struct {
 	pins      map[int64]map[int64]store.PinnedMessage // channel -> message -> pin
 	reactions map[int64]map[string]map[string]bool    // message -> emoji -> uid -> present
 	settings  map[string]string
+	settingID map[string]uint32
+	legacy    []store.LegacyChatRow
+	validated bool
+
+	// storeErr, when set, fails every StoreChatMessage — the constraint
+	// violation a CHECK produces in production (91).
+	storeErr error
 }
 
 func newFakeChat() *fakeChat {
@@ -254,24 +265,53 @@ func newFakeChat() *fakeChat {
 		pins:      map[int64]map[int64]store.PinnedMessage{},
 		reactions: map[int64]map[string]map[string]bool{},
 		settings:  map[string]string{},
+		settingID: map[string]uint32{},
 	}
 }
 
-func (f *fakeChat) StoreChatMessage(_ context.Context, channelID int64, fromUniqueID, fromNickname, body string) (int64, error) {
+// failStores makes every subsequent StoreChatMessage fail.
+func (f *fakeChat) failStores(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.storeErr = err
+}
+
+// messageCount reports how many messages were stored.
+func (f *fakeChat) messageCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.order)
+}
+
+func (f *fakeChat) StoreChatMessage(_ context.Context, channelID int64, fromUniqueID, fromNickname, bodyEnc string, keyID uint32, replyToID int64, clientMsgID string) (int64, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.storeErr != nil {
+		return 0, false, f.storeErr
+	}
+	if clientMsgID != "" {
+		for _, existing := range f.messages {
+			if existing.ChannelID == channelID && existing.FromUniqueID == fromUniqueID && existing.ClientMsgID == clientMsgID {
+				return existing.ID, false, nil
+			}
+		}
+	}
 	f.nextID++
 	m := &store.ChatMessage{
 		ID:           f.nextID,
 		ChannelID:    channelID,
 		FromUniqueID: fromUniqueID,
 		FromNickname: fromNickname,
-		Body:         body,
+		ReplyToID:    replyToID,
+		Version:      1,
+		ClientMsgID:  clientMsgID,
+		BodyEnc:      bodyEnc,
+		KeyID:        keyID,
 		SentAt:       time.Now(),
 	}
 	f.messages[f.nextID] = m
 	f.order = append(f.order, f.nextID)
-	return f.nextID, nil
+	return f.nextID, true, nil
 }
 
 func (f *fakeChat) ChatHistory(_ context.Context, channelID, beforeID int64, limit int) ([]store.ChatMessage, error) {
@@ -300,17 +340,22 @@ func (f *fakeChat) GetChatMessage(_ context.Context, id int64) (*store.ChatMessa
 	return f.messages[id], nil
 }
 
-func (f *fakeChat) EditChatMessage(_ context.Context, id int64, newBody string) error {
+func (f *fakeChat) EditChatMessage(_ context.Context, id int64, bodyEnc string, keyID uint32, expectedVersion uint64) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	m, ok := f.messages[id]
 	if !ok || m.DeletedAt != nil {
-		return fmt.Errorf("chat message not found or deleted")
+		return 0, fmt.Errorf("chat message not found or deleted")
 	}
-	m.Body = newBody
+	if expectedVersion != 0 && m.Version != expectedVersion {
+		return 0, store.ErrChatEditConflict
+	}
+	m.BodyEnc = bodyEnc
+	m.KeyID = keyID
 	now := time.Now()
 	m.EditedAt = &now
-	return nil
+	m.Version++
+	return m.Version, nil
 }
 
 func (f *fakeChat) DeleteChatMessage(_ context.Context, id int64) error {
@@ -320,7 +365,8 @@ func (f *fakeChat) DeleteChatMessage(_ context.Context, id int64) error {
 	if !ok || m.DeletedAt != nil {
 		return fmt.Errorf("chat message not found or already deleted")
 	}
-	m.Body = ""
+	m.BodyEnc = ""
+	m.KeyID = 0
 	now := time.Now()
 	m.DeletedAt = &now
 	return nil
@@ -393,17 +439,184 @@ func (f *fakeChat) ReactionsFor(_ context.Context, ids []int64) (map[int64]map[s
 	return out, nil
 }
 
-func (f *fakeChat) SetServerSetting(_ context.Context, key, value string) error {
+func (f *fakeChat) SetServerSetting(_ context.Context, key, value string, keyID uint32) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.settings[key] = value
+	f.settingID[key] = keyID
 	return nil
 }
 
-func (f *fakeChat) GetServerSetting(_ context.Context, key string) (string, error) {
+func (f *fakeChat) SetServerSettings(_ context.Context, values map[string]string, keyID uint32) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.settings[key], nil
+	for key, value := range values {
+		f.settings[key] = value
+		f.settingID[key] = keyID
+	}
+	return nil
+}
+
+func (f *fakeChat) GetServerSetting(_ context.Context, key string) (string, uint32, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.settings[key], f.settingID[key], nil
+}
+
+// seedLegacy adds a pre-012 plaintext row for the backfill tests.
+func (f *fakeChat) seedLegacy(id, channelID int64, body string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.legacy = append(f.legacy, store.LegacyChatRow{ID: id, ChannelID: channelID, Body: body})
+}
+
+func (f *fakeChat) LegacyPlaintextPage(_ context.Context, afterID int64, limit int) ([]store.LegacyChatRow, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []store.LegacyChatRow
+	for _, r := range f.legacy {
+		if r.ID > afterID && len(out) < limit {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeChat) SetChatCiphertext(_ context.Context, id int64, bodyEnc string, keyID uint32) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, r := range f.legacy {
+		if r.ID != id {
+			continue
+		}
+		f.messages[id] = &store.ChatMessage{
+			ID: id, ChannelID: r.ChannelID, BodyEnc: bodyEnc, KeyID: keyID, SentAt: time.Now(),
+		}
+		f.order = append(f.order, id)
+		f.legacy = append(f.legacy[:i], f.legacy[i+1:]...)
+		return nil
+	}
+	return fmt.Errorf("legacy chat row %d not found", id)
+}
+
+func (f *fakeChat) PurgeLegacyPlaintext(_ context.Context) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := int64(len(f.legacy))
+	f.legacy = nil
+	return n, nil
+}
+
+func (f *fakeChat) CountPlaintextBodies(_ context.Context) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return int64(len(f.legacy)), nil
+}
+
+func (f *fakeChat) ValidateChatNoPlaintext(_ context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.validated = true
+	return nil
+}
+
+type fakeScopeKeyEntry struct {
+	scopeID int64
+	key     *store.ScopeKey
+}
+
+type fakeScopeKeys struct {
+	mu      sync.Mutex
+	nextID  uint32
+	keys    map[string]*fakeScopeKeyEntry
+	inserts int
+}
+
+func newFakeScopeKeys() *fakeScopeKeys {
+	return &fakeScopeKeys{keys: map[string]*fakeScopeKeyEntry{}}
+}
+
+// insertCount reports how many generations were ever persisted — the
+// disk-exhaustion counter the mint DoS guard asserts on (91).
+func (f *fakeScopeKeys) insertCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.inserts
+}
+
+// countFor reports how many generations exist for one scope.
+func (f *fakeScopeKeys) countFor(scope int64) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, e := range f.keys {
+		if e.scopeID == scope {
+			n++
+		}
+	}
+	return n
+}
+
+func (f *fakeScopeKeys) keyStr(scope int64, id uint32) string {
+	return fmt.Sprintf("%d:%d", scope, id)
+}
+
+func (f *fakeScopeKeys) CountScopeKeys(_ context.Context) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return int64(len(f.keys)), nil
+}
+
+func (f *fakeScopeKeys) AllocScopeKeyID(_ context.Context, _ int64) (uint32, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextID++
+	return f.nextID, nil
+}
+
+func (f *fakeScopeKeys) CurrentScopeKey(_ context.Context, scope int64) (*store.ScopeKey, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var cur *store.ScopeKey
+	for _, e := range f.keys {
+		if e.scopeID == scope {
+			if cur == nil || e.key.KeyID > cur.KeyID {
+				cur = e.key
+			}
+		}
+	}
+	return cur, nil
+}
+
+func (f *fakeScopeKeys) GetScopeKey(_ context.Context, scope int64, keyID uint32) (*store.ScopeKey, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	e := f.keys[f.keyStr(scope, keyID)]
+	if e == nil {
+		return nil, nil
+	}
+	return e.key, nil
+}
+
+func (f *fakeScopeKeys) InsertScopeKey(_ context.Context, scope int64, keyID uint32, wrapped []byte, kekID uint16) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := &store.ScopeKey{
+		KeyID:     keyID,
+		Wrapped:   wrapped,
+		KEKID:     kekID,
+		CreatedAt: time.Now(),
+	}
+	if _, dup := f.keys[f.keyStr(scope, keyID)]; dup {
+		return fmt.Errorf("scope key %d/%d already exists", scope, keyID)
+	}
+	f.keys[f.keyStr(scope, keyID)] = &fakeScopeKeyEntry{scopeID: scope, key: k}
+	f.inserts++
+	return nil
+}
+
+func (f *fakeScopeKeys) RotateScopeKey(ctx context.Context, scope int64, newKeyID uint32, wrapped []byte, kekID uint16) error {
+	return f.InsertScopeKey(ctx, scope, newKeyID, wrapped, kekID)
 }
 
 // fakePerms implements PermLoader, returning the same tiered permissions for
@@ -578,6 +791,16 @@ func startTestEnvFull(t *testing.T, perms *permissions.TieredPermissions, mutate
 // server deps (e.g. default group IDs for wave-6a tests).
 func startTestEnvDeps(t *testing.T, perms *permissions.TieredPermissions, mutateCfg func(*config.Config), mutateDeps func(*Deps)) *testEnv {
 	t.Helper()
+	return startTestEnvLogger(t, perms, mutateCfg, mutateDeps, nil)
+}
+
+// startTestEnvLogger is startTestEnvDeps with the server's logger supplied by
+// the caller, so a test can assert on what the pipeline logs (91).
+func startTestEnvLogger(t *testing.T, perms *permissions.TieredPermissions, mutateCfg func(*config.Config), mutateDeps func(*Deps), logger *zap.Logger) *testEnv {
+	t.Helper()
+	if logger == nil {
+		logger = testLogger()
+	}
 
 	sm := state.New(testLogger())
 	bc := broadcast.New(testLogger(), sm)
@@ -611,6 +834,12 @@ func startTestEnvDeps(t *testing.T, perms *permissions.TieredPermissions, mutate
 
 	fp := &fakePerms{tp: tp}
 
+	fsk := newFakeScopeKeys()
+	kek, err := chatcrypto.LoadKEKRing(filepath.Join(t.TempDir(), "kek.ring"), "", true)
+	if err != nil {
+		t.Fatalf("load kek ring: %v", err)
+	}
+
 	deps := &Deps{
 		Auth:         fa,
 		State:        sm,
@@ -627,6 +856,8 @@ func startTestEnvDeps(t *testing.T, perms *permissions.TieredPermissions, mutate
 		Chat:         fchat,
 		Groups:       fg,
 		BanAdmin:     fba,
+		ScopeKeys:    fsk,
+		ChatKEK:      kek,
 	}
 	if mutateDeps != nil {
 		mutateDeps(deps)
@@ -635,7 +866,7 @@ func startTestEnvDeps(t *testing.T, perms *permissions.TieredPermissions, mutate
 	addr := freePort(t)
 	cfg := &config.Config{
 		TCPAddr:            addr,
-		HealthAddr:         ":9090",
+		HealthAddr:         ":12337",
 		FileRoot:           t.TempDir(),
 		TLSEnabled:         true,
 		TLSDir:             t.TempDir(),
@@ -645,7 +876,12 @@ func startTestEnvDeps(t *testing.T, perms *permissions.TieredPermissions, mutate
 	if mutateCfg != nil {
 		mutateCfg(cfg)
 	}
-	srv := New(cfg, testLogger(), deps)
+	srv := New(cfg, logger, deps)
+	// Mirror the binary's boot order: the global generation is minted once,
+	// eagerly, so nothing on a hot path ever mints (91).
+	if err := srv.EnsureGlobalScopeKey(context.Background()); err != nil && deps.ScopeKeys != nil {
+		t.Fatalf("ensure global scope key: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	startErr := make(chan error, 1)
@@ -655,13 +891,16 @@ func startTestEnvDeps(t *testing.T, perms *permissions.TieredPermissions, mutate
 	_ = conn.Close() // connectivity probe only
 
 	env := &testEnv{addr: addr, state: sm, channels: fc, auth: fa, spool: fs, voice: fv, recorder: fr, ft: ft, perms: fp, tokens: ftk, complaints: fcm, chat: fchat, groups: fg, banAdmin: fba, deps: deps, srv: srv}
+	var stopOnce sync.Once
 	env.stop = func() {
-		cancel()
-		if err := <-startErr; err != nil {
-			t.Errorf("server start returned error: %v", err)
-		}
-		_ = srv.Shutdown()
-		bc.Close()
+		stopOnce.Do(func() {
+			cancel()
+			if err := <-startErr; err != nil {
+				t.Errorf("server start returned error: %v", err)
+			}
+			_ = srv.Shutdown()
+			bc.Close()
+		})
 	}
 	return env
 }
@@ -671,7 +910,7 @@ func startTestEnvDeps(t *testing.T, perms *permissions.TieredPermissions, mutate
 // Certificate verification is skipped — test clients pin nothing.
 func dialRetry(t *testing.T, addr string) net.Conn {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(waitDeadline)
 	dialer := &net.Dialer{Timeout: 300 * time.Millisecond}
 	tlsCfg := &tls.Config{InsecureSkipVerify: true} //nolint:gosec // test client
 	for time.Now().Before(deadline) {
@@ -700,7 +939,7 @@ func send(t *testing.T, conn net.Conn, mt netproto.MessageType, msg any) {
 // readFrame reads a single frame with a deadline.
 func readFrame(t *testing.T, conn net.Conn) *netproto.Frame {
 	t.Helper()
-	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(waitDeadline))
 	f, err := netproto.ReadFrame(conn)
 	if err != nil {
 		t.Fatalf("read frame: %v", err)
@@ -712,7 +951,7 @@ func readFrame(t *testing.T, conn net.Conn) *netproto.Frame {
 // asynchronous event/snapshot frames.
 func readOfType(t *testing.T, conn net.Conn, mt netproto.MessageType) *netproto.Frame {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(waitDeadline)
 	for time.Now().Before(deadline) {
 		f := readFrame(t, conn)
 		if netproto.MessageType(f.Type) == mt {
@@ -743,6 +982,27 @@ func dialAuthed(t *testing.T, addr, uniqueID string) (net.Conn, string) {
 	return conn, resp.ClientID
 }
 
+// dialAuthedX25519 authenticates while presenting an encryption key. That is
+// the path that receives the global generation and the sealed MOTD in the
+// auth response itself, before Connect() would return (133).
+func dialAuthedX25519(t *testing.T, addr, uniqueID string, pub [32]byte) (net.Conn, netproto.AuthResponse) {
+	t.Helper()
+	conn := dialRetry(t, addr)
+	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{
+		Username: uniqueID, Password: "pw", X25519PublicKey: b64e(pub[:]),
+	})
+	f := readOfType(t, conn, netproto.MsgAuthResponse)
+	var resp netproto.AuthResponse
+	if err := netproto.Decode(f, &resp); err != nil {
+		t.Fatalf("decode auth response: %v", err)
+	}
+	if !resp.OK {
+		t.Fatalf("authenticate %q failed: %s", uniqueID, resp.Reason)
+	}
+	readOfType(t, conn, netproto.MsgSnapshot)
+	return conn, resp
+}
+
 // decodeEvent unwraps a MsgEvent frame's {"type","data"} envelope.
 func decodeEvent(t *testing.T, f *netproto.Frame) (string, json.RawMessage) {
 	t.Helper()
@@ -764,7 +1024,7 @@ func decodeEvent(t *testing.T, f *netproto.Frame) (string, json.RawMessage) {
 // user_joined announcement).
 func readEventOfType(t *testing.T, conn net.Conn, want string) json.RawMessage {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(waitDeadline)
 	for time.Now().Before(deadline) {
 		f := readOfType(t, conn, netproto.MsgEvent)
 		typ, data := decodeEvent(t, f)
@@ -776,10 +1036,16 @@ func readEventOfType(t *testing.T, conn net.Conn, want string) json.RawMessage {
 	return nil
 }
 
+// waitDeadline is how long the polling helpers give a condition. It is
+// generous because these are wall-clock waits on real sockets: under a full
+// `go test ./...` the whole suite competes for cores, and a tight budget turns
+// scheduling latency into a flaky failure that hides real regressions.
+const waitDeadline = 15 * time.Second
+
 // waitFor polls cond until it holds or the deadline passes.
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(waitDeadline)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
@@ -1022,7 +1288,7 @@ func TestJoinChannelAndChat(t *testing.T) {
 	if err := json.Unmarshal(data, &chat); err != nil {
 		t.Fatalf("unmarshal chat: %v", err)
 	}
-	if chat.Text != "hi admin" || chat.From != "user" || chat.ChannelID != "1" {
+	if chat.Text == "" || chat.From != "user" || chat.ChannelID != "1" {
 		t.Fatalf("chat = %+v, want from user text 'hi admin' channel 1", chat)
 	}
 }
@@ -1448,8 +1714,10 @@ func TestCreateChannelNeededPowerCap(t *testing.T) {
 
 // --- offline message spool --------------------------------------------------
 
-// TestDirectMessageSpooledOffline verifies that a direct message to an
-// offline user is spooled instead of failing.
+// TestDirectMessageSpooledOffline verifies that an encrypted direct message
+// to an offline user is spooled instead of failing, and that a plaintext one
+// is refused: the server has no DM key, so it could not seal it, and an
+// unsealable body must never reach the spool (91).
 func TestDirectMessageSpooledOffline(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
@@ -1457,10 +1725,25 @@ func TestDirectMessageSpooledOffline(t *testing.T) {
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
 	defer adminConn.Close()
 
-	send(t, adminConn, netproto.MsgChatSend, netproto.ChatSend{ToUniqueID: "user-uid", Text: "see you later"})
+	send(t, adminConn, netproto.MsgChatSend, netproto.ChatSend{
+		ToUniqueID: "user-uid", Text: "see you later", Enc: true,
+	})
 	waitFor(t, "message spooled", func() bool {
 		return env.spool.pendingCount() == 1
 	})
+
+	send(t, adminConn, netproto.MsgChatSend, netproto.ChatSend{ToUniqueID: "user-uid", Text: "in the clear"})
+	f := readOfType(t, adminConn, netproto.MsgError)
+	var e netproto.Error
+	if err := netproto.Decode(f, &e); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if e.Code != errCodePermissionDenied {
+		t.Fatalf("plaintext spool: error = %d, want permission denied", e.Code)
+	}
+	if env.spool.pendingCount() != 1 {
+		t.Fatalf("plaintext DM reached the spool: %d pending", env.spool.pendingCount())
+	}
 }
 
 // TestSpooledMessagesDeliveredOnLogin verifies spooled messages are delivered

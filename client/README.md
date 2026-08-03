@@ -246,7 +246,7 @@ write and denials arrive as toasts (grant-cap errors included).
 - **Permission Manager** (Permissions menu): tabs for Server Groups / Clients /
   Channel / Channel Groups. The right side is the editable permission grid
   (136) — click a row for the inline editor (value + grant inputs, skip/negate
-  checkboxes with TS3 tooltips (152/153), Set/Unset). A filter box searches
+  checkboxes with tooltips, Set/Unset). A filter box searches
   keys (154); ⬇ exports the target's grid as JSON (148). Current values are
   read via the `PermList` request; after each write the grid re-queries.
 - **Trace** (137/155): on the Clients tab, each row's editor has a Trace
@@ -312,7 +312,7 @@ The files UI (`frontend/src/files-ui.js`, bindings in `files.go`) adds a
 - **Multi-server tabs (281)**: TS3-style server tab bar above the panes.
   Architecture (documented in `tabs.go`): the backend keeps one connManager
   per tab; all bindings operate on the *active* tab, so the bound API is
-  unchanged. Events from background tabs are journaled in Go and replayed on
+  unchanged. State events from every tab are journaled in Go and replayed on
   activation (after a `tab_reset` that clears chat/tree state), keeping the
   frontend single-state. Tabs show addr + nickname, unread/mention badges,
   and a close button; "+" opens the connect dialog for a new tab. Voice is
@@ -510,7 +510,7 @@ wails dev
 wails build        # output: build/bin/voicx-client.exe
 ```
 
-Connect from the login dialog: server address (`127.0.0.1:10011`), your
+Connect from the login dialog: server address (`127.0.0.1:12333`), your
 unique ID, account password, and the server password if the server has one
 set.
 
@@ -529,7 +529,7 @@ first-run admin token the server logs at WARN on an empty database.
 
 ## Identity & login
 
-TS3-style identity: on first run the client generates an Ed25519 key pair
+Cryptographic identity: on first run the client generates an Ed25519 key pair
 and persists it to `<UserConfigDir>/voicx/identity.json` (0600). The unique
 ID is derived from the public key — you never type one.
 
@@ -541,23 +541,22 @@ The login dialog asks for:
   account's canonical unique ID, and binds your identity key to the account
   so future logins work passwordless (challenge auth with the same key).
 - **Password** — optional. Empty = guest login with your own identity
-  (key-derived unique ID, TS3 guest semantics).
+  (key-derived unique ID, guest semantics).
 - **Server password** — only if the server has a global password set.
 
 ## Hotkeys & troubleshooting
 
-- **Space** — push-to-talk (works in the background; while the chat input is
-  focused in the voicx window, Space types instead). Also hold the big mic
-  button in the voice bar for mouse PTT. Rebindable in Settings → Hotkeys
-  (any key spec like `F5`, `Ctrl+M`, `Ctrl+Shift+F5`).
+- **Push-to-talk is unbound by default.** Configure it in Settings → Hotkeys,
+  or hold the big mic button in the voice bar. On Windows, configured hotkeys
+  are observed passively, so the foreground application still receives the
+  same keys.
 - **Ctrl+M** — mute toggle (also rebindable).
 
 The big mic button glows and the **● TALKING** banner appears while
-push-to-talk is active. The keyboard icon in the voice bar shows global
-hotkey status (`⌨ ptt` = registered, `⌨ off` = failed). If a hotkey shows
-off: check `<UserConfigDir>/voicx/client.log` — the usual cause is a second
-client instance already holding the global hotkey. Debug lines like
-`hotkey ptt_down fired` are logged there for every captured event.
+push-to-talk is active. The keyboard icon in the voice bar shows hotkey
+status (`⌨ ptt` = active, `⌨ off` = failed). If a hotkey shows off, check
+`<UserConfigDir>/voicx/client.log`. Debug lines like `hotkey ptt_down fired`
+are logged there for every observed event.
 
 ## Auto-update
 
@@ -594,12 +593,12 @@ server — no Wails runtime needed (the backend's events go through an
 ```bash
 # server must be running (e.g. docker compose up)
 cd client
-VOICX_LIVE_ADDR=127.0.0.1:10011 go test -run Live -v ./... -count=1
-VOICX_LIVE_ADDR=127.0.0.1:10011 go test -race -run Live ./... -count=1
+VOICX_LIVE_ADDR=127.0.0.1:12333 go test -run Live -v ./... -count=1
+VOICX_LIVE_ADDR=127.0.0.1:12333 go test -race -run Live ./... -count=1
 ```
 
 Optional env: `VOICX_LIVE_QUERY_ADDR` (ServerQuery port, default
-`<host>:10012`). The test creates a throwaway permanent channel via
+`<host>:12335`). The test creates a throwaway permanent channel via
 ServerQuery (admin account) so channel-dependent assertions are real. Note
 `GetPermissions` returns an empty set on a fresh server — registered users
 have no granted permissions until seeded; the test asserts the

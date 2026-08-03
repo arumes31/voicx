@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -13,7 +14,7 @@ func TestSettingsRoundTrip(t *testing.T) {
 
 	// Missing file: defaults.
 	s := loadSettingsAt(path)
-	if s.HotkeyPTT != "Space" || s.HotkeyMute != "Ctrl+M" || s.Volume != 100 ||
+	if s.HotkeyPTT != "" || s.HotkeyMute != "Ctrl+M" || s.Volume != 100 ||
 		s.ActivationMode != "ptt" || s.ChatMaxLines != 200 {
 		t.Fatalf("defaults = %+v", s)
 	}
@@ -21,7 +22,7 @@ func TestSettingsRoundTrip(t *testing.T) {
 	s.ChatMaxLines = 42
 	s.Volume = 150
 	s.HotkeyPTT = "F5"
-	s.Bookmarks = []Bookmark{{Name: "local", Addr: "127.0.0.1:10011", Nickname: "alice"}}
+	s.Bookmarks = []Bookmark{{Name: "local", Addr: "127.0.0.1:12333", Nickname: "alice"}}
 	s.WhisperClients = []string{"uid-1"}
 
 	if err := saveSettingsAt(path, s); err != nil {
@@ -39,11 +40,66 @@ func TestSettingsRoundTrip(t *testing.T) {
 	if loaded.ChatMaxLines != 42 || loaded.Volume != 150 || loaded.HotkeyPTT != "F5" {
 		t.Fatalf("reloaded = %+v", loaded)
 	}
-	if len(loaded.Bookmarks) != 1 || loaded.Bookmarks[0].Addr != "127.0.0.1:10011" {
+	if len(loaded.Bookmarks) != 1 || loaded.Bookmarks[0].Addr != "127.0.0.1:12333" {
 		t.Fatalf("bookmarks = %+v", loaded.Bookmarks)
 	}
 	if len(loaded.WhisperClients) != 1 || loaded.WhisperClients[0] != "uid-1" {
 		t.Fatalf("whisper clients = %+v", loaded.WhisperClients)
+	}
+}
+
+// TestSaveSettingsKeepsGoOwnedFields verifies a frontend save carrying a
+// stale cached blob cannot wipe fields the Go side maintains on its own
+// (282 recents, 330 what's-new marker).
+func TestSaveSettingsKeepsGoOwnedFields(t *testing.T) {
+	a := &App{
+		settings:     DefaultSettings(),
+		hotkeys:      map[string]*hotkeyReg{},
+		settingsPath: filepath.Join(t.TempDir(), "settings.json"),
+	}
+	// What the frontend cached before the connect happened.
+	stale := a.GetSettings()
+
+	a.RecordRecent("127.0.0.1:12333", "alice")
+	a.settings.LastSeenVersion = "9.9"
+
+	stale.Volume = 120
+	if err := a.SaveSettings(stale); err != "" {
+		t.Fatalf("save: %s", err)
+	}
+	if len(a.settings.Recents) != 1 || a.settings.Recents[0].Addr != "127.0.0.1:12333" {
+		t.Fatalf("recents clobbered by frontend save: %+v", a.settings.Recents)
+	}
+	if a.settings.LastSeenVersion != "9.9" {
+		t.Fatalf("last_seen_version = %q, want 9.9", a.settings.LastSeenVersion)
+	}
+	if a.settings.Volume != 120 {
+		t.Fatalf("frontend-owned volume = %d, want 120", a.settings.Volume)
+	}
+	loaded := loadSettingsAt(a.settingsPath)
+	if len(loaded.Recents) != 1 || loaded.LastSeenVersion != "9.9" {
+		t.Fatalf("persisted settings = %+v / %q", loaded.Recents, loaded.LastSeenVersion)
+	}
+}
+
+func TestSaveSettingsAllowsUnboundHotkeys(t *testing.T) {
+	a := &App{
+		settings:     DefaultSettings(),
+		hotkeys:      map[string]*hotkeyReg{},
+		settingsPath: filepath.Join(t.TempDir(), "settings.json"),
+	}
+	s := DefaultSettings()
+	s.HotkeyPTT = ""
+	s.HotkeyMute = ""
+	s.WhisperReplyHotkey = ""
+
+	if err := a.SaveSettings(s); err != "" {
+		t.Fatalf("save unbound hotkeys: %s", err)
+	}
+	loaded := loadSettingsAt(a.settingsPath)
+	if loaded.HotkeyPTT != "" || loaded.HotkeyMute != "" || loaded.WhisperReplyHotkey != "" {
+		t.Fatalf("unbound hotkeys did not persist: ptt=%q mute=%q whisper=%q",
+			loaded.HotkeyPTT, loaded.HotkeyMute, loaded.WhisperReplyHotkey)
 	}
 }
 
@@ -54,7 +110,7 @@ func TestSettingsCorruptFile(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 	s := loadSettingsAt(path)
-	if s.HotkeyPTT != "Space" {
+	if s.HotkeyPTT != "" {
 		t.Fatalf("corrupt file did not fall back to defaults: %+v", s)
 	}
 }
@@ -70,7 +126,7 @@ func TestSettingsMergeMissingFields(t *testing.T) {
 	if s.Volume != 175 {
 		t.Fatalf("volume = %d, want 175", s.Volume)
 	}
-	if s.HotkeyPTT != "Space" || s.ChatMaxLines != 200 {
+	if s.HotkeyPTT != "" || s.ChatMaxLines != 200 {
 		t.Fatalf("missing fields not defaulted: %+v", s)
 	}
 }
@@ -214,5 +270,178 @@ func TestSettingsWave9(t *testing.T) {
 	}
 	if len(back.Keywords["srv"]) != 2 || back.AlphaDismissed != "0.4.0" {
 		t.Fatalf("keywords/alpha = %+v %q", back.Keywords, back.AlphaDismissed)
+	}
+}
+
+// TestDefaultsThatMustNotBeZero pins the settings whose zero value disables a
+// feature. A reader added without its default is how the master sound gate
+// silenced every notification (28); merging a file onto the defaults means an
+// older file's false wins, which is what migrateSettings repairs.
+func TestDefaultsThatMustNotBeZero(t *testing.T) {
+	raw, err := json.Marshal(DefaultSettings())
+	if err != nil {
+		t.Fatalf("marshal defaults: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("unmarshal defaults: %v", err)
+	}
+	for _, key := range []string{"play_sounds", "warn_muted_talking", "warn_empty_channel", "voice_limiter"} {
+		if m[key] != true {
+			t.Errorf("%s default = %v, want true", key, m[key])
+		}
+	}
+}
+
+// TestMigrateSettingsRestoresPlaySounds covers both directions: a pre-version
+// file gets sound back, a current file keeps a deliberate opt-out.
+func TestMigrateSettingsRestoresPlaySounds(t *testing.T) {
+	old := DefaultSettings()
+	old.SettingsVersion = 0
+	old.PlaySounds = false
+	if got := migrateSettings(old); !got.PlaySounds {
+		t.Error("pre-version file did not get play_sounds restored")
+	} else if got.SettingsVersion != settingsVersion {
+		t.Errorf("version = %d, want %d", got.SettingsVersion, settingsVersion)
+	}
+
+	cur := DefaultSettings()
+	cur.PlaySounds = false
+	if migrateSettings(cur).PlaySounds {
+		t.Error("migration overrode a deliberate opt-out")
+	}
+}
+
+func TestMigrateSettingsUnbindsLegacyDefaultPTT(t *testing.T) {
+	old := DefaultSettings()
+	old.SettingsVersion = 4
+	old.HotkeyPTT = "Space"
+	if got := migrateSettings(old).HotkeyPTT; got != "" {
+		t.Fatalf("legacy PTT hotkey = %q, want unbound", got)
+	}
+
+	current := DefaultSettings()
+	current.HotkeyPTT = "F8"
+	if got := migrateSettings(current).HotkeyPTT; got != "F8" {
+		t.Fatalf("current PTT hotkey = %q, want F8", got)
+	}
+}
+
+// TestWindowOpacityMigration covers 292: opacity defaults to fully opaque, an
+// older file (which carries 0) gets that back, and a deliberate value survives.
+func TestWindowOpacityMigration(t *testing.T) {
+	if DefaultSettings().WindowOpacity != 100 {
+		t.Fatalf("default opacity = %d, want 100", DefaultSettings().WindowOpacity)
+	}
+	old := DefaultSettings()
+	old.SettingsVersion = 2
+	old.WindowOpacity = 0
+	if got := migrateSettings(old).WindowOpacity; got != 100 {
+		t.Errorf("pre-version file opacity = %d, want 100", got)
+	}
+	cur := DefaultSettings()
+	cur.WindowOpacity = 70
+	if got := migrateSettings(cur).WindowOpacity; got != 70 {
+		t.Errorf("migration overrode a deliberate opacity: %d", got)
+	}
+}
+
+// TestAutoAwayMessage covers 390: the away line has a non-zero default, an
+// older file gets it back, and the resolver clamps to the server's limit.
+func TestAutoAwayMessage(t *testing.T) {
+	if DefaultSettings().AutoAwayMessage != defaultAutoAwayMessage {
+		t.Fatalf("default away message = %q", DefaultSettings().AutoAwayMessage)
+	}
+
+	// A file written before the field existed must not publish a blank line.
+	old := DefaultSettings()
+	old.SettingsVersion = 1
+	old.AutoAwayMessage = ""
+	if got := migrateSettings(old).AutoAwayMessage; got != defaultAutoAwayMessage {
+		t.Errorf("migrated away message = %q, want %q", got, defaultAutoAwayMessage)
+	}
+	// A deliberate current-version value survives.
+	cur := DefaultSettings()
+	cur.AutoAwayMessage = "bin gleich zurück"
+	if got := migrateSettings(cur).AutoAwayMessage; got != "bin gleich zurück" {
+		t.Errorf("migration overrode a chosen message: %q", got)
+	}
+
+	a := &App{settings: DefaultSettings(), settingsPath: filepath.Join(t.TempDir(), "settings.json")}
+	a.settings.AutoAwayMessage = "  away from keyboard  "
+	if got := a.autoAwayMessage(); got != "away from keyboard" {
+		t.Errorf("away message = %q", got)
+	}
+	a.settings.AutoAwayMessage = ""
+	if got := a.autoAwayMessage(); got != defaultAutoAwayMessage {
+		t.Errorf("empty away message = %q, want the default", got)
+	}
+	a.settings.AutoAwayMessage = strings.Repeat("x", 400)
+	if got := len(a.autoAwayMessage()); got != 200 {
+		t.Errorf("away message length = %d, want the server limit of 200", got)
+	}
+}
+
+// TestIdentitySettingsRoundTrip covers 351/354: the active identity and the
+// key-protection mode persist, and an empty protection mode means "protect
+// when possible" so a file predating the option needs no migration.
+func TestIdentitySettingsRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	s := DefaultSettings()
+	if s.ActiveIdentity != "" || s.IdentityKeyProtection != "" {
+		t.Fatalf("identity defaults should be empty: %+v", s)
+	}
+	s.ActiveIdentity = "work-account"
+	s.IdentityKeyProtection = "off"
+	if err := saveSettingsAt(path, s); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	loaded := loadSettingsAt(path)
+	if loaded.ActiveIdentity != "work-account" || loaded.IdentityKeyProtection != "off" {
+		t.Fatalf("identity settings lost: %+v", loaded)
+	}
+
+	old := keyProtectionSetting
+	t.Cleanup(func() { keyProtectionSetting = old })
+	keyProtectionSetting = func() string { return "" }
+	if !keyProtectionWanted() {
+		t.Error("empty protection mode must mean auto, not off")
+	}
+	keyProtectionSetting = func() string { return "off" }
+	if keyProtectionWanted() {
+		t.Error("off must disable key protection")
+	}
+}
+
+// TestActiveIdentityIsGoOwned verifies a settings blob the frontend cached
+// before an identity switch cannot revert it (351).
+func TestActiveIdentityIsGoOwned(t *testing.T) {
+	a := &App{
+		settings:     DefaultSettings(),
+		hotkeys:      map[string]*hotkeyReg{},
+		settingsPath: filepath.Join(t.TempDir(), "settings.json"),
+	}
+	stale := a.GetSettings()
+	a.settings.ActiveIdentity = "work-account"
+	if err := a.SaveSettings(stale); err != "" {
+		t.Fatalf("save: %s", err)
+	}
+	if a.settings.ActiveIdentity != "work-account" {
+		t.Fatalf("stale frontend save reverted the active identity: %q", a.settings.ActiveIdentity)
+	}
+}
+
+// TestEventSoundsCoverMatrix pins the sound presets against the notification
+// matrix rows (385): a matrix event with no sound entry is how the two lists
+// drifted apart before.
+func TestEventSoundsCoverMatrix(t *testing.T) {
+	sounds := DefaultSettings().EventSounds
+	for _, event := range []string{
+		"mention", "keyword", "dm", "whisper", "poke", "join_leave",
+		"buddy_online", "kick", "announcement", "channel_watch",
+	} {
+		if !sounds[event] {
+			t.Errorf("notification matrix event %q has no default event sound", event)
+		}
 	}
 }

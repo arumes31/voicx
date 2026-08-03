@@ -38,6 +38,11 @@ func NewLinkRegistry() *LinkRegistry {
 
 // Create issues a link for an on-disk file and returns its token.
 func (r *LinkRegistry) Create(path, name string) (string, time.Time, error) {
+	// /dl/<token> holds no key, so a chat attachment would be served as raw
+	// ciphertext that looks like a corrupt download (91-135).
+	if isEncryptedAttachment(name) {
+		return "", time.Time{}, ErrEncryptedAttachment
+	}
 	if _, err := os.Stat(path); err != nil {
 		return "", time.Time{}, errors.New("file not found on disk")
 	}
