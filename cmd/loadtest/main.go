@@ -29,7 +29,7 @@ import (
 	"time"
 
 	"github.com/pion/rtp"
-	"github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v4"
 
 	"voicx/internal/config"
 	"voicx/internal/netproto"

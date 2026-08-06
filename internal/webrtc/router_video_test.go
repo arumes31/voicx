@@ -7,7 +7,7 @@ import (
 
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
-	"github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v4"
 )
 
 // fakeVideoTrack is a VideoTrackReader with a fixed RID/SSRC and a scripted

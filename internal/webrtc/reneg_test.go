@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/pion/rtp"
-	"github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v4"
 )
 
 // newClientPC builds a client-side peer connection with the same codec set as

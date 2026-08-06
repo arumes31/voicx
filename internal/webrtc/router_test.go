@@ -8,7 +8,8 @@ import (
 
 	"github.com/pion/interceptor"
 	"github.com/pion/rtp"
-	"github.com/pion/webrtc/v3"
+	"github.com/pion/sdp/v3"
+	"github.com/pion/webrtc/v4"
 )
 
 // --- fakes ------------------------------------------------------------------
@@ -368,6 +369,31 @@ func TestReadLoopTalkGateMuted(t *testing.T) {
 	}
 	if w.count() != 0 {
 		t.Fatalf("forwarded = %d, want 0 (muted)", w.count())
+	}
+}
+
+func TestAudioLevelExtIDFromExtensions(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		extensions []webrtc.RTPHeaderExtensionParameter
+		expected   uint8
+	}{
+		{name: "negotiated", extensions: []webrtc.RTPHeaderExtensionParameter{{URI: sdp.AudioLevelURI, ID: 14}}, expected: 14},
+		{name: "missing", extensions: []webrtc.RTPHeaderExtensionParameter{{URI: "urn:example", ID: 1}}},
+		{name: "zero is reserved", extensions: []webrtc.RTPHeaderExtensionParameter{{URI: sdp.AudioLevelURI, ID: 0}}},
+		{name: "negative", extensions: []webrtc.RTPHeaderExtensionParameter{{URI: sdp.AudioLevelURI, ID: -1}}},
+		{name: "above wire range", extensions: []webrtc.RTPHeaderExtensionParameter{{URI: sdp.AudioLevelURI, ID: 256}}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := audioLevelExtIDFromExtensions(test.extensions); got != test.expected {
+				t.Fatalf("audioLevelExtIDFromExtensions() = %d, want %d", got, test.expected)
+			}
+		})
 	}
 }
 
