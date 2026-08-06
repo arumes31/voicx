@@ -29,6 +29,14 @@ out/
 dist/
 bin/
 build/
+data/
+.cache/
+.lintcache*/
+graphify-out/
+client/frontend/node_modules/
+client/frontend/dist/
+client/frontend/test-results/
+client/frontend/playwright-report/
 *.exe
 *.test
 *.out
