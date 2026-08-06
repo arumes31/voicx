@@ -382,7 +382,9 @@ function injectFakeTree(n) {
     const ms = performance.now() - t0;
     const domRows = document.querySelectorAll("#channel-tree .channel, #channel-tree .client").length;
     const total = state.channels.length + state.clients.length;
-    console.log(`[virtualization] ${total} logical rows, ${domRows} DOM rows, rendered in ${ms.toFixed(1)}ms (windowed=${virtualizeEnabled()})`);
+    if (import.meta.env.DEV) {
+        console.log(`[virtualization] ${total} logical rows, ${domRows} DOM rows, rendered in ${ms.toFixed(1)}ms (windowed=${virtualizeEnabled()})`);
+    }
     return { ms, domRows, total, windowed: virtualizeEnabled() };
 }
 

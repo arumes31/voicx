@@ -1,6 +1,7 @@
 // settings-ui.js — TS3-style settings dialog with left icon nav.
 import { t } from "./i18n.js";
-import { SOUND_EVENTS } from "./sounds.js";
+import { calibrateMic, startLoopback } from "./audio.js";
+import { play, SOUND_EVENTS, testAll } from "./sounds.js";
 import { MATRIX_EVENTS, defaultMatrixRow } from "./notifications.js";
 
 const V = () => window.__voicx;
@@ -469,7 +470,6 @@ function pageCapture() {
             loopbackCtx = null;
         }
         if (v && testWrap._stream) {
-            const { startLoopback } = await import("./audio.js");
             loopbackCtx = await startLoopback(testWrap._stream);
         }
     });
@@ -536,7 +536,6 @@ function pageCapture() {
         calBtn.disabled = true;
         calOut.textContent = " recording ambient…";
         try {
-            const { calibrateMic } = await import("./audio.js");
             const r = await calibrateMic(s.capture_device_id || undefined, 5000);
             s.vad_threshold = r.suggested;
             calOut.textContent = ` noise floor ${(r.floor * 100).toFixed(1)}% → threshold set to ${r.suggested}`;
@@ -1086,7 +1085,6 @@ function pageNotifications() {
         prev.textContent = "▶";
         prev.title = "preview";
         prev.onclick = async () => {
-            const { play } = await import("./sounds.js");
             // force: a preview must be audible even with the master toggle off.
             if (spec.freq > 0) play("sine", spec.freq, (spec.duration_ms || 200) / 1000, 1, true);
         };
@@ -1149,7 +1147,6 @@ function pageNotifications() {
     const testBtn = document.createElement("button");
     testBtn.textContent = "Test all sounds";
     testBtn.onclick = async () => {
-        const { testAll } = await import("./sounds.js");
         testAll();
     };
     el.appendChild(row("Test", testBtn));

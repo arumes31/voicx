@@ -5,6 +5,7 @@
 // transfers window with a throughput sparkline (277/278). Folders are
 // virtual (derived from file rows — empty folders do not persist).
 import { humanBytes } from "./clientinfo.js";
+import { pickIcon } from "./image-tools.js";
 
 const V = () => window.__voicx;
 const App = () => window.go.main.App;
@@ -652,7 +653,6 @@ async function loadServerBanner() {
 // setServerBanner uploads a new banner (admin only). Reachable from the files
 // toolbar; the server refuses non-admins.
 async function setServerBanner() {
-    const { pickIcon } = await import("./image-tools.js");
     // Banners are wide, so allow more pixels than a 256px icon; the quality
     // loop still keeps it under the server's 256 KiB cap (274).
     const img = await pickIcon(1600, 0.85);
@@ -801,7 +801,6 @@ async function renderEmojiList(overlay) {
 async function addEmoji(overlay) {
     const name = prompt("Emoji name (a-z 0-9 _ -):");
     if (!name) return;
-    const { pickIcon } = await import("./image-tools.js");
     const img = await pickIcon(128, 0.9);
     if (!img) return;
     const err = await App().EmojiUpload(name, img.dataBase64);
