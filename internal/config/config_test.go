@@ -20,7 +20,7 @@ func TestLoadFromEnv(t *testing.T) {
 	t.Setenv("VOICX_QUERY_ADDR", ":44444")
 	t.Setenv("VOICX_QUERY_ALLOW_REMOTE", "true")
 	t.Setenv("VOICX_METRICS_ALLOW_REMOTE", "true")
-	t.Setenv("VOICX_DATABASE_URL", "postgres://user:pass@db:5432/x")
+	t.Setenv("VOICX_DATABASE_URL", "postgres://user:pass@db:5432/x?sslmode=require")
 	t.Setenv("VOICX_REDIS_ADDR", "redis:6379")
 	t.Setenv("VOICX_REDIS_PASSWORD", "secret")
 	t.Setenv("VOICX_MAX_CLIENTS", "512")
@@ -57,7 +57,7 @@ func TestLoadFromEnv(t *testing.T) {
 		{"QueryAddr", cfg.QueryAddr, ":44444"},
 		{"QueryAllowRemote", cfg.QueryAllowRemote, true},
 		{"MetricsAllowRemote", cfg.MetricsAllowRemote, true},
-		{"DatabaseURL", cfg.DatabaseURL, "postgres://user:pass@db:5432/x"},
+		{"DatabaseURL", cfg.DatabaseURL, "postgres://user:pass@db:5432/x?sslmode=require"},
 		{"RedisAddr", cfg.RedisAddr, "redis:6379"},
 		{"RedisPassword", cfg.RedisPassword, "secret"},
 		{"MaxClients", cfg.MaxClients, 512},
@@ -180,6 +180,7 @@ udp_addr: ":19987"
 max_clients: 256
 dev_mode: false
 log_level: "error"
+database_url: "postgres://app:secret@db:5432/voicx?sslmode=require"
 webrtc:
   enable_av1: true
   ice_servers:
@@ -350,6 +351,30 @@ func TestValidateRejectsUnsafeValues(t *testing.T) {
 			},
 			wantErr: "chat_allow_plaintext",
 		},
+		{
+			name: "production default database credentials",
+			mutate: func(c *Config) {
+				c.DevMode = false
+				c.DatabaseURL = "postgres://voicx:voicx@db:5432/voicx?sslmode=require"
+			},
+			wantErr: "default voicx:voicx credentials",
+		},
+		{
+			name: "production database TLS disabled",
+			mutate: func(c *Config) {
+				c.DevMode = false
+				c.DatabaseURL = "postgres://app:secret@db:5432/voicx?sslmode=disable"
+			},
+			wantErr: "database_url sslmode",
+		},
+		{
+			name: "production database TLS implicit",
+			mutate: func(c *Config) {
+				c.DevMode = false
+				c.DatabaseURL = "postgres://app:secret@db:5432/voicx"
+			},
+			wantErr: "database_url sslmode",
+		},
 		{name: "negative udp rate", mutate: func(c *Config) { c.UDPRateLimitPPS = -1 }, wantErr: "udp_rate_limit_pps"},
 	}
 
@@ -360,6 +385,20 @@ func TestValidateRejectsUnsafeValues(t *testing.T) {
 			err := cfg.Validate()
 			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
 				t.Fatalf("Validate() error = %v, want text %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateProductionDatabaseTLSModes(t *testing.T) {
+	base := loadDefaultConfig(t)
+	base.DevMode = false
+	for _, mode := range []string{"require", "verify-ca", "verify-full"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := cloneConfig(base)
+			cfg.DatabaseURL = "postgres://app:secret@db:5432/voicx?sslmode=" + mode
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate() error = %v", err)
 			}
 		})
 	}

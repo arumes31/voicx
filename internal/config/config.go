@@ -381,6 +381,10 @@ func (c *Config) Validate() error {
 
 	if err := validateDatabaseURL(c.DatabaseURL); err != nil {
 		errs = append(errs, err)
+	} else if !c.DevMode {
+		if err := validateProductionDatabaseURL(c.DatabaseURL); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	if c.RedisEnabled {
 		if err := validateAddress("redis_addr", c.RedisAddr); err != nil {
@@ -609,6 +613,30 @@ func validateDatabaseURL(raw string) error {
 		return errors.New("database_url must include a host")
 	}
 	return nil
+}
+
+func validateProductionDatabaseURL(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("database_url is invalid: %w", err)
+	}
+	if parsed.User != nil {
+		password, hasPassword := parsed.User.Password()
+		if hasPassword && strings.EqualFold(parsed.User.Username(), "voicx") && password == "voicx" {
+			return errors.New("database_url must not use the default voicx:voicx credentials when dev_mode=false")
+		}
+	}
+
+	sslMode := strings.ToLower(strings.TrimSpace(parsed.Query().Get("sslmode")))
+	switch sslMode {
+	case "require", "verify-ca", "verify-full":
+		return nil
+	default:
+		return fmt.Errorf(
+			"database_url sslmode %q must be require, verify-ca, or verify-full when dev_mode=false",
+			sslMode,
+		)
+	}
 }
 
 func validateICEURL(name, raw string, turnOnly bool) error {

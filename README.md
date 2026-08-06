@@ -125,10 +125,18 @@ flowchart TD
    cd voicx
    ```
 
-2. Launch the server stack with PostgreSQL and Redis:
+2. Create an explicit local-development environment, then launch PostgreSQL,
+   Redis, and the server:
    ```bash
+   cp .env.example .env
    docker compose up -d
    ```
+
+   The sample environment is for host-local development. Before exposing a
+   deployment, set `VOICX_DEV_MODE=false`, replace the sample PostgreSQL
+   credential, and set `VOICX_COMPOSE_DATABASE_URL` with `sslmode=require`,
+   `verify-ca`, or `verify-full`. Production startup rejects the sample
+   credential and plaintext database transport.
 
 3. View initial startup log (includes the generated **Admin Privilege Token**):
    ```bash

@@ -85,10 +85,12 @@ services:
     environment:
       # --- Logging ---
       VOICX_LOG_LEVEL: ${VOICX_LOG_LEVEL:-info}
-      VOICX_DEV_MODE: ${VOICX_DEV_MODE:-false}
+      # Required explicit choice: the sample .env selects local development.
+      # Production validation adds database credential and TLS requirements.
+      VOICX_DEV_MODE: ${VOICX_DEV_MODE:?set VOICX_DEV_MODE to true or false}
 
       # --- Database (points at the postgres service) ---
-      VOICX_DATABASE_URL: "postgres://${POSTGRES_USER:-voicx}:${POSTGRES_PASSWORD:-voicx}@postgres:5432/${POSTGRES_DB:-voicx}?sslmode=disable"
+      VOICX_DATABASE_URL: "${VOICX_COMPOSE_DATABASE_URL:-postgres://${POSTGRES_USER:-voicx}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-voicx}?sslmode=disable}"
       VOICX_PII_KEY_FILE: "/data/keys/pii.key"
 
       # --- Redis (points at the redis service) ---
@@ -141,7 +143,7 @@ services:
       - "5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-voicx}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-voicx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-voicx}
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -164,7 +166,7 @@ services:
     networks:
       - voicx-net
     environment:
-      DATABASE_URL: "postgres://${POSTGRES_USER:-voicx}:${POSTGRES_PASSWORD:-voicx}@postgres:5432/${POSTGRES_DB:-voicx}?sslmode=disable"
+      DATABASE_URL: "${VOICX_COMPOSE_DATABASE_URL:-postgres://${POSTGRES_USER:-voicx}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-voicx}?sslmode=disable}"
       POSTGRES_DB: ${POSTGRES_DB:-voicx}
       BACKUP_DIR: /backups/postgres
       BACKUP_RETENTION_DAYS: 7
