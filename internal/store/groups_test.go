@@ -20,10 +20,10 @@ func testDBStore(t *testing.T) *Store {
 		t.Skipf("no database available (%v); skipping DB-backed test", err)
 	}
 	if err := s.Migrate(); err != nil {
-		s.Close()
+		_ = s.Close()
 		t.Skipf("migrations failed (%v); skipping DB-backed test", err)
 	}
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
 

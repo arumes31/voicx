@@ -27,7 +27,7 @@ func TestAuthSetsBotFlag(t *testing.T) {
 	env := startTestEnv(t, &tp)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if !stateClientFor(t, env, "user-uid").IsBot {
 		t.Fatalf("account holding b_client_is_bot is not flagged in state")
@@ -42,13 +42,13 @@ func TestAuthLeavesNonBotsUnflagged(t *testing.T) {
 	defer env.stop()
 
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 	if stateClientFor(t, env, "user-uid").IsBot {
 		t.Errorf("plain user is flagged as a bot")
 	}
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	if stateClientFor(t, env, "admin-uid").IsBot {
 		t.Errorf("server admin is flagged as a bot")
 	}
@@ -61,7 +61,7 @@ func TestGuestAuthLeavesBotUnflagged(t *testing.T) {
 	env := startTestEnv(t, &tp)
 	defer env.stop()
 	conn, _ := dialGuest(t, env.addr, "g", "")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	for _, c := range env.state.ListClients() {
 		if c.IsBot {

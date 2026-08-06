@@ -101,7 +101,7 @@ func (s *Store) ChatHistory(ctx context.Context, channelID, beforeID int64, limi
 	if err != nil {
 		return nil, fmt.Errorf("querying chat history: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 
 	var out []ChatMessage
 	for rows.Next() {
@@ -220,7 +220,7 @@ func (s *Store) ChatPins(ctx context.Context, channelID int64) ([]PinnedMessage,
 	if err != nil {
 		return nil, fmt.Errorf("querying pins: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 
 	var out []PinnedMessage
 	for rows.Next() {
@@ -386,7 +386,7 @@ func queryReactions(ctx context.Context, qx reactionQuerier, messageID int64) (m
 	if err != nil {
 		return nil, fmt.Errorf("querying reactions: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	out := map[string]int{}
 	for rows.Next() {
 		var emoji string
@@ -421,7 +421,7 @@ func (s *Store) ReactionsFor(ctx context.Context, ids []int64) (map[int64]map[st
 	if err != nil {
 		return nil, fmt.Errorf("querying reactions page: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	for rows.Next() {
 		var id int64
 		var emoji string
@@ -519,7 +519,7 @@ func (s *Store) LegacyPlaintextPage(ctx context.Context, afterID int64, limit in
 	if err != nil {
 		return nil, fmt.Errorf("querying legacy chat rows: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []LegacyChatRow
 	for rows.Next() {
 		var r LegacyChatRow

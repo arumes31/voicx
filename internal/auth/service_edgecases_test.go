@@ -23,7 +23,7 @@ func TestGenerateChallengeHasProtocolLength(t *testing.T) {
 func TestIsUniqueViolation(t *testing.T) {
 	t.Parallel()
 
-	unique := &pq.Error{Code: pq.ErrorCode("23505")}
+	unique := &pq.Error{Code: "23505"}
 	tests := []struct {
 		name string
 		err  error
@@ -31,7 +31,7 @@ func TestIsUniqueViolation(t *testing.T) {
 	}{
 		{name: "nil", want: false},
 		{name: "unrelated", err: errors.New("database unavailable"), want: false},
-		{name: "different PostgreSQL code", err: &pq.Error{Code: pq.ErrorCode("23503")}, want: false},
+		{name: "different PostgreSQL code", err: &pq.Error{Code: "23503"}, want: false},
 		{name: "unique violation", err: unique, want: true},
 		{name: "wrapped unique violation", err: fmt.Errorf("insert failed: %w", unique), want: true},
 	}

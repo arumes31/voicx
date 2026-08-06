@@ -233,7 +233,7 @@ func (m *ChannelManager) LoadIntoState(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("querying channels: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	count := 0
 	for rows.Next() {
@@ -357,7 +357,7 @@ func (m *ChannelManager) SetChannelType(ctx context.Context, channelID int64, ne
 // database and the in-memory state. It returns ErrChannelNotFound for unknown
 // channels and validates the resulting values (bitrate must be non-negative,
 // max clients non-negative).
-func (m *ChannelManager) UpdateChannel(ctx context.Context, channelID int64, upd ChannelUpdate) error {
+func (m *ChannelManager) UpdateChannel(ctx context.Context, channelID int64, upd ChannelUpdate) (retErr error) {
 	if upd.OpusBitrate != nil && *upd.OpusBitrate < 0 {
 		return fmt.Errorf("%w: opus bitrate must be >= 0", ErrInvalidSpec)
 	}
@@ -429,7 +429,11 @@ func (m *ChannelManager) UpdateChannel(ctx context.Context, channelID int64, upd
 	if err != nil {
 		return fmt.Errorf("beginning channel update: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			retErr = errors.Join(retErr, fmt.Errorf("rolling back channel update: %w", err))
+		}
+	}()
 	// Validate and write under the same transaction. validateMoveTx locks the
 	// moved channel and each prospective ancestor before reading its parent, so
 	// a concurrent move cannot validate against a stale chain.

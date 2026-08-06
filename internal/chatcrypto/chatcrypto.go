@@ -65,9 +65,9 @@ func LoadKEKRing(path, envB64 string, allowCreate bool) (*KEKRing, error) {
 	case !errors.Is(err, fs.ErrNotExist):
 		return nil, fmt.Errorf("reading chat master key %s: %w", path, err)
 	case !allowCreate:
-		return nil, fmt.Errorf("chat master key missing: stored scope key generations cannot be unwrapped.\n"+
-			"restore %s (or set VOICX_CHAT_MASTER_KEY) — it is backed up WITH the database.\n"+
-			"to abandon all chat history instead, run with --reset-chat-keys.", path)
+		return nil, fmt.Errorf("chat master key missing: stored scope key generations cannot be unwrapped; "+
+			"restore %s (or set VOICX_CHAT_MASTER_KEY) — it is backed up with the database; "+
+			"to abandon all chat history instead, run with --reset-chat-keys", path)
 	}
 	return createRing(path)
 }

@@ -68,10 +68,18 @@ func hasFlag(name string) bool {
 	return false
 }
 
+// syncLogger flushes buffered log entries. Zap commonly gets EINVAL when
+// syncing a console stream, which is not a durability failure.
+func syncLogger(logger *zap.Logger) {
+	if err := logger.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) {
+		fmt.Fprintf(os.Stderr, "voicx: syncing logger: %v\n", err)
+	}
+}
+
 // rewrapChatKeys re-wraps every stored scope key generation under the newest
 // KEK. It is the ONLY thing that ever rewrites wrapped_key: the scope keys
 // themselves are unchanged, so every stored message still opens (91).
-func rewrapChatKeys() error {
+func rewrapChatKeys() (retErr error) {
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
@@ -80,14 +88,18 @@ func rewrapChatKeys() error {
 	if err != nil {
 		return fmt.Errorf("initializing logger: %w", err)
 	}
-	defer logger.Sync()
+	defer syncLogger(logger)
 
 	dbStore, err := store.New(cfg.DatabaseURL, logger,
 		cfg.DBMaxOpenConns, cfg.DBMaxIdleConns, cfg.DBConnMaxLifetime)
 	if err != nil {
 		return fmt.Errorf("opening store: %w", err)
 	}
-	defer dbStore.Close()
+	defer func() {
+		if err := dbStore.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("closing store: %w", err))
+		}
+	}()
 
 	ring, err := chatcrypto.LoadKEKRing(cfg.ChatMasterKeyFile, os.Getenv("VOICX_CHAT_MASTER_KEY"), false)
 	if err != nil {
@@ -95,44 +107,50 @@ func rewrapChatKeys() error {
 	}
 	newest := ring.NewestID()
 
-	ctx := context.Background()
-	rows, err := dbStore.DB().QueryContext(ctx,
-		`SELECT scope_id, key_id, wrapped_key, kek_id FROM chat_scope_keys WHERE kek_id <> $1`, int32(newest))
-	if err != nil {
-		return fmt.Errorf("listing scope keys: %w", err)
-	}
 	type pending struct {
 		scope int64
 		keyID int64
 		key   [32]byte
 	}
-	var todo []pending
-	for rows.Next() {
-		var (
-			p       pending
-			wrapped []byte
-			kekID   int64
-		)
-		if err := rows.Scan(&p.scope, &p.keyID, &wrapped, &kekID); err != nil {
-			rows.Close()
-			return fmt.Errorf("scanning scope key: %w", err)
-		}
-		storedKEKID, err := safecast.Int64ToUint16(kekID)
+	ctx := context.Background()
+	todo, err := func() (out []pending, retErr error) {
+		rows, err := dbStore.DB().QueryContext(ctx,
+			`SELECT scope_id, key_id, wrapped_key, kek_id FROM chat_scope_keys WHERE kek_id <> $1`, int32(newest))
 		if err != nil {
-			rows.Close()
-			return fmt.Errorf("scope %d generation %d has invalid kek id %d: %w", p.scope, p.keyID, kekID, err)
+			return nil, fmt.Errorf("listing scope keys: %w", err)
 		}
-		key, err := ring.Unwrap(storedKEKID, wrapped)
-		if err != nil {
-			rows.Close()
-			return fmt.Errorf("unwrapping scope %d generation %d: %w", p.scope, p.keyID, err)
+		defer func() {
+			if err := rows.Close(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("closing scope key rows: %w", err))
+			}
+		}()
+		for rows.Next() {
+			var (
+				p       pending
+				wrapped []byte
+				kekID   int64
+			)
+			if err := rows.Scan(&p.scope, &p.keyID, &wrapped, &kekID); err != nil {
+				return nil, fmt.Errorf("scanning scope key: %w", err)
+			}
+			storedKEKID, err := safecast.Int64ToUint16(kekID)
+			if err != nil {
+				return nil, fmt.Errorf("scope %d generation %d has invalid kek id %d: %w", p.scope, p.keyID, kekID, err)
+			}
+			key, err := ring.Unwrap(storedKEKID, wrapped)
+			if err != nil {
+				return nil, fmt.Errorf("unwrapping scope %d generation %d: %w", p.scope, p.keyID, err)
+			}
+			p.key = key
+			out = append(out, p)
 		}
-		p.key = key
-		todo = append(todo, p)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("listing scope keys: %w", err)
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("listing scope keys: %w", err)
+		}
+		return out, nil
+	}()
+	if err != nil {
+		return err
 	}
 
 	for _, p := range todo {
@@ -195,7 +213,7 @@ func resetChatKeys(ctx context.Context, dbStore *store.Store, logger *zap.Logger
 	return nil
 }
 
-func run() error {
+func run() (retErr error) {
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
@@ -205,7 +223,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("initializing logger: %w", err)
 	}
-	defer logger.Sync()
+	defer func() { syncLogger(logger) }()
 
 	// (223) tee log lines into the in-memory ring buffer for `logview`.
 	logger = logger.WithOptions(logging.Tee())
@@ -233,7 +251,11 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("opening store: %w", err)
 	}
-	defer dbStore.Close()
+	defer func() {
+		if err := dbStore.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("closing store: %w", err))
+		}
+	}()
 
 	if err := dbStore.Migrate(); err != nil {
 		return fmt.Errorf("running migrations: %w", err)
@@ -474,7 +496,11 @@ func run() error {
 			_ = rdb.Close()
 		} else {
 			logger.Info("redis connected", zap.String("addr", cfg.RedactedRedisAddr()))
-			defer rdb.Close()
+			defer func() {
+				if err := rdb.Close(); err != nil {
+					logger.Warn("redis close error", zap.Error(err))
+				}
+			}()
 		}
 	} else {
 		logger.Info("redis disabled")

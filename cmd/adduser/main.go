@@ -69,7 +69,11 @@ func run(nickname, password string, admin bool, dsn string) error {
 	if err != nil {
 		return fmt.Errorf("opening store: %w", err)
 	}
-	defer dbStore.Close()
+	defer func() {
+		if err := dbStore.Close(); err != nil {
+			logger.Warn("closing store failed", zap.Error(err))
+		}
+	}()
 
 	if err := dbStore.Migrate(); err != nil {
 		return fmt.Errorf("running migrations: %w", err)

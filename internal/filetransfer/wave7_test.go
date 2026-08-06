@@ -24,7 +24,7 @@ func uploadOne(t *testing.T, addr string, s *Server, folder, name string, conten
 		t.Fatalf("InitUpload %s/%s: %v", folder, name, err)
 	}
 	conn := dialTransfer(t, addr, id, token)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if err := netproto.WriteFrame(conn, &netproto.Frame{Type: frameChunk, Payload: content}); err != nil {
 		t.Fatalf("write chunk: %v", err)
 	}

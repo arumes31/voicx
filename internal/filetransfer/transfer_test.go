@@ -107,7 +107,7 @@ func TestUploadRoundTrip(t *testing.T) {
 	}
 
 	conn := dialTransfer(t, addr, id, token)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Two chunks, then the digest.
 	for _, chunk := range [][]byte{content[:6], content[6:]} {
@@ -153,7 +153,7 @@ func TestUploadSizeMismatch(t *testing.T) {
 	}
 
 	conn := dialTransfer(t, addr, id, token)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if err := netproto.WriteFrame(conn, &netproto.Frame{Type: frameChunk, Payload: []byte("hello")}); err != nil {
 		t.Fatalf("write chunk: %v", err)
@@ -183,7 +183,7 @@ func TestUploadChecksumMismatch(t *testing.T) {
 	}
 
 	conn := dialTransfer(t, addr, id, token)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if err := netproto.WriteFrame(conn, &netproto.Frame{Type: frameChunk, Payload: content}); err != nil {
 		t.Fatalf("write chunk: %v", err)
 	}
@@ -224,7 +224,7 @@ func TestDownloadRoundTrip(t *testing.T) {
 	}
 
 	conn := dialTransfer(t, addr, id, token)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	var got []byte
@@ -291,7 +291,7 @@ func TestDownloadResume(t *testing.T) {
 		if err != nil {
 			t.Fatalf("dial: %v", err)
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		if err := writeJSON(conn, frameInit, initMsg{Token: token, TransferID: id, Offset: off}); err != nil {
 			t.Fatalf("write init: %v", err)
 		}
@@ -360,7 +360,7 @@ func TestInvalidInitFrame(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if err := netproto.WriteFrame(conn, &netproto.Frame{Type: frameChunk, Payload: []byte("x")}); err != nil {
 		t.Fatalf("write: %v", err)
@@ -377,7 +377,7 @@ func TestInvalidToken(t *testing.T) {
 	addr, _ := startServer(t, fs)
 
 	conn := dialTransfer(t, addr, "no-such-id", "no-such-token")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	st := readStatus(t, conn)
 	if st.OK {
 		t.Fatal("invalid token accepted")

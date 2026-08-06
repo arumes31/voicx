@@ -164,7 +164,7 @@ func TestServerPassword(t *testing.T) {
 
 	// Missing server password: rejected.
 	conn := dialRetry(t, env.addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: "user-uid", Password: "pw"})
 	f := readOfType(t, conn, netproto.MsgAuthResponse)
 	var resp netproto.AuthResponse
@@ -205,7 +205,7 @@ func TestAvatarSetGet(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Wrong type rejected.
 	send(t, conn, netproto.MsgAvatarSet, netproto.AvatarSet{DataBase64: b64([]byte("not an image"))})
@@ -243,7 +243,7 @@ func TestAvatarOversize(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	big := make([]byte, maxImageBytes+1)
 	copy(big, tinyPNG)
@@ -265,9 +265,9 @@ func TestAvatarChangedEvent(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, userID := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	send(t, userConn, netproto.MsgAvatarSet, netproto.AvatarSet{DataBase64: b64(tinyPNG)})
 	data := readEventOfType(t, adminConn, eventAvatarChanged)
@@ -285,7 +285,7 @@ func TestAvatarSetRequiresPermission(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgAvatarSet, netproto.AvatarSet{DataBase64: b64(tinyPNG)})
 	f := readOfType(t, conn, netproto.MsgError)
@@ -306,9 +306,9 @@ func TestChannelIconSet(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Lobby", Type: 2})
 	readOfType(t, adminConn, netproto.MsgChannelList)
@@ -343,7 +343,7 @@ func TestTokenUse(t *testing.T) {
 	env.tokens.grants = map[string]int64{"tok-abc": 5}
 
 	conn, userID := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgTokenUse, netproto.TokenUse{Token: "tok-abc"})
 	data := readEventOfType(t, conn, eventTokenUsed)
@@ -372,7 +372,7 @@ func TestTokenUseUnknown(t *testing.T) {
 	env.tokens.exhausted = map[string]bool{"tok-old": true}
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgTokenUse, netproto.TokenUse{Token: "nope"})
 	f := readOfType(t, conn, netproto.MsgError)
@@ -402,7 +402,7 @@ func TestComplaint(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	for i := 0; i < store.MaxOpenComplaints; i++ {
 		send(t, conn, netproto.MsgComplaint, netproto.Complaint{TargetUniqueID: "admin-uid", Reason: "spam"})
@@ -428,7 +428,7 @@ func TestComplaintUnknownTarget(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgComplaint, netproto.Complaint{TargetUniqueID: "ghost", Reason: "x"})
 	f := readOfType(t, conn, netproto.MsgError)
@@ -449,9 +449,9 @@ func TestScreenShare(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, userID := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Lobby", Type: 2})
 	readOfType(t, adminConn, netproto.MsgChannelList)
@@ -488,7 +488,7 @@ func TestScreenShareDenied(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgScreenShare, netproto.ScreenShare{Active: true})
 	f := readOfType(t, conn, netproto.MsgError)
@@ -513,7 +513,7 @@ func TestPermissionsQuery(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgPermissionsQuery, netproto.PermissionsQuery{})
 	f := readOfType(t, conn, netproto.MsgPermissionsResponse)
@@ -542,7 +542,7 @@ func TestPermissionsQueryEmpty(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgPermissionsQuery, netproto.PermissionsQuery{})
 	f := readOfType(t, conn, netproto.MsgPermissionsResponse)
@@ -585,7 +585,7 @@ func TestAnonymousAuthHappy(t *testing.T) {
 	defer env.stop()
 
 	conn, resp := dialGuest(t, env.addr, "guesty", "")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if !resp.OK {
 		t.Fatalf("guest auth failed: %s", resp.Reason)
@@ -612,9 +612,9 @@ func TestAnonymousNicknameDedup(t *testing.T) {
 	defer env.stop()
 
 	conn1, resp1 := dialGuest(t, env.addr, "guesty", "")
-	defer conn1.Close()
+	defer func() { _ = conn1.Close() }()
 	conn2, resp2 := dialGuest(t, env.addr, "guesty", "")
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 
 	if resp1.Nickname != "guesty" {
 		t.Fatalf("first nickname = %q, want guesty", resp1.Nickname)
@@ -637,7 +637,7 @@ func TestAnonymousServerPassword(t *testing.T) {
 
 	// Without server password: rejected.
 	conn := dialRetry(t, env.addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Anonymous: true, Nickname: "g"})
 	f := readOfType(t, conn, netproto.MsgAuthResponse)
 	var resp netproto.AuthResponse
@@ -666,7 +666,7 @@ func TestAnonymousBannedIP(t *testing.T) {
 	env.auth.bans["127.0.0.1"] = &auth.Ban{ID: 9, Type: 0, Value: "127.0.0.1"}
 
 	conn := dialRetry(t, env.addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Anonymous: true, Nickname: "g"})
 	f := readOfType(t, conn, netproto.MsgAuthResponse)
 	var resp netproto.AuthResponse
@@ -685,7 +685,7 @@ func TestAnonymousCreateDenied(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialGuest(t, env.addr, "guesty", "")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "nope", Type: 0})
 	f := readOfType(t, conn, netproto.MsgError)
@@ -715,7 +715,7 @@ func TestGuestWithIdentity(t *testing.T) {
 	}
 
 	conn := dialRetry(t, env.addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{
 		Username:  uid,
 		Anonymous: true,
@@ -763,7 +763,7 @@ func TestNicknamePasswordLogin(t *testing.T) {
 	env.auth.nicknames["user"] = env.auth.users["user-uid"]
 
 	conn := dialRetry(t, env.addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{
 		Username:  "user", // nickname, not the unique ID
 		Password:  "pw",
@@ -800,7 +800,7 @@ func TestNicknameLoginWrongPassword(t *testing.T) {
 	env.auth.nicknames["user"] = env.auth.users["user-uid"]
 
 	conn := dialRetry(t, env.addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: "user", Password: "wrong"})
 	f := readOfType(t, conn, netproto.MsgAuthResponse)
 	var resp netproto.AuthResponse
@@ -832,7 +832,7 @@ func TestChallengeAuthWithBoundKey(t *testing.T) {
 	}
 
 	conn := dialRetry(t, env.addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: uid, Nickname: "user", Anonymous: true})
 	f := readOfType(t, conn, netproto.MsgAuthChallenge)
 	var ch netproto.AuthChallenge
@@ -879,7 +879,7 @@ func TestClientInfoSelf(t *testing.T) {
 	defer env.stop()
 
 	conn, clientID := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	resp := queryClientInfo(t, conn, clientID)
 	if resp.ClientID != clientID || resp.UniqueID != "user-uid" || resp.Nickname != "user" {
@@ -907,9 +907,9 @@ func TestClientInfoOtherGuestDenied(t *testing.T) {
 	defer env.stop()
 
 	bobConn, bobID := dialAuthed(t, env.addr, "user-uid")
-	defer bobConn.Close()
+	defer func() { _ = bobConn.Close() }()
 	guestConn, _ := dialGuest(t, env.addr, "snoopy", "")
-	defer guestConn.Close()
+	defer func() { _ = guestConn.Close() }()
 
 	resp := queryClientInfo(t, guestConn, bobID)
 	if resp.ClientID != bobID {
@@ -928,9 +928,9 @@ func TestClientInfoOtherGranted(t *testing.T) {
 	defer env.stop()
 
 	bobConn, bobID := dialAuthed(t, env.addr, "user-uid")
-	defer bobConn.Close()
+	defer func() { _ = bobConn.Close() }()
 	aliceConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer aliceConn.Close()
+	defer func() { _ = aliceConn.Close() }()
 
 	resp := queryClientInfo(t, aliceConn, bobID)
 	if resp.IP == "" || resp.Port == 0 {
@@ -945,9 +945,9 @@ func TestClientInfoAdminBypass(t *testing.T) {
 	defer env.stop()
 
 	userConn, userID := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 
 	resp := queryClientInfo(t, adminConn, userID)
 	if resp.IP == "" || resp.Port == 0 {
@@ -961,7 +961,7 @@ func TestClientInfoUnknown(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgClientInfoQuery, netproto.ClientInfoQuery{ClientID: "c-nope"})
 	f := readOfType(t, conn, netproto.MsgError)
@@ -981,7 +981,7 @@ func TestClientInfoActivityTracking(t *testing.T) {
 	defer env.stop()
 
 	conn, clientID := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	before := queryClientInfo(t, conn, clientID)
 	// Send a chat message to bump activity.
@@ -1017,11 +1017,11 @@ func TestComplaintList(t *testing.T) {
 	defer env.stop()
 
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 	send(t, userConn, netproto.MsgComplaint, netproto.Complaint{TargetUniqueID: "admin-uid", Reason: "spam"})
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	send(t, adminConn, netproto.MsgComplaintList, netproto.ComplaintList{})
 
 	f := readOfType(t, adminConn, netproto.MsgComplaints)
@@ -1051,11 +1051,11 @@ func TestComplaintClear(t *testing.T) {
 	defer env.stop()
 
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 	send(t, userConn, netproto.MsgComplaint, netproto.Complaint{TargetUniqueID: "admin-uid", Reason: "spam"})
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	send(t, adminConn, netproto.MsgComplaint, netproto.Complaint{TargetUniqueID: "user-uid", Reason: "flood"})
 
 	// Targeted clear: only the complaint from user-uid against admin-uid goes.
@@ -1105,7 +1105,7 @@ func TestComplaintReviewDenied(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgComplaintList, netproto.ComplaintList{})
 	if e := readError(t, conn); e.Code != errCodePermissionDenied {
@@ -1125,7 +1125,7 @@ func TestComplaintReviewBanPermission(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	send(t, conn, netproto.MsgComplaintList, netproto.ComplaintList{})
 
 	f := readOfType(t, conn, netproto.MsgComplaints)
@@ -1153,7 +1153,7 @@ func TestTokenManagement(t *testing.T) {
 	}
 
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgTokenList, netproto.TokenList{})
 	f := readOfType(t, conn, netproto.MsgTokens)
@@ -1222,7 +1222,7 @@ func TestTokenManagementDenied(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	for _, tc := range []struct {
 		name string
@@ -1253,7 +1253,7 @@ func TestTokenAddGranted(t *testing.T) {
 	}
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgTokenAdd, netproto.TokenAdd{GroupID: gid})
 	f := readOfType(t, conn, netproto.MsgTokens)
@@ -1286,7 +1286,7 @@ func TestTokenUseGuestPromotes(t *testing.T) {
 	env.tokens.grants = map[string]int64{"tok-abc": 5}
 
 	conn := dialRetry(t, env.addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Anonymous: true, Nickname: "guest"})
 	f := readOfType(t, conn, netproto.MsgAuthResponse)
 	var ar netproto.AuthResponse

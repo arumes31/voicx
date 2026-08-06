@@ -316,7 +316,7 @@ func e2eOpenDM(blobB64 string, senderPub, recipientPriv [32]byte) (string, error
 func main() {
 	var o options
 	flag.StringVar(&o.addr, "addr", "127.0.0.1"+config.DefaultTCPAddr, "control channel address")
-	flag.StringVar(&o.queryAddr, "query-addr", "127.0.0.1"+config.DefaultQueryAddr, "ServerQuery address")
+	flag.StringVar(&o.queryAddr, "query-addr", config.DefaultQueryAddr, "ServerQuery address")
 	flag.StringVar(&o.healthURL, "health-url", "http://127.0.0.1"+config.DefaultHealthAddr, "health endpoint base URL")
 	flag.StringVar(&o.udpAddr, "udp-addr", "127.0.0.1"+config.DefaultUDPAddr, "UDP media address")
 	flag.StringVar(&o.fileAddr, "file-addr", "127.0.0.1"+config.DefaultFileAddr, "file-transfer address (fallback; the port from the init response wins)")
@@ -443,7 +443,7 @@ func httpGet(url string) (int, string, error) {
 	if err != nil {
 		return 0, "", err
 	}
-	defer resp.Body.Close()
+	defer closeE2EResource(resp.Body)
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	return resp.StatusCode, string(body), err
 }
@@ -497,7 +497,7 @@ func checkUDP(c *checkCtx) error {
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer closeE2EResource(conn)
 
 	if _, err := conn.Write([]byte{netproto.UDPMsgPing}); err != nil {
 		return err
@@ -574,9 +574,27 @@ func writeMsg(conn net.Conn, mt netproto.MessageType, msg any) error {
 	return netproto.WriteFrame(conn, f)
 }
 
+func reportE2ECleanupError(action string, err error) {
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "e2e: cleanup %s: %v\n", action, err)
+	}
+}
+
+func closeE2EResource(closer io.Closer) {
+	reportE2ECleanupError("close failed", closer.Close())
+}
+
+func clearE2EReadDeadline(conn net.Conn) {
+	reportE2ECleanupError("clear read deadline failed", conn.SetReadDeadline(time.Time{}))
+}
+
+func writeE2ECleanupMsg(conn net.Conn, mt netproto.MessageType, msg any) {
+	reportE2ECleanupError("restore message failed", writeMsg(conn, mt, msg))
+}
+
 func readOfType(conn net.Conn, mt netproto.MessageType, timeout time.Duration) (*netproto.Frame, error) {
 	_ = conn.SetReadDeadline(time.Now().Add(timeout))
-	defer conn.SetReadDeadline(time.Time{})
+	defer clearE2EReadDeadline(conn)
 	for {
 		f, err := netproto.ReadFrame(conn)
 		if err != nil {
@@ -655,7 +673,7 @@ func checkAuth(c *checkCtx) error {
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer closeE2EResource(conn)
 	if err := writeMsg(conn, netproto.MsgAuthenticate, netproto.Authenticate{
 		Username: c.opts.aliceUID, Password: "definitely-wrong", ServerPassword: c.opts.serverPass,
 	}); err != nil {
@@ -687,7 +705,7 @@ func checkAuthNickname(c *checkCtx) error {
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer closeE2EResource(conn)
 	if err := writeMsg(conn, netproto.MsgAuthenticate, netproto.Authenticate{
 		Username:       nick,
 		Password:       c.opts.alicePass,
@@ -751,7 +769,7 @@ type lineReader struct {
 
 func (l *lineReader) readLine(timeout time.Duration) (string, error) {
 	_ = l.conn.SetReadDeadline(time.Now().Add(timeout))
-	defer l.conn.SetReadDeadline(time.Time{})
+	defer clearE2EReadDeadline(l.conn)
 	one := make([]byte, 1)
 	for {
 		n, err := l.conn.Read(one)
@@ -811,12 +829,18 @@ func (q *querySession) cmd(command string) ([]string, error) {
 	}
 }
 
+func runE2EQueryCleanup(q *querySession, action, command string) {
+	if _, err := q.cmd(command); err != nil {
+		reportE2ECleanupError(action, err)
+	}
+}
+
 func checkCreateViaQuery(c *checkCtx) error {
 	q, err := dialQuery(c.opts.queryAddr, c.opts.adminUID, c.opts.adminPass)
 	if err != nil {
 		return err
 	}
-	defer q.conn.Close()
+	defer closeE2EResource(q.conn)
 
 	lines, err := q.cmd(`channelcreate channel_name=e2e\schannel channel_flag_permanent=1`)
 	if err != nil {
@@ -892,24 +916,6 @@ func waitForMove(conn net.Conn, clientID string) error {
 // ---------------------------------------------------------------------------
 // Chat
 // ---------------------------------------------------------------------------
-
-func readChat(conn net.Conn, wantText string) error {
-	deadline := time.Now().Add(readTimeout)
-	for time.Now().Before(deadline) {
-		env, err := readEvent(conn, "chat", time.Until(deadline))
-		if err != nil {
-			return err
-		}
-		var chat netproto.ChatBroadcast
-		if err := json.Unmarshal(env.Data, &chat); err != nil {
-			return err
-		}
-		if chat.Text == wantText {
-			return nil
-		}
-	}
-	return fmt.Errorf("chat %q not received", wantText)
-}
 
 func checkChatChannel(c *checkCtx) error {
 	text := "channel-" + randHex(4)
@@ -1184,7 +1190,7 @@ func checkChatSlowMode(c *checkCtx) error {
 	if err != nil {
 		return err
 	}
-	defer q.conn.Close()
+	defer closeE2EResource(q.conn)
 
 	setSlow := func(seconds int) error {
 		if _, err := q.cmd(fmt.Sprintf("channeledit cid=%d slow_mode_seconds=%d", c.channelID, seconds)); err != nil {
@@ -1340,7 +1346,7 @@ func writeFTJSON(conn net.Conn, frameType uint16, v any) error {
 
 func readStatusFrame(conn net.Conn) (bool, string, error) {
 	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
-	defer conn.SetReadDeadline(time.Time{})
+	defer clearE2EReadDeadline(conn)
 	f, err := netproto.ReadFrame(conn)
 	if err != nil {
 		return false, "", err
@@ -1389,7 +1395,7 @@ func uploadFile(addr string, init netproto.FileTransferInitResponse, payload []b
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer closeE2EResource(conn)
 
 	if err := writeFTJSON(conn, ftInit, map[string]string{
 		"token": init.Token, "transfer_id": init.TransferID,
@@ -1424,7 +1430,7 @@ func downloadFile(addr string, init netproto.FileTransferInitResponse) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
+	defer closeE2EResource(conn)
 
 	if err := writeFTJSON(conn, ftInit, map[string]string{
 		"token": init.Token, "transfer_id": init.TransferID,
@@ -1433,7 +1439,7 @@ func downloadFile(addr string, init netproto.FileTransferInitResponse) ([]byte, 
 	}
 
 	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
-	defer conn.SetReadDeadline(time.Time{})
+	defer clearE2EReadDeadline(conn)
 	var got []byte
 	for {
 		f, err := netproto.ReadFrame(conn)
@@ -1476,7 +1482,7 @@ func checkQuery(c *checkCtx) error {
 	if err != nil {
 		return err
 	}
-	defer q.conn.Close()
+	defer closeE2EResource(q.conn)
 
 	lines, err := q.cmd("clientlist")
 	if err != nil {
@@ -1629,7 +1635,7 @@ func checkAnonymousServerPassword(c *checkCtx) error {
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer closeE2EResource(conn)
 	if err := writeMsg(conn, netproto.MsgAuthenticate, netproto.Authenticate{
 		Anonymous: true, Nickname: "e2e-guest-nopass",
 	}); err != nil {
@@ -1709,7 +1715,7 @@ func checkGroupManagement(c *checkCtx) error {
 	if err != nil {
 		return fmt.Errorf("admin: %w", err)
 	}
-	defer admin.conn.Close()
+	defer closeE2EResource(admin.conn)
 
 	// Default groups (143/144): Guest and Member are seeded at startup;
 	// alice auto-joined Member on her first login.
@@ -1725,7 +1731,7 @@ func checkGroupManagement(c *checkCtx) error {
 		return errors.New("default Member group missing")
 	}
 	if member.MemberCount < 1 {
-		return fmt.Errorf("Member group has %d members, want >= 1 (alice auto-join)", member.MemberCount)
+		return fmt.Errorf("member group has %d members, want >= 1 (alice auto-join)", member.MemberCount)
 	}
 
 	// Create a group (the response is the refreshed list).
@@ -1794,7 +1800,7 @@ func checkGuestDefaultGroup(c *checkCtx) error {
 	if err != nil {
 		return fmt.Errorf("admin: %w", err)
 	}
-	defer admin.conn.Close()
+	defer closeE2EResource(admin.conn)
 
 	list, err := groupList(admin.conn, "server")
 	if err != nil {
@@ -1811,7 +1817,7 @@ func checkGuestDefaultGroup(c *checkCtx) error {
 	}); err != nil {
 		return err
 	}
-	defer writeMsg(admin.conn, netproto.MsgPermUnset, netproto.PermUnset{
+	defer writeE2ECleanupMsg(admin.conn, netproto.MsgPermUnset, netproto.PermUnset{
 		Tier: "server_group", GroupID: guest.ID, Key: "i_client_talk_power",
 	})
 
@@ -1819,7 +1825,7 @@ func checkGuestDefaultGroup(c *checkCtx) error {
 	if err != nil {
 		return err
 	}
-	defer g.conn.Close()
+	defer closeE2EResource(g.conn)
 
 	// The PermSet travels on the admin connection and is processed
 	// asynchronously to the guest connection: poll the guest's resolved
@@ -1856,7 +1862,7 @@ func checkPermSetTrace(c *checkCtx) error {
 	if err != nil {
 		return fmt.Errorf("admin: %w", err)
 	}
-	defer admin.conn.Close()
+	defer closeE2EResource(admin.conn)
 
 	trace := func() (*netproto.PermTraceResponse, error) {
 		if err := writeMsg(admin.conn, netproto.MsgPermTrace, netproto.PermTrace{
@@ -1880,7 +1886,7 @@ func checkPermSetTrace(c *checkCtx) error {
 	}); err != nil {
 		return err
 	}
-	defer writeMsg(admin.conn, netproto.MsgPermUnset, netproto.PermUnset{
+	defer writeE2ECleanupMsg(admin.conn, netproto.MsgPermUnset, netproto.PermUnset{
 		Tier: "client", UniqueID: c.opts.aliceUID, Key: "i_client_talk_power",
 	})
 
@@ -1915,7 +1921,7 @@ func checkQueryWave10a(c *checkCtx) error {
 	if err != nil {
 		return err
 	}
-	defer q.conn.Close()
+	defer closeE2EResource(q.conn)
 
 	// Read the current server name for later restore.
 	lines, err := q.cmd("serverinfo")
@@ -1941,7 +1947,7 @@ func checkQueryWave10a(c *checkCtx) error {
 		return fmt.Errorf("serverinfo after edit = %v", lines)
 	}
 	if origName != "" {
-		defer q.cmd(`serveredit virtualserver_name=` + origName)
+		defer runE2EQueryCleanup(q, "restore server name failed", `serveredit virtualserver_name=`+origName)
 	}
 
 	// (221) server group cycle.
@@ -1958,15 +1964,23 @@ func checkQueryWave10a(c *checkCtx) error {
 		return fmt.Errorf("servergroupclientlist = %v, %v", lines, err)
 	}
 	defer func() {
-		q.cmd("servergroupdelclient sgid=" + sgid + " cldbid=" + c.opts.aliceUID)
-		q.cmd("servergroupdel sgid=" + sgid + " force=1")
+		runE2EQueryCleanup(
+			q,
+			"remove server group member failed",
+			"servergroupdelclient sgid="+sgid+" cldbid="+c.opts.aliceUID,
+		)
+		runE2EQueryCleanup(q, "delete server group failed", "servergroupdel sgid="+sgid+" force=1")
 	}()
 
 	// (220) channel-tier permission, then (219) permoverview shows it.
 	if _, err := q.cmd("channeladdperm cid=1 permid=i_client_needed_talk_power permvalue=77"); err != nil {
 		return fmt.Errorf("channeladdperm: %w", err)
 	}
-	defer q.cmd("channeldelperm cid=1 permid=i_client_needed_talk_power")
+	defer runE2EQueryCleanup(
+		q,
+		"remove channel permission failed",
+		"channeldelperm cid=1 permid=i_client_needed_talk_power",
+	)
 	lines, err = q.cmd("permoverview unique_id=" + c.opts.aliceUID + " cid=1")
 	if err != nil {
 		return fmt.Errorf("permoverview: %w", err)
@@ -1985,7 +1999,11 @@ func checkQueryWave10a(c *checkCtx) error {
 	if _, err := q.cmd("customset cldbid=" + c.opts.aliceUID + " ident=role value=tester"); err != nil {
 		return fmt.Errorf("customset: %w", err)
 	}
-	defer q.cmd("customdel cldbid=" + c.opts.aliceUID + " ident=role")
+	defer runE2EQueryCleanup(
+		q,
+		"delete custom property failed",
+		"customdel cldbid="+c.opts.aliceUID+" ident=role",
+	)
 	lines, err = q.cmd("custominfo cldbid=" + c.opts.aliceUID)
 	if err != nil || len(lines) == 0 || !strings.Contains(lines[0], "ident=role") {
 		return fmt.Errorf("custominfo = %v, %v", lines, err)
@@ -2211,7 +2229,7 @@ func awaitReadyz(baseURL string, want func(int) bool, within time.Duration) (int
 // server keepalives while it waits.
 func readAnyOf(conn net.Conn, timeout time.Duration, want ...netproto.MessageType) (*netproto.Frame, error) {
 	_ = conn.SetReadDeadline(time.Now().Add(timeout))
-	defer conn.SetReadDeadline(time.Time{})
+	defer clearE2EReadDeadline(conn)
 	for {
 		f, err := netproto.ReadFrame(conn)
 		if err != nil {
@@ -2297,12 +2315,12 @@ func checkChaosPostgres(c *checkCtx) error {
 	if err != nil {
 		return fmt.Errorf("traffic session: %w", err)
 	}
-	defer traffic.conn.Close()
+	defer closeE2EResource(traffic.conn)
 	probe, err := dialAuth(c.opts.addr, c.opts.aliceUID, c.opts.alicePass, c.opts.serverPass)
 	if err != nil {
 		return fmt.Errorf("probe session: %w", err)
 	}
-	defer probe.conn.Close()
+	defer closeE2EResource(probe.conn)
 	if err := chaosJoin(traffic, c.channelID); err != nil {
 		return fmt.Errorf("traffic session join: %w", err)
 	}
@@ -2426,7 +2444,7 @@ func checkChaosPostgres(c *checkCtx) error {
 			return fmt.Errorf("authentication never recovered: %w", err)
 		}
 	}
-	defer fresh.conn.Close()
+	defer closeE2EResource(fresh.conn)
 	if err := chaosJoin(fresh, c.channelID); err != nil {
 		return fmt.Errorf("post-recovery join: %w", err)
 	}

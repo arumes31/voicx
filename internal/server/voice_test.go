@@ -5,6 +5,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"sync"
 	"testing"
 
@@ -13,6 +14,13 @@ import (
 	"voicx/internal/recorder"
 	"voicx/internal/webrtc"
 )
+
+func closeVoiceTestResource(t *testing.T, closer io.Closer) {
+	t.Helper()
+	if err := closer.Close(); err != nil {
+		t.Logf("closing test resource: %v", err)
+	}
+}
 
 // fakeVoice implements VoiceBackend, recording all calls.
 type fakeVoice struct {
@@ -160,12 +168,6 @@ func (f *fakeVoice) RemoveTap(tapID string) {
 // PeerCount returns 0 (no peers in the fake).
 func (f *fakeVoice) PeerCount() int { return 0 }
 
-func (f *fakeVoice) closedCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return len(f.closed)
-}
-
 func (f *fakeVoice) lastWhisper() (whisperCall, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -186,7 +188,7 @@ func TestWebRTCOfferAnswer(t *testing.T) {
 	env.voice.answerSDP = "server-answer-sdp"
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer closeVoiceTestResource(t, conn)
 
 	// The server must have installed its voice callbacks at construction.
 	env.voice.mu.Lock()
@@ -232,7 +234,7 @@ func TestICECandidateFromClient(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer closeVoiceTestResource(t, conn)
 
 	send(t, conn, netproto.MsgICECandidate, netproto.ICECandidate{Candidate: "cand-xyz", SDPMid: "0"})
 	waitFor(t, "candidate forwarded", func() bool {
@@ -249,9 +251,9 @@ func TestWhisperSet(t *testing.T) {
 	defer env.stop()
 
 	adminConn, adminID := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer closeVoiceTestResource(t, adminConn)
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer closeVoiceTestResource(t, userConn)
 
 	send(t, userConn, netproto.MsgWhisperSet, netproto.WhisperSet{
 		UniqueIDs:  []string{"admin-uid", "offline-uid"},
@@ -286,7 +288,7 @@ func TestWhisperSetDenied(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer closeVoiceTestResource(t, conn)
 
 	send(t, conn, netproto.MsgWhisperSet, netproto.WhisperSet{Active: true})
 	f := readOfType(t, conn, netproto.MsgError)
@@ -312,9 +314,9 @@ func TestWhisperSpeakingSignalsTarget(t *testing.T) {
 	defer env.stop()
 
 	adminConn, adminID := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer closeVoiceTestResource(t, adminConn)
 	userConn, userID := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer closeVoiceTestResource(t, userConn)
 
 	send(t, userConn, netproto.MsgWhisperSet, netproto.WhisperSet{
 		UniqueIDs: []string{"admin-uid"},
@@ -377,9 +379,9 @@ func TestPositionUpdate(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer closeVoiceTestResource(t, adminConn)
 	userConn, userID := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer closeVoiceTestResource(t, userConn)
 
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Arena", Type: 2})
 	readOfType(t, adminConn, netproto.MsgChannelList)
@@ -409,7 +411,7 @@ func TestVoiceMembershipSync(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer closeVoiceTestResource(t, adminConn)
 	userConn, userID := dialAuthed(t, env.addr, "user-uid")
 
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Lobby", Type: 2})
@@ -483,7 +485,7 @@ func TestVideoQuality(t *testing.T) {
 	defer env.stop()
 
 	conn, userID := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer closeVoiceTestResource(t, conn)
 
 	send(t, conn, netproto.MsgVideoQuality, netproto.VideoQuality{Quality: "high"})
 	waitFor(t, "quality recorded", func() bool {
@@ -505,7 +507,7 @@ func TestRecordingControl(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer closeVoiceTestResource(t, adminConn)
 
 	send(t, adminConn, netproto.MsgRecordingControl, netproto.RecordingControl{ChannelID: 1, Action: "start"})
 	waitFor(t, "recording started", func() bool {
@@ -533,7 +535,7 @@ func TestRecordingControlDenied(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer closeVoiceTestResource(t, conn)
 
 	send(t, conn, netproto.MsgRecordingControl, netproto.RecordingControl{ChannelID: 1, Action: "start"})
 	f := readOfType(t, conn, netproto.MsgError)

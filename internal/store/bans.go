@@ -30,7 +30,7 @@ func (s *Store) ListBans(ctx context.Context) ([]BanRecord, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listing bans: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []BanRecord
 	for rows.Next() {
 		var r BanRecord

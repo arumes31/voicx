@@ -201,7 +201,7 @@ func simulateClient(ctx context.Context, opts options, st *stats, index int) {
 		st.connectsFail.Add(1)
 		return
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	st.connectsOK.Add(1)
 
 	// Authenticate: anonymous guest (loadtest-N) or the shared account.
@@ -245,7 +245,7 @@ func simulateClient(ctx context.Context, opts options, st *stats, index int) {
 			return
 		}
 		st.webrtcOK.Add(1)
-		defer pc.Close()
+		defer func() { _ = pc.Close() }()
 	}
 
 	// UDP pings (optional): one packet per second.
@@ -411,7 +411,7 @@ func startOpusPublisher(conn net.Conn, supplied []netproto.ICEServer, relayOnly 
 
 func readWebRTCAnswer(conn net.Conn, timeout time.Duration) (netproto.WebRTCAnswer, []netproto.ICECandidate, error) {
 	_ = conn.SetReadDeadline(time.Now().Add(timeout))
-	defer conn.SetReadDeadline(time.Time{})
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
 	var candidates []netproto.ICECandidate
 	for {
 		f, err := netproto.ReadFrame(conn)
@@ -446,7 +446,7 @@ func udpPinger(addr string, done chan struct{}) {
 	if err != nil {
 		return
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
@@ -472,7 +472,7 @@ func writeMsg(conn net.Conn, mt netproto.MessageType, msg any) error {
 // deadline passes.
 func readOfType(conn net.Conn, mt netproto.MessageType, timeout time.Duration) (*netproto.Frame, error) {
 	_ = conn.SetReadDeadline(time.Now().Add(timeout))
-	defer conn.SetReadDeadline(time.Time{})
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
 	for {
 		f, err := netproto.ReadFrame(conn)
 		if err != nil {

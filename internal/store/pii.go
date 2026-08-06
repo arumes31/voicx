@@ -41,7 +41,7 @@ func NewPIICipher(key []byte) (*PIICipher, error) {
 func LoadOrCreatePIICipher(path string) (*PIICipher, error) {
 	rf, err := os.Open(path)
 	if err == nil {
-		defer rf.Close()
+		defer func() { _ = rf.Close() }()
 		info, statErr := rf.Stat()
 		if statErr != nil {
 			return nil, fmt.Errorf("checking PII key permissions: %w", statErr)

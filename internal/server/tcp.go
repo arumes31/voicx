@@ -435,7 +435,11 @@ func (s *TCPServer) Shutdown() error {
 
 // handleConn services a single client connection for its lifetime.
 func (s *TCPServer) handleConn(ctx context.Context, conn net.Conn) {
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			s.logger.Debug("closing client connection", zap.Error(err))
+		}
+	}()
 
 	client := &Client{
 		ID:   newClientID(),

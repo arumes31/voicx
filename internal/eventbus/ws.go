@@ -63,7 +63,11 @@ func Handler(bus *Bus, auth Authenticator, logger *zap.Logger) http.Handler {
 
 		types := parseTypes(r.URL.Query().Get("types"))
 		websocket.Handler(func(conn *websocket.Conn) {
-			defer conn.Close()
+			defer func() {
+				if err := conn.Close(); err != nil {
+					logger.Debug("closing event stream websocket failed", zap.Error(err))
+				}
+			}()
 			serveStream(bus, conn, user, types, logger)
 		}).ServeHTTP(w, r)
 	})

@@ -161,7 +161,7 @@ func (f *fakeFileStore) FindFileBySHA(_ context.Context, channelID int64, sha256
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, rec := range f.files {
-		if rec.ChannelID == channelID && rec.SHA256 == sha256 && !(rec.Folder == exclFolder && rec.Name == exclName) {
+		if rec.ChannelID == channelID && rec.SHA256 == sha256 && (rec.Folder != exclFolder || rec.Name != exclName) {
 			cp := rec
 			return &cp, nil
 		}

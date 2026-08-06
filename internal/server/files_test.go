@@ -4,6 +4,7 @@ package server
 
 import (
 	"context"
+	"io"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +15,13 @@ import (
 	"voicx/internal/state"
 	"voicx/internal/store"
 )
+
+func closeFileTestResource(t *testing.T, closer io.Closer) {
+	t.Helper()
+	if err := closer.Close(); err != nil {
+		t.Logf("closing test resource: %v", err)
+	}
+}
 
 // fakeFileTransfer implements FileTransferBackend, recording calls.
 type fakeFileTransfer struct {
@@ -103,7 +111,7 @@ func (f *fakeFileTransfer) DeleteFile(_ context.Context, channelID int64, folder
 	f.deleted = append(f.deleted, folder+"/"+name)
 	keep := f.files[:0]
 	for _, rec := range f.files {
-		if !(rec.Folder == folder && rec.Name == name) {
+		if rec.Folder != folder || rec.Name != name {
 			keep = append(keep, rec)
 		}
 	}
@@ -166,7 +174,7 @@ func TestFileTransferInitUpload(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer closeFileTestResource(t, conn)
 
 	send(t, conn, netproto.MsgFileTransferInit, netproto.FileTransferInit{
 		ChannelID: 1, Direction: "upload", Name: "a.txt", Size: 42,
@@ -200,7 +208,7 @@ func TestFileTransferInitDenied(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer closeFileTestResource(t, conn)
 
 	send(t, conn, netproto.MsgFileTransferInit, netproto.FileTransferInit{
 		ChannelID: 1, Direction: "upload", Name: "a.txt", Size: 42,
@@ -231,7 +239,7 @@ func TestFileTransferUploadQuotaPermission(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer closeFileTestResource(t, conn)
 
 	send(t, conn, netproto.MsgFileTransferInit, netproto.FileTransferInit{
 		ChannelID: 1, Direction: "upload", Name: "a.txt", Size: 42,
@@ -254,7 +262,7 @@ func TestFileRenameCrossChannel(t *testing.T) {
 	env.state.AddChannel(&state.Channel{ChannelID: 2, Name: "target"})
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer closeFileTestResource(t, conn)
 
 	send(t, conn, netproto.MsgFileRename, netproto.FileRename{
 		ChannelID: 1, Name: "a.txt", NewName: "a.txt", NewChannelID: 2,
@@ -293,7 +301,7 @@ func TestFileRenameCrossChannelDenied(t *testing.T) {
 	env.state.AddChannel(&state.Channel{ChannelID: 2, Name: "target"})
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer closeFileTestResource(t, conn)
 
 	send(t, conn, netproto.MsgFileRename, netproto.FileRename{
 		ChannelID: 1, Name: "a.txt", NewName: "a.txt", NewChannelID: 2,
@@ -319,7 +327,7 @@ func TestFileTransferInitDownload(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer closeFileTestResource(t, conn)
 
 	send(t, conn, netproto.MsgFileTransferInit, netproto.FileTransferInit{
 		ChannelID: 1, Direction: "download", Name: "a.txt",
@@ -344,7 +352,7 @@ func TestFileList(t *testing.T) {
 	}
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer closeFileTestResource(t, conn)
 
 	send(t, conn, netproto.MsgFileList, netproto.FileList{ChannelID: 1})
 	f := readOfType(t, conn, netproto.MsgFileListResponse)
@@ -370,7 +378,7 @@ func TestFileListQuota(t *testing.T) {
 	}
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer closeFileTestResource(t, conn)
 
 	send(t, conn, netproto.MsgFileList, netproto.FileList{ChannelID: 1})
 	f := readOfType(t, conn, netproto.MsgFileListResponse)
@@ -394,7 +402,7 @@ func TestFileDeleteGates(t *testing.T) {
 	}
 
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer closeFileTestResource(t, userConn)
 
 	// Uploader deletes their own file.
 	send(t, userConn, netproto.MsgFileDelete, netproto.FileDelete{ChannelID: 1, Name: "owned.txt"})
@@ -412,7 +420,7 @@ func TestFileDeleteGates(t *testing.T) {
 
 	// Admin bypasses.
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer closeFileTestResource(t, adminConn)
 	send(t, adminConn, netproto.MsgFileDelete, netproto.FileDelete{ChannelID: 1, Name: "foreign.txt"})
 	waitFor(t, "admin delete", func() bool {
 		env.ft.mu.Lock()
@@ -433,7 +441,7 @@ func TestFileRename(t *testing.T) {
 	}
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer closeFileTestResource(t, conn)
 
 	send(t, conn, netproto.MsgFileRename, netproto.FileRename{
 		ChannelID: 1, Name: "old.txt", NewName: "new.txt", NewFolder: "docs",
@@ -462,7 +470,7 @@ func TestFileVersions(t *testing.T) {
 	}
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer closeFileTestResource(t, conn)
 
 	send(t, conn, netproto.MsgFileVersions, netproto.FileVersions{ChannelID: 1, Name: "a.txt"})
 	f := readOfType(t, conn, netproto.MsgFileVersionsResponse)
@@ -488,7 +496,7 @@ func TestFileLink(t *testing.T) {
 	env.auth.users["other-uid"] = &authUser3
 	env.auth.passwords["other-uid"] = "pw"
 	otherConn, _ := dialAuthed(t, env.addr, "other-uid")
-	defer otherConn.Close()
+	defer closeFileTestResource(t, otherConn)
 	send(t, otherConn, netproto.MsgFileLink, netproto.FileLink{ChannelID: 1, Name: "a.txt"})
 	if e := readError(t, otherConn); e.Code != errCodePermissionDenied {
 		t.Fatalf("error = %+v, want permission denied", e)
@@ -496,7 +504,7 @@ func TestFileLink(t *testing.T) {
 
 	// The uploader gets a link.
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer closeFileTestResource(t, conn)
 	send(t, conn, netproto.MsgFileLink, netproto.FileLink{ChannelID: 1, Name: "a.txt"})
 	f := readOfType(t, conn, netproto.MsgFileLinkResponse)
 	var resp netproto.FileLinkResponse
@@ -521,14 +529,14 @@ func TestServerIconSetGet(t *testing.T) {
 
 	// Non-admin: denied.
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer closeFileTestResource(t, userConn)
 	send(t, userConn, netproto.MsgServerIconSet, netproto.ServerIconSet{DataBase64: b64(tinyPNG)})
 	if e := readError(t, userConn); e.Code != errCodePermissionDenied {
 		t.Fatalf("error = %+v, want permission denied", e)
 	}
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer closeFileTestResource(t, adminConn)
 	send(t, adminConn, netproto.MsgServerIconSet, netproto.ServerIconSet{DataBase64: b64(tinyPNG)})
 	deadline := time.Now().Add(3 * time.Second)
 	for {

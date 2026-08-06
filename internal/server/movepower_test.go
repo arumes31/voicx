@@ -40,9 +40,9 @@ func TestMoveClientBelowTargetNeededPowerDenied(t *testing.T) {
 	defer env.stop()
 
 	callerConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer callerConn.Close()
+	defer func() { _ = callerConn.Close() }()
 	targetConn, targetID := dialAuthed(t, env.addr, "user2-uid")
-	defer targetConn.Close()
+	defer func() { _ = targetConn.Close() }()
 
 	send(t, callerConn, netproto.MsgMoveClient, netproto.MoveClient{ClientID: targetID, ChannelID: 1})
 	f := readOfType(t, callerConn, netproto.MsgError)
@@ -68,9 +68,9 @@ func TestMoveClientMeetsTargetNeededPower(t *testing.T) {
 	defer env.stop()
 
 	callerConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer callerConn.Close()
+	defer func() { _ = callerConn.Close() }()
 	targetConn, targetID := dialAuthed(t, env.addr, "user2-uid")
-	defer targetConn.Close()
+	defer func() { _ = targetConn.Close() }()
 
 	send(t, callerConn, netproto.MsgMoveClient, netproto.MoveClient{ClientID: targetID, ChannelID: 1})
 

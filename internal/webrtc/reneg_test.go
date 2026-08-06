@@ -24,7 +24,7 @@ func newClientPC(t *testing.T) *webrtc.PeerConnection {
 	if err != nil {
 		t.Fatalf("client NewPeerConnection: %v", err)
 	}
-	t.Cleanup(func() { pc.Close() })
+	t.Cleanup(func() { _ = pc.Close() })
 	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio); err != nil {
 		t.Fatalf("AddTransceiverFromKind: %v", err)
 	}
@@ -121,10 +121,10 @@ func TestRenegotiationDebounceAndRateLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 	v := NewVoice(e, r, testLogger())
-	defer v.ClosePeer("c1") // stops pending renegotiation timers
+	defer func() { _ = v.ClosePeer("c1") }() // stops pending renegotiation timers
 
 	clientPC := newClientPC(t)
 	rec := &offerRecorder{}
@@ -193,10 +193,10 @@ func TestRenegotiationUnansweredTolerance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 	v := NewVoice(e, r, testLogger())
-	defer v.ClosePeer("c1") // stops pending renegotiation timers
+	defer func() { _ = v.ClosePeer("c1") }() // stops pending renegotiation timers
 
 	clientPC := newClientPC(t)
 	rec := &offerRecorder{}
@@ -246,7 +246,7 @@ func TestCreateOfferRequiresStable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 
 	wrapper, err := e.NewPeerConnection("c1")
 	if err != nil {

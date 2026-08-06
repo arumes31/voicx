@@ -287,14 +287,14 @@ func TestTapWritesRTPOverUDP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListenUDP: %v", err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	port := listener.LocalAddr().(*net.UDPAddr).Port
 
 	tap, err := NewTap(port)
 	if err != nil {
 		t.Fatalf("NewTap: %v", err)
 	}
-	defer tap.Close()
+	defer func() { _ = tap.Close() }()
 
 	pkt := &rtp.Packet{
 		Header:  rtp.Header{Version: 2, PayloadType: 111, SequenceNumber: 42, SSRC: 9001},
@@ -324,7 +324,7 @@ func TestBufferedTapDropsWhenRingIsFull(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	b, err := NewBufferedTap(listener.LocalAddr().(*net.UDPAddr).Port, 1)
 	if err != nil {
 		t.Fatal(err)

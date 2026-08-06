@@ -435,7 +435,7 @@ func TestGroupCreateListRenameDelete(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Empty list first.
 	send(t, conn, netproto.MsgGroupList, netproto.GroupList{Type: "server"})
@@ -488,7 +488,7 @@ func TestGroupManageGate(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgGroupCreate, netproto.GroupCreate{Type: "server", Name: "Nope"})
 	if e := readError(t, conn); e.Code != errCodePermissionDenied {
@@ -501,7 +501,7 @@ func TestGroupManageGate(t *testing.T) {
 	env2 := startTestEnv(t, &tp)
 	defer env2.stop()
 	conn2, _ := dialAuthed(t, env2.addr, "user-uid")
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 
 	send(t, conn2, netproto.MsgGroupCreate, netproto.GroupCreate{Type: "server", Name: "OK"})
 	readOfType(t, conn2, netproto.MsgGroupListResponse)
@@ -518,7 +518,7 @@ func TestGroupDeleteRequiresForce(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	gid, err := env.groups.CreateGroup(context.Background(), "server", "Busy", 0)
 	if err != nil {
@@ -554,9 +554,9 @@ func TestGroupAssign(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	gid, _ := env.groups.CreateGroup(context.Background(), "server", "VIPs", 0)
 
@@ -601,7 +601,7 @@ func TestGroupAssignChannelRequiresChannelID(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	gid, _ := env.groups.CreateGroup(context.Background(), "channel", "ChanOps", 0)
 
@@ -628,7 +628,7 @@ func TestPermSetUnset(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgPermSet, netproto.PermSet{
 		Tier: "server_group", GroupID: 3, Key: "i_client_talk_power", Value: 10, Grant: 50,
@@ -679,7 +679,7 @@ func TestPermSetGate(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgPermSet, netproto.PermSet{
 		Tier: "server_group", GroupID: 3, Key: "i_client_talk_power", Value: 1,
@@ -703,7 +703,7 @@ func TestPermSetGrantCap(t *testing.T) {
 	env := startTestEnv(t, &tp)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Within the cap: allowed.
 	send(t, conn, netproto.MsgPermSet, netproto.PermSet{
@@ -751,7 +751,7 @@ func TestPermUnsetGrantCap(t *testing.T) {
 	env := startTestEnv(t, &tp)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	for _, key := range []string{"i_channel_modify_power", "i_client_ban_power"} {
 		if err := env.groups.SetPermission(ctx, store.PermTierServerGroup, target, key, 100, 100, false, false); err != nil {
@@ -791,7 +791,7 @@ func TestPermUnsetGrantCap(t *testing.T) {
 	env2 := startTestEnv(t, &strong)
 	defer env2.stop()
 	conn2, _ := dialAuthed(t, env2.addr, "user-uid")
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 
 	if err := env2.groups.SetPermission(ctx, store.PermTierServerGroup, target, "i_channel_modify_power", 100, 100, false, false); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -813,7 +813,7 @@ func TestPermTemplateApply(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgPermTemplateApply, netproto.PermTemplateApply{
 		Template: "moderator", Tier: "server_group", GroupID: 4,
@@ -852,7 +852,7 @@ func TestPermTemplateApplyGrantCap(t *testing.T) {
 	env := startTestEnv(t, &tp)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgPermTemplateApply, netproto.PermTemplateApply{
 		Template: "admin", Tier: "server_group", GroupID: 4,
@@ -882,7 +882,7 @@ func TestPermTemplateApplyOverwriteGrantCap(t *testing.T) {
 	env := startTestEnv(t, &tp)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Untouched target: every key is within the caller's grant, so it lands.
 	send(t, conn, netproto.MsgPermTemplateApply, netproto.PermTemplateApply{
@@ -937,7 +937,7 @@ func TestPermTrace(t *testing.T) {
 	env := startTestEnv(t, &tp)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgPermTrace, netproto.PermTrace{UniqueID: "user-uid", Key: "i_client_talk_power", ChannelID: 1})
 	f := readOfType(t, conn, netproto.MsgPermTraceResponse)
@@ -970,7 +970,7 @@ func TestPermTraceGate(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgPermTrace, netproto.PermTrace{UniqueID: "user-uid", Key: "i_client_talk_power"})
 	if e := readError(t, conn); e.Code != errCodePermissionDenied {
@@ -987,7 +987,7 @@ func TestAuditLog(t *testing.T) {
 
 	// Non-admin without b_audit_view: denied.
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 	send(t, userConn, netproto.MsgAuditLog, netproto.AuditLog{})
 	if e := readError(t, userConn); e.Code != errCodePermissionDenied {
 		t.Fatalf("error = %+v, want permission denied", e)
@@ -995,7 +995,7 @@ func TestAuditLog(t *testing.T) {
 
 	// Seed three entries via real writes (group creates as admin).
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	for _, name := range []string{"g1", "g2", "g3"} {
 		send(t, adminConn, netproto.MsgGroupCreate, netproto.GroupCreate{Type: "server", Name: name})
 		readOfType(t, adminConn, netproto.MsgGroupListResponse)
@@ -1040,12 +1040,12 @@ func TestAssignDefaultGroup(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	conn.Close()
+	_ = conn.Close()
 	waitFor(t, "default group assigned", func() bool { return env.groups.hasServerMember(7, 2) })
 
 	// Second login: the user already has a membership, no duplicate work.
 	conn2, _ := dialAuthed(t, env.addr, "user-uid")
-	conn2.Close()
+	_ = conn2.Close()
 	ids, err := env.groups.UserGroupIDs(context.Background(), 2)
 	if err != nil || len(ids) != 1 || ids[0] != 7 {
 		t.Fatalf("groups after relogin = %v, err=%v", ids, err)
@@ -1058,7 +1058,7 @@ func TestNoDefaultGroupWhenDisabled(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	conn.Close()
+	_ = conn.Close()
 	ids, err := env.groups.UserGroupIDs(context.Background(), 2)
 	if err != nil || len(ids) != 0 {
 		t.Fatalf("groups = %v, want none", ids)
@@ -1111,7 +1111,7 @@ func TestReapExpiredGroups(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	gid, _ := env.groups.CreateGroup(context.Background(), "server", "TempTrial", 0)
 	env.groups.seedExpiredMember(gid, 2)
@@ -1197,7 +1197,7 @@ func TestBanListRemove(t *testing.T) {
 
 	// Non-admin without ban permission: denied.
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 	send(t, userConn, netproto.MsgBanList, netproto.BanList{})
 	if e := readError(t, userConn); e.Code != errCodePermissionDenied {
 		t.Fatalf("error = %+v, want permission denied", e)
@@ -1205,7 +1205,7 @@ func TestBanListRemove(t *testing.T) {
 
 	// Admin lists.
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	send(t, adminConn, netproto.MsgBanList, netproto.BanList{})
 	f := readOfType(t, adminConn, netproto.MsgBanListResponse)
 	var list netproto.BanListResponse
@@ -1232,7 +1232,7 @@ func TestGroupIconSetGet(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Unknown group: empty payload (not an error).
 	send(t, conn, netproto.MsgGroupIconGet, netproto.GroupIconGet{GroupID: 42})
@@ -1271,7 +1271,7 @@ func TestGroupMembers(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	gid, _ := env.groups.CreateGroup(context.Background(), "server", "Membered", 0)
 	if err := env.groups.AssignServerGroup(context.Background(), gid, 2, time.Hour); err != nil {
@@ -1315,14 +1315,14 @@ func TestPermList(t *testing.T) {
 
 	// Gate: non-admin without b_permission_manage is denied.
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 	send(t, userConn, netproto.MsgPermList, netproto.PermList{Tier: "server_group", GroupID: 3})
 	if e := readError(t, userConn); e.Code != errCodePermissionDenied {
 		t.Fatalf("error = %+v, want permission denied", e)
 	}
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	send(t, adminConn, netproto.MsgPermSet, netproto.PermSet{
 		Tier: "server_group", GroupID: 3, Key: "i_client_talk_power", Value: 10, Grant: 50, Skip: true,
 	})
@@ -1413,7 +1413,7 @@ func TestGroupEditCosmetics(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	env.groups.seedGroup("server", 10, "Mods")
 
 	color, hoist, sortID := "#Ff8800", true, 3
@@ -1452,7 +1452,7 @@ func TestGroupEditRejectsBadColor(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	env.groups.seedGroup("server", 10, "Mods")
 
 	for _, bad := range []string{"red", "#fff", "#12345g", "#1234567", "javascript:x"} {
@@ -1484,7 +1484,7 @@ func TestGroupEditGate(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	env.groups.seedGroup("server", 10, "Mods")
 
 	color := "#123456"
@@ -1532,7 +1532,7 @@ func TestPermCopyMergeAndReplace(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	ctx := context.Background()
 
 	src := store.PermTarget{GroupID: 10}
@@ -1570,7 +1570,7 @@ func TestPermCopyGate(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	mustSet(t, env, store.PermTarget{GroupID: 10}, "b_channel_modify", 1, 0)
 
 	callHandler(t, env, "user-uid", netproto.MsgPermCopy,
@@ -1591,7 +1591,7 @@ func TestPermCopyGrantCap(t *testing.T) {
 	env := startTestEnv(t, &tp)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	mustSet(t, env, store.PermTarget{GroupID: 10}, "b_channel_modify", 1, 0)
 
 	// The caller holds no grant for b_channel_modify, so it may not deposit it.
@@ -1616,7 +1616,7 @@ func TestPermCopyReplaceCapsRemovals(t *testing.T) {
 	env := startTestEnv(t, &tp)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	mustSet(t, env, store.PermTarget{GroupID: 10}, "b_channel_modify", 1, 1)
 	// The destination holds an entry far above the caller's level.
@@ -1646,7 +1646,7 @@ func TestPermCopyBadTargets(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	for _, msg := range []netproto.PermCopy{
 		{FromKind: "nonsense", FromID: "10", ToKind: "servergroup", ToID: "11"},
@@ -1667,7 +1667,7 @@ func TestPermCopyClientTiers(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	ctx := context.Background()
 	mustSet(t, env, store.PermTarget{GroupID: 10}, "b_channel_modify", 1, 0)
 
@@ -1726,9 +1726,9 @@ func TestPermsInvalidReachesGroupMembersOnly(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	env.groups.seedGroup("server", 10, "Mods")
 	if err := env.groups.AssignServerGroup(context.Background(), 10, 2, 0); err != nil {
@@ -1751,9 +1751,9 @@ func TestPermsInvalidOnGroupAssign(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 	env.groups.seedGroup("server", 10, "Mods")
 
 	send(t, adminConn, netproto.MsgGroupAssign, netproto.GroupAssign{
@@ -1777,9 +1777,9 @@ func TestPermsInvalidOnGroupDelete(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	env.groups.seedGroup("server", 10, "Mods")
 	if err := env.groups.AssignServerGroup(context.Background(), 10, 2, 0); err != nil {
@@ -1797,9 +1797,9 @@ func TestPermsInvalidOnGroupEdit(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	env.groups.seedGroup("server", 10, "Mods")
 	if err := env.groups.AssignServerGroup(context.Background(), 10, 2, 0); err != nil {
@@ -1819,9 +1819,9 @@ func TestPermsInvalidOnChannelTier(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, userID := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	env.state.AddChannel(&state.Channel{ChannelID: 7, Name: "room"})
 	if err := env.state.JoinChannel(userID, 7); err != nil {
@@ -1882,7 +1882,7 @@ func TestClientIsBot(t *testing.T) {
 	plain := startTestEnv(t, nil)
 	defer plain.stop()
 	adminConn, _ := dialAuthed(t, plain.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	if plain.srv.ClientIsBot(context.Background(), srvClient(t, plain, "admin-uid")) {
 		t.Fatalf("server admin resolved as a bot")
 	}
@@ -1891,7 +1891,7 @@ func TestClientIsBot(t *testing.T) {
 	botEnv := startTestEnv(t, &tp)
 	defer botEnv.stop()
 	conn, _ := dialAuthed(t, botEnv.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if !botEnv.srv.ClientIsBot(context.Background(), srvClient(t, botEnv, "user-uid")) {
 		t.Fatalf("account holding b_client_is_bot did not resolve as a bot")
 	}

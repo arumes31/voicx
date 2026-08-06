@@ -155,7 +155,7 @@ func TestForwardRTPChannelFanout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 
 	for _, id := range []string{"a", "b", "c"} {
@@ -202,7 +202,7 @@ func TestForwardRTPTap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 
 	attachFakePeer(t, e, r, "a")
@@ -230,7 +230,7 @@ func TestWhisperRouting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 
 	for _, id := range []string{"a", "b", "c", "d"} {
@@ -262,7 +262,7 @@ func TestWhisperDedup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 
 	attachFakePeer(t, e, r, "a")
@@ -419,7 +419,7 @@ func TestAttachPeer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 
 	r := NewRouter(nil)
 	attachFakePeer(t, e, r, "c1")
@@ -462,7 +462,7 @@ func TestPublisherTrackMSID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 
 	for _, id := range []string{"a", "b", "c"} {
@@ -501,7 +501,7 @@ func TestTrackSlotMSID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 
 	for _, id := range []string{"a", "b"} {
@@ -545,7 +545,7 @@ func TestForwardRTPUnknownSlotDropped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 
 	for _, id := range []string{"a", "b"} {
@@ -569,7 +569,7 @@ func TestReadLoopSlotClaimedOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 
 	attachFakePeer(t, e, r, "b")
@@ -603,7 +603,7 @@ func TestEnsurePublishersEchoSelfPair(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 	r.SetEchoChannel(15)
 
@@ -640,7 +640,7 @@ func TestVoiceHandleOffer(t *testing.T) {
 	}
 	r := NewRouter(nil)
 	v := NewVoice(e, r, testLogger())
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 
 	// Build a genuine offer with a client-side peer connection (using the
 	// same codec set as the engine so negotiation can succeed).
@@ -652,7 +652,7 @@ func TestVoiceHandleOffer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client NewPeerConnection: %v", err)
 	}
-	defer clientPC.Close()
+	defer func() { _ = clientPC.Close() }()
 	if _, err := clientPC.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio); err != nil {
 		t.Fatalf("AddTransceiverFromKind: %v", err)
 	}
@@ -707,7 +707,7 @@ func TestVoiceHandleOfferKeepsChannel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 	v := NewVoice(e, r, testLogger())
 
@@ -724,7 +724,7 @@ func TestVoiceHandleOfferKeepsChannel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client NewPeerConnection: %v", err)
 	}
-	defer clientPC.Close()
+	defer func() { _ = clientPC.Close() }()
 	if _, err := clientPC.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio); err != nil {
 		t.Fatalf("AddTransceiverFromKind: %v", err)
 	}
@@ -775,7 +775,7 @@ func TestVoiceHandleOfferConcurrentMove(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 	v := NewVoice(e, r, testLogger())
 
@@ -824,7 +824,7 @@ func TestVoiceNoPeer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	v := NewVoice(e, NewRouter(nil), testLogger())
 
 	if err := v.HandleAnswer("ghost", "sdp"); err != ErrNoPeer {

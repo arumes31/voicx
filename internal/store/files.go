@@ -85,7 +85,7 @@ func (s *Store) ListFiles(ctx context.Context, channelID int64, folder string) (
 	if err != nil {
 		return nil, fmt.Errorf("querying files: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 
 	var out []FileRecord
 	for rows.Next() {
@@ -106,7 +106,7 @@ func (s *Store) ListFileFolders(ctx context.Context, channelID int64) ([]string,
 	if err != nil {
 		return nil, fmt.Errorf("querying file folders: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []string
 	for rows.Next() {
 		var f string
@@ -128,7 +128,7 @@ func (s *Store) ListFileVersions(ctx context.Context, channelID int64, folder, b
 	if err != nil {
 		return nil, fmt.Errorf("querying file versions: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []FileRecord
 	for rows.Next() {
 		var rec FileRecord

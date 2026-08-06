@@ -31,7 +31,11 @@ func TestNew(t *testing.T) {
 func TestPingUnreachable(t *testing.T) {
 	// Port 1 on loopback refuses connections immediately.
 	c := New("127.0.0.1:1", "", nil)
-	defer c.Close()
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()

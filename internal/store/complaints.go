@@ -52,7 +52,7 @@ func (s *Store) ListComplaints(ctx context.Context) ([]Complaint, error) {
 	if err != nil {
 		return nil, fmt.Errorf("querying complaints: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 
 	var out []Complaint
 	for rows.Next() {

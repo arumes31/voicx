@@ -1064,7 +1064,7 @@ func TestRequiresAuthentication(t *testing.T) {
 	defer env.stop()
 
 	conn := dialRetry(t, env.addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgChatSend, netproto.ChatSend{Text: "hello"})
 	f := readOfType(t, conn, netproto.MsgError)
@@ -1087,7 +1087,7 @@ func TestAuthenticateBadCredentials(t *testing.T) {
 	defer env.stop()
 
 	conn := dialRetry(t, env.addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: "user-uid", Password: "wrong"})
 	f := readOfType(t, conn, netproto.MsgAuthResponse)
@@ -1119,7 +1119,7 @@ func TestAuthenticateBannedUniqueID(t *testing.T) {
 	env.auth.bans["user-uid"] = &auth.Ban{ID: 1, Type: 1, Value: "user-uid", Reason: "spam"}
 
 	conn := dialRetry(t, env.addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: "user-uid", Password: "pw"})
 	f := readOfType(t, conn, netproto.MsgAuthResponse)
@@ -1145,7 +1145,7 @@ func TestAuthenticateBannedIP(t *testing.T) {
 	env.auth.bans["127.0.0.1"] = &auth.Ban{ID: 2, Type: 0, Value: "127.0.0.1"}
 
 	conn := dialRetry(t, env.addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: "user-uid", Password: "pw"})
 	f := readOfType(t, conn, netproto.MsgAuthResponse)
@@ -1191,7 +1191,7 @@ func TestCreateChannelPermissionDenied(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "nope", Type: 0})
 	f := readOfType(t, conn, netproto.MsgError)
@@ -1215,7 +1215,7 @@ func TestCreateChannelGranted(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Temp", Type: 0})
 	f := readOfType(t, conn, netproto.MsgChannelList)
@@ -1238,9 +1238,9 @@ func TestCreateChannelAsAdminBroadcasts(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Lobby", Type: 2})
 	readOfType(t, adminConn, netproto.MsgChannelList)
@@ -1262,9 +1262,9 @@ func TestJoinChannelAndChat(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	// Admin creates a permanent channel.
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Lobby", Type: 2})
@@ -1300,9 +1300,9 @@ func TestDirectMessage(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, userID := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	send(t, adminConn, netproto.MsgChatSend, netproto.ChatSend{ToClientID: userID, Text: "psst"})
 
@@ -1323,9 +1323,9 @@ func TestMoveOtherClientDenied(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, userID := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Lobby", Type: 2})
 	readOfType(t, adminConn, netproto.MsgChannelList)
@@ -1348,9 +1348,9 @@ func TestKickFromChannel(t *testing.T) {
 	defer env.stop()
 
 	adminConn, adminID := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, userID := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Lobby", Type: 2})
 	readOfType(t, adminConn, netproto.MsgChannelList)
@@ -1393,9 +1393,9 @@ func TestDeleteChannel(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Lobby", Type: 2})
 	readOfType(t, adminConn, netproto.MsgChannelList)
@@ -1420,7 +1420,7 @@ func TestJoinUnknownChannel(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgJoinChannel, netproto.JoinChannel{ChannelID: 999})
 	f := readOfType(t, conn, netproto.MsgError)
@@ -1439,7 +1439,7 @@ func TestSendErrorOnMalformed(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if err := netproto.WriteFrame(conn, &netproto.Frame{
 		Type:    uint16(netproto.MsgCreateChannel),
@@ -1482,7 +1482,7 @@ func TestChallengeAuthHandshake(t *testing.T) {
 	env.auth.users[uid] = &auth.User{ID: 3, UniqueID: uid, Nickname: "keyuser"}
 
 	conn := dialRetry(t, env.addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Round 1: authenticate without a password -> challenge.
 	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: uid})
@@ -1530,7 +1530,7 @@ func TestChallengeAuthBadSignature(t *testing.T) {
 	env.auth.users[uid] = &auth.User{ID: 3, UniqueID: uid, Nickname: "keyuser"}
 
 	conn := dialRetry(t, env.addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: uid})
 	readOfType(t, conn, netproto.MsgAuthChallenge)
@@ -1566,9 +1566,9 @@ func TestJoinChannelPassword(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, userID := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Vault", Type: 2, Password: "chanpw"})
 	readOfType(t, adminConn, netproto.MsgChannelList)
@@ -1608,9 +1608,9 @@ func TestJoinChannelIgnorePassword(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, userID := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Vault", Type: 2, Password: "chanpw"})
 	readOfType(t, adminConn, netproto.MsgChannelList)
@@ -1634,9 +1634,9 @@ func TestJoinChannelNeededPower(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "HQ", Type: 2, NeededJoinPower: 50})
 	readOfType(t, adminConn, netproto.MsgChannelList)
@@ -1660,9 +1660,9 @@ func TestJoinChannelNeededPowerGranted(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, userID := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "HQ", Type: 2, NeededJoinPower: 50})
 	readOfType(t, adminConn, netproto.MsgChannelList)
@@ -1689,7 +1689,7 @@ func TestCreateChannelNeededPowerCap(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "TooHigh", Type: 0, NeededJoinPower: 50})
 	f := readOfType(t, conn, netproto.MsgError)
@@ -1723,7 +1723,7 @@ func TestDirectMessageSpooledOffline(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 
 	send(t, adminConn, netproto.MsgChatSend, netproto.ChatSend{
 		ToUniqueID: "user-uid", Text: "see you later", Enc: true,
@@ -1758,7 +1758,7 @@ func TestSpooledMessagesDeliveredOnLogin(t *testing.T) {
 	}
 
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	data := readEventOfType(t, userConn, eventChat)
 	var chat netproto.ChatBroadcast

@@ -190,7 +190,7 @@ func (s *Store) appliedMigrations() (map[string]bool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading schema_migrations: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	out := map[string]bool{}
 	for rows.Next() {
 		var name string
@@ -212,6 +212,12 @@ func (s *Store) Ping() error {
 // Close releases the database connection pool.
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+// closeRows releases query resources. Callers return iteration failures via
+// Rows.Err, while Close itself has no additional actionable error here.
+func closeRows(rows *sql.Rows) {
+	_ = rows.Close()
 }
 
 // DB returns the underlying *sql.DB for direct access by other packages.
@@ -253,7 +259,7 @@ func (s *Store) PendingMessages(ctx context.Context, toUserID int64) ([]SpooledM
 	if err != nil {
 		return nil, fmt.Errorf("querying offline messages: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 
 	var out []SpooledMessage
 	for rows.Next() {

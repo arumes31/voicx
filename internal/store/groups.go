@@ -42,7 +42,7 @@ func (s *Store) ListGroups(ctx context.Context, groupType string) ([]Group, erro
 	if err != nil {
 		return nil, fmt.Errorf("listing %s groups: %w", groupType, err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []Group
 	for rows.Next() {
 		var g Group
@@ -233,7 +233,7 @@ func (s *Store) ExpiredGroupMembers(ctx context.Context, now time.Time) ([][2]in
 	if err != nil {
 		return nil, fmt.Errorf("reaping expired group members: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out [][2]int64
 	for rows.Next() {
 		var pair [2]int64
@@ -253,7 +253,7 @@ func (s *Store) UserGroupIDs(ctx context.Context, userID int64) ([]int64, error)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []int64
 	for rows.Next() {
 		var id int64
@@ -357,7 +357,7 @@ func (s *Store) ListChannelGroupMembers(ctx context.Context, groupID, channelID 
 	if err != nil {
 		return nil, fmt.Errorf("listing channel group members: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []GroupMember
 	for rows.Next() {
 		var gm GroupMember
@@ -376,7 +376,7 @@ func (s *Store) scanGroupMembers(ctx context.Context, q string, groupID int64) (
 	if err != nil {
 		return nil, fmt.Errorf("listing group members: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []GroupMember
 	for rows.Next() {
 		var gm GroupMember
@@ -530,7 +530,7 @@ func (s *Store) ListPermissions(ctx context.Context, tier PermTier, target PermT
 	if err != nil {
 		return nil, fmt.Errorf("listing %s permissions: %w", tier, err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []PermEntry
 	for rows.Next() {
 		var e PermEntry
@@ -578,12 +578,16 @@ func unsetPermissionWith(ctx context.Context, db permissionExecutor, tier PermTi
 // CopyPermissions atomically removes destination-only keys and writes the
 // source entries. Callers perform authorization before entering this store
 // operation; the transaction guarantees Replace cannot leave a partial copy.
-func (s *Store) CopyPermissions(ctx context.Context, tier PermTier, target PermTarget, remove []string, entries []PermEntry) error {
+func (s *Store) CopyPermissions(ctx context.Context, tier PermTier, target PermTarget, remove []string, entries []PermEntry) (retErr error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("beginning permission copy: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			retErr = errors.Join(retErr, fmt.Errorf("rolling back permission copy: %w", err))
+		}
+	}()
 	for _, key := range remove {
 		if err := unsetPermissionWith(ctx, tx, tier, target, key); err != nil {
 			return err
@@ -640,7 +644,7 @@ func (s *Store) AuditList(ctx context.Context, beforeID int64, limit int) ([]Aud
 	if err != nil {
 		return nil, fmt.Errorf("listing audit log: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []AuditEntry
 	for rows.Next() {
 		var e AuditEntry

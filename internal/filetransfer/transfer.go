@@ -27,7 +27,11 @@ const connTimeout = 10 * time.Minute
 // serve handles one file-transfer connection: validate the init frame's
 // token, then run the upload or download flow.
 func (s *Server) serve(ctx context.Context, conn net.Conn) {
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			s.logger.Debug("closing file transfer connection", zap.Error(err))
+		}
+	}()
 	_ = conn.SetDeadline(time.Now().Add(connTimeout))
 
 	f, err := netproto.ReadFrame(conn)
@@ -242,12 +246,16 @@ func (s *Server) rotateVersions(ctx context.Context, tr *transfer) {
 // (259): the prefix the client already holds is folded into the hash but not
 // re-sent, so the digest still covers the whole file and a resumed download
 // is verified exactly as strictly as a fresh one.
-func (s *Server) sendDownload(conn net.Conn, tr *transfer, offset int64) error {
+func (s *Server) sendDownload(conn net.Conn, tr *transfer, offset int64) (retErr error) {
 	f, err := os.Open(s.filePath(tr.ChannelID, tr.Folder, tr.Name))
 	if err != nil {
 		return fmt.Errorf("opening file: %w", err)
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("closing file: %w", err))
+		}
+	}()
 
 	h := sha256.New()
 	if offset > 0 {

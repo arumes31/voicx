@@ -31,7 +31,9 @@ func TestHashIdentifiesTheWording(t *testing.T) {
 	if Hash("be nice") == Hash("be nicer") {
 		t.Fatal("different wording shares an acceptance hash")
 	}
-	if Hash("be nice") != Hash("be nice") {
+	first := Hash("be nice")
+	second := Hash("be nice")
+	if first != second {
 		t.Fatal("hash is not stable")
 	}
 	for _, blank := range []string{"", "   ", "\n\t"} {
