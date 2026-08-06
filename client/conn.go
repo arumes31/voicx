@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -189,6 +190,14 @@ func (m *connManager) dialTransport(addr string) (net.Conn, error) {
 		return conn, nil
 	}
 	tlsErr := err
+	if errors.Is(tlsErr, errFingerprintMismatch) {
+		m.mu.Lock()
+		m.tlsUsed = true
+		m.fingerprint = fingerprint
+		m.newServer = false
+		m.mu.Unlock()
+		return nil, errFingerprintMismatch
+	}
 
 	m.mu.Lock()
 	allowPlain := m.allowPlaintext

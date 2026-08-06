@@ -7,8 +7,10 @@ package main
 
 import (
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,6 +36,7 @@ type knownServers struct {
 	path    string
 	mu      sync.Mutex
 	Servers map[string]string `json:"servers"`
+	loadErr error
 }
 
 // knownServersPath returns the default TOFU store location.
@@ -49,13 +52,24 @@ func knownServersPath() (string, error) {
 // empty store (first run).
 func loadKnownServersAt(path string) *knownServers {
 	ks := &knownServers{path: path, Servers: map[string]string{}}
+	// #nosec G304 -- path is the application-owned config path or an explicit test path.
 	data, err := os.ReadFile(path)
-	if err != nil {
+	if errors.Is(err, os.ErrNotExist) {
 		return ks
 	}
-	_ = json.Unmarshal(data, ks)
-	if ks.Servers == nil {
-		ks.Servers = map[string]string{}
+	if err != nil {
+		ks.loadErr = fmt.Errorf("reading TLS trust store: %w", err)
+		return ks
+	}
+	var persisted struct {
+		Servers map[string]string `json:"servers"`
+	}
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		ks.loadErr = fmt.Errorf("parsing TLS trust store: %w", err)
+		return ks
+	}
+	if persisted.Servers != nil {
+		ks.Servers = persisted.Servers
 	}
 	return ks
 }
@@ -87,15 +101,80 @@ func secureEqualFold(a, b string) bool {
 func (k *knownServers) trust(addr, fp string) error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	k.Servers[addr] = fp
-	if err := os.MkdirAll(filepath.Dir(k.path), 0o750); err != nil {
-		return err
+	if k.loadErr != nil {
+		return k.loadErr
 	}
-	raw, err := json.MarshalIndent(k, "", "  ")
+	next := make(map[string]string, len(k.Servers)+1)
+	for knownAddr, knownFingerprint := range k.Servers {
+		next[knownAddr] = knownFingerprint
+	}
+	next[addr] = fp
+	raw, err := json.MarshalIndent(struct {
+		Servers map[string]string `json:"servers"`
+	}{Servers: next}, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(k.path, raw, 0o600)
+	if err := writeKnownServers(k.path, raw); err != nil {
+		return err
+	}
+	k.Servers = next
+	return nil
+}
+
+func writeKnownServers(path string, raw []byte) (retErr error) {
+	dir := filepath.Dir(path)
+	// #nosec G703 -- dir is derived from the application-owned trust-store path.
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return fmt.Errorf("create TLS trust-store directory: %w", err)
+	}
+	// #nosec G304 -- dir is derived from the application-owned trust-store path.
+	tmp, err := os.CreateTemp(dir, ".known_servers-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary TLS trust store: %w", err)
+	}
+	tmpPath := tmp.Name()
+	keep := false
+	defer func() {
+		_ = tmp.Close()
+		if !keep {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0o600); err != nil {
+		return fmt.Errorf("secure temporary TLS trust store: %w", err)
+	}
+	if _, err := tmp.Write(raw); err != nil {
+		return fmt.Errorf("write temporary TLS trust store: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("sync temporary TLS trust store: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temporary TLS trust store: %w", err)
+	}
+	// #nosec G703 -- both paths are within the application-owned trust-store directory.
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("replace TLS trust store: %w", err)
+	}
+	keep = true
+	return nil
+}
+
+func normalizeFingerprint(fingerprint string) (string, error) {
+	parts := strings.Split(strings.TrimSpace(fingerprint), ":")
+	if len(parts) != 32 {
+		return "", errors.New("fingerprint must contain 32 colon-separated bytes")
+	}
+	for _, part := range parts {
+		if len(part) != 2 {
+			return "", errors.New("fingerprint must contain two hex digits per byte")
+		}
+		if _, err := hex.DecodeString(part); err != nil {
+			return "", errors.New("fingerprint contains non-hexadecimal data")
+		}
+	}
+	return strings.ToLower(strings.Join(parts, ":")), nil
 }
 
 // errFingerprintMismatch is returned when a server's presented certificate

@@ -11,6 +11,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"voicx/internal/safecast"
 )
 
 var (
@@ -38,9 +40,13 @@ func callCrypt(proc *windows.LazyProc, in []byte) ([]byte, error) {
 	if len(in) == 0 {
 		return nil, fmt.Errorf("empty input")
 	}
-	inBlob := windows.DataBlob{Size: uint32(len(in)), Data: &in[0]}
+	inputSize, err := safecast.IntToUint32(len(in))
+	if err != nil {
+		return nil, fmt.Errorf("input is too large: %w", err)
+	}
+	inBlob := windows.DataBlob{Size: inputSize, Data: &in[0]}
 	var outBlob windows.DataBlob
-	r, _, err := proc.Call(
+	r, _, callErr := proc.Call(
 		uintptr(unsafe.Pointer(&inBlob)),
 		0, // szDataDescr / ppszDataDescr
 		0, // pOptionalEntropy
@@ -50,7 +56,7 @@ func callCrypt(proc *windows.LazyProc, in []byte) ([]byte, error) {
 		uintptr(unsafe.Pointer(&outBlob)),
 	)
 	if r == 0 {
-		return nil, fmt.Errorf("%s: %w", proc.Name, err)
+		return nil, fmt.Errorf("%s: %w", proc.Name, callErr)
 	}
 	defer windows.LocalFree(windows.Handle(unsafe.Pointer(outBlob.Data)))
 	// The blob lives in LocalAlloc memory freed above, so it has to be copied.

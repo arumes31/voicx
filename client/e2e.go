@@ -36,6 +36,7 @@ import (
 
 	securee2ee "voicx/internal/e2ee"
 	"voicx/internal/netproto"
+	"voicx/internal/safecast"
 )
 
 type E2EEDiagnostics struct {
@@ -379,7 +380,11 @@ func sealFile(data []byte, key [32]byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := binary.Write(&out, binary.BigEndian, uint32(len(blob))); err != nil {
+		blobLength, err := safecast.IntToUint32(len(blob))
+		if err != nil {
+			return nil, fmt.Errorf("encrypted attachment chunk is too large: %w", err)
+		}
+		if err := binary.Write(&out, binary.BigEndian, blobLength); err != nil {
 			return nil, err
 		}
 		out.Write(blob)
@@ -413,10 +418,14 @@ func openFile(blob []byte, key [32]byte) ([]byte, error) {
 		var out bytes.Buffer
 		for index := uint64(0); reader.Len() > 0; index++ {
 			var size uint32
-			if err := binary.Read(reader, binary.BigEndian, &size); err != nil || size == 0 || size > attachmentChunkSize+64 || uint64(size) > uint64(reader.Len()) {
+			if err := binary.Read(reader, binary.BigEndian, &size); err != nil || size == 0 || size > attachmentChunkSize+64 {
 				return nil, errors.New("invalid attachment chunk framing")
 			}
-			chunk := make([]byte, int(size))
+			chunkLength, err := safecast.Uint32ToInt(size)
+			if err != nil || chunkLength > reader.Len() {
+				return nil, errors.New("invalid attachment chunk framing")
+			}
+			chunk := make([]byte, chunkLength)
 			if _, err := reader.Read(chunk); err != nil {
 				return nil, errors.New("invalid attachment chunk")
 			}

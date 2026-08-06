@@ -30,6 +30,7 @@ import { initMetaUI } from "./meta-ui.js";
 import { initPolishUI } from "./polish-ui.js";
 import { initNotifications } from "./notifications.js";
 import { setLanguage, applyStaticLabels } from "./i18n.js";
+import { extractPresentedFingerprint } from "./security.js";
 
 const P = () => window.__voicxPerms;
 window.__voicxChat = chatUI;
@@ -264,6 +265,7 @@ async function connectFromLogin() {
 // may explicitly trust the new fingerprint, which updates known_servers.json
 // and retries the connect.
 async function showFingerprintWarning(addr, detail) {
+    const presented = extractPresentedFingerprint(detail);
     const overlay = document.createElement("div");
     overlay.className = "dlg-overlay";
     overlay.innerHTML = `
@@ -280,8 +282,12 @@ async function showFingerprintWarning(addr, detail) {
     overlay.querySelector(".fp-detail").textContent = detail;
     overlay.querySelector(".dlg-cancel").onclick = () => overlay.remove();
     overlay.querySelector(".dlg-ok").onclick = async () => {
-        const fp = await window.go.main.App.ServerFingerprint();
-        const err = await window.go.main.App.TrustServerFingerprint(addr, fp);
+        if (!presented) {
+            overlay.remove();
+            $("login-error").textContent = "trust failed: the server did not provide a valid replacement fingerprint";
+            return;
+        }
+        const err = await window.go.main.App.TrustServerFingerprint(addr, presented);
         overlay.remove();
         if (err) {
             $("login-error").textContent = "trust failed: " + err;

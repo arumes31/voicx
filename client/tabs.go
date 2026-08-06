@@ -269,8 +269,7 @@ func (a *App) ConnectBookmarkTab(bookmark, addr, nickname, password, serverPassw
 	if err != "" {
 		a.removeTab(id)
 		if err == errFingerprintMismatch.Error() {
-			_, presented, _ := ts.cm.securitySnapshot()
-			return fmt.Sprintf("%s: the server certificate changed (presented: %s). Possible MITM — only trust it if you expected the change", err, presented)
+			return fingerprintMismatchMessage(ts.cm)
 		}
 		return err
 	}
@@ -295,6 +294,9 @@ func (a *App) ConnectGuestBookmarkTab(bookmark, addr, nickname string) string {
 	id, ts := a.newTab()
 	if err := ts.cm.connect(addr, nickname, "", ""); err != "" {
 		a.removeTab(id)
+		if err == errFingerprintMismatch.Error() {
+			return fingerprintMismatchMessage(ts.cm)
+		}
 		return err
 	}
 	ts.info.Addr = addr
@@ -302,6 +304,12 @@ func (a *App) ConnectGuestBookmarkTab(bookmark, addr, nickname string) string {
 	a.onTabConnected(ts.cm, bookmark, addr, nickname)
 	a.activate(id)
 	return ""
+}
+
+func fingerprintMismatchMessage(cm *connManager) string {
+	_, presented, _ := cm.securitySnapshot()
+	return fmt.Sprintf("%s: the server certificate changed (presented: %s). Possible MITM — only trust it if you expected the change",
+		errFingerprintMismatch, presented)
 }
 
 // lookupBookmark resolves the bookmark a connection belongs to, by explicit
