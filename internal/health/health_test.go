@@ -18,6 +18,12 @@ func TestHealthz(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("/healthz status = %d, want 200", rec.Code)
 	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("/healthz Cache-Control = %q, want no-store", got)
+	}
+	if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("/healthz X-Content-Type-Options = %q, want nosniff", got)
+	}
 }
 
 // TestReadyz verifies the readiness endpoint reflects the probe result.
@@ -33,12 +39,13 @@ func TestReadyz(t *testing.T) {
 		t.Fatalf("/readyz (healthy) status = %d, want 200", rec.Code)
 	}
 
-	// Probe fails -> 500.
+	// Probe fails -> 503, which tells orchestrators the dependency is
+	// temporarily unavailable rather than reporting an application bug.
 	probeErr = errors.New("database unreachable")
 	rec = httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("/readyz (unhealthy) status = %d, want 500", rec.Code)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("/readyz (unhealthy) status = %d, want 503", rec.Code)
 	}
 }
 
@@ -106,7 +113,12 @@ func TestHandleLocalGETRestrictsMethodAndRemoteAddress(t *testing.T) {
 	}{
 		{name: "IPv4 loopback", method: http.MethodGet, remoteAddr: "127.0.0.1:1234", wantStatus: http.StatusOK},
 		{name: "IPv6 loopback", method: http.MethodGet, remoteAddr: "[::1]:1234", wantStatus: http.StatusOK},
+		{name: "IPv6 scoped loopback", method: http.MethodGet, remoteAddr: "[::1%lo0]:1234", wantStatus: http.StatusOK},
+		{name: "IPv4 mapped loopback", method: http.MethodGet, remoteAddr: "[::ffff:127.0.0.1]:1234", wantStatus: http.StatusOK},
+		{name: "bare loopback", method: http.MethodGet, remoteAddr: "127.0.0.1", wantStatus: http.StatusOK},
 		{name: "remote", method: http.MethodGet, remoteAddr: "192.0.2.10:1234", wantStatus: http.StatusForbidden},
+		{name: "hostname is not trusted", method: http.MethodGet, remoteAddr: "localhost:1234", wantStatus: http.StatusForbidden},
+		{name: "malformed remote", method: http.MethodGet, remoteAddr: "not an address", wantStatus: http.StatusForbidden},
 		{name: "non GET", method: http.MethodPost, remoteAddr: "127.0.0.1:1234", wantStatus: http.StatusMethodNotAllowed},
 	}
 	for _, test := range tests {

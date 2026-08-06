@@ -9,8 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
+	"net/netip"
 	"time"
 
 	"go.uber.org/zap"
@@ -69,7 +69,7 @@ func New(addr string, logger *zap.Logger, ready func(ctx context.Context) error)
 
 	s.srv = &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           operationalHeaders(mux),
 		ReadHeaderTimeout: readTimeout,
 		ReadTimeout:       readTimeout,
 		WriteTimeout:      writeTimeout,
@@ -124,20 +124,28 @@ func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	_, _ = fmt.Fprintf(w, `{"status":"ok","version":%q}`+"\n", version.String())
 }
 
-// handleReadyz reports readiness: 200 when the probe succeeds, 500 otherwise.
+// handleReadyz reports readiness: 200 when the probe succeeds, 503 otherwise.
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request, ready func(ctx context.Context) error) {
 	if ready != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), readyTimeout)
 		defer cancel()
 		if err := ready(ctx); err != nil {
 			s.logger.Warn("readiness probe failed", zap.Error(err))
-			w.WriteHeader(http.StatusInternalServerError)
+			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte("not ready\n"))
 			return
 		}
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok\n"))
+}
+
+func operationalHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func getOnly(next http.Handler) http.Handler {
@@ -162,10 +170,9 @@ func localGET(next http.Handler) http.Handler {
 }
 
 func remoteIsLoopback(remoteAddr string) bool {
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		host = remoteAddr
+	if addrPort, err := netip.ParseAddrPort(remoteAddr); err == nil {
+		return addrPort.Addr().Unmap().IsLoopback()
 	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	addr, err := netip.ParseAddr(remoteAddr)
+	return err == nil && addr.Unmap().IsLoopback()
 }
