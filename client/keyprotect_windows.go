@@ -47,21 +47,23 @@ func callCrypt(proc *windows.LazyProc, in []byte) ([]byte, error) {
 	inBlob := windows.DataBlob{Size: inputSize, Data: &in[0]}
 	var outBlob windows.DataBlob
 	r, _, callErr := proc.Call(
-		uintptr(unsafe.Pointer(&inBlob)),
-		0, // szDataDescr / ppszDataDescr
-		0, // pOptionalEntropy
-		0, // pvReserved
-		0, // pPromptStruct
+		uintptr(unsafe.Pointer(&inBlob)), // #nosec G103 -- CryptProtectData requires a DATA_BLOB pointer.
+		0,                                // szDataDescr / ppszDataDescr
+		0,                                // pOptionalEntropy
+		0,                                // pvReserved
+		0,                                // pPromptStruct
 		uintptr(cryptProtectUIForbidden),
-		uintptr(unsafe.Pointer(&outBlob)),
+		uintptr(unsafe.Pointer(&outBlob)), // #nosec G103 -- CryptProtectData writes a DATA_BLOB through this pointer.
 	)
 	if r == 0 {
 		return nil, fmt.Errorf("%s: %w", proc.Name, callErr)
 	}
 	defer func() {
+		// #nosec G103 -- DPAPI allocates outBlob.Data with LocalAlloc; LocalFree is the matching release API.
 		_, _ = windows.LocalFree(windows.Handle(unsafe.Pointer(outBlob.Data)))
 	}()
 	// The blob lives in LocalAlloc memory freed above, so it has to be copied.
+	// #nosec G103 -- DPAPI returned outBlob.Size bytes at outBlob.Data; the copy completes before LocalFree.
 	return append([]byte(nil), unsafe.Slice(outBlob.Data, outBlob.Size)...), nil
 }
 

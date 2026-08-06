@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -453,7 +454,15 @@ func (a *App) dmLoadLog(peer string) (dmLog, error) {
 	if err != nil {
 		return dmLog{}, err
 	}
-	blob, err := os.ReadFile(path)
+	root, name, err := openParentRoot(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return dmLog{Peer: peer}, nil
+		}
+		return dmLog{}, err
+	}
+	defer func() { _ = root.Close() }()
+	blob, err := root.ReadFile(name)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return dmLog{Peer: peer}, nil
@@ -623,7 +632,12 @@ func (a *App) DMHistoryPeers() []DMPeer {
 	if err != nil {
 		return out
 	}
-	ents, err := os.ReadDir(dir)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return out
+	}
+	defer func() { _ = root.Close() }()
+	ents, err := fs.ReadDir(root.FS(), ".")
 	if err != nil {
 		return out
 	}
@@ -631,7 +645,7 @@ func (a *App) DMHistoryPeers() []DMPeer {
 		if ent.IsDir() || !strings.HasSuffix(ent.Name(), dmHistoryExt) {
 			continue
 		}
-		blob, err := os.ReadFile(filepath.Join(dir, ent.Name()))
+		blob, err := root.ReadFile(ent.Name())
 		if err != nil {
 			continue
 		}

@@ -33,6 +33,7 @@ func findMainWindow() uintptr {
 	var hwnd uintptr
 	cb := syscall.NewCallback(func(h uintptr, l uintptr) uintptr {
 		var windowPID uint32
+		// #nosec G103 -- GetWindowThreadProcessId requires a writable DWORD pointer.
 		_, _, _ = procGetWindowPID.Call(h, uintptr(unsafe.Pointer(&windowPID)))
 		if windowPID == pid {
 			visible, _, _ := procIsWindowVisible.Call(h)
