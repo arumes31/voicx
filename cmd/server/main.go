@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -74,6 +75,34 @@ func syncLogger(logger *zap.Logger) {
 	if err := logger.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) {
 		fmt.Fprintf(os.Stderr, "voicx: syncing logger: %v\n", err)
 	}
+}
+
+type serviceExit struct {
+	name string
+	err  error
+}
+
+// startService reports every service exit, including an unexpected nil error.
+// The caller provides a channel large enough for every launched service so
+// shutdown cannot strand a reporter after the first exit wins the select.
+func startService(exits chan<- serviceExit, name string, start func() error) {
+	go func() {
+		exits <- serviceExit{name: name, err: start()}
+	}()
+}
+
+func unexpectedServiceExit(exit serviceExit) error {
+	if exit.err == nil {
+		return fmt.Errorf("%s exited unexpectedly", exit.name)
+	}
+	return fmt.Errorf("%s exited unexpectedly: %w", exit.name, exit.err)
+}
+
+func joinShutdownError(current error, service string, err error) error {
+	if err == nil || errors.Is(err, net.ErrClosed) {
+		return current
+	}
+	return errors.Join(current, fmt.Errorf("shutting down %s: %w", service, err))
 }
 
 // rewrapChatKeys re-wraps every stored scope key generation under the newest
@@ -511,13 +540,23 @@ func run() (retErr error) {
 	m := metrics.New()
 	m.RegisterDBPool(dbStore.DB())
 	voiceRouter.SetForwardObserver(m.IncRTPForwarded)
-	healthServer := health.New(cfg.HealthAddr, logger, func(context.Context) error {
+	var servingReady atomic.Bool
+	healthServer := health.New(cfg.HealthAddr, logger, func(ctx context.Context) error {
+		if !servingReady.Load() {
+			return errors.New("server startup is not complete")
+		}
 		// Retry once on transient pool errors (e.g. "driver: bad connection"
 		// right after the database container restarts).
-		err := dbStore.Ping()
+		err := dbStore.DB().PingContext(ctx)
 		if err != nil && strings.Contains(err.Error(), "bad connection") {
-			time.Sleep(100 * time.Millisecond)
-			err = dbStore.Ping()
+			timer := time.NewTimer(100 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				err = dbStore.DB().PingContext(ctx)
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 		return err
 	})
@@ -527,10 +566,10 @@ func run() (retErr error) {
 		healthServer.HandleLocalGET("/metrics", m.Handler())
 	}
 	healthServer.Handle("/api/v1/schema/version", health.SchemaVersionHandler(dbStore.SchemaVersion))
-	healthErr := make(chan error, 1)
-	go func() {
-		healthErr <- healthServer.Start()
-	}()
+	// At most seven services are launched below. The spare slot ensures every
+	// reporter can finish even after the first exit initiates shutdown.
+	serviceExits := make(chan serviceExit, 8)
+	startService(serviceExits, "health HTTP server", healthServer.Start)
 
 	// TLS material is minted ONCE here and handed to both listeners: the data
 	// port must present the same certificate as the control channel so the
@@ -655,12 +694,7 @@ func run() (retErr error) {
 		return fmt.Errorf("encrypting legacy chat history: %w", err)
 	}
 
-	serverErr := make(chan error, 1)
-	go func() {
-		if err := tcpServer.Start(ctx); err != nil {
-			serverErr <- err
-		}
-	}()
+	startService(serviceExits, "TCP control server", func() error { return tcpServer.Start(ctx) })
 
 	// Timed group memberships (145): reap expired rows every 60s, invalidate
 	// the permission cache, and notify affected online users.
@@ -696,7 +730,11 @@ func run() (retErr error) {
 			} else {
 				logger.Warn("serverstop via ServerQuery: shutting down gracefully")
 			}
-			shutdownReq <- restart
+			select {
+			case shutdownReq <- restart:
+			default:
+				logger.Debug("shutdown request already pending")
+			}
 		},
 		startedAt:  time.Now(),
 		serverName: cfg.ServerName,
@@ -704,12 +742,7 @@ func run() (retErr error) {
 		rules:      rulesSvc,
 	}
 	queryServer := query.New(cfg.QueryAddr, logger, qBackend)
-	queryErr := make(chan error, 1)
-	go func() {
-		if err := queryServer.Start(ctx); err != nil {
-			queryErr <- err
-		}
-	}()
+	startService(serviceExits, "ServerQuery server", func() error { return queryServer.Start(ctx) })
 
 	// (231) the event stream for bots, on the health listener next to
 	// /metrics. Same credentials as ServerQuery: the stream reveals who is
@@ -720,94 +753,59 @@ func run() (retErr error) {
 	// (232) the gRPC API on the reserved port: same backend, same
 	// admin-only credentials, plus Events.Subscribe on the event bus.
 	grpcServer := grpcserver.New(cfg.GRPCAddr, qBackend, events, logger, queryServer)
-	grpcErr := make(chan error, 1)
-	go func() {
-		if err := grpcServer.Start(ctx); err != nil {
-			grpcErr <- err
-		}
-	}()
+	startService(serviceExits, "gRPC server", func() error { return grpcServer.Start(ctx) })
 
 	// (224) the same command set over SSH, opt-in.
 	var sshQuery *query.SSHServer
 	if cfg.QuerySSHEnabled {
 		sshQuery = query.NewSSH(cfg.QuerySSHAddr, cfg.QuerySSHHostKey, queryServer)
-		go func() {
-			if err := sshQuery.Start(ctx); err != nil {
-				queryErr <- err
-			}
-		}()
+		startService(serviceExits, "ServerQuery SSH server", func() error { return sshQuery.Start(ctx) })
 	}
 
 	// Start the file-transfer listener.
-	ftErr := make(chan error, 1)
-	go func() {
-		if err := ftServer.Start(ctx); err != nil {
-			ftErr <- err
-		}
-	}()
+	startService(serviceExits, "file-transfer server", func() error { return ftServer.Start(ctx) })
 
 	// Start the UDP media/signaling listener.
 	udpServer := server.NewUDP(cfg, logger)
 	udpServer.Metrics = m
-	udpErr := make(chan error, 1)
-	go func() {
-		if err := udpServer.Start(ctx); err != nil {
-			udpErr <- err
-		}
-	}()
+	startService(serviceExits, "UDP media server", func() error { return udpServer.Start(ctx) })
 
+	servingReady.Store(true)
 	logger.Info("voicx server running, waiting for shutdown signal")
+	var runErr error
 	select {
 	case <-ctx.Done():
 		logger.Info("voicx server shutting down")
 	case restart := <-shutdownReq:
 		logger.Info("voicx server shutting down via ServerQuery", zap.Bool("restart", restart))
-	case err := <-serverErr:
-		logger.Error("TCP server exited unexpectedly", zap.Error(err))
-	case err := <-udpErr:
-		logger.Error("UDP server exited unexpectedly", zap.Error(err))
-	case err := <-healthErr:
-		logger.Error("health server exited unexpectedly", zap.Error(err))
-	case err := <-queryErr:
-		logger.Error("query server exited unexpectedly", zap.Error(err))
-	case err := <-ftErr:
-		logger.Error("file transfer server exited unexpectedly", zap.Error(err))
-	case err := <-grpcErr:
-		logger.Error("gRPC server exited unexpectedly", zap.Error(err))
+	case exit := <-serviceExits:
+		runErr = unexpectedServiceExit(exit)
 	}
+	servingReady.Store(false)
+	stop()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := healthServer.Shutdown(shutdownCtx); err != nil {
-		logger.Warn("health server shutdown error", zap.Error(err))
+		runErr = joinShutdownError(runErr, "health HTTP server", err)
 	}
 
-	if err := tcpServer.Shutdown(); err != nil && !errors.Is(err, net.ErrClosed) {
-		logger.Warn("TCP server shutdown error", zap.Error(err))
-	}
-	if err := queryServer.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-		logger.Warn("query server shutdown error", zap.Error(err))
-	}
+	runErr = joinShutdownError(runErr, "TCP control server", tcpServer.Shutdown())
+	runErr = joinShutdownError(runErr, "ServerQuery server", queryServer.Close())
 	if sshQuery != nil {
-		if err := sshQuery.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			logger.Warn("query ssh server shutdown error", zap.Error(err))
-		}
+		runErr = joinShutdownError(runErr, "ServerQuery SSH server", sshQuery.Close())
 	}
 	// Event subscriptions are open-ended, so this cannot wait for them.
 	grpcServer.Stop()
-	if err := ftServer.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-		logger.Warn("file transfer server shutdown error", zap.Error(err))
-	}
-	if err := udpServer.Shutdown(); err != nil && !errors.Is(err, net.ErrClosed) {
-		logger.Warn("UDP server shutdown error", zap.Error(err))
-	}
+	runErr = joinShutdownError(runErr, "file-transfer server", ftServer.Close())
+	runErr = joinShutdownError(runErr, "UDP media server", udpServer.Shutdown())
 	stats := udpServer.Stats()
 	logger.Info("udp server stats",
 		zap.Uint64("packets_received", stats.PacketsReceived),
 		zap.Uint64("packets_dropped", stats.PacketsDropped),
 		zap.Uint64("packets_processed", stats.PacketsProcessed),
 	)
-	return nil
+	return runErr
 }
 
 // ensureServerGroup returns the ID of the named server group, creating it
