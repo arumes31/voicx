@@ -78,25 +78,33 @@ func (s *Server) serve(ctx context.Context, conn net.Conn) {
 	writeStatus(conn, true, "")
 }
 
-// receiveUpload reads chunk frames into a .part file, enforces the declared
-// size, verifies the client's SHA-256 digest, and atomically moves the file
-// into place with a files-table record. On any failure the .part file is
-// removed.
+// receiveUpload reads chunk frames into an exclusive, randomly named partial
+// file, verifies the declared size and SHA-256 digest, and atomically moves the
+// file into place with a files-table record. On failure the partial is removed.
 func (s *Server) receiveUpload(ctx context.Context, conn net.Conn, tr *transfer) error {
-	finalPath := s.filePath(tr.ChannelID, tr.Folder, tr.Name)
-	if err := os.MkdirAll(filepath.Dir(finalPath), 0o750); err != nil {
+	root, err := s.openBlobRoot()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	finalPath := blobPath(tr.ChannelID, tr.Folder, tr.Name)
+	if err := root.MkdirAll(filepath.Dir(finalPath), 0o700); err != nil {
 		return fmt.Errorf("creating channel dir: %w", err)
 	}
-	tmpPath := finalPath + ".part"
+	tmpID, err := randomHex(8)
+	if err != nil {
+		return fmt.Errorf("generating temporary upload name: %w", err)
+	}
+	tmpPath := finalPath + ".part-" + tmpID
 
-	f, err := os.Create(tmpPath)
+	f, err := root.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return fmt.Errorf("creating temp file: %w", err)
 	}
 	// On any error path: close and remove the partial file.
 	fail := func(err error) error {
 		_ = f.Close()
-		_ = os.Remove(tmpPath)
+		_ = root.Remove(tmpPath)
 		return err
 	}
 
@@ -136,11 +144,16 @@ func (s *Server) receiveUpload(ctx context.Context, conn net.Conn, tr *transfer)
 			if digest.SHA256 != sum {
 				return fail(errors.New("checksum mismatch"))
 			}
+			if err := f.Sync(); err != nil {
+				_ = f.Close()
+				_ = root.Remove(tmpPath)
+				return fmt.Errorf("syncing file: %w", err)
+			}
 			if err := f.Close(); err != nil {
-				_ = os.Remove(tmpPath)
+				_ = root.Remove(tmpPath)
 				return fmt.Errorf("closing file: %w", err)
 			}
-			if err := s.finalizeUpload(ctx, tr, tmpPath, finalPath, received, sum); err != nil {
+			if err := s.finalizeUpload(ctx, tr, root, tmpPath, finalPath, received, sum); err != nil {
 				return err
 			}
 			s.logger.Info("upload complete",
@@ -168,40 +181,45 @@ const maxFileVersions = 3
 // for, and its name must be the truncated digest of the ciphertext: that is
 // what makes the name unforgeable, so an upload cannot displace the blob an
 // older message still points at.
-func (s *Server) finalizeUpload(ctx context.Context, tr *transfer, tmpPath, finalPath string, size int64, sum string) error {
+func (s *Server) finalizeUpload(ctx context.Context, tr *transfer, root *os.Root, tmpPath, finalPath string, size int64, sum string) error {
 	encrypted := isEncryptedAttachment(tr.Name)
 	if encrypted && tr.Name != sum[:encryptedNameLen]+encryptedSuffix {
-		_ = os.Remove(tmpPath)
+		_ = root.Remove(tmpPath)
 		return fmt.Errorf("encrypted attachment name is not its content digest")
 	}
 
 	// Identical re-upload of the current file: keep the blob, refresh the row.
 	if cur, err := s.store.GetFile(ctx, tr.ChannelID, tr.Folder, tr.Name); err == nil && cur.SHA256 == sum {
-		_ = os.Remove(tmpPath)
-		return s.store.AddFile(ctx, store.FileRecord{
-			ChannelID: tr.ChannelID, Folder: tr.Folder, Name: tr.Name,
-			Size: size, SHA256: sum, Uploader: tr.Uploader, Encrypted: encrypted,
-		})
+		if info, statErr := root.Lstat(finalPath); statErr == nil && info.Mode().IsRegular() {
+			_ = root.Remove(tmpPath)
+			return s.store.AddFile(ctx, store.FileRecord{
+				ChannelID: tr.ChannelID, Folder: tr.Folder, Name: tr.Name,
+				Size: size, SHA256: sum, Uploader: tr.Uploader, Encrypted: encrypted,
+			})
+		}
 	}
 
 	// Content-derived .vcx names never collide, so rotation can only burn four
 	// store lookups on a guaranteed miss for them (91-135).
 	if !encrypted {
-		s.rotateVersions(ctx, tr)
+		s.rotateVersions(ctx, tr, root)
 	}
 
 	// Dedup (275): point at an identical existing blob instead of storing a
 	// second copy.
 	linked := false
 	if ex, err := s.store.FindFileBySHA(ctx, tr.ChannelID, sum, tr.Folder, tr.Name); err == nil && ex != nil {
-		if err := os.Link(s.filePath(tr.ChannelID, ex.Folder, ex.Name), finalPath); err == nil {
-			linked = true
-			_ = os.Remove(tmpPath)
+		existingPath := blobPath(tr.ChannelID, ex.Folder, ex.Name)
+		if info, statErr := root.Lstat(existingPath); statErr == nil && info.Mode().IsRegular() {
+			if err := root.Link(existingPath, finalPath); err == nil {
+				linked = true
+				_ = root.Remove(tmpPath)
+			}
 		}
 	}
 	if !linked {
-		if err := os.Rename(tmpPath, finalPath); err != nil {
-			_ = os.Remove(tmpPath)
+		if err := root.Rename(tmpPath, finalPath); err != nil {
+			_ = root.Remove(tmpPath)
 			return fmt.Errorf("finalizing file: %w", err)
 		}
 	}
@@ -214,18 +232,25 @@ func (s *Server) finalizeUpload(ctx context.Context, tr *transfer, tmpPath, fina
 // rotateVersions shifts <name>.v1..v2 up one slot (dropping the oldest) and
 // renames the current file to <name>.v1 (264). Failures are logged, not
 // fatal: losing a version must not break the upload.
-func (s *Server) rotateVersions(ctx context.Context, tr *transfer) {
+func (s *Server) rotateVersions(ctx context.Context, tr *transfer, root *os.Root) {
 	rename := func(folder, from, to string) {
 		if _, err := s.store.GetFile(ctx, tr.ChannelID, folder, from); err != nil {
 			return // nothing to rotate
+		}
+		oldPath := blobPath(tr.ChannelID, folder, from)
+		newPath := blobPath(tr.ChannelID, folder, to)
+		if info, err := root.Lstat(oldPath); err == nil && !info.Mode().IsRegular() {
+			s.logger.Warn("version rotate refused non-regular blob", zap.String("from", from))
+			return
+		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+			s.logger.Warn("version rotate (disk check) failed", zap.String("from", from), zap.Error(err))
+			return
 		}
 		if err := s.store.RenameFile(ctx, tr.ChannelID, folder, from, folder, to); err != nil {
 			s.logger.Warn("version rotate (db) failed", zap.String("from", from), zap.Error(err))
 			return
 		}
-		oldPath := s.filePath(tr.ChannelID, folder, from)
-		newPath := s.filePath(tr.ChannelID, folder, to)
-		if err := os.Rename(oldPath, newPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := root.Rename(oldPath, newPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			s.logger.Warn("version rotate (disk) failed", zap.String("from", from), zap.Error(err))
 		}
 	}
@@ -233,7 +258,7 @@ func (s *Server) rotateVersions(ctx context.Context, tr *transfer) {
 	oldest := tr.Name + ".v" + strconv.Itoa(maxFileVersions)
 	if _, err := s.store.GetFile(ctx, tr.ChannelID, tr.Folder, oldest); err == nil {
 		_ = s.store.DeleteFile(ctx, tr.ChannelID, tr.Folder, oldest)
-		_ = os.Remove(s.filePath(tr.ChannelID, tr.Folder, oldest))
+		_ = root.Remove(blobPath(tr.ChannelID, tr.Folder, oldest))
 	}
 	for v := maxFileVersions - 1; v >= 1; v-- {
 		rename(tr.Folder, tr.Name+".v"+strconv.Itoa(v), tr.Name+".v"+strconv.Itoa(v+1))
@@ -247,7 +272,12 @@ func (s *Server) rotateVersions(ctx context.Context, tr *transfer) {
 // re-sent, so the digest still covers the whole file and a resumed download
 // is verified exactly as strictly as a fresh one.
 func (s *Server) sendDownload(conn net.Conn, tr *transfer, offset int64) (retErr error) {
-	f, err := os.Open(s.filePath(tr.ChannelID, tr.Folder, tr.Name))
+	root, err := s.openBlobRoot()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	f, err := openRegularBlob(root, blobPath(tr.ChannelID, tr.Folder, tr.Name))
 	if err != nil {
 		return fmt.Errorf("opening file: %w", err)
 	}

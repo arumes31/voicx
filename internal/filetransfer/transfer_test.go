@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -131,6 +132,22 @@ func TestUploadRoundTrip(t *testing.T) {
 	if string(onDisk) != string(content) {
 		t.Fatalf("file content = %q, want %q", onDisk, content)
 	}
+	if runtime.GOOS != "windows" {
+		fileInfo, err := os.Stat(filepath.Join(s.cfg.RootDir, "7", "hello.txt"))
+		if err != nil {
+			t.Fatalf("stat uploaded file: %v", err)
+		}
+		if got := fileInfo.Mode().Perm(); got != 0o600 {
+			t.Errorf("uploaded file mode = %o, want 600", got)
+		}
+		dirInfo, err := os.Stat(filepath.Join(s.cfg.RootDir, "7"))
+		if err != nil {
+			t.Fatalf("stat channel directory: %v", err)
+		}
+		if got := dirInfo.Mode().Perm(); got != 0o700 {
+			t.Errorf("channel directory mode = %o, want 700", got)
+		}
+	}
 
 	rec, err := fs.GetFile(context.Background(), 7, "", "hello.txt")
 	if err != nil {
@@ -138,6 +155,68 @@ func TestUploadRoundTrip(t *testing.T) {
 	}
 	if rec.Size != int64(len(content)) || rec.SHA256 != sha256Hex(content) || rec.Uploader != "uid-1" {
 		t.Fatalf("store record = %+v", rec)
+	}
+}
+
+func TestDownloadRejectsNonRegularBlob(t *testing.T) {
+	rootDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(rootDir, "7", "directory.txt"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s := New(Config{Addr: ":0", RootDir: rootDir}, newFakeFileStore(), nil)
+	serverConn, clientConn := net.Pipe()
+	defer func() { _ = serverConn.Close() }()
+	defer func() { _ = clientConn.Close() }()
+
+	err := s.sendDownload(serverConn, &transfer{ChannelID: 7, Name: "directory.txt"}, 0)
+	if err == nil {
+		t.Fatal("sendDownload accepted a directory as a blob")
+	}
+}
+
+func TestDownloadRejectsSymlinkEscape(t *testing.T) {
+	rootDir := t.TempDir()
+	outsideDir := t.TempDir()
+	outside := filepath.Join(outsideDir, "outside.txt")
+	if err := os.WriteFile(outside, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	channelDir := filepath.Join(rootDir, "7")
+	if err := os.Mkdir(channelDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(channelDir, "link.txt")); err != nil {
+		t.Skipf("symlink creation is not supported: %v", err)
+	}
+	s := New(Config{Addr: ":0", RootDir: rootDir}, newFakeFileStore(), nil)
+	serverConn, clientConn := net.Pipe()
+	defer func() { _ = serverConn.Close() }()
+	defer func() { _ = clientConn.Close() }()
+
+	err := s.sendDownload(serverConn, &transfer{ChannelID: 7, Name: "link.txt", Size: 6}, 0)
+	if err == nil {
+		t.Fatal("sendDownload followed a symlink outside the blob root")
+	}
+}
+
+func TestUploadRejectsSymlinkEscape(t *testing.T) {
+	rootDir := t.TempDir()
+	outsideDir := t.TempDir()
+	if err := os.Symlink(outsideDir, filepath.Join(rootDir, "7")); err != nil {
+		t.Skipf("directory symlink creation is not supported: %v", err)
+	}
+	s := New(Config{Addr: ":0", RootDir: rootDir}, newFakeFileStore(), nil)
+
+	err := s.receiveUpload(context.Background(), nil, &transfer{ChannelID: 7, Name: "escape.txt", Size: 1})
+	if err == nil {
+		t.Fatal("receiveUpload followed a directory symlink outside the blob root")
+	}
+	entries, err := os.ReadDir(outsideDir)
+	if err != nil {
+		t.Fatalf("read outside directory: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("upload created files outside the root: %v", entries)
 	}
 }
 

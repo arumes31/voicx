@@ -19,7 +19,7 @@ const LinkTTL = 15 * time.Minute
 
 // link is one issued download link.
 type link struct {
-	path    string // absolute on-disk path
+	path    string // path relative to the registry's confined root
 	name    string // download file name (Content-Disposition)
 	expires time.Time
 }
@@ -27,23 +27,34 @@ type link struct {
 // LinkRegistry tracks issued download links and serves them over HTTP. It
 // implements http.Handler mounted at /dl/ on the health server.
 type LinkRegistry struct {
-	mu    sync.Mutex
-	links map[string]link
+	mu      sync.Mutex
+	rootDir string
+	links   map[string]link
 }
 
 // NewLinkRegistry returns an empty registry.
-func NewLinkRegistry() *LinkRegistry {
-	return &LinkRegistry{links: map[string]link{}}
+func NewLinkRegistry(rootDir string) *LinkRegistry {
+	return &LinkRegistry{rootDir: rootDir, links: map[string]link{}}
 }
 
-// Create issues a link for an on-disk file and returns its token.
+// Create issues a link for a regular file beneath the configured root and
+// returns its token. path must be relative to that root.
 func (r *LinkRegistry) Create(path, name string) (string, time.Time, error) {
 	// /dl/<token> holds no key, so a chat attachment would be served as raw
 	// ciphertext that looks like a corrupt download (91-135).
 	if isEncryptedAttachment(name) {
 		return "", time.Time{}, ErrEncryptedAttachment
 	}
-	if _, err := os.Stat(path); err != nil {
+	root, err := os.OpenRoot(r.rootDir)
+	if err != nil {
+		return "", time.Time{}, errors.New("file not found on disk")
+	}
+	defer func() { _ = root.Close() }()
+	f, err := openRegularBlob(root, path)
+	if err != nil {
+		return "", time.Time{}, errors.New("file not found on disk")
+	}
+	if err := f.Close(); err != nil {
 		return "", time.Time{}, errors.New("file not found on disk")
 	}
 	token, err := randomHex(16)
@@ -83,6 +94,23 @@ func (r *LinkRegistry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "unknown or expired link", http.StatusNotFound)
 		return
 	}
+	root, err := os.OpenRoot(r.rootDir)
+	if err != nil {
+		http.Error(w, "file not found", http.StatusNotFound)
+		return
+	}
+	defer func() { _ = root.Close() }()
+	f, err := openRegularBlob(root, l.path)
+	if err != nil {
+		http.Error(w, "file not found", http.StatusNotFound)
+		return
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		http.Error(w, "file not found", http.StatusNotFound)
+		return
+	}
 	w.Header().Set("Content-Disposition", "attachment; filename="+strconv.Quote(l.name))
-	http.ServeFile(w, req, l.path)
+	http.ServeContent(w, req, l.name, info.ModTime(), f)
 }

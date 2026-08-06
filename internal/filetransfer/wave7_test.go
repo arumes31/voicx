@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"voicx/internal/netproto"
@@ -53,7 +54,10 @@ func TestFolderUpload(t *testing.T) {
 		t.Fatalf("record = %+v, err=%v", rec, err)
 	}
 
-	for _, bad := range []string{"..", "../etc", "a//b", "/abs", "a/", `a\b`} {
+	for _, bad := range []string{
+		"..", "../etc", `..\etc`, "a//b", "/abs", "a/", `a\b`,
+		`C:\Windows`, `\\server\share`,
+	} {
 		if _, err := sanitizeFolder(bad); err == nil {
 			t.Errorf("sanitizeFolder(%q) accepted", bad)
 		}
@@ -181,5 +185,36 @@ func TestDownloadLink(t *testing.T) {
 	// Missing file: link creation fails.
 	if _, _, err := s.CreateLink(context.Background(), 7, "", "ghost.txt"); err == nil {
 		t.Fatal("link for missing file succeeded")
+	}
+}
+
+func TestDownloadLinkRejectsSymlinkSwap(t *testing.T) {
+	fs := newFakeFileStore()
+	addr, s := startServer(t, fs)
+	uploadOne(t, addr, s, "", "shared.txt", []byte("safe"))
+
+	token, _, err := s.CreateLink(context.Background(), 7, "", "shared.txt")
+	if err != nil {
+		t.Fatalf("CreateLink: %v", err)
+	}
+	path := s.filePath(7, "", "shared.txt")
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove linked file: %v", err)
+	}
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("outside secret"), 0o600); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+	if err := os.Symlink(outside, path); err != nil {
+		t.Skipf("symlink creation is not supported: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	s.Links().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dl/"+token, nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("symlink-swapped link status = %d, want 404", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "outside secret") {
+		t.Fatal("download link disclosed a symlink target outside the file root")
 	}
 }

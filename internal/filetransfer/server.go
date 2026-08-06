@@ -8,8 +8,8 @@
 // length + 2-byte type + payload) with a tiny frame vocabulary (see
 // protocol.go): one init frame authenticates the connection, raw chunk
 // frames carry the data, and a digest frame carrying the SHA-256 of the file
-// closes the transfer. Uploads are written to <root>/<channel_id>/<name>.part
-// and atomically renamed on success; a same-name upload replaces the
+// closes the transfer. Uploads are written to a random, exclusive temporary
+// file below <root>/<channel_id> and atomically renamed on success; a same-name upload replaces the
 // previous file (both on disk and in the files table).
 //
 // The port speaks TLS whenever Config.TLSEnabled is set (91-135); when it is
@@ -193,7 +193,7 @@ type Server struct {
 	links *LinkRegistry
 	// moveBlobFn is injectable in tests so metadata rollback can be exercised
 	// without depending on the host's volume layout.
-	moveBlobFn func(string, string) error
+	moveBlobFn func(*os.Root, string, string) error
 
 	// OnTransferComplete, when set, is called with the direction and result
 	// ("ok"/"error") when a transfer finishes (metrics).
@@ -226,7 +226,7 @@ func New(cfg Config, st FileStore, logger *zap.Logger) *Server {
 		store:      st,
 		logger:     logger,
 		port:       port,
-		links:      NewLinkRegistry(),
+		links:      NewLinkRegistry(cfg.RootDir),
 		moveBlobFn: moveBlob,
 		stopCh:     make(chan struct{}),
 		transfers:  make(map[string]*transfer),
@@ -367,7 +367,17 @@ func (s *Server) DeleteFile(ctx context.Context, channelID int64, folder, name s
 	if err := s.store.DeleteFile(ctx, channelID, folder, name); err != nil {
 		return err
 	}
-	if err := os.Remove(s.filePath(channelID, folder, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	root, err := s.openBlobRoot()
+	if err != nil {
+		s.logger.Warn("opening file root failed while removing blob",
+			zap.Int64("channel_id", channelID),
+			zap.String("name", name),
+			zap.Error(err),
+		)
+		return nil
+	}
+	defer func() { _ = root.Close() }()
+	if err := root.Remove(blobPath(channelID, folder, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		s.logger.Warn("removing file blob failed",
 			zap.Int64("channel_id", channelID),
 			zap.String("name", name),
@@ -408,9 +418,14 @@ func (s *Server) MoveFile(ctx context.Context, channelID int64, folder, name str
 	if channelID == newChannelID && folder == newFolder && name == newName {
 		return errors.New("nothing to rename")
 	}
-	oldPath := s.filePath(channelID, folder, name)
-	newPath := s.filePath(newChannelID, newFolder, newName)
-	if err := os.MkdirAll(filepath.Dir(newPath), 0o750); err != nil {
+	root, err := s.openBlobRoot()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	oldPath := blobPath(channelID, folder, name)
+	newPath := blobPath(newChannelID, newFolder, newName)
+	if err := root.MkdirAll(filepath.Dir(newPath), 0o700); err != nil {
 		return fmt.Errorf("creating target folder: %w", err)
 	}
 	// A move into an occupied name would silently orphan the blob already
@@ -426,7 +441,7 @@ func (s *Server) MoveFile(ctx context.Context, channelID int64, folder, name str
 		}
 		return err
 	}
-	if err := s.moveBlobFn(oldPath, newPath); err != nil {
+	if err := s.moveBlobFn(root, oldPath, newPath); err != nil {
 		rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer rbCancel()
 		rollbackErr := s.store.MoveFile(rbCtx, newChannelID, newFolder, newName, channelID, folder, name)
@@ -442,22 +457,33 @@ func (s *Server) MoveFile(ctx context.Context, channelID int64, folder, name str
 // on different volumes (a cross-channel move can cross a mount point when the
 // storage root spans devices, and Rename fails with EXDEV there). A missing
 // source is not an error: the row is the record of truth.
-func moveBlob(oldPath, newPath string) error {
-	err := os.Rename(oldPath, newPath)
+func moveBlob(root *os.Root, oldPath, newPath string) error {
+	info, err := root.Lstat(oldPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("checking source blob: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("source blob %q is not a regular file", oldPath)
+	}
+
+	err = root.Rename(oldPath, newPath)
 	if err == nil || errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	return copyBlobAndRemove(oldPath, newPath, err)
+	return copyBlobAndRemove(root, oldPath, newPath, err)
 }
 
 // copyBlobAndRemove is the cross-volume fallback after Rename fails.
-func copyBlobAndRemove(oldPath, newPath string, renameErr error) error {
-	src, openErr := os.Open(oldPath)
+func copyBlobAndRemove(root *os.Root, oldPath, newPath string, renameErr error) error {
+	src, openErr := openRegularBlob(root, oldPath)
 	if openErr != nil {
 		if errors.Is(openErr, os.ErrNotExist) {
 			return nil
 		}
-		return renameErr
+		return fmt.Errorf("copy fallback after rename failed (%v): %w", renameErr, openErr)
 	}
 	srcClosed := false
 	defer func() {
@@ -465,27 +491,32 @@ func copyBlobAndRemove(oldPath, newPath string, renameErr error) error {
 			_ = src.Close()
 		}
 	}()
-	dst, createErr := os.Create(newPath)
+	dst, createErr := root.OpenFile(newPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if createErr != nil {
 		return createErr
 	}
 	if _, copyErr := io.Copy(dst, src); copyErr != nil {
 		_ = dst.Close()
-		_ = os.Remove(newPath)
+		_ = root.Remove(newPath)
 		return copyErr
 	}
+	if syncErr := dst.Sync(); syncErr != nil {
+		_ = dst.Close()
+		_ = root.Remove(newPath)
+		return syncErr
+	}
 	if closeErr := dst.Close(); closeErr != nil {
-		_ = os.Remove(newPath)
+		_ = root.Remove(newPath)
 		return closeErr
 	}
 	closeErr := src.Close()
 	srcClosed = true
 	if closeErr != nil {
-		_ = os.Remove(newPath)
+		_ = root.Remove(newPath)
 		return closeErr
 	}
 	// Only drop the source once the copy is safely closed.
-	_ = os.Remove(oldPath)
+	_ = root.Remove(oldPath)
 	return nil
 }
 
@@ -541,7 +572,7 @@ func (s *Server) CreateLink(ctx context.Context, channelID int64, folder, name s
 	if _, err := s.store.GetFile(ctx, channelID, folder, name); err != nil {
 		return "", time.Time{}, err
 	}
-	return s.links.Create(s.filePath(channelID, folder, name), name)
+	return s.links.Create(blobPath(channelID, folder, name), name)
 }
 
 // register creates a transfer ID and token and records the pending transfer.
@@ -644,23 +675,90 @@ func sanitizeFolder(folder string) (string, error) {
 	return folder, nil
 }
 
-// filePath returns the on-disk path for a channel file.
+// blobPath returns a path relative to the configured storage root. Remote
+// folders and names are validated before this helper is reached; os.Root is
+// the final confinement layer for every filesystem operation.
+func blobPath(channelID int64, folder, name string) string {
+	return filepath.Join(strconv.FormatInt(channelID, 10), filepath.FromSlash(folder), name)
+}
+
+// filePath returns the absolute on-disk path for APIs that require one. Blob
+// reads and writes use blobPath with os.Root instead.
 func (s *Server) filePath(channelID int64, folder, name string) string {
-	return filepath.Join(s.cfg.RootDir, strconv.FormatInt(channelID, 10), filepath.FromSlash(folder), name)
+	return filepath.Join(s.cfg.RootDir, blobPath(channelID, folder, name))
+}
+
+// openBlobRoot creates the trusted configured root when necessary and opens
+// a capability that rejects traversal and symlink escapes for relative blob
+// paths. Callers close the root after their operation; Root itself is safe for
+// concurrent use while open.
+func (s *Server) openBlobRoot() (*os.Root, error) {
+	if err := os.MkdirAll(s.cfg.RootDir, 0o700); err != nil {
+		return nil, fmt.Errorf("creating file root %s: %w", s.cfg.RootDir, err)
+	}
+	root, err := os.OpenRoot(s.cfg.RootDir)
+	if err != nil {
+		return nil, fmt.Errorf("opening file root %s: %w", s.cfg.RootDir, err)
+	}
+	return root, nil
+}
+
+// openRegularBlob opens an existing blob only when the directory entry and
+// the opened target are regular files. The second check rejects a non-regular
+// target swapped in between Lstat and Open; os.Root keeps either lookup
+// confined in all cases.
+func openRegularBlob(root *os.Root, name string) (*os.File, error) {
+	info, err := root.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("blob %q is not a regular file", name)
+	}
+	f, err := root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	openedInfo, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if !openedInfo.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("blob %q is not a regular file", name)
+	}
+	return f, nil
 }
 
 // CheckRoot verifies the storage root exists and is writable, creating it if
 // needed. It is called at startup so a misconfigured volume is logged loudly
 // instead of failing on the first upload.
 func (s *Server) CheckRoot() error {
-	if err := os.MkdirAll(s.cfg.RootDir, 0o750); err != nil {
-		return fmt.Errorf("creating file root %s: %w", s.cfg.RootDir, err)
+	root, err := s.openBlobRoot()
+	if err != nil {
+		return err
 	}
-	probe := filepath.Join(s.cfg.RootDir, ".writetest")
-	if err := os.WriteFile(probe, []byte("ok"), 0o600); err != nil {
+	defer func() { _ = root.Close() }()
+	probeID, err := randomHex(8)
+	if err != nil {
+		return err
+	}
+	probe := ".writetest-" + probeID
+	f, err := root.OpenFile(probe, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
 		return fmt.Errorf("file root %s is not writable: %w", s.cfg.RootDir, err)
 	}
-	_ = os.Remove(probe)
+	if _, err := f.Write([]byte("ok")); err != nil {
+		_ = f.Close()
+		_ = root.Remove(probe)
+		return fmt.Errorf("file root %s is not writable: %w", s.cfg.RootDir, err)
+	}
+	if err := f.Close(); err != nil {
+		_ = root.Remove(probe)
+		return fmt.Errorf("file root %s is not writable: %w", s.cfg.RootDir, err)
+	}
+	_ = root.Remove(probe)
 	return nil
 }
 

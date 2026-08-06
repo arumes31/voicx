@@ -27,9 +27,8 @@ type initMsg struct {
 	// many bytes before streaming. The digest frame still covers the WHOLE
 	// file, so a resuming client must fold the bytes it already holds into
 	// its own hash — that is what keeps the end-to-end integrity check
-	// meaningful across a resume. Uploads ignore it: an upload's .part file
-	// is discarded on failure, so there is nothing on the server to resume
-	// onto.
+	// meaningful across a resume. Uploads ignore it: an upload's partial file
+	// is discarded on failure, so there is nothing on the server to resume.
 	Offset int64 `json:"offset,omitempty"`
 }
 
