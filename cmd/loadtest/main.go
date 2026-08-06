@@ -7,7 +7,8 @@
 // Usage:
 //
 //	loadtest -addr 127.0.0.1:12333 -clients 50 -duration 30s -ramp 5s \
-//	    -unique-id <uid> -password <pw> [-channel 1] [-udp -udp-addr 127.0.0.1:12334]
+//	    -unique-id <uid> -password <pw> [-channel 1] [-udp -udp-addr 127.0.0.1:12334] \
+//	    [-tls | -tls-fingerprint <sha256> | -tls-insecure]
 //
 // Authentication uses a single shared account for all simulated clients
 // (voicx allows multiple connections per unique ID). Create a test user
@@ -17,13 +18,19 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
-	"math/rand/v2"
+	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,6 +55,8 @@ type options struct {
 	channel     int64
 	udp         bool
 	anonymous   bool
+	tlsVerify   bool
+	tlsPin      string
 	tlsInsecure bool
 	webrtc      bool
 	relayOnly   bool
@@ -118,11 +127,17 @@ func main() {
 	flag.Int64Var(&opts.channel, "channel", 1, "channel ID to join (0 = don't join)")
 	flag.BoolVar(&opts.udp, "udp", false, "also send UDP pings to exercise the UDP path")
 	flag.BoolVar(&opts.anonymous, "anonymous", false, "connect as anonymous guests (loadtest-N nicknames; -unique-id/-password not needed)")
-	flag.BoolVar(&opts.tlsInsecure, "tls-insecure", false, "dial with TLS but skip certificate verification (self-signed certs), logging the fingerprint once")
+	flag.BoolVar(&opts.tlsVerify, "tls", false, "dial with TLS 1.3 and verify the server with system roots")
+	flag.StringVar(&opts.tlsPin, "tls-fingerprint", "", "dial with TLS 1.3 and require this SHA-256 certificate fingerprint")
+	flag.BoolVar(&opts.tlsInsecure, "tls-insecure", false, "dial with unverified TLS 1.3 (explicit loopback-only test mode)")
 	flag.BoolVar(&opts.webrtc, "webrtc", false, "publish a continuous Opus RTP stream from every simulated client")
 	flag.BoolVar(&opts.relayOnly, "ice-relay-only", false, "require TURN relay candidates (for the Toxiproxy chaos profile)")
 	flag.Parse()
 
+	if _, _, err := controlTLSConfig(opts); err != nil {
+		fmt.Fprintf(os.Stderr, "loadtest: %v\n", err)
+		os.Exit(2)
+	}
 	if !opts.anonymous && (opts.uniqueID == "" || opts.password == "") {
 		fmt.Fprintln(os.Stderr, "loadtest: -unique-id and -password are required (or use -anonymous)")
 		os.Exit(2)
@@ -174,15 +189,17 @@ func run(ctx context.Context, opts options, st *stats) error {
 // loggedFP prints the server fingerprint only on the first TLS dial.
 var loggedFP sync.Once
 
-// dialControl dials the control channel, honoring -tls-insecure (TLS with
-// certificate verification skipped for self-signed server certs; the
-// presented fingerprint is logged once).
+// dialControl dials the control channel in plaintext or in the explicitly
+// selected authenticated TLS mode. Unverified TLS is limited to loopback.
 func dialControl(opts options) (net.Conn, error) {
-	if !opts.tlsInsecure {
+	tlsConfig, useTLS, err := controlTLSConfig(opts)
+	if err != nil {
+		return nil, err
+	}
+	if !useTLS {
 		return net.DialTimeout("tcp", opts.addr, 5*time.Second)
 	}
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", opts.addr,
-		&tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}) //nolint:gosec // loadtest flag
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", opts.addr, tlsConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -192,6 +209,92 @@ func dialControl(opts options) (net.Conn, error) {
 		}
 	})
 	return conn, nil
+}
+
+func controlTLSConfig(opts options) (*tls.Config, bool, error) {
+	modes := 0
+	if opts.tlsVerify {
+		modes++
+	}
+	if strings.TrimSpace(opts.tlsPin) != "" {
+		modes++
+	}
+	if opts.tlsInsecure {
+		modes++
+	}
+	if modes > 1 {
+		return nil, false, errors.New("choose only one of -tls, -tls-fingerprint, or -tls-insecure")
+	}
+
+	switch {
+	case strings.TrimSpace(opts.tlsPin) != "":
+		cfg, err := pinnedTLSConfig(opts.tlsPin)
+		return cfg, true, err
+	case opts.tlsInsecure:
+		if !isLoopbackEndpoint(opts.addr) {
+			return nil, false, fmt.Errorf("-tls-insecure is restricted to loopback addresses, got %q", opts.addr)
+		}
+		return &tls.Config{
+			InsecureSkipVerify: true, // #nosec G402 -- explicitly requested test mode is restricted to loopback.
+			MinVersion:         tls.VersionTLS13,
+		}, true, nil
+	case opts.tlsVerify:
+		host, _, err := net.SplitHostPort(opts.addr)
+		if err != nil || host == "" {
+			return nil, false, fmt.Errorf("TLS address %q must include a host and port", opts.addr)
+		}
+		return &tls.Config{MinVersion: tls.VersionTLS13, ServerName: host}, true, nil
+	default:
+		return nil, false, nil
+	}
+}
+
+func pinnedTLSConfig(fingerprint string) (*tls.Config, error) {
+	expected, err := parseTLSFingerprint(fingerprint)
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Config{
+		InsecureSkipVerify: true, // #nosec G402 -- VerifyConnection authenticates the exact certificate fingerprint.
+		MinVersion:         tls.VersionTLS13,
+		VerifyConnection: func(state tls.ConnectionState) error {
+			if len(state.PeerCertificates) == 0 {
+				return errors.New("server presented no TLS certificate")
+			}
+			got := sha256.Sum256(state.PeerCertificates[0].Raw)
+			if subtle.ConstantTimeCompare(got[:], expected[:]) != 1 {
+				return fmt.Errorf("TLS fingerprint = %s, want %s",
+					tlscert.FingerprintDER(state.PeerCertificates[0].Raw), fingerprint)
+			}
+			return nil
+		},
+	}, nil
+}
+
+func parseTLSFingerprint(value string) ([sha256.Size]byte, error) {
+	var fingerprint [sha256.Size]byte
+	compact := strings.ReplaceAll(strings.TrimSpace(value), ":", "")
+	if len(compact) != hex.EncodedLen(sha256.Size) {
+		return fingerprint, fmt.Errorf("TLS fingerprint must contain %d SHA-256 bytes", sha256.Size)
+	}
+	raw, err := hex.DecodeString(compact)
+	if err != nil {
+		return fingerprint, fmt.Errorf("decoding TLS fingerprint: %w", err)
+	}
+	copy(fingerprint[:], raw)
+	return fingerprint, nil
+}
+
+func isLoopbackEndpoint(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // simulateClient is one simulated client connection lifecycle.
@@ -385,12 +488,14 @@ func startOpusPublisher(conn net.Conn, supplied []netproto.ICEServer, relayOnly 
 			return nil, err
 		}
 	}
+	sequence, timestamp, ssrc, err := readRTPIdentifiers(rand.Reader)
+	if err != nil {
+		_ = pc.Close()
+		return nil, fmt.Errorf("generating RTP identifiers: %w", err)
+	}
 	go func() {
 		ticker := time.NewTicker(20 * time.Millisecond)
 		defer ticker.Stop()
-		sequence := uint16(rand.Uint32())
-		timestamp := rand.Uint32()
-		ssrc := rand.Uint32()
 		for {
 			select {
 			case <-ctx.Done():
@@ -407,6 +512,16 @@ func startOpusPublisher(conn net.Conn, supplied []netproto.ICEServer, relayOnly 
 		}
 	}()
 	return pc, nil
+}
+
+func readRTPIdentifiers(source io.Reader) (uint16, uint32, uint32, error) {
+	var seed [10]byte
+	if _, err := io.ReadFull(source, seed[:]); err != nil {
+		return 0, 0, 0, err
+	}
+	return binary.BigEndian.Uint16(seed[0:2]),
+		binary.BigEndian.Uint32(seed[2:6]),
+		binary.BigEndian.Uint32(seed[6:10]), nil
 }
 
 func readWebRTCAnswer(conn net.Conn, timeout time.Duration) (netproto.WebRTCAnswer, []netproto.ICECandidate, error) {

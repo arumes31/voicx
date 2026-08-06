@@ -4,10 +4,10 @@
 //
 //	adduser -nickname <name> -password <pw> [-admin] [-db <dsn>]
 //
-// The database DSN comes from -db, then VOICX_DATABASE_URL, then the
-// built-in default. Migrations are applied (idempotent). With -admin the
-// user gets the is_admin flag (RegisterUser creates non-admin users, so it
-// is set with a follow-up UPDATE).
+// The database DSN comes from -db, then VOICX_DATABASE_URL. Migrations are
+// applied (idempotent). With -admin the user gets the is_admin flag
+// (RegisterUser creates non-admin users, so it is set with a follow-up
+// UPDATE).
 //
 // Exit codes: 0 on success, and also 0 when the user already exists
 // (idempotent for provisioning scripts); 1 on real errors.
@@ -27,13 +27,11 @@ import (
 	"voicx/internal/store"
 )
 
-const defaultDSN = "postgres://voicx:voicx@localhost:5432/voicx?sslmode=disable"
-
 func main() {
 	nickname := flag.String("nickname", "", "user nickname (required)")
 	password := flag.String("password", "", "user password (required)")
 	admin := flag.Bool("admin", false, "grant server admin (users.is_admin)")
-	dsn := flag.String("db", "", "database DSN (default: VOICX_DATABASE_URL or built-in default)")
+	dsn := flag.String("db", "", "database DSN (default: VOICX_DATABASE_URL; required when unset)")
 	flag.Parse()
 
 	if *nickname == "" || *password == "" {
@@ -52,11 +50,9 @@ func main() {
 }
 
 func run(nickname, password string, admin bool, dsn string) error {
-	if dsn == "" {
-		dsn = os.Getenv("VOICX_DATABASE_URL")
-	}
-	if dsn == "" {
-		dsn = defaultDSN
+	dsn, err := databaseDSN(dsn)
+	if err != nil {
+		return err
 	}
 
 	logger, err := zap.NewProduction()
@@ -97,4 +93,14 @@ func run(nickname, password string, admin bool, dsn string) error {
 
 	fmt.Printf("registered user %q\nunique_id: %s\nadmin: %v\n", nickname, uniqueID, admin)
 	return nil
+}
+
+func databaseDSN(explicit string) (string, error) {
+	if explicit != "" {
+		return explicit, nil
+	}
+	if fromEnv := os.Getenv("VOICX_DATABASE_URL"); fromEnv != "" {
+		return fromEnv, nil
+	}
+	return "", errors.New("database DSN is required: set -db or VOICX_DATABASE_URL")
 }

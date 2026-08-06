@@ -6,7 +6,8 @@
 // Usage:
 //
 //	e2e -addr 127.0.0.1:12333 -alice-uid <uid> -alice-pass <pw> \
-//	    -bob-uid <uid> -bob-pass <pw> -admin-uid <uid> -admin-pass <pw>
+//	    -bob-uid <uid> -bob-pass <pw> -admin-uid <uid> -admin-pass <pw> \
+//	    [-tls | -tls-fingerprint <sha256> | -tls-insecure]
 //
 // The *-uid flags take the unique IDs printed by cmd/adduser. All endpoints
 // default to localhost with the standard ports.
@@ -16,6 +17,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
@@ -57,6 +59,8 @@ type options struct {
 	adminPass     string
 	serverPass    string
 	filePayload   int64
+	tlsVerify     bool
+	tlsPin        string
 	tlsInsecure   bool
 	chaos         bool
 	chaosStopCmd  string
@@ -73,21 +77,28 @@ const (
 
 const readTimeout = 5 * time.Second
 
-// e2eTLSInsecure mirrors -tls-insecure: dial the control channel with TLS
-// but skip certificate verification (self-signed server certs).
-var e2eTLSInsecure bool
+type controlTLSMode struct {
+	verify   bool
+	pin      string
+	insecure bool
+}
+
+var e2eTLSMode controlTLSMode
 
 // loggedFP prints the server fingerprint only on the first TLS dial.
 var loggedFP sync.Once
 
-// dialTCP dials the control channel, honoring -tls-insecure. With TLS the
-// presented fingerprint is logged once so runs are auditable.
+// dialTCP dials the control channel in plaintext or in the explicitly selected
+// authenticated TLS mode. Unverified TLS is limited to loopback.
 func dialTCP(addr string) (net.Conn, error) {
-	if !e2eTLSInsecure {
+	tlsConfig, useTLS, err := controlTLSConfig(addr, e2eTLSMode)
+	if err != nil {
+		return nil, err
+	}
+	if !useTLS {
 		return net.DialTimeout("tcp", addr, readTimeout)
 	}
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: readTimeout}, "tcp", addr,
-		&tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}) //nolint:gosec // e2e flag
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: readTimeout}, "tcp", addr, tlsConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -97,6 +108,92 @@ func dialTCP(addr string) (net.Conn, error) {
 		}
 	})
 	return conn, nil
+}
+
+func controlTLSConfig(addr string, mode controlTLSMode) (*tls.Config, bool, error) {
+	modes := 0
+	if mode.verify {
+		modes++
+	}
+	if strings.TrimSpace(mode.pin) != "" {
+		modes++
+	}
+	if mode.insecure {
+		modes++
+	}
+	if modes > 1 {
+		return nil, false, errors.New("choose only one of -tls, -tls-fingerprint, or -tls-insecure")
+	}
+
+	switch {
+	case strings.TrimSpace(mode.pin) != "":
+		cfg, err := pinnedTLSConfig(mode.pin)
+		return cfg, true, err
+	case mode.insecure:
+		if !isLoopbackEndpoint(addr) {
+			return nil, false, fmt.Errorf("-tls-insecure is restricted to loopback addresses, got %q", addr)
+		}
+		return &tls.Config{
+			InsecureSkipVerify: true, // #nosec G402 -- explicitly requested test mode is restricted to loopback.
+			MinVersion:         tls.VersionTLS13,
+		}, true, nil
+	case mode.verify:
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil || host == "" {
+			return nil, false, fmt.Errorf("TLS address %q must include a host and port", addr)
+		}
+		return &tls.Config{MinVersion: tls.VersionTLS13, ServerName: host}, true, nil
+	default:
+		return nil, false, nil
+	}
+}
+
+func pinnedTLSConfig(fingerprint string) (*tls.Config, error) {
+	expected, err := parseTLSFingerprint(fingerprint)
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Config{
+		InsecureSkipVerify: true, // #nosec G402 -- VerifyConnection authenticates the exact certificate fingerprint.
+		MinVersion:         tls.VersionTLS13,
+		VerifyConnection: func(state tls.ConnectionState) error {
+			if len(state.PeerCertificates) == 0 {
+				return errors.New("server presented no TLS certificate")
+			}
+			got := sha256.Sum256(state.PeerCertificates[0].Raw)
+			if subtle.ConstantTimeCompare(got[:], expected[:]) != 1 {
+				return fmt.Errorf("TLS fingerprint = %s, want %s",
+					tlscert.FingerprintDER(state.PeerCertificates[0].Raw), fingerprint)
+			}
+			return nil
+		},
+	}, nil
+}
+
+func parseTLSFingerprint(value string) ([sha256.Size]byte, error) {
+	var fingerprint [sha256.Size]byte
+	compact := strings.ReplaceAll(strings.TrimSpace(value), ":", "")
+	if len(compact) != hex.EncodedLen(sha256.Size) {
+		return fingerprint, fmt.Errorf("TLS fingerprint must contain %d SHA-256 bytes", sha256.Size)
+	}
+	raw, err := hex.DecodeString(compact)
+	if err != nil {
+		return fingerprint, fmt.Errorf("decoding TLS fingerprint: %w", err)
+	}
+	copy(fingerprint[:], raw)
+	return fingerprint, nil
+}
+
+func isLoopbackEndpoint(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // client is one control-channel connection.
@@ -329,12 +426,18 @@ func main() {
 	flag.StringVar(&o.adminPass, "admin-pass", "", "admin's password")
 	flag.StringVar(&o.serverPass, "server-password", "", "global server password (if set)")
 	flag.Int64Var(&o.filePayload, "file-payload", 64*1024, "upload test payload size in bytes")
-	flag.BoolVar(&o.tlsInsecure, "tls-insecure", false, "dial the control channel with TLS but skip certificate verification (self-signed certs), logging the fingerprint")
+	flag.BoolVar(&o.tlsVerify, "tls", false, "dial the control channel with TLS 1.3 and verify the server with system roots")
+	flag.StringVar(&o.tlsPin, "tls-fingerprint", "", "dial the control channel with TLS 1.3 and require this SHA-256 certificate fingerprint")
+	flag.BoolVar(&o.tlsInsecure, "tls-insecure", false, "dial with unverified TLS 1.3 (explicit loopback-only test mode)")
 	flag.BoolVar(&o.chaos, "chaos", false, "additionally run the database chaos drill (467): stops PostgreSQL mid-traffic and verifies recovery (needs Docker; disruptive)")
 	flag.StringVar(&o.chaosStopCmd, "chaos-stop-cmd", "docker compose stop postgres", "command that takes the database down (split on whitespace, run without a shell)")
 	flag.StringVar(&o.chaosStartCmd, "chaos-start-cmd", "docker compose start postgres", "command that brings the database back up (split on whitespace, run without a shell)")
 	flag.Parse()
-	e2eTLSInsecure = o.tlsInsecure
+	e2eTLSMode = controlTLSMode{verify: o.tlsVerify, pin: o.tlsPin, insecure: o.tlsInsecure}
+	if _, _, err := controlTLSConfig(o.addr, e2eTLSMode); err != nil {
+		fmt.Fprintf(os.Stderr, "e2e: %v\n", err)
+		os.Exit(2)
+	}
 
 	for _, req := range []struct{ name, val string }{
 		{"alice-uid", o.aliceUID}, {"alice-pass", o.alicePass},
@@ -1364,30 +1467,29 @@ func readStatusFrame(conn net.Conn) (bool, string, error) {
 	return st.OK, st.Error, nil
 }
 
-// dialFileTransfer dials the data port. It is TLS whenever the server offers
-// it (file_tls_enabled defaults on), with a plaintext fallback so the harness
-// still runs against a dev server that disabled it.
+// dialFileTransfer follows the server's declared data-port mode. A TLS port
+// must carry the certificate fingerprint learned over the authenticated
+// control channel; plaintext is used only when the server explicitly says the
+// data port is plaintext.
 func dialFileTransfer(addr string, init netproto.FileTransferInitResponse) (net.Conn, error) {
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: readTimeout}, "tcp", addr,
-		&tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}) //nolint:gosec // e2e harness
-	if err == nil {
-		if init.TLSFingerprint != "" {
-			pc := conn.ConnectionState().PeerCertificates
-			var got string
-			if len(pc) > 0 {
-				got = tlscert.FingerprintDER(pc[0].Raw)
-			}
-			if len(pc) == 0 || !strings.EqualFold(got, init.TLSFingerprint) {
-				_ = conn.Close()
-				return nil, fmt.Errorf("file transfer fingerprint = %s, want %s", got, init.TLSFingerprint)
-			}
+	if !init.TLS {
+		if strings.TrimSpace(init.TLSFingerprint) != "" {
+			return nil, errors.New("file transfer response supplied a TLS fingerprint for a plaintext port")
 		}
-		return conn, nil
+		return net.DialTimeout("tcp", addr, readTimeout)
 	}
-	if init.TLS {
-		return nil, fmt.Errorf("file transfer port requires TLS: %w", err)
+	if strings.TrimSpace(init.TLSFingerprint) == "" {
+		return nil, errors.New("file transfer TLS response omitted its certificate fingerprint")
 	}
-	return net.DialTimeout("tcp", addr, readTimeout)
+	tlsConfig, err := pinnedTLSConfig(init.TLSFingerprint)
+	if err != nil {
+		return nil, fmt.Errorf("file transfer TLS fingerprint: %w", err)
+	}
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: readTimeout}, "tcp", addr, tlsConfig)
+	if err != nil {
+		return nil, fmt.Errorf("file transfer TLS: %w", err)
+	}
+	return conn, nil
 }
 
 func uploadFile(addr string, init netproto.FileTransferInitResponse, payload []byte) error {
@@ -2201,7 +2303,7 @@ func runChaosCmd(cmdline string) (string, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), chaosCommandTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, fields[0], fields[1:]...).CombinedOutput() //nolint:gosec // operator-supplied drill command
+	out, err := exec.CommandContext(ctx, fields[0], fields[1:]...).CombinedOutput() // #nosec G204 -- explicit operator-supplied drill command; no shell is used.
 	return strings.TrimSpace(string(out)), err
 }
 
