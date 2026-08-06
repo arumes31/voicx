@@ -1,8 +1,10 @@
 package auth
 
 import (
+	"bytes"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -126,31 +128,63 @@ func TestHashPasswordRandomSalt(t *testing.T) {
 }
 
 func FuzzParseEncodedHash(f *testing.F) {
-	valid := "argon2id$v=19$m=65536,t=3,p=4$" +
-		base64.StdEncoding.EncodeToString([]byte("salt")) + "$" +
-		base64.StdEncoding.EncodeToString([]byte("hash"))
-	for _, seed := range []string{
+	saltB64 := base64.StdEncoding.EncodeToString([]byte("salt"))
+	hashB64 := base64.StdEncoding.EncodeToString([]byte("hash"))
+	for _, encoded := range []string{
 		"",
-		"argon2id$v=19$m=65536,t=3,p=4$bad$bad",
-		"argon2id$v=19$m=262145,t=3,p=4$c2FsdA==$aGFzaA==",
-		valid,
+		"argon2id$v=19$m=1,t=1,p=1$" + saltB64 + "$" + hashB64,
+		"argon2id$v=19$p=16,t=10,m=262144$" + saltB64 + "$" + hashB64,
+		"argon2id$v=19$m=0,t=1,p=1$" + saltB64 + "$" + hashB64,
+		"argon2id$v=19$m=262145,t=1,p=1$" + saltB64 + "$" + hashB64,
+		"argon2id$v=19$m=1,t=1,p=1,p=2$" + saltB64 + "$" + hashB64,
+		"argon2id$v=19$m=1,t=1,x=1$" + saltB64 + "$" + hashB64,
+		"argon2id$v=19$m=1,t=1,p=1$!$" + hashB64,
+		"argon2id$v=19$m=1,t=1,p=1$" + saltB64 + "$!",
+		strings.Repeat("x", argonMaxEncodedLength+1),
 	} {
-		f.Add(seed)
+		f.Add(encoded)
 	}
 
 	f.Fuzz(func(t *testing.T, encoded string) {
-		salt, hash, memory, time, threads, err := parseEncodedHash(encoded)
+		salt, hash, memory, timeCost, threads, err := parseEncodedHash(encoded)
 		if err != nil {
 			if !errors.Is(err, ErrMalformedHash) {
-				t.Fatalf("parseEncodedHash(%q) error = %v, want ErrMalformedHash", encoded, err)
+				t.Fatalf("parseEncodedHash error = %v, want ErrMalformedHash", err)
 			}
 			return
 		}
-		if len(salt) == 0 || len(hash) == 0 || len(hash) > argonMaxHashLength {
-			t.Fatalf("accepted invalid decoded lengths: salt=%d hash=%d", len(salt), len(hash))
+
+		if len(encoded) > argonMaxEncodedLength {
+			t.Fatalf("parseEncodedHash accepted %d bytes, limit is %d", len(encoded), argonMaxEncodedLength)
 		}
-		if memory == 0 || memory > argonMaxMemory || time == 0 || time > argonMaxTime || threads == 0 || threads > argonMaxThreads {
-			t.Fatalf("accepted unsafe params: m=%d t=%d p=%d", memory, time, threads)
+		if len(salt) == 0 || len(salt) > argonMaxSaltLength {
+			t.Fatalf("salt length = %d, want 1..%d", len(salt), argonMaxSaltLength)
+		}
+		if len(hash) == 0 || len(hash) > argonMaxHashLength {
+			t.Fatalf("hash length = %d, want 1..%d", len(hash), argonMaxHashLength)
+		}
+		if memory == 0 || memory > argonMaxMemory {
+			t.Fatalf("memory cost = %d, want 1..%d", memory, argonMaxMemory)
+		}
+		if timeCost == 0 || timeCost > argonMaxTime {
+			t.Fatalf("time cost = %d, want 1..%d", timeCost, argonMaxTime)
+		}
+		if threads == 0 || threads > argonMaxThreads {
+			t.Fatalf("thread cost = %d, want 1..%d", threads, argonMaxThreads)
+		}
+
+		canonical := fmt.Sprintf("argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
+			argon2idVersion, memory, timeCost, threads,
+			base64.StdEncoding.EncodeToString(salt),
+			base64.StdEncoding.EncodeToString(hash),
+		)
+		salt2, hash2, memory2, time2, threads2, err := parseEncodedHash(canonical)
+		if err != nil {
+			t.Fatalf("parseEncodedHash(canonical) error = %v", err)
+		}
+		if !bytes.Equal(salt2, salt) || !bytes.Equal(hash2, hash) ||
+			memory2 != memory || time2 != timeCost || threads2 != threads {
+			t.Fatal("canonical hash did not preserve parsed values")
 		}
 	})
 }
