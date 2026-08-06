@@ -1,0 +1,49 @@
+name: Scheduled Fuzzing
+
+on:
+  schedule:
+    - cron: "30 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: ./internal/netproto
+            target: FuzzReadFrame
+          - package: ./internal/netproto
+            target: FuzzDecodeChatSend
+          - package: ./internal/query
+            target: FuzzEscapeUnescape
+          - package: ./internal/query
+            target: FuzzParseCommand
+          - package: ./internal/auth
+            target: FuzzParseEncodedHash
+          - package: ./internal/chatcrypto
+            target: FuzzParseRing
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Fuzz ${{ matrix.target }}
+        run: go test -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime=2m ${{ matrix.package }}
