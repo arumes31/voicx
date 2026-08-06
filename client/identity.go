@@ -132,6 +132,51 @@ func legacyIdentityPath() (string, error) {
 	return filepath.Join(root, "identity.json"), nil
 }
 
+// identityFileLocation validates that path names exactly one identity JSON
+// file. Callers choose the parent store (the application config directory in
+// production and a temporary directory in tests); os.Root then confines the
+// operation to that store.
+func identityFileLocation(path string) (dir, name string, err error) {
+	path = filepath.Clean(path)
+	name = filepath.Base(path)
+	if filepath.Ext(name) != ".json" {
+		return "", "", errors.New("identity path must name a .json file")
+	}
+	if err := validateIdentityID(strings.TrimSuffix(name, ".json")); err != nil {
+		return "", "", err
+	}
+	return filepath.Dir(path), name, nil
+}
+
+func readIdentityAt(path string) ([]byte, error) {
+	dir, name, err := identityFileLocation(path)
+	if err != nil {
+		return nil, err
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	return root.ReadFile(name)
+}
+
+func writeIdentityAt(path string, raw []byte) error {
+	dir, name, err := identityFileLocation(path)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	return root.WriteFile(name, raw, 0o600)
+}
+
 // identityIDs lists the identity file stems in dir, sorted.
 func identityIDs(dir string) []string {
 	entries, err := os.ReadDir(dir)
@@ -143,7 +188,11 @@ func identityIDs(dir string) []string {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 			continue
 		}
-		out = append(out, strings.TrimSuffix(e.Name(), ".json"))
+		id := strings.TrimSuffix(e.Name(), ".json")
+		if validateIdentityID(id) != nil {
+			continue
+		}
+		out = append(out, id)
 	}
 	sort.Strings(out)
 	return out
@@ -161,14 +210,11 @@ func migrateLegacyIdentity(dir string) {
 	if err != nil {
 		return
 	}
-	raw, err := os.ReadFile(legacy)
+	raw, err := readIdentityAt(legacy)
 	if err != nil || len(raw) == 0 {
 		return
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return
-	}
-	if err := os.WriteFile(filepath.Join(dir, defaultIdentityID+".json"), raw, 0o600); err != nil {
+	if err := writeIdentityAt(filepath.Join(dir, defaultIdentityID+".json"), raw); err != nil {
 		log.Printf("migrating legacy identity: %v", err)
 		return
 	}
@@ -320,7 +366,7 @@ func decodeIdentity(raw []byte) (*identity, error) {
 // An existing but undecodable file is an ERROR, never a regeneration: the key
 // is the user's account everywhere and overwriting it is unrecoverable.
 func loadOrCreateIdentityAt(path string) (*identity, error) {
-	data, err := os.ReadFile(path)
+	data, err := readIdentityAt(path)
 	if err == nil && len(data) > 0 {
 		id, derr := decodeIdentity(data)
 		if derr != nil {
@@ -413,9 +459,6 @@ func keyProtectionWanted() bool { return keyProtectionSetting() != "off" }
 // failure falls back to the plaintext file — refusing to write would cost the
 // user a key they can never recover.
 func saveIdentityAt(path string, id *identity) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
 	out := *id
 	out.Protection = ""
 	if keyProtectionWanted() && keyProtectionAvailable() {
@@ -426,11 +469,13 @@ func saveIdentityAt(path string, id *identity) error {
 			log.Printf("key protection unavailable, storing identity in plaintext: %v", err)
 		}
 	}
+	// #nosec G117 -- an identity file is intentionally a serialized keypair;
+	// it is owner-only and the private key is platform-protected when enabled.
 	raw, err := json.MarshalIndent(&out, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
+	if err := writeIdentityAt(path, raw); err != nil {
 		return err
 	}
 	id.Protection = out.Protection
@@ -444,6 +489,8 @@ func exportIdentityTo(dest, src string, id *identity) error {
 	out := *id
 	out.Protection = ""
 	out.ExportedAt = time.Now().Unix()
+	// #nosec G117 -- a portable identity backup must contain its private key;
+	// the native save-dialog destination is written with owner-only permissions.
 	raw, err := json.MarshalIndent(&out, "", "  ")
 	if err != nil {
 		return err
@@ -533,7 +580,7 @@ type IdentityLevelResult struct {
 func entryFor(dir, id, activeID string) IdentityEntry {
 	path := filepath.Join(dir, id+".json")
 	e := IdentityEntry{ID: id, Name: id, Path: path, Active: id == activeID, Protection: "plaintext"}
-	raw, err := os.ReadFile(path)
+	raw, err := readIdentityAt(path)
 	if err != nil {
 		e.Error = err.Error()
 		return e
@@ -794,7 +841,7 @@ func (a *App) IdentityBackupPending() bool {
 	if err != nil {
 		return false
 	}
-	raw, err := os.ReadFile(path)
+	raw, err := readIdentityAt(path)
 	if err != nil {
 		return false // nothing generated yet: nothing to lose
 	}

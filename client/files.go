@@ -375,6 +375,8 @@ func (a *App) UploadPathProgress(id string, channelID int64, folder, path string
 // ftUploadFile streams a file off disk to the data port, hashing as it goes so
 // nothing larger than one chunk is ever held in memory.
 func (a *App) ftUploadFile(id string, ep ftEndpoint, token, transferID, path string, p *ftProgress) error {
+	// #nosec G304 -- path is an explicit native-picker selection and is
+	// intentionally opened for upload.
 	src, err := os.Open(path)
 	if err != nil {
 		return err
@@ -509,6 +511,8 @@ func (a *App) DownloadFileProgress(id string, channelID int64, folder, name, des
 func resumeState(destPath string) (*os.File, int64, hash.Hash, error) {
 	partPath := destPath + partSuffix
 	h := sha256.New()
+	// #nosec G304 -- destPath is a user-selected or configured download target;
+	// its sibling partial file is intentional.
 	f, err := os.OpenFile(partPath, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
 		return nil, 0, nil, err
