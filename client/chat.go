@@ -13,7 +13,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -1018,26 +1017,27 @@ func ftDial(ep ftEndpoint) (net.Conn, error) {
 		return nil, errors.New("file transfer TLS fingerprint is missing")
 	}
 	return tls.DialWithDialer(&net.Dialer{Timeout: 15 * time.Second}, "tcp", ep.addr, &tls.Config{
-		InsecureSkipVerify:    true, // pinned below — same TOFU model as client/tofu.go
-		MinVersion:            tls.VersionTLS12,
-		VerifyPeerCertificate: pinFingerprint(ep.fingerprint),
+		// #nosec G402 -- VerifyConnection enforces the established control-channel pin on every handshake.
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS13,
+		VerifyConnection:   pinFingerprint(ep.fingerprint),
 	})
 }
 
 // pinFingerprint builds the mandatory certificate check for the data port.
 // An empty pin fails closed because server-generated self-signed certificates
 // have no PKI trust anchor; the established control-channel pin is that anchor.
-func pinFingerprint(want string) func([][]byte, [][]*x509.Certificate) error {
+func pinFingerprint(want string) func(tls.ConnectionState) error {
 	if want == "" {
-		return func([][]byte, [][]*x509.Certificate) error {
+		return func(tls.ConnectionState) error {
 			return errors.New("file transfer TLS fingerprint is missing")
 		}
 	}
-	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-		if len(rawCerts) == 0 {
+	return func(state tls.ConnectionState) error {
+		if len(state.PeerCertificates) == 0 {
 			return errors.New("file transfer server presented no certificate")
 		}
-		got := tlscert.FingerprintDER(rawCerts[0])
+		got := tlscert.FingerprintDER(state.PeerCertificates[0].Raw)
 		if !secureEqualFold(got, want) {
 			return fmt.Errorf("file transfer certificate mismatch (%s, expected %s)", got, want)
 		}

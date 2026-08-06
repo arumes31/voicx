@@ -13,7 +13,7 @@
 package version
 
 import (
-	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -32,6 +32,10 @@ var (
 	// auto-updates. Operators set it at build time; it defaults to a
 	// placeholder that yields "no update source".
 	UpdateRepo = "voicx/voicx"
+	// UpdatePublicKeys contains one or more comma-separated, base64-encoded
+	// Ed25519 public keys trusted to authenticate client update manifests.
+	// It deliberately defaults to empty so non-release builds fail closed.
+	UpdatePublicKeys = ""
 )
 
 // String returns the full version string, e.g. "0.4.0+87.abc1234-dirty".
@@ -70,7 +74,7 @@ func Parse(v string) (base string, build int) {
 	if plus != "" {
 		count, rest, _ := strings.Cut(plus, ".")
 		_ = rest // commit hash suffix ignored
-		fmt.Sscanf(count, "%d", &build)
+		build, _ = strconv.Atoi(count)
 	}
 	return base, build
 }
@@ -97,10 +101,10 @@ func compareSemver(a, b string) int {
 	for i := 0; i < n; i++ {
 		var x, y int
 		if i < len(pa) {
-			fmt.Sscanf(pa[i], "%d", &x)
+			x, _ = strconv.Atoi(pa[i])
 		}
 		if i < len(pb) {
-			fmt.Sscanf(pb[i], "%d", &y)
+			y, _ = strconv.Atoi(pb[i])
 		}
 		if x != y {
 			if x > y {

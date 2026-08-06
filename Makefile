@@ -15,6 +15,7 @@ VOICX_COMMIT     ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 VOICX_DIRTY      ?= $(shell git diff --quiet 2>/dev/null && echo false || echo true)
 VOICX_BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 VOICX_UPDATE_REPO ?= voicx/voicx
+VOICX_UPDATE_PUBLIC_KEYS ?=
 
 VERSION_FLAGS = -ldflags="-s -w \
 	-X voicx/internal/version.Version=$(VOICX_VERSION) \
@@ -22,7 +23,8 @@ VERSION_FLAGS = -ldflags="-s -w \
 	-X voicx/internal/version.Commit=$(VOICX_COMMIT) \
 	-X voicx/internal/version.BuildDate=$(VOICX_BUILD_DATE) \
 	-X voicx/internal/version.Dirty=$(VOICX_DIRTY) \
-	-X voicx/internal/version.UpdateRepo=$(VOICX_UPDATE_REPO)"
+	-X voicx/internal/version.UpdateRepo=$(VOICX_UPDATE_REPO) \
+	-X voicx/internal/version.UpdatePublicKeys=$(VOICX_UPDATE_PUBLIC_KEYS)"
 
 .PHONY: all build run migrate proto tidy test cover fmt vet docker-build docker-run docker-stop compose-up compose-down compose-logs chaos chaos-webrtc profile-db query-load webrtc-load canary clean help client-build
 

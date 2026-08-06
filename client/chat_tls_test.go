@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"strings"
 	"testing"
 
@@ -13,13 +15,15 @@ func TestPinFingerprint(t *testing.T) {
 	leaf := []byte("test certificate DER")
 	want := tlscert.FingerprintDER(leaf)
 	verify := pinFingerprint(strings.ToUpper(want))
-	if err := verify([][]byte{leaf}, nil); err != nil {
+	state := tls.ConnectionState{PeerCertificates: []*x509.Certificate{{Raw: leaf}}}
+	if err := verify(state); err != nil {
 		t.Fatalf("matching certificate rejected: %v", err)
 	}
-	if err := verify(nil, nil); err == nil {
+	if err := verify(tls.ConnectionState{}); err == nil {
 		t.Fatal("missing certificate accepted")
 	}
-	if err := verify([][]byte{[]byte("different certificate")}, nil); err == nil {
+	different := tls.ConnectionState{PeerCertificates: []*x509.Certificate{{Raw: []byte("different certificate")}}}
+	if err := verify(different); err == nil {
 		t.Fatal("mismatched certificate accepted")
 	}
 }
@@ -31,7 +35,8 @@ func TestPinFingerprintRequiresPin(t *testing.T) {
 	if verify == nil {
 		t.Fatal("empty fingerprint disabled the custom verifier")
 	}
-	if err := verify([][]byte{[]byte("certificate")}, nil); err == nil {
+	state := tls.ConnectionState{PeerCertificates: []*x509.Certificate{{Raw: []byte("certificate")}}}
+	if err := verify(state); err == nil {
 		t.Fatal("empty fingerprint accepted a certificate")
 	}
 }

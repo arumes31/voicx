@@ -177,6 +177,8 @@ jobs:
     needs: test
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
+    env:
+      VOICX_UPDATE_PUBLIC_KEYS: ${{ vars.VOICX_UPDATE_PUBLIC_KEYS }}
     permissions:
       contents: write
     steps:
@@ -198,8 +200,22 @@ jobs:
           echo "VOICX_BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
           echo "VOICX_DIRTY=false" >> "$GITHUB_ENV"
 
+      - name: validate update signing configuration
+        shell: bash
+        env:
+          VOICX_UPDATE_SIGNING_KEY: ${{ secrets.VOICX_UPDATE_SIGNING_KEY }}
+        run: |
+          test -n "$VOICX_UPDATE_PUBLIC_KEYS" || {
+            echo "repository variable VOICX_UPDATE_PUBLIC_KEYS is required" >&2
+            exit 1
+          }
+          test -n "$VOICX_UPDATE_SIGNING_KEY" || {
+            echo "repository secret VOICX_UPDATE_SIGNING_KEY is required" >&2
+            exit 1
+          }
+
       - name: install wails CLI
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0
 
       - name: build client (windows/amd64)
         shell: bash
@@ -211,7 +227,8 @@ jobs:
             -X voicx/internal/version.Commit=${{ env.VOICX_COMMIT }} \
             -X voicx/internal/version.BuildDate=${{ env.VOICX_BUILD_DATE }} \
             -X voicx/internal/version.Dirty=${{ env.VOICX_DIRTY }} \
-            -X voicx/internal/version.UpdateRepo=${{ github.repository }}"
+            -X voicx/internal/version.UpdateRepo=${{ github.repository }} \
+            -X voicx/internal/version.UpdatePublicKeys=${{ env.VOICX_UPDATE_PUBLIC_KEYS }}"
 
       - name: build server (linux/amd64)
         run: |
@@ -229,8 +246,15 @@ jobs:
         shell: bash
         run: |
           cp client/build/bin/voicx-client.exe voicx-client-windows-amd64.exe
-          sha256sum voicx-client-windows-amd64.exe voicx-server-linux-amd64 > checksums.txt
+          printf '# voicx-version: %s\n' "$GITHUB_REF_NAME" > checksums.txt
+          sha256sum voicx-client-windows-amd64.exe voicx-server-linux-amd64 >> checksums.txt
           cat checksums.txt
+
+      - name: sign update manifest
+        shell: bash
+        env:
+          VOICX_UPDATE_SIGNING_KEY: ${{ secrets.VOICX_UPDATE_SIGNING_KEY }}
+        run: go run ./cmd/signrelease -in checksums.txt -out checksums.txt.sig
 
       - name: upload to GitHub Release
         uses: softprops/action-gh-release@v2
@@ -239,3 +263,4 @@ jobs:
             voicx-client-windows-amd64.exe
             voicx-server-linux-amd64
             checksums.txt
+            checksums.txt.sig
