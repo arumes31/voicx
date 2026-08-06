@@ -298,7 +298,9 @@ func TestLegacyIdentityMigrates(t *testing.T) {
 func TestSecurityLevel(t *testing.T) {
 	a := identityTestApp(t, "off")
 
-	if securityLevelOf("abc", 7) != securityLevelOf("abc", 7) {
+	first := securityLevelOf("abc", 7)
+	second := securityLevelOf("abc", 7)
+	if first != second {
 		t.Fatal("security level is not deterministic")
 	}
 	if securityLevelOf("abc", 7) == securityLevelOf("abc", 8) &&

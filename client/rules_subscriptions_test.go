@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"testing"
 
 	"voicx/internal/netproto"
@@ -8,7 +9,7 @@ import (
 
 func TestDispatchRulesAndAuthoritativeSubscriptions(t *testing.T) {
 	rec := &eventRecorder{}
-	cm := newConnManager(nil)
+	cm := newConnManager(context.Background())
 	cm.sink = rec
 
 	subscriptions := []byte(`{"channel_ids":[3,9]}`)

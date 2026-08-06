@@ -43,9 +43,6 @@ type App struct {
 	// visible opacity divergent (292).
 	opacityMu sync.Mutex
 
-	// readMu guards settings.LastReadChannels: server pushes from the read
-	// loop race the frontend's own mark-read calls (121).
-	readMu sync.Mutex
 	// dmMu serialises the local DM logs — every append rewrites a whole
 	// file, so two concurrent DMs with one peer would otherwise lose one (122).
 	dmMu sync.Mutex

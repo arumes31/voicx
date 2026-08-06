@@ -58,7 +58,9 @@ func callCrypt(proc *windows.LazyProc, in []byte) ([]byte, error) {
 	if r == 0 {
 		return nil, fmt.Errorf("%s: %w", proc.Name, callErr)
 	}
-	defer windows.LocalFree(windows.Handle(unsafe.Pointer(outBlob.Data)))
+	defer func() {
+		_, _ = windows.LocalFree(windows.Handle(unsafe.Pointer(outBlob.Data)))
+	}()
 	// The blob lives in LocalAlloc memory freed above, so it has to be copied.
 	return append([]byte(nil), unsafe.Slice(outBlob.Data, outBlob.Size)...), nil
 }

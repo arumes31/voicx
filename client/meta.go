@@ -5,6 +5,7 @@ package main
 
 import (
 	"archive/zip"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -52,14 +53,21 @@ func (a *App) ExportLogs() string {
 	if err != nil {
 		return err.Error()
 	}
-	defer root.Close()
+	if err := exportLogsTo(root, dest); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+func exportLogsTo(root *os.Root, dest string) (retErr error) {
+	defer func() { retErr = errors.Join(retErr, root.Close()) }()
 	// #nosec G304 -- dest is explicitly selected by the local user in the
 	// native save dialog; exporting there is the requested operation.
 	out, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
-		return err.Error()
+		return err
 	}
-	defer out.Close()
+	defer func() { retErr = errors.Join(retErr, out.Close()) }()
 	zw := zip.NewWriter(out)
 	entries, _ := fs.ReadDir(root.FS(), ".")
 	for _, entry := range entries {
@@ -78,9 +86,9 @@ func (a *App) ExportLogs() string {
 		_, _ = w.Write(raw)
 	}
 	if err := zw.Close(); err != nil {
-		return err.Error()
+		return err
 	}
-	return ""
+	return nil
 }
 
 // SetDebugFrames toggles the debug console's frame tee (327).
@@ -106,7 +114,7 @@ func guardCrash(context string, fn func()) {
 			if err == nil {
 				f, err := root.OpenFile(crashLogName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 				if err == nil {
-					fmt.Fprintf(f, "\n=== %s: panic in %s: %v\n%s\n",
+					_, _ = fmt.Fprintf(f, "\n=== %s: panic in %s: %v\n%s\n",
 						time.Now().Format(time.RFC3339), context, r, debug.Stack())
 					_ = f.Close()
 				}
@@ -125,7 +133,7 @@ func (a *App) LastCrash() string {
 	if err != nil {
 		return ""
 	}
-	defer root.Close()
+	defer func() { _ = root.Close() }()
 	raw, err := root.ReadFile(crashLogName)
 	if err != nil || len(raw) == 0 {
 		return ""

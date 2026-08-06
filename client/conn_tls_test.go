@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"path/filepath"
@@ -42,7 +43,7 @@ func TestDialTransportPreservesFingerprintMismatch(t *testing.T) {
 	if err := store.trust(addr, tlscert.FingerprintDER([]byte("old certificate"))); err != nil {
 		t.Fatalf("seed old fingerprint: %v", err)
 	}
-	manager := newConnManager(nil)
+	manager := newConnManager(context.Background())
 	manager.knownServers = store
 	conn, err := manager.dialTransport(addr)
 	if conn != nil {
@@ -67,7 +68,7 @@ func TestDialTransportPreservesFingerprintMismatch(t *testing.T) {
 }
 
 func TestFingerprintMismatchMessageIncludesPresentedFingerprint(t *testing.T) {
-	manager := newConnManager(nil)
+	manager := newConnManager(context.Background())
 	want := tlscert.FingerprintDER([]byte("replacement certificate"))
 	manager.mu.Lock()
 	manager.tlsUsed = true

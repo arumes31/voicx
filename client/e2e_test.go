@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
@@ -60,7 +61,7 @@ func TestE2EEDiagnostics(t *testing.T) {
 		t.Fatalf("offline E2EEDiagnostics error = %v, want not connected", err)
 	}
 
-	cm := newConnManager(nil)
+	cm := newConnManager(context.Background())
 	cm.id = mustTempIdentity(t)
 	peerPub, _ := genPair(t)
 	cm.pubKeys.put("peer", peerPub)
@@ -301,7 +302,7 @@ func TestAttachmentLegacyAndFramingValidation(t *testing.T) {
 func TestEncryptChatScopes(t *testing.T) {
 	t.Parallel()
 
-	cm := newConnManager(nil)
+	cm := newConnManager(context.Background())
 	cm.id = mustTempIdentity(t)
 	ownPub, _, err := cm.id.x25519()
 	if err != nil {
@@ -368,7 +369,7 @@ func TestEncryptChatScopes(t *testing.T) {
 func TestEncryptedEventTransformation(t *testing.T) {
 	t.Parallel()
 
-	cm := newConnManager(nil)
+	cm := newConnManager(context.Background())
 	key := [32]byte{3}
 	cm.scopeKeys.put(42, 8, key)
 

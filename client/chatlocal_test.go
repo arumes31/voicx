@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -94,7 +95,7 @@ func TestDMHistoryIsCiphertextAtRest(t *testing.T) {
 	}
 
 	// A different identity over the same files reads nothing at all.
-	other := newConnManager(nil)
+	other := newConnManager(context.Background())
 	other.sink = &eventRecorder{}
 	other.id = mustTempIdentity(t)
 	stranger := appWithCM(other)

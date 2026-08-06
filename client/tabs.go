@@ -40,10 +40,9 @@ type journalEntry struct {
 
 // tabState bundles a tab's manager with its replay journal and badges.
 type tabState struct {
-	cm       *connManager
-	info     TabInfo
-	journal  []journalEntry // events since the last snapshot
-	maxItems int
+	cm      *connManager
+	info    TabInfo
+	journal []journalEntry // events since the last snapshot
 }
 
 // tabsMu guards tabs/activeID. cmMu (app.go) guards the active cm pointer.
@@ -165,16 +164,6 @@ func (a *App) tabsRegistry() map[string]*tabState {
 	a.tabsMu.Lock()
 	defer a.tabsMu.Unlock()
 	return a.tabs
-}
-
-// activeCM returns the active tab's connManager (may be nil).
-func (a *App) activeCM() *connManager {
-	a.tabsMu.Lock()
-	defer a.tabsMu.Unlock()
-	if ts := a.tabs[a.activeID]; ts != nil {
-		return ts.cm
-	}
-	return nil
 }
 
 // newTab creates a tab with a fresh connManager and registers it.

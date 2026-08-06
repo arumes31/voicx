@@ -280,7 +280,7 @@ func (a *App) ftUploadProgress(id string, ep ftEndpoint, token, transferID strin
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	untrack := trackTransfer(id, conn)
 	defer untrack()
 
@@ -381,13 +381,13 @@ func (a *App) ftUploadFile(id string, ep ftEndpoint, token, transferID, path str
 	if err != nil {
 		return err
 	}
-	defer src.Close()
+	defer func() { _ = src.Close() }()
 
 	conn, err := ftDial(ep)
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	untrack := trackTransfer(id, conn)
 	defer untrack()
 
@@ -543,7 +543,7 @@ func (a *App) ftDownloadProgress(id string, ep ftEndpoint, token, transferID, de
 		_ = out.Close()
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	untrack := trackTransfer(id, conn)
 	defer untrack()
 
@@ -554,7 +554,7 @@ func (a *App) ftDownloadProgress(id string, ep ftEndpoint, token, transferID, de
 		return err
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	defer conn.SetReadDeadline(time.Time{})
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
 
 	fail := func(err error) error {
 		_ = out.Close()

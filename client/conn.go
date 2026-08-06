@@ -114,17 +114,6 @@ func newConnManager(wailsCtx context.Context) *connManager {
 	}
 }
 
-// appOf returns the App this manager belongs to, or nil for a test or
-// headless manager. The tab sink is the only back-channel a connManager has,
-// and read-state pushes (121) arrive on the read loop but have to land in the
-// App's settings.
-func (m *connManager) appOf() *App {
-	if s, ok := m.sink.(tabSink); ok {
-		return s.app
-	}
-	return nil
-}
-
 // identity returns the client's key pair, loading or generating it lazily.
 func (m *connManager) identity() (*identity, error) {
 	m.mu.Lock()

@@ -9,6 +9,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -102,7 +103,7 @@ func (r *eventRecorder) waitFor(t *testing.T, name string, pred func(string) boo
 func newTestBackend(t *testing.T) (*connManager, *eventRecorder) {
 	t.Helper()
 	rec := &eventRecorder{}
-	cm := newConnManager(nil)
+	cm := newConnManager(context.Background())
 	cm.sink = rec
 	cm.id = mustTempIdentity(t)
 	return cm, rec
@@ -138,7 +139,7 @@ func ensureLiveChannel(t *testing.T) int64 {
 	if err != nil {
 		t.Fatalf("dial query: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	r := bufio.NewReader(conn)
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if _, err := r.ReadString('\n'); err != nil { // banner line 1
@@ -646,7 +647,9 @@ func TestLiveFileManagement(t *testing.T) {
 		t.Fatalf("GET link: %v", err)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("close link response: %v", err)
+	}
 	if string(body) != "docs" {
 		t.Fatalf("link body = %q, want %q", body, "docs")
 	}

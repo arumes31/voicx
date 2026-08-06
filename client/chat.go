@@ -1051,7 +1051,7 @@ func ftUpload(ep ftEndpoint, token, transferID string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if err := ftWriteJSON(conn, ftInit, map[string]string{"token": token, "transfer_id": transferID}); err != nil {
 		return err
@@ -1080,13 +1080,13 @@ func ftDownload(ep ftEndpoint, token, transferID string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if err := ftWriteJSON(conn, ftInit, map[string]string{"token": token, "transfer_id": transferID}); err != nil {
 		return nil, err
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	defer conn.SetReadDeadline(time.Time{})
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
 
 	h := sha256.New()
 	var got []byte
@@ -1131,7 +1131,7 @@ func ftWriteJSON(conn net.Conn, frameType uint16, v any) error {
 // ftReadStatus reads the server's final status frame.
 func ftReadStatus(conn net.Conn) error {
 	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	defer conn.SetReadDeadline(time.Time{})
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
 	f, err := netproto.ReadFrame(conn)
 	if err != nil {
 		return err

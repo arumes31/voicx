@@ -30,7 +30,7 @@ func runApp() {
 		logDir := filepath.Join(dir, "voicx")
 		if writer, err := newDailyLogWriter(logDir, "client.log"); err == nil {
 			log.SetOutput(writer)
-			defer writer.Close()
+			defer func() { _ = writer.Close() }()
 		}
 	}
 

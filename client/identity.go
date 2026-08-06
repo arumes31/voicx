@@ -157,7 +157,7 @@ func readIdentityAt(path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer root.Close()
+	defer func() { _ = root.Close() }()
 	return root.ReadFile(name)
 }
 
@@ -173,7 +173,7 @@ func writeIdentityAt(path string, raw []byte) error {
 	if err != nil {
 		return err
 	}
-	defer root.Close()
+	defer func() { _ = root.Close() }()
 	return root.WriteFile(name, raw, 0o600)
 }
 
