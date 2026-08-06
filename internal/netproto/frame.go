@@ -18,6 +18,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+
+	"voicx/internal/safecast"
 )
 
 // MaxFrameSize is the largest frame (type + payload) the server will accept.
@@ -75,7 +77,10 @@ func WriteFrame(w io.Writer, f *Frame) error {
 		return ErrFrameTooLarge
 	}
 
-	length := uint32(2 + len(f.Payload))
+	length, err := safecast.IntToUint32(2 + len(f.Payload))
+	if err != nil {
+		return ErrFrameTooLarge
+	}
 	var header [6]byte
 	binary.BigEndian.PutUint32(header[:4], length)
 	binary.BigEndian.PutUint16(header[4:6], f.Type)

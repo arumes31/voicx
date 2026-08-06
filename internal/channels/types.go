@@ -9,6 +9,8 @@ package channels
 
 import (
 	"fmt"
+
+	"voicx/internal/safecast"
 )
 
 // ChannelType distinguishes temporary, semi-permanent, and permanent channels.
@@ -50,6 +52,22 @@ func (t ChannelType) Valid() bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// ParseChannelType validates an integer before converting it to ChannelType.
+// It is used at wire and database boundaries where narrowing first could turn
+// an out-of-range value such as 256 into a valid temporary-channel value.
+func ParseChannelType(value int) (ChannelType, error) {
+	switch value {
+	case int(ChannelTypeTemporary):
+		return ChannelTypeTemporary, nil
+	case int(ChannelTypeSemiPermanent):
+		return ChannelTypeSemiPermanent, nil
+	case int(ChannelTypePermanent):
+		return ChannelTypePermanent, nil
+	default:
+		return 0, fmt.Errorf("invalid channel type %d", value)
 	}
 }
 
@@ -117,6 +135,11 @@ func (s ChannelSpec) Validate() error {
 	}
 	if !s.Type.Valid() {
 		return fmt.Errorf("invalid channel type %d", s.Type)
+	}
+	if s.MaxClients > 0 {
+		if _, err := safecast.IntToInt32(s.MaxClients); err != nil {
+			return fmt.Errorf("max clients is out of range: %w", err)
+		}
 	}
 	return nil
 }

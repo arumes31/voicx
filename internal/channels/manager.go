@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"voicx/internal/auth"
+	"voicx/internal/safecast"
 	"voicx/internal/state"
 	"voicx/internal/store"
 )
@@ -132,7 +133,11 @@ func (m *ChannelManager) CreateChannel(ctx context.Context, spec ChannelSpec) (i
 	// max_clients is stored as NULL when 0 or negative (unlimited).
 	var maxClients sql.NullInt32
 	if spec.MaxClients > 0 {
-		maxClients = sql.NullInt32{Int32: int32(spec.MaxClients), Valid: true}
+		value, err := safecast.IntToInt32(spec.MaxClients)
+		if err != nil {
+			return 0, fmt.Errorf("%w: max clients is out of range: %v", ErrInvalidSpec, err)
+		}
+		maxClients = sql.NullInt32{Int32: value, Valid: true}
 	}
 
 	var parentID sql.NullInt64
@@ -241,11 +246,15 @@ func (m *ChannelManager) LoadIntoState(ctx context.Context) (int, error) {
 			&ch.Description, &ch.InheritPermissions); err != nil {
 			return count, fmt.Errorf("scanning channel row: %w", err)
 		}
-		ch.ChannelType = int(channelType)
+		parsedType, err := ParseChannelType(int(channelType))
+		if err != nil {
+			return count, fmt.Errorf("channel %d has invalid stored type %d: %w", ch.ChannelID, channelType, err)
+		}
+		ch.ChannelType = int(parsedType)
 		m.state.AddChannel(&ch)
 		count++
 
-		if ChannelType(channelType) == ChannelTypeTemporary {
+		if parsedType == ChannelTypeTemporary {
 			m.StartCleanupWatcher(ch.ChannelID)
 		}
 	}
@@ -304,7 +313,11 @@ func (m *ChannelManager) SetChannelType(ctx context.Context, channelID int64, ne
 		}
 		return fmt.Errorf("querying channel type: %w", err)
 	}
-	if ChannelType(currentType) == newType {
+	parsedCurrentType, err := ParseChannelType(int(currentType))
+	if err != nil {
+		return fmt.Errorf("channel %d has invalid stored type %d: %w", channelID, currentType, err)
+	}
+	if parsedCurrentType == newType {
 		return nil // no change
 	}
 
@@ -334,7 +347,7 @@ func (m *ChannelManager) SetChannelType(ctx context.Context, channelID int64, ne
 
 	m.logger.Info("channel type changed",
 		zap.Int64("channel_id", channelID),
-		zap.String("from", ChannelType(currentType).String()),
+		zap.String("from", parsedCurrentType.String()),
 		zap.String("to", newType.String()),
 	)
 	return nil

@@ -697,8 +697,8 @@ func (s *TCPServer) handleCreateChannel(ctx context.Context, client *Client, f *
 		return s.sendError(client, errCodeUnavailable, "channel backend unavailable")
 	}
 
-	ct := channels.ChannelType(msg.Type)
-	if !ct.Valid() {
+	ct, err := channels.ParseChannelType(msg.Type)
+	if err != nil {
 		return s.sendError(client, errCodeMalformed, "invalid channel type")
 	}
 

@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/lib/pq"
+
+	"voicx/internal/safecast"
 )
 
 // ErrChatEditConflict means the message changed after the caller rendered it.
@@ -112,7 +114,10 @@ func (s *Store) ChatHistory(ctx context.Context, channelID, beforeID int64, limi
 			return nil, fmt.Errorf("scanning chat message: %w", err)
 		}
 		m.ReplyToID = replyToID.Int64
-		m.KeyID = uint32(keyID)
+		m.KeyID, err = safecast.Int64ToUint32(keyID)
+		if err != nil {
+			return nil, fmt.Errorf("scanning chat message %d has invalid key id %d: %w", m.ID, keyID, err)
+		}
 		out = append(out, m)
 	}
 	return out, rows.Err()
@@ -137,7 +142,10 @@ func (s *Store) GetChatMessage(ctx context.Context, id int64) (*ChatMessage, err
 		}
 		return nil, fmt.Errorf("querying chat message: %w", err)
 	}
-	m.KeyID = uint32(keyID)
+	m.KeyID, err = safecast.Int64ToUint32(keyID)
+	if err != nil {
+		return nil, fmt.Errorf("querying chat message %d returned invalid key id %d: %w", id, keyID, err)
+	}
 	m.ReplyToID = replyToID.Int64
 	return &m, nil
 }
@@ -485,7 +493,11 @@ func (s *Store) GetServerSetting(ctx context.Context, key string) (string, uint3
 		}
 		return "", 0, fmt.Errorf("loading server setting: %w", err)
 	}
-	return v, uint32(keyID), nil
+	convertedKeyID, err := safecast.Int64ToUint32(keyID)
+	if err != nil {
+		return "", 0, fmt.Errorf("loading server setting %q returned invalid key id %d: %w", key, keyID, err)
+	}
+	return v, convertedKeyID, nil
 }
 
 // --- One-shot legacy backfill (migration 012) --------------------------------

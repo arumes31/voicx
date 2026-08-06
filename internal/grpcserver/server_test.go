@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"math"
 	"net"
+	"strconv"
 	"testing"
 	"time"
 
@@ -193,6 +195,42 @@ func TestControlRPCs(t *testing.T) {
 	}
 	if _, err := client.QueryPermissions(ctx, &voicxv1.QueryPermissionsRequest{UserId: "perm-boom"}); status.Code(err) != codes.Internal || status.Convert(err).Message() != "internal error" {
 		t.Fatalf("backend-error QueryPermissions = %v", err)
+	}
+}
+
+func TestListChannelsRejectsInvalidCounts(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		channel query.ChannelInfo
+	}{
+		{name: "negative max clients", channel: query.ChannelInfo{ChannelID: 1, MaxClients: -1}},
+		{name: "negative current clients", channel: query.ChannelInfo{ChannelID: 1, ClientCount: -1}},
+	}
+	if strconv.IntSize == 64 {
+		tooLarge := int(int64(math.MaxInt32) + 1)
+		tests = append(tests,
+			struct {
+				name    string
+				channel query.ChannelInfo
+			}{name: "max clients overflow", channel: query.ChannelInfo{ChannelID: 1, MaxClients: tooLarge}},
+			struct {
+				name    string
+				channel query.ChannelInfo
+			}{name: "current clients overflow", channel: query.ChannelInfo{ChannelID: 1, ClientCount: tooLarge}},
+		)
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			service := &controlService{backend: &stubBackend{channels: []query.ChannelInfo{test.channel}}, logger: zap.NewNop()}
+			_, err := service.ListChannels(context.Background(), &voicxv1.ListChannelsRequest{})
+			if status.Code(err) != codes.Internal {
+				t.Fatalf("ListChannels() error = %v, want Internal", err)
+			}
+		})
 	}
 }
 

@@ -4,12 +4,15 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
 
 	"voicx/internal/e2ee"
+	"voicx/internal/safecast"
 )
 
 func TestPublishPreKeyBundleValidatesBeforeDatabaseAccess(t *testing.T) {
@@ -51,5 +54,13 @@ func TestPublishAndConsumePreKeyBundle(t *testing.T) {
 	got, err = s.ConsumePreKeyBundle(ctx, userID)
 	if err != nil || got.OneTimePreKey != nil {
 		t.Fatalf("second consume = %+v, %v", got, err)
+	}
+
+	if _, err := s.DB().ExecContext(ctx, `UPDATE e2ee_prekey_bundles
+		SET signed_prekey_id = $1 WHERE user_id = $2`, int64(math.MaxUint32)+1, userID); err != nil {
+		t.Fatalf("seeding out-of-range signed prekey id: %v", err)
+	}
+	if _, err := s.ConsumePreKeyBundle(ctx, userID); !errors.Is(err, safecast.ErrOutOfRange) {
+		t.Fatalf("ConsumePreKeyBundle() error = %v, want ErrOutOfRange", err)
 	}
 }

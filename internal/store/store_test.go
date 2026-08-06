@@ -260,6 +260,68 @@ func TestMigrationLedgerRunsEachFileOnce(t *testing.T) {
 	}
 }
 
+// TestMigrationWidensKEKID preserves key-ring ids that older binaries stored
+// through signed SMALLINT. It also proves the migrated column accepts every
+// value representable by the application's uint16 KEK id.
+func TestMigrationWidensKEKID(t *testing.T) {
+	s := testScratchStore(t)
+	applyPreLedgerMigrations(t, s, "024")
+	if _, err := s.DB().Exec(`CREATE TABLE schema_migrations (
+		filename TEXT PRIMARY KEY,
+		applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`); err != nil {
+		t.Fatalf("creating legacy migration ledger: %v", err)
+	}
+	for _, name := range migrationNames(t) {
+		if name >= "024" {
+			break
+		}
+		if _, err := s.DB().Exec(`INSERT INTO schema_migrations (filename) VALUES ($1)`, name); err != nil {
+			t.Fatalf("recording legacy migration %s: %v", name, err)
+		}
+	}
+
+	// Recreate the exact pre-024 type. The current 012 migration uses INTEGER
+	// for fresh databases, while existing deployments still arrive as SMALLINT.
+	if _, err := s.DB().Exec(`ALTER TABLE chat_scope_keys
+		ALTER COLUMN kek_id TYPE SMALLINT USING kek_id::SMALLINT`); err != nil {
+		t.Fatalf("restoring legacy kek_id type: %v", err)
+	}
+	if _, err := s.DB().Exec(`INSERT INTO chat_scope_keys
+		(scope_id, key_id, wrapped_key, kek_id) VALUES (9001, 1, '\x01', -1)`); err != nil {
+		t.Fatalf("seeding signed legacy kek id: %v", err)
+	}
+
+	if err := s.Migrate(); err != nil {
+		t.Fatalf("migrating legacy kek id: %v", err)
+	}
+	var (
+		dataType string
+		kekID    int64
+	)
+	if err := s.DB().QueryRow(`SELECT data_type FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'chat_scope_keys' AND column_name = 'kek_id'`).Scan(&dataType); err != nil {
+		t.Fatalf("reading kek_id type: %v", err)
+	}
+	if dataType != "integer" {
+		t.Fatalf("kek_id type = %q, want integer", dataType)
+	}
+	if err := s.DB().QueryRow(`SELECT kek_id FROM chat_scope_keys WHERE scope_id = 9001`).Scan(&kekID); err != nil {
+		t.Fatalf("reading migrated kek id: %v", err)
+	}
+	if kekID != 65535 {
+		t.Fatalf("migrated kek id = %d, want 65535", kekID)
+	}
+	if _, err := s.DB().Exec(`INSERT INTO chat_scope_keys
+		(scope_id, key_id, wrapped_key, kek_id) VALUES (9002, 1, '\x02', 65535)`); err != nil {
+		t.Fatalf("inserting maximum uint16 kek id: %v", err)
+	}
+	if _, err := s.DB().Exec(`INSERT INTO chat_scope_keys
+		(scope_id, key_id, wrapped_key, kek_id) VALUES (9003, 1, '\x03', 65536)`); err == nil {
+		t.Fatal("kek id above uint16 range was accepted")
+	}
+}
+
 // TestMigrationLedgerRecordsPreExistingFiles covers the upgrade path: a
 // database migrated by the pre-ledger binary must have every old file recorded
 // (so none is ever replayed again) while 012 applies exactly once.

@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"voicx/internal/e2ee"
+	"voicx/internal/safecast"
 )
 
 const maxPreKeysPerPublish = 200
@@ -101,7 +102,10 @@ func (s *Store) ConsumePreKeyBundle(ctx context.Context, userID int64) (*PreKeyB
 		}
 		return nil, fmt.Errorf("loading prekey bundle: %w", err)
 	}
-	bundle.SignedPreKeyID = uint32(signedID)
+	bundle.SignedPreKeyID, err = safecast.Int64ToUint32(signedID)
+	if err != nil {
+		return nil, fmt.Errorf("loading prekey bundle returned invalid signed prekey id %d: %w", signedID, err)
+	}
 	const oneTimeQuery = `SELECT key_id, public_key, COALESCE(signature, ''::bytea)
 	                      FROM e2ee_prekeys WHERE user_id=$1 AND one_time AND consumed_at IS NULL
 	                      ORDER BY key_id LIMIT 1 FOR UPDATE SKIP LOCKED`
@@ -112,7 +116,11 @@ func (s *Store) ConsumePreKeyBundle(ctx context.Context, userID int64) (*PreKeyB
 		return nil, fmt.Errorf("loading one-time prekey: %w", err)
 	}
 	if err == nil {
-		key.KeyID, key.OneTime = uint32(keyID), true
+		key.KeyID, err = safecast.Int64ToUint32(keyID)
+		if err != nil {
+			return nil, fmt.Errorf("loading one-time prekey returned invalid key id %d: %w", keyID, err)
+		}
+		key.OneTime = true
 		if _, err := tx.ExecContext(ctx, `UPDATE e2ee_prekeys SET consumed_at=NOW() WHERE user_id=$1 AND key_id=$2`, userID, keyID); err != nil {
 			return nil, fmt.Errorf("consuming one-time prekey: %w", err)
 		}
@@ -186,14 +194,19 @@ func (s *Store) ConsumePreKey(ctx context.Context, userID int64) (*PreKey, error
 	          FROM e2ee_prekeys WHERE user_id = $1 AND one_time AND consumed_at IS NULL
 	          ORDER BY key_id LIMIT 1 FOR UPDATE SKIP LOCKED`
 	var key PreKey
-	if err := tx.QueryRowContext(ctx, q, userID).Scan(&key.KeyID, &key.PublicKey, &key.Signature); err != nil {
+	var keyID int64
+	if err := tx.QueryRowContext(ctx, q, userID).Scan(&keyID, &key.PublicKey, &key.Signature); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNoPreKeyBundle
 		}
 		return nil, err
 	}
+	key.KeyID, err = safecast.Int64ToUint32(keyID)
+	if err != nil {
+		return nil, fmt.Errorf("loading prekey returned invalid key id %d: %w", keyID, err)
+	}
 	key.OneTime = true
-	if _, err := tx.ExecContext(ctx, `UPDATE e2ee_prekeys SET consumed_at = NOW() WHERE user_id = $1 AND key_id = $2`, userID, key.KeyID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE e2ee_prekeys SET consumed_at = NOW() WHERE user_id = $1 AND key_id = $2`, userID, keyID); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {

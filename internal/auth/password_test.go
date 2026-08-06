@@ -1,6 +1,8 @@
 package auth
 
 import (
+	"encoding/base64"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -39,17 +41,70 @@ func TestVerifyPasswordCorrect(t *testing.T) {
 // TestVerifyPasswordMalformed verifies that VerifyPassword fails on a
 // malformed hash.
 func TestVerifyPasswordMalformed(t *testing.T) {
-	cases := []string{
-		"",
-		"not-a-hash",
-		"argon2id$v=19$m=65536,t=3,p=4$",
-		"argon2id$v=19$m=65536,t=3,p=4$YmFkc2FsdA==$",
-		"argon2id$v=99$m=65536,t=3,p=4$YmFkc2FsdA==$YmFkaGFzaA==",
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		hash string
+	}{
+		{name: "empty", hash: ""},
+		{name: "not encoded", hash: "not-a-hash"},
+		{name: "missing fields", hash: "argon2id$v=19$m=65536,t=3,p=4$"},
+		{name: "empty hash", hash: "argon2id$v=19$m=65536,t=3,p=4$YmFkc2FsdA==$"},
+		{name: "wrong version", hash: "argon2id$v=99$m=65536,t=3,p=4$YmFkc2FsdA==$YmFkaGFzaA=="},
+		{name: "encoded value too long", hash: strings.Repeat("x", argonMaxEncodedLength+1)},
 	}
-	for _, c := range cases {
-		if err := VerifyPassword("pw", c); err == nil {
-			t.Fatalf("VerifyPassword(%q) unexpectedly succeeded", c)
-		}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if err := VerifyPassword("pw", test.hash); !errors.Is(err, ErrMalformedHash) {
+				t.Fatalf("VerifyPassword(%q) error = %v, want ErrMalformedHash", test.hash, err)
+			}
+		})
+	}
+}
+
+func TestParseParams(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		params          string
+		expectedMemory  uint32
+		expectedTime    uint32
+		expectedThreads uint8
+		shouldErr       bool
+	}{
+		{name: "valid", params: "m=65536,t=3,p=4", expectedMemory: 65536, expectedTime: 3, expectedThreads: 4},
+		{name: "maximum safe values", params: "m=262144,t=10,p=16", expectedMemory: argonMaxMemory, expectedTime: argonMaxTime, expectedThreads: argonMaxThreads},
+		{name: "parallelism above cap", params: "m=65536,t=3,p=17", shouldErr: true},
+		{name: "parallelism overflow", params: "m=65536,t=3,p=256", shouldErr: true},
+		{name: "memory above cap", params: "m=262145,t=3,p=4", shouldErr: true},
+		{name: "iterations above cap", params: "m=65536,t=11,p=4", shouldErr: true},
+		{name: "duplicate parameter", params: "m=65536,t=3,p=4,p=5", shouldErr: true},
+		{name: "missing parameter", params: "m=65536,t=3", shouldErr: true},
+		{name: "zero parameter", params: "m=65536,t=3,p=0", shouldErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			memory, time, threads, err := parseParams(test.params)
+			if test.shouldErr {
+				if !errors.Is(err, ErrMalformedHash) {
+					t.Fatalf("parseParams(%q) error = %v, want ErrMalformedHash", test.params, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseParams(%q): %v", test.params, err)
+			}
+			if memory != test.expectedMemory || time != test.expectedTime || threads != test.expectedThreads {
+				t.Fatalf("parseParams(%q) = (%d, %d, %d), want (%d, %d, %d)",
+					test.params, memory, time, threads,
+					test.expectedMemory, test.expectedTime, test.expectedThreads)
+			}
+		})
 	}
 }
 
@@ -68,4 +123,34 @@ func TestHashPasswordRandomSalt(t *testing.T) {
 	if h1 == h2 {
 		t.Fatal("expected different hashes for same password (random salt)")
 	}
+}
+
+func FuzzParseEncodedHash(f *testing.F) {
+	valid := "argon2id$v=19$m=65536,t=3,p=4$" +
+		base64.StdEncoding.EncodeToString([]byte("salt")) + "$" +
+		base64.StdEncoding.EncodeToString([]byte("hash"))
+	for _, seed := range []string{
+		"",
+		"argon2id$v=19$m=65536,t=3,p=4$bad$bad",
+		"argon2id$v=19$m=262145,t=3,p=4$c2FsdA==$aGFzaA==",
+		valid,
+	} {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, encoded string) {
+		salt, hash, memory, time, threads, err := parseEncodedHash(encoded)
+		if err != nil {
+			if !errors.Is(err, ErrMalformedHash) {
+				t.Fatalf("parseEncodedHash(%q) error = %v, want ErrMalformedHash", encoded, err)
+			}
+			return
+		}
+		if len(salt) == 0 || len(hash) == 0 || len(hash) > argonMaxHashLength {
+			t.Fatalf("accepted invalid decoded lengths: salt=%d hash=%d", len(salt), len(hash))
+		}
+		if memory == 0 || memory > argonMaxMemory || time == 0 || time > argonMaxTime || threads == 0 || threads > argonMaxThreads {
+			t.Fatalf("accepted unsafe params: m=%d t=%d p=%d", memory, time, threads)
+		}
+	})
 }

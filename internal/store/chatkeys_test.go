@@ -6,9 +6,13 @@ package store
 
 import (
 	"context"
+	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
+
+	"voicx/internal/safecast"
 )
 
 // testScope returns a scope id no channel uses, so tests never collide with
@@ -61,7 +65,7 @@ func TestScopeKeyRoundTrip(t *testing.T) {
 		t.Fatalf("first generation id = %d, want 1", id)
 	}
 	wrapped := wrappedFixture(3)
-	if err := s.InsertScopeKey(ctx, scope, id, wrapped, 2); err != nil {
+	if err := s.InsertScopeKey(ctx, scope, id, wrapped, math.MaxUint16); err != nil {
 		t.Fatalf("InsertScopeKey: %v", err)
 	}
 
@@ -69,7 +73,7 @@ func TestScopeKeyRoundTrip(t *testing.T) {
 	if err != nil || cur == nil {
 		t.Fatalf("CurrentScopeKey = %+v, err=%v", cur, err)
 	}
-	if cur.KeyID != id || cur.KEKID != 2 || string(cur.Wrapped) != string(wrapped) {
+	if cur.KeyID != id || cur.KEKID != math.MaxUint16 || string(cur.Wrapped) != string(wrapped) {
 		t.Fatalf("current key = %+v, want the inserted generation", cur)
 	}
 	if cur.RetiredAt != nil {
@@ -89,6 +93,29 @@ func TestScopeKeyRoundTrip(t *testing.T) {
 	}
 	if after-before < 1 {
 		t.Fatalf("CountScopeKeys did not grow: %d -> %d", before, after)
+	}
+}
+
+func TestScopeKeyRejectsOutOfRangeDatabaseIDs(t *testing.T) {
+	s := testDBStore(t)
+	ctx := context.Background()
+	scope := testScope(t, s)
+
+	if _, err := s.DB().ExecContext(ctx, `INSERT INTO chat_scope_keys
+		(scope_id, key_id, wrapped_key, kek_id) VALUES ($1, $2, $3, 1)`,
+		scope, int64(math.MaxUint32)+1, wrappedFixture(1)); err != nil {
+		t.Fatalf("seeding out-of-range scope key: %v", err)
+	}
+	if _, err := s.CurrentScopeKey(ctx, scope); !errors.Is(err, safecast.ErrOutOfRange) {
+		t.Fatalf("CurrentScopeKey() error = %v, want ErrOutOfRange", err)
+	}
+
+	if _, err := s.DB().ExecContext(ctx, `INSERT INTO chat_scope_seq (scope_id, next_key_id)
+		VALUES ($1, $2)`, scope, int64(math.MaxUint32)+2); err != nil {
+		t.Fatalf("seeding out-of-range scope sequence: %v", err)
+	}
+	if _, err := s.AllocScopeKeyID(ctx, scope); !errors.Is(err, safecast.ErrOutOfRange) {
+		t.Fatalf("AllocScopeKeyID() error = %v, want ErrOutOfRange", err)
 	}
 }
 
