@@ -310,6 +310,8 @@ func loadOrCreateHostKey(path string) (ssh.Signer, error) {
 	if path == "" {
 		return nil, errors.New("no host key path configured")
 	}
+	// #nosec G304 -- path is an administrator-selected SSH host-key location,
+	// intentionally outside a fixed application data root.
 	raw, err := os.ReadFile(path)
 	if err == nil {
 		return ssh.ParsePrivateKey(raw)
@@ -330,7 +332,28 @@ func loadOrCreateHostKey(path string) (ssh.Signer, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+	// Use O_EXCL so concurrent server starts cannot overwrite each other's keys.
+	// #nosec G304 -- path is the same administrator-selected host-key location.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		raw, readErr := os.ReadFile(path) // #nosec G304 -- configured host-key path.
+		if readErr != nil {
+			return nil, readErr
+		}
+		return ssh.ParsePrivateKey(raw)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if _, err := f.Write(encoded); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
 		return nil, err
 	}
 	return ssh.ParsePrivateKey(encoded)

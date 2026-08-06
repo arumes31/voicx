@@ -8,6 +8,8 @@ package turn
 
 import (
 	"crypto/hmac"
+	// #nosec G505 -- coturn's REST credential protocol mandates HMAC-SHA1;
+	// collision attacks against plain SHA-1 do not break this keyed construction.
 	"crypto/sha1"
 	"encoding/base64"
 	"fmt"

@@ -150,6 +150,8 @@ func writePEM(cert tls.Certificate, certFile, keyFile string) error {
 	for _, der := range cert.Certificate {
 		certPEM = append(certPEM, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})...)
 	}
+	// #nosec G306 -- certificates contain public material and are intentionally
+	// world-readable; the private key below remains restricted to 0600.
 	if err := os.WriteFile(certFile, certPEM, 0o644); err != nil {
 		return fmt.Errorf("writing certificate: %w", err)
 	}

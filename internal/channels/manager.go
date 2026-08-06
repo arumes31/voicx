@@ -444,6 +444,8 @@ func (m *ChannelManager) UpdateChannel(ctx context.Context, channelID int64, upd
 	}
 
 	args = append(args, channelID)
+	// #nosec G201 -- every column name is selected from fixed literals above;
+	// all caller-controlled values remain positional query parameters.
 	q := fmt.Sprintf("UPDATE channels SET %s WHERE id = $%d",
 		strings.Join(sets, ", "), len(args))
 	res, err := tx.ExecContext(ctx, q, args...)

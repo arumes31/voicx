@@ -121,6 +121,8 @@ func (w *cmdWrapper) Kill() error {
 
 // defaultExec starts a real OS process.
 func defaultExec(ctx context.Context, name string, args ...string) Command {
+	// #nosec G204 -- the executable and arguments come from trusted server
+	// configuration and are passed directly without invoking a shell.
 	return &cmdWrapper{cmd: exec.CommandContext(ctx, name, args...)}
 }
 

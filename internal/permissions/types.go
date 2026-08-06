@@ -112,8 +112,9 @@ const (
 	PermissionKeyVirtualserverTokenDelete        PermissionKey = "b_virtualserver_token_delete"
 
 	// --- Chat (wave 5a) ---
-	PermissionKeyChatDeleteAny      PermissionKey = "b_chat_delete_any"
-	PermissionKeyChatMentionAll     PermissionKey = "b_chat_mention_all"
+	PermissionKeyChatDeleteAny  PermissionKey = "b_chat_delete_any"
+	PermissionKeyChatMentionAll PermissionKey = "b_chat_mention_all"
+	// #nosec G101 -- this is a public permission identifier, not a credential.
 	PermissionKeyChatSlowmodeBypass PermissionKey = "b_chat_slowmode_bypass"
 	PermissionKeyEmojiManage        PermissionKey = "b_emoji_manage"
 	// PermissionKeyChatFilterManage gates reading AND writing the runtime

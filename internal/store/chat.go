@@ -93,10 +93,12 @@ func (s *Store) ChatHistory(ctx context.Context, channelID, beforeID int64, limi
 	      WHERE channel_id = $1`
 	args := []any{channelID}
 	if beforeID > 0 {
-		q += ` AND id < $2`
-		args = append(args, beforeID)
+		q += ` AND id < $2 ORDER BY id DESC LIMIT $3`
+		args = append(args, beforeID, limit)
+	} else {
+		q += ` ORDER BY id DESC LIMIT $2`
+		args = append(args, limit)
 	}
-	q += fmt.Sprintf(` ORDER BY id DESC LIMIT %d`, limit)
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("querying chat history: %w", err)

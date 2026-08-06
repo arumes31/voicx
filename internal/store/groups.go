@@ -306,6 +306,8 @@ func (s *Store) SetGroupCosmetics(ctx context.Context, groupID int64, color *str
 		return errors.New("no cosmetic fields to set")
 	}
 	args = append(args, groupID)
+	// #nosec G201 -- every SET expression is assembled from the three fixed
+	// column names above; all caller-controlled values remain parameters.
 	q := fmt.Sprintf(`UPDATE server_groups SET %s WHERE id = $%d`, strings.Join(sets, ", "), len(args))
 	res, err := s.db.ExecContext(ctx, q, args...)
 	if err != nil {
@@ -636,10 +638,12 @@ func (s *Store) AuditList(ctx context.Context, beforeID int64, limit int) ([]Aud
 	q := `SELECT id, actor_unique_id, action, target, detail, created_at FROM audit_log`
 	args := []any{}
 	if beforeID > 0 {
-		q += ` WHERE id < $1`
-		args = append(args, beforeID)
+		q += ` WHERE id < $1 ORDER BY id DESC LIMIT $2`
+		args = append(args, beforeID, limit)
+	} else {
+		q += ` ORDER BY id DESC LIMIT $1`
+		args = append(args, limit)
 	}
-	q += fmt.Sprintf(` ORDER BY id DESC LIMIT %d`, limit)
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("listing audit log: %w", err)

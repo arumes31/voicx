@@ -58,6 +58,8 @@ func LoadKEKRing(path, envB64 string, allowCreate bool) (*KEKRing, error) {
 	if path == "" {
 		return nil, errors.New("chat master key: chat_master_key_file is empty and VOICX_CHAT_MASTER_KEY is unset")
 	}
+	// #nosec G304 -- path is an administrator-selected master-key location,
+	// intentionally outside a fixed application data root.
 	raw, err := os.ReadFile(path)
 	switch {
 	case err == nil:
@@ -139,6 +141,7 @@ func createRing(path string) (*KEKRing, error) {
 	}
 	line := "1:" + base64.StdEncoding.EncodeToString(key[:]) + "\n"
 	// O_EXCL so a concurrent starter cannot lose its key to ours.
+	// #nosec G304 -- path is the same administrator-selected key location.
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("creating chat master key %s: %w", path, err)
@@ -158,6 +161,7 @@ func createRing(path string) (*KEKRing, error) {
 	if dirPath == "" {
 		dirPath = "."
 	}
+	// #nosec G304 -- dirPath is derived solely from the configured key path.
 	if d, err := os.Open(dirPath); err == nil {
 		_ = d.Sync()
 		_ = d.Close()
