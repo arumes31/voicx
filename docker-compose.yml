@@ -131,7 +131,7 @@ services:
   # postgres — primary relational database
   # ---------------------------------------------------------------------------
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777 # 16.14-alpine3.24
     container_name: voicx-postgres
     restart: unless-stopped
     networks:
@@ -155,7 +155,7 @@ services:
   # Nightly compressed dumps. Backups use a volume separate from pgdata and
   # are retained for seven days; set BACKUP_REMOTE for optional object upload.
   postgres-backup:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777 # 16.14-alpine3.24
     profiles: ["backup"]
     restart: unless-stopped
     depends_on:
@@ -180,7 +180,7 @@ services:
   # redis — cache / pub-sub / session store
   # ---------------------------------------------------------------------------
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2 # 7.4.10-alpine
     container_name: voicx-redis
     restart: unless-stopped
     networks:
@@ -227,7 +227,7 @@ services:
   # 101-port relay publish — but it cannot coexist with the voicx-net bridge.)
   # ---------------------------------------------------------------------------
   coturn:
-    image: coturn/coturn:latest
+    image: coturn/coturn:4.17.0-r0@sha256:7df59bcd84800c3978da2dd0d7fb17a8179e77a8bf667f678813120a9f18b094
     container_name: voicx-coturn
     profiles: [ "turn" ]
     restart: unless-stopped
@@ -279,7 +279,7 @@ services:
   # not UDP; this still exercises the SFU media path under latency, jitter and
   # periodic transport outages rather than merely perturbing signaling.
   toxiproxy:
-    image: ghcr.io/shopify/toxiproxy:2.12.0
+    image: ghcr.io/shopify/toxiproxy:2.12.0@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e
     container_name: voicx-toxiproxy
     profiles: [ "chaos-network" ]
     restart: "no"
