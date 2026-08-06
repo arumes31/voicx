@@ -25,6 +25,8 @@ coverage.txt
 # Go
 vendor/
 go.work.sum
+/.cache/
+/.lintcache*/
 
 # Docs
 BACKLOG.md
