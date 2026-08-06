@@ -459,7 +459,12 @@ func copyBlobAndRemove(oldPath, newPath string, renameErr error) error {
 		}
 		return renameErr
 	}
-	defer src.Close()
+	srcClosed := false
+	defer func() {
+		if !srcClosed {
+			_ = src.Close()
+		}
+	}()
 	dst, createErr := os.Create(newPath)
 	if createErr != nil {
 		return createErr
@@ -473,7 +478,12 @@ func copyBlobAndRemove(oldPath, newPath string, renameErr error) error {
 		_ = os.Remove(newPath)
 		return closeErr
 	}
-	_ = src.Close()
+	closeErr := src.Close()
+	srcClosed = true
+	if closeErr != nil {
+		_ = os.Remove(newPath)
+		return closeErr
+	}
 	// Only drop the source once the copy is safely closed.
 	_ = os.Remove(oldPath)
 	return nil
@@ -680,7 +690,7 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.cfg.TLSEnabled {
 		ln = tls.NewListener(ln, &tls.Config{
 			Certificates: []tls.Certificate{s.cfg.Cert},
-			MinVersion:   tls.VersionTLS12,
+			MinVersion:   tls.VersionTLS13,
 		})
 	}
 	s.lifecycleMu.Lock()

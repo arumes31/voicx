@@ -42,8 +42,8 @@ graph TD
         Control["TCP Control Listener\n:12333 (TLS / TOFU)"]
         Keepalive["UDP Keepalive Worker Pool\n:12334"]
         WebRTC["Pion WebRTC SFU Engine\n(DTLS-SRTP / ICE / Opus)"]
-        Query["ServerQuery Admin Protocol\n:12335 (Text Interface)"]
-        FileXfer["File Transfer Service\n:12336 (Token Authorized)"]
+        Query["ServerQuery Admin Protocol\n127.0.0.1:12335 (Raw) / :12339 (SSH opt-in)"]
+        FileXfer["File Transfer Service\n:12336 (TLS 1.3 / Token Authorized)"]
         Health["Health & Metrics Service\n:12337 (/healthz, /readyz)"]
     end
 
@@ -71,9 +71,9 @@ graph TD
 | **`TCP :12333`** | Control Engine | Length-prefixed JSON frames over TLS 1.3 | Ed25519 Challenge / Argon2id / TOFU Pinning |
 | **`UDP :12334`** | Connection Probes | Datagram Ping/Pong Keepalive | Session Token Verification |
 | **`UDP Dynamic`** | WebRTC SFU Engine | DTLS-SRTP (Opus audio, H.264/VP8 video) | ICE candidate negotiation & SRTP encryption |
-| **`TCP :12335`** | ServerQuery Protocol | Line-based ASCII / UTF-8 Text Stream | Admin authentication & Brute-force lockout |
-| **`TCP :12336`** | File Transfer Engine | Single-use token HTTP/Raw stream | Ephemeral single-use cryptographically signed token |
-| **`TCP :12337`** | Health & Prometheus | HTTP GET (`/healthz`, `/readyz`, `/metrics`) | Unauthenticated / IP Whitelist |
+| **`TCP 127.0.0.1:12335`** | ServerQuery Protocol | Line-based ASCII / UTF-8 plaintext stream | Loopback by default; remote binding requires explicit opt-in, and SSH is preferred |
+| **`TCP :12336`** | File Transfer Engine | Binary frames over TLS 1.3 | TOFU-pinned certificate plus an ephemeral single-use token |
+| **`TCP :12337`** | Health & Prometheus | HTTP GET (`/healthz`, `/readyz`, `/metrics`) | Liveness/readiness follow the listener bind; metrics are loopback-only unless explicitly enabled |
 
 ---
 
@@ -168,21 +168,60 @@ VoicX can be configured via environment variables or a YAML configuration file (
 | :--- | :--- | :--- |
 | `VOICX_TCP_ADDR` | `:12333` | Primary control TCP listener address |
 | `VOICX_UDP_ADDR` | `:12334` | UDP keepalive ping/pong listener address |
+| `VOICX_GRPC_ADDR` | `127.0.0.1:12338` | Plaintext gRPC administration listener; loopback is mandatory |
 | `VOICX_QUERY_ADDR` | `127.0.0.1:12335` | ServerQuery admin protocol binding address |
+| `VOICX_QUERY_ALLOW_REMOTE` | `false` | Explicitly permit a non-loopback raw ServerQuery bind; prefer SSH instead |
+| `VOICX_QUERY_SSH_ENABLED` | `false` | Enable the SSH-wrapped ServerQuery listener |
+| `VOICX_QUERY_SSH_ADDR` | `:12339` | SSH ServerQuery listener address |
 | `VOICX_FILE_ADDR` | `:12336` | File transfer upload/download listener address |
-| `VOICX_HEALTH_ADDR` | `:12337` | Health check (`/healthz`) and metrics HTTP listener |
+| `VOICX_HEALTH_ADDR` | `:12337` | Health/readiness and metrics HTTP listener |
+| `VOICX_METRICS_ALLOW_REMOTE` | `false` | Permit remote `/metrics` requests; without this opt-in, only IPv4/IPv6 loopback is accepted |
 | `VOICX_DATABASE_URL` | `postgres://...` | PostgreSQL connection URL |
 | `VOICX_REDIS_ADDR` | `localhost:6379` | Optional Redis address for pub/sub fanout |
 | `VOICX_TLS_ENABLED` | `true` | Enable TLS 1.3 encryption on control port |
-| `VOICX_TLS_DIR` | `./certs` | Directory storing self-signed or custom TLS certificates |
+| `VOICX_TLS_DIR` | `./data/tls` | Directory storing the generated TLS certificate and key |
+| `VOICX_TLS_CERT_FILE` / `VOICX_TLS_KEY_FILE` | empty | Custom certificate and key; both must be configured together |
+| `VOICX_FILE_TLS_ENABLED` | `true` | Enable TLS 1.3 on file transfers; disabling is development-only |
 | `VOICX_FILE_ROOT` | `./data/files` | Root storage path for uploaded channel files & avatars |
-| `VOICX_PII_KEY_PATH` | `./data/pii.key` | AES-256-GCM master key file path for PII encryption |
+| `VOICX_PII_KEY_FILE` | `./data/keys/pii.key` | AES-256-GCM master key file path for PII encryption |
+| `VOICX_CHANNEL_TEMP_LIFETIME_SECONDS` | `60` | Grace period before an empty temporary channel is removed |
+| `VOICX_CHAT_MASTER_KEY_FILE` | `./data/keys/chat_master.key` | KEK file used to wrap persisted chat scope keys; back it up with PostgreSQL |
+| `VOICX_CHAT_LEGACY_HISTORY` | `encrypt` | One-time handling for legacy plaintext rows: `encrypt` or `purge` |
+| `VOICX_CHAT_KEY_ROTATE_MIN_SECONDS` | `60` | Minimum interval used to coalesce scope-key rotations |
+| `VOICX_CHAT_SEARCH_MAX_MESSAGES` | `2000` | Maximum history messages scanned by client-side search |
+| `VOICX_CHAT_MAX_LENGTH` | `4096` | Maximum decrypted chat payload size in UTF-8 bytes |
+| `VOICX_DEFAULT_GROUPS_ENABLED` | `true` | Auto-create and assign the built-in Guest and Member groups |
+| `VOICX_TURN_CREDENTIALS_TTL` | `24h` | TURN credential lifetime; must be positive and at most 30 days |
+
+### Certificate trust and rotation
+
+The generated certificate under `VOICX_TLS_DIR` is the server's persistent
+identity. Back up that directory with the server data volume; replacing or
+losing it changes the fingerprint seen by every client.
+
+On first connection, the desktop client pins the control certificate's SHA-256
+fingerprint. Later changes fail closed. For a planned rotation:
+
+1. Generate or install the new certificate and record the fingerprint printed
+   by the server at startup.
+2. Verify that fingerprint with users over a separate trusted channel.
+3. Reconnect. In the certificate-changed warning, compare the presented value
+   with the verified value and choose **Trust new fingerprint** only when they
+   match.
+4. Reconnect once more and confirm the connection-security message reports the
+   expected fingerprint. If verification fails, abort and restore the previous
+   certificate and key; do not delete `known_servers.json` to bypass the check.
 
 ---
 
 ## 💻 ServerQuery Admin Protocol
 
-VoicX exposes a line-based administrative text interface on port `12335` for headless automation, scripts, and bot integrations.
+VoicX exposes a line-based administrative text interface on `127.0.0.1:12335`
+for host-local automation. The raw protocol is plaintext: a non-loopback bind is
+rejected unless `VOICX_QUERY_ALLOW_REMOTE=true` is set explicitly. For remote
+administration, enable the SSH transport on port `12339` instead. Docker Compose
+does not publish either administration port by default; publish `12339` when
+enabling Query SSH.
 
 ### Key ServerQuery Commands
 

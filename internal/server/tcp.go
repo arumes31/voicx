@@ -361,7 +361,7 @@ func (s *TCPServer) Start(ctx context.Context) error {
 			cert, fp = c, f
 		}
 		s.tlsFingerprint = fp
-		ln = tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
+		ln = tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13})
 		s.logger.Info("TCP control listener started (TLS)",
 			zap.String("addr", s.cfg.TCPAddr),
 			zap.String("tls_fingerprint", fp),

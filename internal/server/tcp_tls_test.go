@@ -115,6 +115,34 @@ func TestTLSRejectsPlaintext(t *testing.T) {
 	}
 }
 
+// TestTLSRequiresVersion13 pins the control listener's documented minimum.
+func TestTLSRequiresVersion13(t *testing.T) {
+	addr, _, stop := startTLSTestServer(t, true)
+	defer stop()
+
+	legacy, err := tls.Dial("tcp", addr, &tls.Config{
+		InsecureSkipVerify: true, //nolint:gosec // protocol-version test
+		MinVersion:         tls.VersionTLS12,
+		MaxVersion:         tls.VersionTLS12,
+	})
+	if err == nil {
+		_ = legacy.Close()
+		t.Fatal("TLS 1.2 handshake succeeded, want rejection")
+	}
+
+	current, err := tls.Dial("tcp", addr, &tls.Config{
+		InsecureSkipVerify: true, //nolint:gosec // test client
+		MinVersion:         tls.VersionTLS13,
+	})
+	if err != nil {
+		t.Fatalf("TLS 1.3 dial: %v", err)
+	}
+	defer current.Close()
+	if version := current.ConnectionState().Version; version != tls.VersionTLS13 {
+		t.Fatalf("negotiated TLS version = %#x, want TLS 1.3", version)
+	}
+}
+
 // TestPlaintextStillAllowed verifies tls_enabled=false keeps the dev/e2e
 // escape hatch working.
 func TestPlaintextStillAllowed(t *testing.T) {

@@ -65,10 +65,15 @@ services:
     ports:
       # TeamSpeak-style voice transport (UDP)
       - "12334:12334/udp"
-      # ServerQuery / raw TCP control
+      # TLS control channel
       - "12333:12333"
-      # ServerQuery (admin/bot text protocol)
-      - "12335:12335"
+      # Raw ServerQuery is loopback-only inside the container by default.
+      # Prefer SSH for remote administration. If raw remote access is
+      # intentional, publish 12335 and set both VOICX_QUERY_ADDR=:12335 and
+      # VOICX_QUERY_ALLOW_REMOTE=true.
+      # - "12335:12335"
+      # Preferred remote administration: enable Query SSH and publish 12339.
+      # - "12339:12339"
       # File transfer
       - "12336:12336"
       # Health/readiness/metrics HTTP endpoint
@@ -96,8 +101,12 @@ services:
       # gRPC carries Basic credentials over plaintext and is loopback-only.
       VOICX_GRPC_ADDR: "127.0.0.1:12338"
       VOICX_HEALTH_ADDR: ":12337"
-      VOICX_QUERY_ADDR: ":12335"
+      VOICX_METRICS_ALLOW_REMOTE: ${VOICX_METRICS_ALLOW_REMOTE:-false}
+      VOICX_QUERY_ADDR: ${VOICX_QUERY_ADDR:-127.0.0.1:12335}
+      VOICX_QUERY_ALLOW_REMOTE: ${VOICX_QUERY_ALLOW_REMOTE:-false}
+      VOICX_QUERY_SSH_ENABLED: ${VOICX_QUERY_SSH_ENABLED:-false}
       VOICX_QUERY_SSH_ADDR: ":12339"
+      VOICX_QUERY_SSH_HOST_KEY: "/data/keys/query_ssh_host.key"
       VOICX_FILE_ADDR: ":12336"
 
       # --- Writable data on the named volume (read_only root fs) ---

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -18,7 +19,7 @@ func main() {
 	}
 }
 
-func run() error {
+func run() (runErr error) {
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
@@ -28,16 +29,27 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("initializing logger: %w", err)
 	}
-	defer logger.Sync()
+	defer func() {
+		if err := logger.Sync(); err != nil {
+			// Sync commonly returns EINVAL for console streams even though all
+			// bytes were written. Surface it without turning a successful schema
+			// migration into a failed command.
+			fmt.Fprintf(os.Stderr, "voicx-migrate: syncing logger: %v\n", err)
+		}
+	}()
 
-	logger.Info("running database migrations", zap.String("database_url", cfg.DatabaseURL))
+	logger.Info("running database migrations", zap.String("database_url", cfg.RedactedDatabaseURL()))
 
 	s, err := store.New(cfg.DatabaseURL, logger,
 		cfg.DBMaxOpenConns, cfg.DBMaxIdleConns, cfg.DBConnMaxLifetime)
 	if err != nil {
 		return fmt.Errorf("opening store: %w", err)
 	}
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("closing store: %w", err))
+		}
+	}()
 
 	if err := s.Migrate(); err != nil {
 		return fmt.Errorf("applying migrations: %w", err)

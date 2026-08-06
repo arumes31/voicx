@@ -20,7 +20,7 @@ const (
 const (
 	DefaultTCPAddr      = ":12333"
 	DefaultUDPAddr      = ":12334"
-	DefaultQueryAddr    = ":12335"
+	DefaultQueryAddr    = "127.0.0.1:12335"
 	DefaultFileAddr     = ":12336"
 	DefaultHealthAddr   = ":12337"
 	DefaultGRPCAddr     = "127.0.0.1:12338"

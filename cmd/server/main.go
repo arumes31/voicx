@@ -35,6 +35,7 @@ import (
 	"voicx/internal/recorder"
 	"voicx/internal/redisx"
 	"voicx/internal/rules"
+	"voicx/internal/safecast"
 	"voicx/internal/server"
 	"voicx/internal/state"
 	"voicx/internal/store"
@@ -96,7 +97,7 @@ func rewrapChatKeys() error {
 
 	ctx := context.Background()
 	rows, err := dbStore.DB().QueryContext(ctx,
-		`SELECT scope_id, key_id, wrapped_key, kek_id FROM chat_scope_keys WHERE kek_id <> $1`, int16(newest))
+		`SELECT scope_id, key_id, wrapped_key, kek_id FROM chat_scope_keys WHERE kek_id <> $1`, int32(newest))
 	if err != nil {
 		return fmt.Errorf("listing scope keys: %w", err)
 	}
@@ -110,13 +111,18 @@ func rewrapChatKeys() error {
 		var (
 			p       pending
 			wrapped []byte
-			kekID   int16
+			kekID   int64
 		)
 		if err := rows.Scan(&p.scope, &p.keyID, &wrapped, &kekID); err != nil {
 			rows.Close()
 			return fmt.Errorf("scanning scope key: %w", err)
 		}
-		key, err := ring.Unwrap(uint16(kekID), wrapped)
+		storedKEKID, err := safecast.Int64ToUint16(kekID)
+		if err != nil {
+			rows.Close()
+			return fmt.Errorf("scope %d generation %d has invalid kek id %d: %w", p.scope, p.keyID, kekID, err)
+		}
+		key, err := ring.Unwrap(storedKEKID, wrapped)
 		if err != nil {
 			rows.Close()
 			return fmt.Errorf("unwrapping scope %d generation %d: %w", p.scope, p.keyID, err)
@@ -136,7 +142,7 @@ func rewrapChatKeys() error {
 		}
 		if _, err := dbStore.DB().ExecContext(ctx,
 			`UPDATE chat_scope_keys SET wrapped_key = $1, kek_id = $2 WHERE scope_id = $3 AND key_id = $4`,
-			wrapped, int16(kekID), p.scope, p.keyID); err != nil {
+			wrapped, int32(kekID), p.scope, p.keyID); err != nil {
 			return fmt.Errorf("rewrapping scope %d generation %d: %w", p.scope, p.keyID, err)
 		}
 	}
@@ -212,11 +218,14 @@ func run() error {
 		zap.String("tcp_addr", cfg.TCPAddr),
 		zap.String("udp_addr", cfg.UDPAddr),
 		zap.String("grpc_addr", cfg.GRPCAddr),
-		zap.String("database_url", cfg.DatabaseURL),
-		zap.String("redis_addr", cfg.RedisAddr),
+		zap.String("database_url", cfg.RedactedDatabaseURL()),
+		zap.String("redis_addr", cfg.RedactedRedisAddr()),
 		zap.Int("max_clients", cfg.MaxClients),
 	)
 	logger.Info("config summary", zap.String("config", cfg.Summary()))
+	for _, warning := range cfg.Warnings() {
+		logger.Warn("unsafe configuration", zap.String("warning", warning))
+	}
 
 	// Initialize the PostgreSQL store and run migrations on startup.
 	dbStore, err := store.New(cfg.DatabaseURL, logger,
@@ -459,12 +468,12 @@ func run() error {
 		cancel()
 		if pingErr != nil {
 			logger.Warn("redis unavailable, continuing without it",
-				zap.String("addr", cfg.RedisAddr),
+				zap.String("addr", cfg.RedactedRedisAddr()),
 				zap.Error(pingErr),
 			)
 			_ = rdb.Close()
 		} else {
-			logger.Info("redis connected", zap.String("addr", cfg.RedisAddr))
+			logger.Info("redis connected", zap.String("addr", cfg.RedactedRedisAddr()))
 			defer rdb.Close()
 		}
 	} else {
@@ -486,7 +495,11 @@ func run() error {
 		}
 		return err
 	})
-	healthServer.Handle("/metrics", m.Handler())
+	if cfg.MetricsAllowRemote {
+		healthServer.HandleGET("/metrics", m.Handler())
+	} else {
+		healthServer.HandleLocalGET("/metrics", m.Handler())
+	}
 	healthServer.Handle("/api/v1/schema/version", health.SchemaVersionHandler(dbStore.SchemaVersion))
 	healthErr := make(chan error, 1)
 	go func() {
@@ -988,10 +1001,14 @@ func (q *queryBackend) SendText(_ context.Context, targetMode int, target, msg s
 }
 
 func (q *queryBackend) CreateChannel(ctx context.Context, name, topic string, channelType int) (int64, error) {
+	parsedType, err := channels.ParseChannelType(channelType)
+	if err != nil {
+		return 0, err
+	}
 	id, err := q.channelMgr.CreateChannel(ctx, channels.ChannelSpec{
 		Name:  name,
 		Topic: topic,
-		Type:  channels.ChannelType(channelType),
+		Type:  parsedType,
 	})
 	if err != nil {
 		return 0, err

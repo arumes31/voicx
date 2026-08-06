@@ -267,7 +267,7 @@ func TestMOTDDecryptedBeforeConnectReturns(t *testing.T) {
 	}
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
+		MinVersion:   tls.VersionTLS13,
 	})
 	if err != nil {
 		t.Fatalf("listen: %v", err)
