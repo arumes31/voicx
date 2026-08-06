@@ -7,12 +7,19 @@ package metrics
 import (
 	"database/sql"
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"voicx/internal/version"
+)
+
+const (
+	metricsMaxRequestsInFlight = 5
+	metricsHandlerTimeout      = 10 * time.Second
 )
 
 // Sink is the narrow metrics interface used across voicx. *Metrics and Noop
@@ -36,19 +43,26 @@ func (m *Metrics) RegisterDBPool(db *sql.DB) {
 	if m == nil || db == nil {
 		return
 	}
-	gauges := []prometheus.Collector{
-		prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: "voicx", Subsystem: "db_pool", Name: "open_connections", Help: "Open PostgreSQL pool connections."}, func() float64 { return float64(db.Stats().OpenConnections) }),
-		prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: "voicx", Subsystem: "db_pool", Name: "in_use_connections", Help: "PostgreSQL pool connections currently in use."}, func() float64 { return float64(db.Stats().InUse) }),
-		prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: "voicx", Subsystem: "db_pool", Name: "idle_connections", Help: "Idle PostgreSQL pool connections."}, func() float64 { return float64(db.Stats().Idle) }),
-		prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: "voicx", Subsystem: "db_pool", Name: "wait_count_total", Help: "Requests that waited for a PostgreSQL pool connection."}, func() float64 { return float64(db.Stats().WaitCount) }),
-		prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: "voicx", Subsystem: "db_pool", Name: "wait_duration_seconds_total", Help: "Total time spent waiting for PostgreSQL pool connections."}, func() float64 { return db.Stats().WaitDuration.Seconds() }),
-	}
-	m.registry.MustRegister(gauges...)
+	m.dbPoolOnce.Do(func() {
+		poolCollectors := []prometheus.Collector{
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: "voicx", Subsystem: "db_pool", Name: "max_open_connections", Help: "Configured maximum PostgreSQL pool connections."}, func() float64 { return float64(db.Stats().MaxOpenConnections) }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: "voicx", Subsystem: "db_pool", Name: "open_connections", Help: "Open PostgreSQL pool connections."}, func() float64 { return float64(db.Stats().OpenConnections) }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: "voicx", Subsystem: "db_pool", Name: "in_use_connections", Help: "PostgreSQL pool connections currently in use."}, func() float64 { return float64(db.Stats().InUse) }),
+			prometheus.NewGaugeFunc(prometheus.GaugeOpts{Namespace: "voicx", Subsystem: "db_pool", Name: "idle_connections", Help: "Idle PostgreSQL pool connections."}, func() float64 { return float64(db.Stats().Idle) }),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{Namespace: "voicx", Subsystem: "db_pool", Name: "wait_count_total", Help: "Requests that waited for a PostgreSQL pool connection."}, func() float64 { return float64(db.Stats().WaitCount) }),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{Namespace: "voicx", Subsystem: "db_pool", Name: "wait_duration_seconds_total", Help: "Total time spent waiting for PostgreSQL pool connections."}, func() float64 { return db.Stats().WaitDuration.Seconds() }),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{Namespace: "voicx", Subsystem: "db_pool", Name: "closed_max_idle_total", Help: "PostgreSQL connections closed after exceeding the idle pool limit."}, func() float64 { return float64(db.Stats().MaxIdleClosed) }),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{Namespace: "voicx", Subsystem: "db_pool", Name: "closed_max_idle_time_total", Help: "PostgreSQL connections closed after exceeding the idle time limit."}, func() float64 { return float64(db.Stats().MaxIdleTimeClosed) }),
+			prometheus.NewCounterFunc(prometheus.CounterOpts{Namespace: "voicx", Subsystem: "db_pool", Name: "closed_max_lifetime_total", Help: "PostgreSQL connections closed after exceeding the lifetime limit."}, func() float64 { return float64(db.Stats().MaxLifetimeClosed) }),
+		}
+		m.registry.MustRegister(poolCollectors...)
+	})
 }
 
 // Metrics is the Prometheus-backed Sink.
 type Metrics struct {
-	registry *prometheus.Registry
+	registry   *prometheus.Registry
+	dbPoolOnce sync.Once
 
 	clientsConnected prometheus.Gauge
 	channelsActive   prometheus.Gauge
@@ -66,7 +80,7 @@ type Metrics struct {
 // default Go collectors).
 func New() *Metrics {
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(collectors.NewGoCollector())
+	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 
 	m := &Metrics{
 		registry: reg,
@@ -125,21 +139,84 @@ func (m *Metrics) Registry() *prometheus.Registry { return m.registry }
 
 // Handler returns an HTTP handler serving the /metrics text format.
 func (m *Metrics) Handler() http.Handler {
-	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
+	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{
+		EnableOpenMetrics:   true,
+		MaxRequestsInFlight: metricsMaxRequestsInFlight,
+		Timeout:             metricsHandlerTimeout,
+	})
 }
 
-func (m *Metrics) SetClientsConnected(n int)   { m.clientsConnected.Set(float64(n)) }
-func (m *Metrics) SetChannelsActive(n int)     { m.channelsActive.Set(float64(n)) }
-func (m *Metrics) IncUDPPackets(kind string)   { m.udpPackets.WithLabelValues(kind).Inc() }
-func (m *Metrics) IncUDPPacketsDropped()       { m.udpDropped.Inc() }
-func (m *Metrics) IncTCPConnections()          { m.tcpConnections.Inc() }
-func (m *Metrics) IncChatMessage(scope string) { m.chatMessages.WithLabelValues(scope).Inc() }
-func (m *Metrics) SetWebRTCPeers(n int)        { m.webrtcPeers.Set(float64(n)) }
+func (m *Metrics) SetClientsConnected(n int) { m.clientsConnected.Set(nonNegative(n)) }
+func (m *Metrics) SetChannelsActive(n int)   { m.channelsActive.Set(nonNegative(n)) }
+func (m *Metrics) IncUDPPackets(kind string) {
+	m.udpPackets.WithLabelValues(udpKindLabel(kind)).Inc()
+}
+func (m *Metrics) IncUDPPacketsDropped() { m.udpDropped.Inc() }
+func (m *Metrics) IncTCPConnections()    { m.tcpConnections.Inc() }
+func (m *Metrics) IncChatMessage(scope string) {
+	m.chatMessages.WithLabelValues(chatScopeLabel(scope)).Inc()
+}
+func (m *Metrics) SetWebRTCPeers(n int) { m.webrtcPeers.Set(nonNegative(n)) }
 func (m *Metrics) IncRTPForwarded(media string, n int) {
-	m.rtpForwarded.WithLabelValues(media).Add(float64(n))
+	if n <= 0 {
+		return
+	}
+	m.rtpForwarded.WithLabelValues(mediaLabel(media)).Add(float64(n))
 }
 func (m *Metrics) IncFileTransfer(direction, result string) {
-	m.fileTransfers.WithLabelValues(direction, result).Inc()
+	m.fileTransfers.WithLabelValues(transferDirectionLabel(direction), transferResultLabel(result)).Inc()
+}
+
+func udpKindLabel(value string) string {
+	switch value {
+	case "ping", "pong":
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func chatScopeLabel(value string) string {
+	switch value {
+	case "global", "channel", "direct", "rejected":
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func mediaLabel(value string) string {
+	switch value {
+	case "audio", "video":
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func transferDirectionLabel(value string) string {
+	switch value {
+	case "upload", "download":
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func transferResultLabel(value string) string {
+	switch value {
+	case "ok", "error":
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func nonNegative(value int) float64 {
+	if value < 0 {
+		return 0
+	}
+	return float64(value)
 }
 
 // Noop is a Sink that discards everything, for tests and partial startups.
