@@ -11,6 +11,7 @@
 package eventbus
 
 import (
+	"bytes"
 	"encoding/json"
 	"sync"
 	"sync/atomic"
@@ -58,10 +59,14 @@ type Bus struct {
 	// MaxDrops is the consecutive-drop eviction threshold.
 	MaxDrops int
 
-	mu     sync.RWMutex
-	closed bool
-	nextID uint64
-	subs   map[uint64]*Subscription
+	mu sync.RWMutex
+	// publishMu preserves sequence order in every subscriber channel. The
+	// registry lock is intentionally read-shared, so it cannot provide this
+	// ordering when several producers publish concurrently.
+	publishMu sync.Mutex
+	closed    bool
+	nextID    uint64
+	subs      map[uint64]*Subscription
 
 	seq       atomic.Uint64
 	delivered atomic.Uint64
@@ -168,9 +173,13 @@ func (s *Subscription) wants(eventType string) bool {
 	return s.types == nil || s.types[eventType]
 }
 
-// Publish fans an event out to every matching subscriber. It never blocks:
-// this is called from the control server's broadcast path.
+// Publish fans an event out to every matching subscriber. Concurrent
+// publishers serialize to preserve sequence order, but a slow subscriber
+// never blocks that ordered publish path.
 func (b *Bus) Publish(eventType string, data []byte) {
+	b.publishMu.Lock()
+	defer b.publishMu.Unlock()
+
 	b.mu.RLock()
 	if b.closed || len(b.subs) == 0 {
 		b.mu.RUnlock()
@@ -190,7 +199,7 @@ func (b *Bus) Publish(eventType string, data []byte) {
 			continue
 		}
 		select {
-		case sub.ch <- evt:
+		case sub.ch <- cloneEvent(evt):
 			sub.drops.Store(0)
 			b.delivered.Add(1)
 		default:
@@ -211,13 +220,24 @@ func (b *Bus) Publish(eventType string, data []byte) {
 // evict removes a subscriber that stopped draining its buffer.
 func (b *Bus) evict(sub *Subscription) {
 	b.mu.Lock()
-	delete(b.subs, sub.id)
+	current, exists := b.subs[sub.id]
+	if exists && current == sub {
+		delete(b.subs, sub.id)
+	}
 	b.mu.Unlock()
+	if !exists || current != sub {
+		return
+	}
 	b.evicted.Add(1)
 	b.logger.Warn("eventbus subscriber evicted: not draining its buffer",
 		zap.String("name", sub.name), zap.Uint64("id", sub.id),
 		zap.Uint64("dropped", sub.Dropped()))
 	sub.close()
+}
+
+func cloneEvent(event Event) Event {
+	event.Data = bytes.Clone(event.Data)
+	return event
 }
 
 // Stats returns a counter snapshot.
