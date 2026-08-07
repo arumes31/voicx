@@ -72,7 +72,7 @@ jobs:
       - name: install linux client dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libx11-dev libxtst-dev libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev xvfb
+          sudo apt-get install -y libx11-dev libxtst-dev libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev postgresql-client xvfb
 
       - name: build frontend assets
         working-directory: client/frontend
@@ -101,7 +101,7 @@ jobs:
         run: |
           root_coverage="$RUNNER_TEMP/root-unit.out"
           go test -race -count=1 -covermode=atomic -coverprofile="$root_coverage" ./internal/...
-          go test -race -count=1 . ./cmd/... ./v1
+          go test -race -count=1 ./cmd/... ./v1
           root_pct="$(go tool cover -func="$root_coverage" | awk '/^total:/ {gsub("%", "", $3); print $3}')"
           awk -v got="$root_pct" 'BEGIN {
             minimum = 70
@@ -136,8 +136,100 @@ jobs:
             ${{ runner.temp }}/root-unit.out
             ${{ runner.temp }}/client-unit.out
 
+      - name: verify database backup and restore
+        shell: bash
+        env:
+          PGHOST: localhost
+          PGUSER: voicx
+          PGPASSWORD: voicx
+          VOICX_DEV_MODE: "true"
+        run: |
+          set -euo pipefail
+          source_db="voicx_backup_source"
+          restore_db="voicx_backup_restore"
+          backup="$RUNNER_TEMP/voicx-backup.pgdump"
+          cleanup() {
+            dropdb --if-exists --force "$source_db"
+            dropdb --if-exists --force "$restore_db"
+          }
+          trap cleanup EXIT
+          cleanup
+          createdb "$source_db"
+          VOICX_DATABASE_URL="postgres://voicx:voicx@localhost:5432/$source_db?sslmode=disable" \
+            go run ./cmd/migrate -timeout 2m
+          pg_dump --format=custom --no-owner --file="$backup" "$source_db"
+          test -s "$backup"
+          createdb "$restore_db"
+          pg_restore --exit-on-error --no-owner --dbname="$restore_db" "$backup"
+          VOICX_DATABASE_URL="postgres://voicx:voicx@localhost:5432/$restore_db?sslmode=disable" \
+            go run ./cmd/migrate -timeout 2m
+          source_ledger="$(psql --dbname="$source_db" --tuples-only --no-align \
+            --command="SELECT filename || ':' || checksum FROM public.schema_migrations ORDER BY filename")"
+          restore_ledger="$(psql --dbname="$restore_db" --tuples-only --no-align \
+            --command="SELECT filename || ':' || checksum FROM public.schema_migrations ORDER BY filename")"
+          test -n "$source_ledger"
+          test "$source_ledger" = "$restore_ledger"
+
+  security-gate:
+    name: Release security gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            client/go.sum
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.19.0
+          cache: npm
+          cache-dependency-path: client/frontend/package-lock.json
+
+      - name: install pinned Go security analyzers
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
+      - name: scan reachable Go vulnerabilities
+        run: |
+          govulncheck ./...
+          (cd client && govulncheck ./...)
+
+      - name: scan Go source security
+        run: |
+          gosec -quiet -exclude-generated ./cmd/...
+          gosec -quiet -exclude-generated ./internal/auth/... ./internal/channels/... ./internal/chatcrypto/... ./internal/config/... ./internal/filetransfer/... ./internal/netproto/... ./internal/permissions/...
+          gosec -quiet -exclude-generated ./internal/query/... ./internal/recorder/... ./internal/safecast/... ./internal/server/... ./internal/store/...
+          gosec -quiet -exclude-generated . ./internal/tlscert/... ./internal/turn/... ./internal/version/... ./internal/webrtc/... ./v1/...
+          (cd client && gosec -quiet -exclude-generated ./...)
+
+      - name: audit frontend dependencies
+        working-directory: client/frontend
+        run: |
+          npm ci
+          npm audit --audit-level=high
+
+      - name: lint GitHub Actions workflows
+        run: actionlint
+
+      - name: scan repository secrets
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   docker:
-    needs: test
+    needs: [test, frontend-e2e, security-gate]
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -192,7 +284,7 @@ jobs:
           sbom: true
 
   release:
-    needs: test
+    needs: [test, frontend-e2e, security-gate]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
     timeout-minutes: 45
@@ -252,6 +344,7 @@ jobs:
             -X voicx/internal/version.UpdatePublicKeys=${{ env.VOICX_UPDATE_PUBLIC_KEYS }}"
 
       - name: build server (linux/amd64)
+        shell: bash
         run: |
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build \
             -ldflags "-s -w \

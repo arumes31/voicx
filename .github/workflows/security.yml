@@ -2,48 +2,188 @@ name: Security Analysis
 
 on:
   push:
-    branches: [ main, dev ]
+    branches: [main, dev]
+    tags: ['v*']
   pull_request:
-    branches: [ main, dev ]
+    branches: [main, dev]
   schedule:
-    - cron: '0 6 * * 1'
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   codeql:
-    name: CodeQL Analysis
+    name: CodeQL (${{ matrix.language }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       actions: read
       contents: read
       security-events: write
-
     strategy:
       fail-fast: false
       matrix:
-        language: [ 'go', 'javascript-typescript' ]
+        language: [go, javascript-typescript]
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
         with:
           languages: ${{ matrix.language }}
 
       - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
+        uses: github/codeql-action/autobuild@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
 
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
+
+  govulncheck:
+    name: Govulncheck (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - module: server
+            directory: .
+          - module: client
+            directory: client
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            client/go.sum
+
+      - name: Install govulncheck v1.6.0
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+
+      - name: Scan ${{ matrix.module }} module
+        working-directory: ${{ matrix.directory }}
+        run: govulncheck ./...
+
+  gosec:
+    name: Gosec (${{ matrix.scan }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scan: server-commands
+            directory: .
+            packages: ./cmd/...
+          - scan: server-core
+            directory: .
+            packages: ./internal/auth/... ./internal/channels/... ./internal/chatcrypto/... ./internal/config/... ./internal/filetransfer/... ./internal/netproto/... ./internal/permissions/...
+          - scan: server-services
+            directory: .
+            packages: ./internal/query/... ./internal/recorder/... ./internal/safecast/... ./internal/server/... ./internal/store/...
+          - scan: server-platform
+            directory: .
+            packages: . ./internal/tlscert/... ./internal/turn/... ./internal/version/... ./internal/webrtc/... ./v1/...
+          - scan: client
+            directory: client
+            packages: ./...
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            client/go.sum
+
+      - name: Install gosec v2.28.0
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
+
+      - name: Scan ${{ matrix.scan }}
+        working-directory: ${{ matrix.directory }}
+        run: gosec -quiet -exclude-generated ${{ matrix.packages }}
+
+  npm-audit:
+    name: Frontend npm audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.19.0
+          cache: npm
+          cache-dependency-path: client/frontend/package-lock.json
+
+      - name: Audit production and development dependencies
+        working-directory: client/frontend
+        run: npm audit --audit-level=high
+
+  actionlint:
+    name: GitHub Actions lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Install actionlint v1.7.12
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
+      - name: Lint workflows
+        run: actionlint
 
   gitleaks:
-    name: Secret Scanning
+    name: Secret scanning
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
+          persist-credentials: false
+
+      - name: Scan repository
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

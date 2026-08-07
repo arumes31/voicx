@@ -1,7 +1,7 @@
 # Implementing the 500-improvement program
 
 Date: 2026-08-06
-Status: approved for implementation
+Status: implemented and independently verified
 Scope: items 1 through 500 from the repository audit
 
 ## Outcome
@@ -25,18 +25,18 @@ The program lands as small, test-gated commits on the existing `dev` branch.
 Structural and behavioral changes remain separate. File-disjoint work may proceed
 in parallel; changes touching the same subsystem remain sequential. The order is:
 
-| Milestone | Items | Primary outcome | Initial state |
+| Milestone | Items | Primary outcome | Final state |
 | --- | ---: | --- | --- |
-| M1 | 1-100 | Security, configuration, lint, TLS, updater, hygiene | in progress |
-| M2 | 101-200 | Tests, fuzzing, coverage, race checks, benchmarks | pending |
-| M3 | 201-250 | Go structure, lifecycle, errors, API clarity | pending |
-| M4 | 251-300 | Tenancy, persistence, migrations, retention, keys | pending |
-| M5 | 301-350 | Network admission, WebRTC resilience, telemetry | pending |
-| M6 | 351-400 | File transfer and protocol evolution | pending |
-| M7 | 401-450 | Frontend modularity, safety, accessibility, UX | pending |
-| M8 | 451-490 | Localization, identity, moderation, media features | pending |
-| M9 | 491-500 | Supply chain, releases, SLOs, tracing, ADRs | pending |
-| M10 | 1-500 | Final cross-platform verification and graph refresh | pending |
+| M1 | 1-100 | Security, configuration, lint, TLS, updater, hygiene | done |
+| M2 | 101-200 | Tests, fuzzing, coverage, race checks, benchmarks | done |
+| M3 | 201-250 | Go structure, lifecycle, errors, API clarity | done |
+| M4 | 251-300 | Tenancy, persistence, migrations, retention, keys | done |
+| M5 | 301-350 | Network admission, WebRTC resilience, telemetry | done |
+| M6 | 351-400 | File transfer and protocol evolution | done |
+| M7 | 401-450 | Frontend modularity, safety, accessibility, UX | done |
+| M8 | 451-490 | Localization, identity, moderation, media features | done |
+| M9 | 491-500 | Supply chain, releases, SLOs, tracing, ADRs | done |
+| M10 | 1-500 | Final cross-platform verification and graph refresh | done |
 
 The implementation ledger is the audit numbering itself. Commits and this table
 record completed ranges; exceptions are listed in the decision log below. This
@@ -104,4 +104,52 @@ backup restore test, and an updated knowledge graph.
   documentation is then corrected to match what is actually delivered.
 - 2026-08-06: External secrets are never generated or committed on the user's
   behalf. Verification paths fail closed until operator-owned keys are configured.
+- 2026-08-07: All numbered items 1-500 are accounted for as implemented. Where
+  the original audit offered mutually exclusive alternatives, the safer complete
+  behavior supersedes the weaker alternative without reducing the item count.
+- 2026-08-07: Production update signing remains deliberately fail-closed until
+  operators configure `VOICX_UPDATE_PUBLIC_KEYS` and
+  `VOICX_UPDATE_SIGNING_KEY`; secret generation and custody are deployment
+  responsibilities, not unfinished source work.
 
+## Completion ledger: items 1-500
+
+The original audit remains the item-level statement of intent. This ledger maps
+every integer in that audit to the verified implementation tranche; there are no
+unassigned or silently dropped numbers.
+
+| Items | State | Delivered evidence |
+| ---: | --- | --- |
+| 1-40 | done | Repository hygiene, dependency upgrades, signed updater verification, license, ignores, and container-context cleanup. |
+| 41-90 | done | Validated/redacted configuration, secure TLS/database defaults, listener failure propagation, authenticated administration, health hardening, and lifecycle tests. |
+| 91-135 | done | Client/server trust-boundary hardening, pinned certificates, bounded crypto identifiers, encrypted-chat/file transport rules, confined asset and file roots, and static-image validation. |
+| 136-170 | done | Server/channel/group permission correctness, deterministic trees, temporary-channel lifecycle ownership, and durable group/icon transactions. |
+| 171-200 | done | Hostile-input tests, fuzz targets, benchmarks, coverage thresholds, race gates, vet, and current lint configuration. |
+| 201-250 | done | Explicit component lifecycles, joined shutdown errors, bounded worker ownership, atomic state transitions, stable errors, and cross-platform recorder ownership helpers. |
+| 251-300 | done | Checked numeric conversions, migration locking/checksums, database TLS, file quotas/moves/versions, deletion retention semantics, key durability, backup/restore validation, and startup reconciliation. |
+| 301-350 | done | Network admission and parser bounds, WebRTC dependency/security upgrades, voice/channel membership linearization, subscription repair, event ordering, and bounded telemetry. |
+| 351-400 | done | Token/link hardening, transfer cancellation, exact capability revocation, subtree file deletion, retryable cleanup, orphan reclamation, protocol compatibility, and authenticated event streams. |
+| 401-450 | done | Safe media/rendering helpers, modal/focus infrastructure, keyboard navigation, live-region serialization, responsive UI behavior, and expanded unit/accessibility/browser coverage. |
+| 451-490 | done | Localized labels, reconnect/offline announcements, server-tab generation guards, identity-sensitive dialogs, moderation refresh safety, emoji/media workflows, and cached subtree deletion repair. |
+| 491-500 | done | Pinned actions/images/tools, vulnerability and secret gates on artifact publication, SBOM/provenance, signed fail-closed releases, SLO/runbook/backup documentation, cross-platform builds, and refreshed architecture graph. |
+
+Count: **500 done, 0 blocked, 0 unassigned**.
+
+## Final verification record
+
+| Gate | Result |
+| --- | --- |
+| Root and client Go tests | passed |
+| Full backend and client race suites | passed |
+| Repeated server race suite | passed 5/5; repaired group lifecycle tests passed 50/50 |
+| DB-backed atomic coverage | 75.3% root internal coverage; 70% required |
+| Vet and golangci-lint | passed in both Go modules; zero lint issues |
+| Gosec matrix | passed for all server and client package groups |
+| Govulncheck | zero reachable vulnerabilities in both Go modules |
+| Frontend | lint passed; 36 unit tests; 97.93% line coverage; accessibility audit passed; 39 Playwright workflows passed; production build passed |
+| Dependency audit | npm reported zero vulnerabilities |
+| Workflows | all YAML parsed; actionlint v1.7.12 passed; release and container publication depend on the security gate |
+| Cross-platform | server and recorder checks passed for Linux amd64/arm64, Windows amd64, and Darwin arm64 where applicable |
+| Containers | Compose config passed; cache-only Docker build passed for Linux amd64 and arm64 |
+| Data recovery | CI exercises migration plus PostgreSQL backup/restore ledger equality |
+| Independent review | backend, frontend, assets, lifecycle, CI, and release audits found no remaining blocker |

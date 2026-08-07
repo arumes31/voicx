@@ -296,6 +296,17 @@ voicx/
 
 ---
 
+## Operations
+
+Production operators should adopt the repository's
+[service-level objectives](docs/operations/service-level-objectives.md), practice
+the [backup and restore drill](docs/operations/backup-restore.md), and keep the
+[incident runbook](docs/operations/incident-runbook.md) available outside the
+deployment being operated. Update these documents when architecture, telemetry,
+or recovery procedures change.
+
+---
+
 ## 🔒 Security & Vulnerability Reporting
 
 VoicX is engineered around a strict security posture:
