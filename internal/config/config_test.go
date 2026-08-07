@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,8 @@ func TestLoadFromEnv(t *testing.T) {
 	t.Setenv("VOICX_REDIS_ADDR", "redis:6379")
 	t.Setenv("VOICX_REDIS_PASSWORD", "secret")
 	t.Setenv("VOICX_MAX_CLIENTS", "512")
+	t.Setenv("VOICX_RECORDING_MAX_CONCURRENT", "7")
+	t.Setenv("VOICX_RECORDING_WINDOWS_ACL_READY", "true")
 
 	// Ensure no config.yaml is picked up from the working directory by
 	// running from a clean temp dir.
@@ -61,6 +64,8 @@ func TestLoadFromEnv(t *testing.T) {
 		{"RedisAddr", cfg.RedisAddr, "redis:6379"},
 		{"RedisPassword", cfg.RedisPassword, "secret"},
 		{"MaxClients", cfg.MaxClients, 512},
+		{"Recording.MaxConcurrent", cfg.Recording.MaxConcurrent, 7},
+		{"Recording.WindowsACLReady", cfg.Recording.WindowsACLReady, true},
 	}
 	for _, c := range cases {
 		if c.got != c.want {
@@ -132,6 +137,13 @@ func TestLoadDefaults(t *testing.T) {
 	if len(cfg.WebRTC.ICEServers) == 0 {
 		t.Error("WebRTC.ICEServers is empty, want default STUN server")
 	}
+	if cfg.Recording.MaxConcurrent != 4 || cfg.Recording.WindowsACLReady {
+		t.Errorf(
+			"recording defaults = max %d, windows ACL ready %t; want 4/false",
+			cfg.Recording.MaxConcurrent,
+			cfg.Recording.WindowsACLReady,
+		)
+	}
 }
 
 func TestLoadRejectsInvalidFileQuietHours(t *testing.T) {
@@ -185,6 +197,9 @@ webrtc:
   enable_av1: true
   ice_servers:
     - "stun:stun.example.com:19302"
+recording:
+  max_concurrent: 6
+  windows_acl_ready: true
 `)
 	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), yaml, 0o600); err != nil {
 		t.Fatalf("write config.yaml: %v", err)
@@ -218,6 +233,13 @@ webrtc:
 	}
 	if len(cfg.WebRTC.ICEServers) != 1 || cfg.WebRTC.ICEServers[0] != "stun:stun.example.com:19302" {
 		t.Errorf("WebRTC.ICEServers = %v, want [stun:stun.example.com:19302]", cfg.WebRTC.ICEServers)
+	}
+	if cfg.Recording.MaxConcurrent != 6 || !cfg.Recording.WindowsACLReady {
+		t.Errorf(
+			"recording YAML = max %d, windows ACL ready %t; want 6/true",
+			cfg.Recording.MaxConcurrent,
+			cfg.Recording.WindowsACLReady,
+		)
 	}
 }
 
@@ -323,6 +345,24 @@ func TestValidateRejectsUnsafeValues(t *testing.T) {
 			wantErr: "recording.format",
 		},
 		{
+			name: "zero recording concurrency",
+			mutate: func(c *Config) {
+				c.Recording.Enabled = true
+				c.Recording.MaxConcurrent = 0
+				c.Recording.WindowsACLReady = true
+			},
+			wantErr: "recording.max_concurrent",
+		},
+		{
+			name: "excessive recording concurrency",
+			mutate: func(c *Config) {
+				c.Recording.Enabled = true
+				c.Recording.MaxConcurrent = 65
+				c.Recording.WindowsACLReady = true
+			},
+			wantErr: "recording.max_concurrent",
+		},
+		{
 			name:    "certificate without key",
 			mutate:  func(c *Config) { c.TLSCertFile = "cert.pem" },
 			wantErr: "must be set together",
@@ -387,6 +427,18 @@ func TestValidateRejectsUnsafeValues(t *testing.T) {
 				t.Fatalf("Validate() error = %v, want text %q", err, test.wantErr)
 			}
 		})
+	}
+}
+
+func TestValidateRecordingFailsClosedWithoutWindowsACLAcknowledgement(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-specific recording ACL gate")
+	}
+	cfg := loadDefaultConfig(t)
+	cfg.Recording.Enabled = true
+	cfg.Recording.WindowsACLReady = false
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "recording.windows_acl_ready") {
+		t.Fatalf("Validate() = %v, want Windows ACL acknowledgement error", err)
 	}
 }
 

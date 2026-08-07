@@ -16,6 +16,7 @@ import (
 	"voicx/internal/config"
 	"voicx/internal/netproto"
 	"voicx/internal/permissions"
+	"voicx/internal/state"
 )
 
 func TestTypingTrackerCleanupIsRateLimited(t *testing.T) {
@@ -570,8 +571,9 @@ func TestSlowMode(t *testing.T) {
 	defer func() { _ = bob.Close() }()
 
 	env.state.AddChannel(testChannel(3))
-	if ch, ok := env.state.GetChannel(3); ok {
-		ch.SlowModeSeconds = 5
+	slowMode := 5
+	if !env.state.UpdateChannel(3, state.ChannelUpdate{SlowModeSeconds: &slowMode}) {
+		t.Fatal("slow-mode channel missing from state")
 	}
 	// Move both to the slow channel; re-key for the new scope.
 	send(t, alice, netproto.MsgJoinChannel, netproto.JoinChannel{ChannelID: 3})
@@ -612,8 +614,9 @@ func TestSlowModeBypassPermission(t *testing.T) {
 	defer func() { _ = alice.Close() }()
 	defer func() { _ = bob.Close() }()
 
-	if ch, ok := env.state.GetChannel(1); ok {
-		ch.SlowModeSeconds = 60
+	slowMode := 60
+	if !env.state.UpdateChannel(1, state.ChannelUpdate{SlowModeSeconds: &slowMode}) {
+		t.Fatal("slow-mode channel missing from state")
 	}
 	sendEncChat(t, bob, key, keyID, "1", "first")
 	readEventOfType(t, alice, eventChat)

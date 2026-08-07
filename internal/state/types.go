@@ -113,8 +113,7 @@ func (m *Manager) ChannelTreeOrdered() []*Channel {
 	defer m.mu.RUnlock()
 	out := make([]*Channel, 0, len(m.channels))
 	for _, ch := range m.channels {
-		clone := *ch
-		out = append(out, &clone)
+		out = append(out, cloneChannel(ch))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		a, b := out[i], out[j]

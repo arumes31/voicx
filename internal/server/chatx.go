@@ -13,10 +13,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
+	"io/fs"
 	"net/url"
-	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -1268,11 +1266,6 @@ func (s *TCPServer) relayReceipt(client *Client, toUniqueID, eventType, clientMs
 // emojiNameRe validates emoji names.
 var emojiNameRe = regexp.MustCompile(`^[a-z0-9_\-]{1,32}$`)
 
-// emojiDir returns the emoji storage directory under the file root.
-func (s *TCPServer) emojiDir() string {
-	return filepath.Join(s.cfg.FileRoot, "emojis")
-}
-
 // handleEmojiUpload stores a custom emoji image and announces it. Gated by
 // b_emoji_manage.
 func (s *TCPServer) handleEmojiUpload(ctx context.Context, client *Client, f *netproto.Frame) error {
@@ -1294,35 +1287,12 @@ func (s *TCPServer) handleEmojiUpload(ctx context.Context, client *Client, f *ne
 	if err != nil {
 		return s.sendError(client, errCodeMalformed, err.Error())
 	}
-	dir := s.emojiDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return s.sendError(client, errCodeUnavailable, "emoji storage unavailable")
-	}
-	fileName := msg.Name + ext
-	if err := os.WriteFile(filepath.Join(dir, fileName), raw, 0o644); err != nil {
+	fileName, err := s.assets().writeImage("emojis", msg.Name, ext, raw)
+	if err != nil {
 		return s.sendError(client, errCodeUnavailable, "emoji write failed")
 	}
 	s.broadcastEvent(eventEmojiAdded, map[string]any{"name": msg.Name, "file_name": fileName, "by": client.UniqueID})
 	return nil
-}
-
-// emojiFile resolves a shortcode to its stored file name, whatever extension
-// it was uploaded with.
-func (s *TCPServer) emojiFile(name string) (string, bool) {
-	entries, err := os.ReadDir(s.emojiDir())
-	if err != nil {
-		return "", false
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		fn := e.Name()
-		if strings.TrimSuffix(fn, filepath.Ext(fn)) == name {
-			return fn, true
-		}
-	}
-	return "", false
 }
 
 // emojiManageAllowed applies the same gate as upload (272).
@@ -1349,11 +1319,11 @@ func (s *TCPServer) handleEmojiDelete(ctx context.Context, client *Client, f *ne
 	if !emojiNameRe.MatchString(msg.Name) {
 		return s.sendError(client, errCodeMalformed, "invalid emoji name")
 	}
-	fileName, ok := s.emojiFile(msg.Name)
-	if !ok {
+	_, err := s.assets().removeImage("emojis", msg.Name)
+	if errors.Is(err, fs.ErrNotExist) {
 		return s.sendError(client, errCodeNotFound, "emoji not found")
 	}
-	if err := os.Remove(filepath.Join(s.emojiDir(), fileName)); err != nil {
+	if err != nil {
 		return s.sendError(client, errCodeUnavailable, "emoji delete failed")
 	}
 	s.audit(ctx, client.UniqueID, "emoji_delete", msg.Name, "")
@@ -1378,42 +1348,38 @@ func (s *TCPServer) handleEmojiRename(ctx context.Context, client *Client, f *ne
 	if msg.Name == msg.NewName {
 		return s.sendError(client, errCodeMalformed, "new name is the same")
 	}
-	fileName, ok := s.emojiFile(msg.Name)
-	if !ok {
+	fileName, err := s.assets().renameImage("emojis", msg.Name, msg.NewName)
+	if errors.Is(err, fs.ErrNotExist) {
 		return s.sendError(client, errCodeNotFound, "emoji not found")
 	}
-	if _, taken := s.emojiFile(msg.NewName); taken {
+	if errors.Is(err, fs.ErrExist) {
 		return s.sendError(client, errCodeMalformed, "an emoji with that name already exists")
 	}
-	ext := filepath.Ext(fileName)
-	dir := s.emojiDir()
-	if err := os.Rename(filepath.Join(dir, fileName), filepath.Join(dir, msg.NewName+ext)); err != nil {
+	if err != nil {
 		return s.sendError(client, errCodeUnavailable, "emoji rename failed")
 	}
 	s.audit(ctx, client.UniqueID, "emoji_rename", msg.Name, "to "+msg.NewName)
 	s.broadcastEvent(eventEmojiRenamed, map[string]any{
-		"name": msg.Name, "new_name": msg.NewName, "file_name": msg.NewName + ext, "by": client.UniqueID,
+		"name": msg.Name, "new_name": msg.NewName, "file_name": fileName, "by": client.UniqueID,
 	})
 	return nil
 }
 
 // handleEmojiList lists the uploaded custom emojis.
 func (s *TCPServer) handleEmojiList(_ context.Context, client *Client, f *netproto.Frame) error {
-	entries, err := os.ReadDir(s.emojiDir())
+	images, err := s.assets().listImages("emojis")
 	if err != nil {
 		// No emoji directory yet is an empty list, not an error.
 		return s.writeMessage(client, netproto.MsgEmojiListResponse, netproto.EmojiListResponse{Emojis: []netproto.EmojiEntry{}})
 	}
 	out := netproto.EmojiListResponse{Emojis: []netproto.EmojiEntry{}}
-	for _, e := range entries {
-		if e.IsDir() {
+	for _, image := range images {
+		if !emojiNameRe.MatchString(image.base) {
 			continue
 		}
-		name := e.Name()
-		ext := filepath.Ext(name)
 		out.Emojis = append(out.Emojis, netproto.EmojiEntry{
-			Name:     strings.TrimSuffix(name, ext),
-			FileName: name,
+			Name:     image.base,
+			FileName: image.fileName,
 		})
 	}
 	return s.writeMessage(client, netproto.MsgEmojiListResponse, out)
@@ -1429,23 +1395,12 @@ func (s *TCPServer) handleEmojiGet(_ context.Context, client *Client, f *netprot
 	if !emojiNameRe.MatchString(msg.Name) {
 		return s.sendError(client, errCodeMalformed, "invalid emoji name")
 	}
-	entries, err := os.ReadDir(s.emojiDir())
-	if err != nil {
-		return s.sendError(client, errCodeNotFound, "emoji not found")
-	}
-	for _, e := range entries {
-		name := e.Name()
-		if strings.TrimSuffix(name, filepath.Ext(name)) != msg.Name {
-			continue
-		}
-		raw, err := os.ReadFile(filepath.Join(s.emojiDir(), name))
-		if err != nil {
-			return s.sendError(client, errCodeNotFound, "emoji not found")
-		}
+	raw, image, err := s.assets().readImage("emojis", msg.Name)
+	if err == nil {
 		return s.writeMessage(client, netproto.MsgEmojiData, netproto.EmojiData{
 			Name:        msg.Name,
 			DataBase64:  base64.StdEncoding.EncodeToString(raw),
-			ContentType: http.DetectContentType(raw),
+			ContentType: image.contentType,
 		})
 	}
 	return s.sendError(client, errCodeNotFound, "emoji not found")

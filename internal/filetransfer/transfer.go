@@ -53,6 +53,12 @@ func (s *Server) serve(ctx context.Context, conn net.Conn) {
 		writeStatus(conn, false, err.Error())
 		return
 	}
+	active, err := s.activateTransfer(tr, conn)
+	if err != nil {
+		writeStatus(conn, false, err.Error())
+		return
+	}
+	defer s.deactivateTransfer(active)
 
 	if tr.Direction == "upload" {
 		err = s.receiveUpload(ctx, conn, tr)
@@ -182,6 +188,12 @@ const maxFileVersions = 3
 // what makes the name unforgeable, so an upload cannot displace the blob an
 // older message still points at.
 func (s *Server) finalizeUpload(ctx context.Context, tr *transfer, root *os.Root, tmpPath, finalPath string, size int64, sum string) error {
+	s.fileOpsMu.RLock()
+	defer s.fileOpsMu.RUnlock()
+	if s.channelDeleted(tr.ChannelID) {
+		_ = root.Remove(tmpPath)
+		return ErrChannelDeleted
+	}
 	encrypted := isEncryptedAttachment(tr.Name)
 	if encrypted && tr.Name != sum[:encryptedNameLen]+encryptedSuffix {
 		_ = root.Remove(tmpPath)

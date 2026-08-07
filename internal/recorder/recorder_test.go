@@ -2,8 +2,10 @@ package recorder
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +24,7 @@ type fakeCommand struct {
 	started  bool
 	killed   bool
 	waitDone chan struct{}
+	output   string
 }
 
 type fakeWriteCloser struct {
@@ -37,17 +40,27 @@ func (w *fakeWriteCloser) Write(p []byte) (int, error) {
 }
 func (w *fakeWriteCloser) Close() error { return nil }
 
-func newFakeCommand() *fakeCommand {
+func newFakeCommand(output string) *fakeCommand {
 	return &fakeCommand{
 		stdin:    &fakeWriteCloser{},
 		waitDone: make(chan struct{}),
+		output:   output,
 	}
 }
 
 func (c *fakeCommand) StdinPipe() (io.WriteCloser, error) { return c.stdin, nil }
+func (c *fakeCommand) BindRecordingRoot(*os.Root, string, string, string, string) error {
+	return nil
+}
+func (c *fakeCommand) CloseBeforeStart() error { return nil }
 func (c *fakeCommand) Start() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.output != "" {
+		if err := os.WriteFile(c.output, []byte("recording"), 0o600); err != nil {
+			return err
+		}
+	}
 	c.started = true
 	return nil
 }
@@ -92,7 +105,11 @@ func (e *fakeExec) run(_ context.Context, name string, args ...string) Command {
 	defer e.mu.Unlock()
 	e.name = name
 	e.args = args
-	e.cmd = newFakeCommand()
+	output := ""
+	if len(args) > 0 {
+		output = args[len(args)-1]
+	}
+	e.cmd = newFakeCommand(output)
 	return e.cmd
 }
 
@@ -117,13 +134,31 @@ func (f *fakeTapRouter) RemoveTap(tapID string) {
 	f.removed = append(f.removed, tapID)
 }
 
+func waitForRouterRemovals(t *testing.T, router *fakeTapRouter, want int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		router.mu.Lock()
+		got := len(router.removed)
+		router.mu.Unlock()
+		if got == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	router.mu.Lock()
+	got := append([]string(nil), router.removed...)
+	router.mu.Unlock()
+	t.Fatalf("removed taps = %v, want %d", got, want)
+}
+
 func testLogger() *zap.Logger {
 	logger, _ := zap.NewDevelopment()
 	return logger
 }
 
 func testConfig(dir string) Config {
-	return Config{Enabled: true, Dir: dir}
+	return Config{Enabled: true, Dir: dir, WindowsACLReady: true}
 }
 
 // TestBuildArgsDefaults verifies the default ffmpeg command line (copy
@@ -133,7 +168,7 @@ func TestBuildArgsDefaults(t *testing.T) {
 	args := r.buildArgs("in.sdp", "out.webm")
 	joined := strings.Join(args, " ")
 
-	for _, want := range []string{"-protocol_whitelist file,udp,rtp", "-i in.sdp", "-c:a copy", "-c:v copy", "-y out.webm"} {
+	for _, want := range []string{"-protocol_whitelist file,udp,rtp", "-i in.sdp", "-c:a copy", "-c:v copy", "-n out.webm"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("args %q missing %q", joined, want)
 		}
@@ -213,9 +248,7 @@ func TestStartStopLifecycle(t *testing.T) {
 	if exec.cmd.killed {
 		t.Error("ffmpeg was killed despite graceful exit")
 	}
-	if len(router.removed) != 1 {
-		t.Fatalf("removed taps = %v, want 1", router.removed)
-	}
+	waitForRouterRemovals(t, router, 1)
 	if r.SessionCount() != 0 {
 		t.Fatalf("SessionCount = %d, want 0", r.SessionCount())
 	}
@@ -226,10 +259,11 @@ func TestStartStopLifecycle(t *testing.T) {
 }
 
 // TestStopKillsStuckProcess verifies Stop kills ffmpeg when it does not exit
-// within the grace period (tested with a shrunk grace via a fast path: the
-// fake never releases, so Stop must kill).
+// within the recorder's grace period.
 func TestStopKillsStuckProcess(t *testing.T) {
 	r := New(testConfig(t.TempDir()), testLogger())
+	r.stopGracePeriod = 25 * time.Millisecond
+	r.killWait = time.Second
 	exec := &fakeExec{}
 	r.Exec = exec.run
 	router := &fakeTapRouter{}
@@ -238,20 +272,17 @@ func TestStopKillsStuckProcess(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	// Shorten the grace period by racing: release nothing, rely on the
-	// 5s timeout being too slow for tests — instead kill via Close after
-	// asserting the process is still running. We call Stop in a goroutine
-	// and verify the kill happens only after we force it.
+	// The fake never releases, so Stop must take the kill path.
 	done := make(chan error, 1)
 	go func() { done <- r.Stop(3) }()
 
-	// Let Stop reach its wait, then simulate a stuck process that only
-	// exits when killed: release is never called; the grace period will
-	// fire. To keep the test fast we don't wait the full 5s here; instead
-	// assert the process eventually gets killed by Stop's timeout path.
+	// The process exits only when Kill closes its wait channel.
 	select {
-	case <-done:
+	case err := <-done:
 		// Stop returned only after killing (grace period elapsed).
+		if !errors.Is(err, ErrStopTimeout) {
+			t.Fatalf("Stop error = %v, want ErrStopTimeout", err)
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Stop did not return within 10s")
 	}

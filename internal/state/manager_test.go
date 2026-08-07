@@ -161,6 +161,189 @@ func TestAddRemoveChannel(t *testing.T) {
 	}
 }
 
+func TestManagerOwnsInputsAndReturnsIndependentSnapshots(t *testing.T) {
+	m := newTestManager(t)
+	clientInput := &Client{
+		ClientID: "owned-client",
+		Nickname: "original client",
+		Metadata: map[string]string{"role": "original"},
+	}
+	channelInput := &Channel{ChannelID: 41, Name: "original channel", Topic: "original topic"}
+	m.AddClient(clientInput)
+	m.AddChannel(channelInput)
+	if err := m.JoinChannel(clientInput.ClientID, channelInput.ChannelID); err != nil {
+		t.Fatalf("join channel: %v", err)
+	}
+	m.Subscribe(clientInput.ClientID, []int64{channelInput.ChannelID})
+	m.SetSpeaking(clientInput.ClientID, true)
+
+	clientInput.Nickname = "mutated input"
+	clientInput.Metadata["role"] = "mutated input"
+	channelInput.Name = "mutated input"
+	client, _ := m.GetClient(clientInput.ClientID)
+	channel, _ := m.GetChannel(channelInput.ChannelID)
+	if client.Nickname != "original client" || client.Metadata["role"] != "original" {
+		t.Fatalf("stored client aliases AddClient input: %+v", client)
+	}
+	if channel.Name != "original channel" {
+		t.Fatalf("stored channel aliases AddChannel input: %+v", channel)
+	}
+
+	clientSnapshots := [][]*Client{
+		{client},
+		m.ListClients(),
+		m.ChannelMembers(channelInput.ChannelID),
+		m.ChannelSubscribers(channelInput.ChannelID),
+	}
+	for index, snapshots := range clientSnapshots {
+		if len(snapshots) != 1 {
+			t.Fatalf("client snapshot set %d length = %d, want 1", index, len(snapshots))
+		}
+		snapshots[0].Nickname = "mutated snapshot"
+		snapshots[0].Metadata["role"] = "mutated snapshot"
+		stored, _ := m.GetClient(clientInput.ClientID)
+		if stored.Nickname != "original client" || stored.Metadata["role"] != "original" {
+			t.Fatalf("client snapshot set %d aliases manager state: %+v", index, stored)
+		}
+	}
+
+	channelSnapshots := [][]*Channel{
+		{channel},
+		m.ListChannels(),
+		m.ChannelTree(),
+		m.ChannelTreeOrdered(),
+	}
+	for index, snapshots := range channelSnapshots {
+		if len(snapshots) != 1 {
+			t.Fatalf("channel snapshot set %d length = %d, want 1", index, len(snapshots))
+		}
+		snapshots[0].Name = "mutated snapshot"
+		stored, _ := m.GetChannel(channelInput.ChannelID)
+		if stored.Name != "original channel" {
+			t.Fatalf("channel snapshot set %d aliases manager state: %+v", index, stored)
+		}
+	}
+
+	speaking := m.SpeakingClients()
+	if len(speaking) != 1 {
+		t.Fatalf("speaking snapshots = %d, want 1", len(speaking))
+	}
+	speaking[0].ChannelID = 999
+	if stored := m.SpeakingClients(); len(stored) != 1 || stored[0].ChannelID != channelInput.ChannelID {
+		t.Fatalf("speaking snapshot aliases manager state: %+v", stored)
+	}
+}
+
+func TestUpdateChannelAppliesPatchUnderLock(t *testing.T) {
+	m := newTestManager(t)
+	m.AddChannel(&Channel{ChannelID: 7, Name: "before", Topic: "before"})
+	topic := "after"
+	channelType := 2
+	maxClients := 25
+	inherit := true
+	if !m.UpdateChannel(7, ChannelUpdate{
+		Topic:              &topic,
+		ChannelType:        &channelType,
+		MaxClients:         &maxClients,
+		InheritPermissions: &inherit,
+	}) {
+		t.Fatal("UpdateChannel did not find existing channel")
+	}
+	topic = "mutated patch input"
+	channel, _ := m.GetChannel(7)
+	if channel.Topic != "after" || channel.ChannelType != 2 || channel.MaxClients != 25 || !channel.InheritPermissions {
+		t.Fatalf("patched channel = %+v", channel)
+	}
+	if m.UpdateChannel(999, ChannelUpdate{Topic: &topic}) {
+		t.Fatal("UpdateChannel reported an unknown channel as updated")
+	}
+}
+
+func TestManagerInputAndSnapshotAliasesAreRaceIndependent(t *testing.T) {
+	m := newTestManager(t)
+	clientInput := &Client{ClientID: "race-client", Metadata: map[string]string{"key": "input"}}
+	channelInput := &Channel{ChannelID: 9, Name: "input"}
+	m.AddClient(clientInput)
+	m.AddChannel(channelInput)
+	if err := m.JoinChannel(clientInput.ClientID, channelInput.ChannelID); err != nil {
+		t.Fatal(err)
+	}
+	m.SetSpeaking(clientInput.ClientID, true)
+	clientSnapshot, _ := m.GetClient(clientInput.ClientID)
+	channelSnapshot, _ := m.GetChannel(channelInput.ChannelID)
+	members := m.ChannelMembers(channelInput.ChannelID)
+	speaking := m.SpeakingClients()
+
+	const iterations = 2000
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for index := 0; index < iterations; index++ {
+			clientInput.Nickname = "outside"
+			clientInput.Metadata["key"] = "outside"
+			channelInput.Name = "outside"
+		}
+	})
+	wg.Go(func() {
+		for index := 0; index < iterations; index++ {
+			clientSnapshot.Nickname = "snapshot"
+			clientSnapshot.Metadata["key"] = "snapshot"
+			channelSnapshot.Topic = "snapshot"
+			members[0].Status = "snapshot"
+			speaking[0].ChannelID = int64(index)
+		}
+	})
+	wg.Go(func() {
+		for index := 0; index < iterations; index++ {
+			status := "online"
+			topic := "managed"
+			m.SetStatus(clientInput.ClientID, status, "")
+			m.UpdateChannel(channelInput.ChannelID, ChannelUpdate{Topic: &topic})
+			_, _ = m.GetClient(clientInput.ClientID)
+			_, _ = m.GetChannel(channelInput.ChannelID)
+			_ = m.ListClients()
+			_ = m.ListChannels()
+			_ = m.ChannelMembers(channelInput.ChannelID)
+			_ = m.SpeakingClients()
+		}
+	})
+	wg.Wait()
+}
+
+func TestChannelHasIconAccessorsAreLocked(t *testing.T) {
+	m := newTestManager(t)
+	m.AddChannel(&Channel{ChannelID: 1, Name: "icon channel"})
+
+	if m.SetChannelHasIcon(99, true) {
+		t.Fatal("SetChannelHasIcon reported an unknown channel as updated")
+	}
+	if _, found := m.ChannelHasIcon(99); found {
+		t.Fatal("ChannelHasIcon reported an unknown channel as found")
+	}
+	if !m.SetChannelHasIcon(1, true) {
+		t.Fatal("SetChannelHasIcon did not update the existing channel")
+	}
+	if hasIcon, found := m.ChannelHasIcon(1); !found || !hasIcon {
+		t.Fatalf("ChannelHasIcon = %t, %t; want true, true", hasIcon, found)
+	}
+
+	const iterations = 2000
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for index := 0; index < iterations; index++ {
+			m.SetChannelHasIcon(1, index%2 == 0)
+		}
+	})
+	wg.Go(func() {
+		for index := 0; index < iterations; index++ {
+			if _, found := m.ChannelHasIcon(1); !found {
+				t.Error("channel disappeared during icon snapshot")
+				return
+			}
+		}
+	})
+	wg.Wait()
+}
+
 func TestJoinChannelErrors(t *testing.T) {
 	m := newTestManager(t)
 

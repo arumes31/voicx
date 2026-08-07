@@ -141,10 +141,14 @@ func (f *fakeComplaints) count(reporter string) int {
 	return n
 }
 
-// tinyPNG is the smallest byte sequence http.DetectContentType recognizes as
-// image/png.
-var tinyPNG = []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
-	0, 0, 0, 0x0D, 0x49, 0x48, 0x44, 0x52, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1F, 0x15, 0xC4, 0x89}
+// tinyPNG is a complete, decodable 1x1 PNG shared by the image-handler tests.
+var tinyPNG = func() []byte {
+	raw, err := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+	if err != nil {
+		panic(err)
+	}
+	return raw
+}()
 
 func b64(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
 

@@ -25,14 +25,35 @@ func closeFileTestResource(t *testing.T, closer io.Closer) {
 
 // fakeFileTransfer implements FileTransferBackend, recording calls.
 type fakeFileTransfer struct {
-	mu          sync.Mutex
-	uploads     []ftCall
-	downloads   []ftCall
-	files       []store.FileRecord
-	deleted     []string
-	renamed     [][2]string
-	moved       []ftMove
-	fingerprint string
+	mu              sync.Mutex
+	uploads         []ftCall
+	downloads       []ftCall
+	files           []store.FileRecord
+	deleted         []string
+	renamed         [][2]string
+	moved           []ftMove
+	channelsMarked  []int64
+	channelsRemoved []int64
+	fingerprint     string
+	tombstoneHook   func(int64)
+}
+
+func (f *fakeFileTransfer) TombstoneChannelData(channelID int64) error {
+	f.mu.Lock()
+	f.channelsMarked = append(f.channelsMarked, channelID)
+	hook := f.tombstoneHook
+	f.mu.Unlock()
+	if hook != nil {
+		hook(channelID)
+	}
+	return nil
+}
+
+func (f *fakeFileTransfer) DeleteChannelData(_ context.Context, channelID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.channelsRemoved = append(f.channelsRemoved, channelID)
+	return nil
 }
 
 // ftMove records a move with both channel ids so a cross-channel move (262)

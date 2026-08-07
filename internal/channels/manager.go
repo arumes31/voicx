@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,23 @@ var ErrInvalidSpec = errors.New("invalid channel spec")
 // a channel may not become its own parent or descend from itself.
 var ErrInvalidMove = errors.New("invalid channel move")
 
+// DeleteResult describes every client-visible consequence of a cascaded
+// channel deletion. SubscriberIDs identifies clients whose explicit channel
+// subscription snapshot must be refreshed.
+type DeleteResult struct {
+	RootID        int64
+	ChannelIDs    []int64
+	SubscriberIDs []string
+	Members       []DeletedMember
+}
+
+// DeletedMember identifies a client whose voice/control membership was reset
+// because its channel was part of a deleted subtree.
+type DeletedMember struct {
+	ClientID  string
+	ChannelID int64
+}
+
 // ChannelAdminGroupName is the channel group a channel's creator is assigned
 // to on that channel (156). The group is seeded by the group bootstrap; when
 // it does not exist the assignment is skipped.
@@ -45,7 +63,58 @@ const maxChannelDepth = 64
 // temporary channel. The timer is stored so it can be cancelled (e.g. when a
 // client joins the channel before the grace period elapses).
 type cleanupTimer struct {
-	timer *time.Timer
+	timer      *time.Timer
+	generation uint64
+}
+
+// keyedMutexPool provides bounded-lifetime locks for individual channel and
+// client identities. Entries include waiters in their reference count, so an
+// entry is removed only after no goroutine can still acquire its mutex.
+type keyedMutexPool[K comparable] struct {
+	mu      sync.Mutex
+	entries map[K]*keyedMutexEntry
+}
+
+type keyedMutexEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func (p *keyedMutexPool[K]) lock(key K) func() {
+	p.mu.Lock()
+	if p.entries == nil {
+		p.entries = make(map[K]*keyedMutexEntry)
+	}
+	entry := p.entries[key]
+	if entry == nil {
+		entry = new(keyedMutexEntry)
+		p.entries[key] = entry
+	}
+	entry.refs++
+	p.mu.Unlock()
+
+	entry.mu.Lock()
+	return func() {
+		entry.mu.Unlock()
+		p.mu.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(p.entries, key)
+		}
+		p.mu.Unlock()
+	}
+}
+
+type channelManagerHooks struct {
+	afterUpdateCommit   func(int64)
+	afterSetTypeCommit  func(int64)
+	beforeCleanupDelete func(int64)
+	beforeLeaveClient   func(string)
+	beforeRemoveClient  func(string)
+	commitUpdate        func(*sql.Tx) error
+	commitSetType       func(*sql.Tx) error
+	deleteChannel       func(context.Context, int64) (sql.Result, error)
+	rowsAffected        func(sql.Result) (int64, error)
 }
 
 // ChannelManager coordinates the lifecycle of channels across the database
@@ -58,8 +127,21 @@ type ChannelManager struct {
 	state  *state.Manager
 	logger *zap.Logger
 
-	mu     sync.Mutex
-	timers map[int64]*cleanupTimer
+	mu                    sync.Mutex
+	timers                map[int64]*cleanupTimer
+	nextCleanupGeneration uint64
+
+	// treeMu is shared by every supported channel lifecycle operation. Normal
+	// per-channel work takes a read lock; subtree deletion takes the write lock
+	// so discovery, the cascading database delete, timer cancellation, and the
+	// in-memory removal form one observable operation.
+	treeMu       sync.RWMutex
+	channelLocks keyedMutexPool[int64]
+	clientLocks  keyedMutexPool[string]
+	testHooks    channelManagerHooks
+
+	cleanupHandlerMu sync.RWMutex
+	cleanupHandler   func(DeleteResult)
 
 	// CleanupDelay is the grace period after a temporary channel becomes empty
 	// before it is deleted. Defaults to DefaultCleanupDelay when zero. It is
@@ -82,6 +164,24 @@ func New(s *store.Store, sm *state.Manager, logger *zap.Logger) *ChannelManager 
 	}
 }
 
+// SetCleanupDeleteHandler installs the side-effect sink for automatic
+// temporary-channel deletion. The TCP server uses it to invalidate connected
+// clients and voice routing after the manager has committed the deletion.
+func (m *ChannelManager) SetCleanupDeleteHandler(handler func(DeleteResult)) {
+	m.cleanupHandlerMu.Lock()
+	m.cleanupHandler = handler
+	m.cleanupHandlerMu.Unlock()
+}
+
+func (m *ChannelManager) notifyCleanupDelete(result DeleteResult) {
+	m.cleanupHandlerMu.RLock()
+	handler := m.cleanupHandler
+	m.cleanupHandlerMu.RUnlock()
+	if handler != nil {
+		handler(result)
+	}
+}
+
 // cleanupDelayLocked returns the configured cleanup delay, defaulting to
 // DefaultCleanupDelay when unset. The caller must hold m.mu.
 func (m *ChannelManager) cleanupDelayLocked() time.Duration {
@@ -89,6 +189,42 @@ func (m *ChannelManager) cleanupDelayLocked() time.Duration {
 		return DefaultCleanupDelay
 	}
 	return m.CleanupDelay
+}
+
+// lockChannels acquires channel lifecycle locks in ascending ID order. A
+// client move needs both its source and target locks; sorting and de-duplicating
+// here gives every multi-channel operation the same deadlock-free order.
+func (m *ChannelManager) lockChannels(channelIDs ...int64) func() {
+	ids := make([]int64, 0, len(channelIDs))
+	seen := make(map[int64]struct{}, len(channelIDs))
+	for _, channelID := range channelIDs {
+		if channelID <= 0 {
+			continue
+		}
+		if _, ok := seen[channelID]; ok {
+			continue
+		}
+		seen[channelID] = struct{}{}
+		ids = append(ids, channelID)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	unlocks := make([]func(), 0, len(ids))
+	for _, channelID := range ids {
+		unlocks = append(unlocks, m.channelLocks.lock(channelID))
+	}
+	return func() {
+		for i := len(unlocks) - 1; i >= 0; i-- {
+			unlocks[i]()
+		}
+	}
+}
+
+func (m *ChannelManager) resultRowsAffected(result sql.Result) (int64, error) {
+	if hook := m.testHooks.rowsAffected; hook != nil {
+		return hook(result)
+	}
+	return result.RowsAffected()
 }
 
 // SetCleanupDelay sets the grace period an empty temporary channel survives
@@ -112,6 +248,8 @@ func (m *ChannelManager) CreateChannel(ctx context.Context, spec ChannelSpec) (i
 	if err := spec.Validate(); err != nil {
 		return 0, fmt.Errorf("%w: %v", ErrInvalidSpec, err)
 	}
+	m.treeMu.RLock()
+	defer m.treeMu.RUnlock()
 
 	// Verify the parent channel exists if specified.
 	if spec.ParentID != 0 {
@@ -206,11 +344,14 @@ func (m *ChannelManager) CreateChannel(ctx context.Context, spec ChannelSpec) (i
 		zap.Int64("parent_id", spec.ParentID),
 	)
 
-	// Temporary channels start with a cleanup watcher so that if they are
-	// created empty they will be cleaned up after the grace period.
-	if spec.Type == ChannelTypeTemporary {
-		m.StartCleanupWatcher(channelID)
+	// Reconcile both sides of the new tree edge. A child prevents automatic
+	// deletion of a temporary parent; a new empty temporary leaf gets a timer.
+	unlock := m.lockChannels(channelID, spec.ParentID)
+	m.reconcileCleanupWatcherLocked(channelID)
+	if spec.ParentID != 0 {
+		m.reconcileCleanupWatcherLocked(spec.ParentID)
 	}
+	unlock()
 
 	return channelID, nil
 }
@@ -223,6 +364,9 @@ func (m *ChannelManager) CreateChannel(ctx context.Context, spec ChannelSpec) (i
 // a cleanup watcher — matching the semantics of a temp channel that just
 // became empty.
 func (m *ChannelManager) LoadIntoState(ctx context.Context) (int, error) {
+	m.treeMu.Lock()
+	defer m.treeMu.Unlock()
+
 	const q = `SELECT id, COALESCE(parent_id, 0), name, COALESCE(topic, ''),
 	          order_index, channel_type, COALESCE(max_clients, 0), created_at,
 	          COALESCE(password_hash, ''), COALESCE(needed_join_power, 0),
@@ -236,6 +380,7 @@ func (m *ChannelManager) LoadIntoState(ctx context.Context) (int, error) {
 	defer func() { _ = rows.Close() }()
 
 	count := 0
+	var temporaryIDs []int64
 	for rows.Next() {
 		var ch state.Channel
 		var channelType int16
@@ -255,40 +400,140 @@ func (m *ChannelManager) LoadIntoState(ctx context.Context) (int, error) {
 		count++
 
 		if parsedType == ChannelTypeTemporary {
-			m.StartCleanupWatcher(ch.ChannelID)
+			temporaryIDs = append(temporaryIDs, ch.ChannelID)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return count, fmt.Errorf("iterating channel rows: %w", err)
+	}
+	// The full tree must be present before deciding whether a temporary channel
+	// is an empty leaf. Starting timers while rows stream could schedule a
+	// parent before its persisted descendants are loaded.
+	for _, channelID := range temporaryIDs {
+		unlock := m.lockChannels(channelID)
+		m.reconcileCleanupWatcherLocked(channelID)
+		unlock()
 	}
 
 	m.logger.Info("channels loaded into state", zap.Int("count", count))
 	return count, nil
 }
 
-// DeleteChannel removes the channel from the database and the state manager,
-// and cancels any pending cleanup timer. Child channels are removed by the
-// database's ON DELETE CASCADE constraint.
+// DeleteChannel atomically removes a channel subtree from the database, the
+// state manager, and cleanup-timer ownership.
 func (m *ChannelManager) DeleteChannel(ctx context.Context, channelID int64) error {
-	const q = `DELETE FROM channels WHERE id = $1`
-	res, err := m.store.DB().ExecContext(ctx, q, channelID)
+	_, err := m.DeleteChannelSubtree(ctx, channelID)
+	return err
+}
+
+// DeleteChannelSubtree removes a channel and returns the complete cascaded ID
+// set so protocol clients can invalidate the same subtree as the server.
+func (m *ChannelManager) DeleteChannelSubtree(ctx context.Context, channelID int64) (DeleteResult, error) {
+	m.treeMu.Lock()
+	defer m.treeMu.Unlock()
+	return m.deleteChannelLocked(ctx, channelID)
+}
+
+// deleteChannelLocked removes one database-cascaded subtree while treeMu's
+// write lock is held. It discovers IDs from both the database and state so it
+// also repairs an already-stale in-memory descendant.
+func (m *ChannelManager) deleteChannelLocked(ctx context.Context, channelID int64) (DeleteResult, error) {
+	stateParentID := int64(0)
+	if channel, ok := m.state.GetChannel(channelID); ok {
+		stateParentID = channel.ParentID
+	}
+	databaseSubtree, err := m.loadChannelSubtree(ctx, channelID)
 	if err != nil {
-		return fmt.Errorf("deleting channel: %w", err)
+		return DeleteResult{}, err
 	}
-	rows, _ := res.RowsAffected()
+	stateIDs := m.stateChannelSubtreeIDs(channelID)
+	if len(databaseSubtree.IDs) == 0 && len(stateIDs) == 0 {
+		return DeleteResult{}, ErrChannelNotFound
+	}
+	missingStateIDs, err := m.reconcileStateOnlyDescendants(ctx, databaseSubtree.IDs, stateIDs)
+	if err != nil {
+		return DeleteResult{}, err
+	}
+	if len(databaseSubtree.IDs) == 0 && len(missingStateIDs) == 0 {
+		// The only state descendants were live database rows whose authoritative
+		// parents have now been repaired. The requested root itself never existed.
+		return DeleteResult{}, ErrChannelNotFound
+	}
+	channelIDs := mergeChannelIDs(databaseSubtree.IDs, missingStateIDs)
+	parentID := databaseSubtree.RootParentID
+	if len(databaseSubtree.IDs) == 0 {
+		parentID = stateParentID
+	}
+
+	var res sql.Result
+	if hook := m.testHooks.deleteChannel; hook != nil {
+		res, err = hook(ctx, channelID)
+	} else {
+		const q = `DELETE FROM channels WHERE id = $1`
+		res, err = m.store.DB().ExecContext(ctx, q, channelID)
+	}
+	deleteConfirmed := false
+	if err != nil {
+		confirmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		remaining, confirmErr := m.loadChannelSubtree(confirmCtx, channelID)
+		cancel()
+		if confirmErr != nil {
+			return DeleteResult{}, errors.Join(
+				fmt.Errorf("deleting channel: %w", err),
+				fmt.Errorf("confirming ambiguous channel deletion: %w", confirmErr),
+			)
+		}
+		if len(remaining.IDs) != 0 {
+			return DeleteResult{}, fmt.Errorf("deleting channel: %w", err)
+		}
+		deleteConfirmed = true
+		m.logger.Warn("channel deletion returned an error but was confirmed committed",
+			zap.Int64("channel_id", channelID),
+			zap.Error(err),
+		)
+	}
+	rows := int64(1)
+	if !deleteConfirmed {
+		rows, err = res.RowsAffected()
+		if err != nil {
+			return DeleteResult{}, fmt.Errorf("reading deleted channel row count: %w", err)
+		}
+	}
+	for _, id := range channelIDs {
+		m.cancelCleanupLocked(id)
+	}
+	removedState := m.state.RemoveChannels(channelIDs)
+	result := DeleteResult{
+		RootID:        channelID,
+		ChannelIDs:    channelIDs,
+		SubscriberIDs: removedState.SubscriberIDs,
+		Members:       make([]DeletedMember, 0, len(removedState.Members)),
+	}
+	for _, member := range removedState.Members {
+		result.Members = append(result.Members, DeletedMember{
+			ClientID:  member.ClientID,
+			ChannelID: member.ChannelID,
+		})
+	}
+	if parentID != 0 {
+		m.reconcileCleanupWatcherLocked(parentID)
+	}
 	if rows == 0 {
-		// Channel may already have been deleted by a cleanup timer; cancel any
-		// timer and remove from state for idempotency.
-		m.CancelCleanup(channelID)
-		m.state.RemoveChannel(channelID)
-		return ErrChannelNotFound
+		// A pre-delete database or stale-state snapshot established the root's
+		// existence. A zero row count therefore means another writer already
+		// achieved the database postcondition; still publish state consequences.
+		m.logger.Warn("reconciled channel subtree after concurrent database deletion",
+			zap.Int64("channel_id", channelID),
+			zap.Int("state_channels_removed", len(missingStateIDs)),
+		)
+		return result, nil
 	}
 
-	m.CancelCleanup(channelID)
-	m.state.RemoveChannel(channelID)
-
-	m.logger.Info("channel deleted", zap.Int64("channel_id", channelID))
-	return nil
+	m.logger.Info("channel subtree deleted",
+		zap.Int64("channel_id", channelID),
+		zap.Int("channels_removed", len(channelIDs)),
+	)
+	return result, nil
 }
 
 // SetChannelType updates the channel's type in the database and the state
@@ -297,15 +542,30 @@ func (m *ChannelManager) DeleteChannel(ctx context.Context, channelID int64) err
 //   - Changing to Temporary when the channel is currently empty starts the
 //     cleanup timer.
 //   - Changing away from Temporary cancels any pending cleanup timer.
-func (m *ChannelManager) SetChannelType(ctx context.Context, channelID int64, newType ChannelType) error {
+func (m *ChannelManager) SetChannelType(ctx context.Context, channelID int64, newType ChannelType) (retErr error) {
 	if !newType.Valid() {
 		return fmt.Errorf("%w: invalid channel type %d", ErrInvalidSpec, newType)
 	}
+	m.treeMu.RLock()
+	defer m.treeMu.RUnlock()
+	unlock := m.lockChannels(channelID)
+	defer unlock()
 
-	// Read the current type so we know whether a transition is needed.
+	tx, err := m.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning channel type update: %w", err)
+	}
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			retErr = errors.Join(retErr, fmt.Errorf("rolling back channel type update: %w", err))
+		}
+	}()
+
+	// Lock the database row as well as the in-process lifecycle entry. The row
+	// lock protects against writers that do not share this manager instance.
 	var currentType int16
-	err := m.store.DB().QueryRowContext(ctx,
-		`SELECT channel_type FROM channels WHERE id = $1`, channelID,
+	err = tx.QueryRowContext(ctx,
+		`SELECT channel_type FROM channels WHERE id = $1 FOR UPDATE`, channelID,
 	).Scan(&currentType)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -317,39 +577,66 @@ func (m *ChannelManager) SetChannelType(ctx context.Context, channelID int64, ne
 	if err != nil {
 		return fmt.Errorf("channel %d has invalid stored type %d: %w", channelID, currentType, err)
 	}
-	if parsedCurrentType == newType {
-		return nil // no change
-	}
-
-	_, err = m.store.DB().ExecContext(ctx,
-		`UPDATE channels SET channel_type = $1 WHERE id = $2`,
-		int16(newType), channelID,
-	)
-	if err != nil {
-		return fmt.Errorf("updating channel type: %w", err)
-	}
-
-	// Update the in-memory state.
-	if ch, ok := m.state.GetChannel(channelID); ok {
-		ch.ChannelType = int(newType)
-	}
-
-	// Adjust the cleanup timer.
-	if newType == ChannelTypeTemporary {
-		// Changing to temporary: start the timer if the channel is empty.
-		if len(m.state.ChannelMembers(channelID)) == 0 {
-			m.StartCleanupWatcher(channelID)
+	if parsedCurrentType != newType {
+		res, err := tx.ExecContext(ctx,
+			`UPDATE channels SET channel_type = $1 WHERE id = $2`,
+			int16(newType), channelID,
+		)
+		if err != nil {
+			return fmt.Errorf("updating channel type: %w", err)
 		}
-	} else {
-		// Changing away from temporary: cancel any pending timer.
-		m.CancelCleanup(channelID)
+		rows, rowsErr := m.resultRowsAffected(res)
+		if rowsErr != nil {
+			return fmt.Errorf("reading updated channel type row count: %w", rowsErr)
+		}
+		if rows == 0 {
+			return ErrChannelNotFound
+		}
+	}
+	commit := tx.Commit
+	if hook := m.testHooks.commitSetType; hook != nil {
+		commit = func() error { return hook(tx) }
+	}
+	if err := commit(); err != nil {
+		commitErr := fmt.Errorf("committing channel type update: %w", err)
+		channel, reconcileErr := m.reconcilePersistedChannel(ctx, channelID)
+		if reconcileErr != nil {
+			m.cancelCleanupLocked(channelID)
+			return errors.Join(commitErr, fmt.Errorf("reconciling ambiguous channel type commit: %w", reconcileErr))
+		}
+		m.reconcileCleanupWatcherLocked(channelID)
+		if channel.ChannelType != int(newType) {
+			return commitErr
+		}
+		m.logger.Warn("channel type commit returned an error but was confirmed committed",
+			zap.Int64("channel_id", channelID),
+			zap.Error(err),
+		)
+		return nil
+	}
+	if hook := m.testHooks.afterSetTypeCommit; hook != nil {
+		hook(channelID)
 	}
 
-	m.logger.Info("channel type changed",
-		zap.Int64("channel_id", channelID),
-		zap.String("from", parsedCurrentType.String()),
-		zap.String("to", newType.String()),
-	)
+	channelType := int(newType)
+	if _, err := m.mirrorChannelUpdate(ctx, channelID, state.ChannelUpdate{ChannelType: &channelType}); err != nil {
+		// A stale cleanup timer is more dangerous than a missed cleanup while
+		// state is being repaired, so fail safe by cancelling it.
+		m.cancelCleanupLocked(channelID)
+		return fmt.Errorf("channel type committed but state reconciliation failed: %w", err)
+	}
+
+	// Mirror the timer while the same channel lock is still held. This also
+	// repairs an inconsistent timer when the persisted type did not change.
+	m.reconcileCleanupWatcherLocked(channelID)
+
+	if parsedCurrentType != newType {
+		m.logger.Info("channel type changed",
+			zap.Int64("channel_id", channelID),
+			zap.String("from", parsedCurrentType.String()),
+			zap.String("to", newType.String()),
+		)
+	}
 	return nil
 }
 
@@ -424,6 +711,28 @@ func (m *ChannelManager) UpdateChannel(ctx context.Context, channelID int64, upd
 	if len(sets) == 0 {
 		return nil // nothing to do
 	}
+	var unlockTree func()
+	if upd.ParentID != nil {
+		// Reparenting changes cleanup eligibility for two parents. Serialize the
+		// parent snapshot, DB commit, state mirror, and timer reconciliation as
+		// one tree mutation so a second reparent cannot act on a stale old parent.
+		m.treeMu.Lock()
+		unlockTree = m.treeMu.Unlock
+	} else {
+		m.treeMu.RLock()
+		unlockTree = m.treeMu.RUnlock
+	}
+	defer unlockTree()
+	oldParentID := int64(0)
+	lockedChannelIDs := []int64{channelID}
+	if upd.ParentID != nil {
+		if current, ok := m.state.GetChannel(channelID); ok {
+			oldParentID = current.ParentID
+		}
+		lockedChannelIDs = append(lockedChannelIDs, oldParentID, *upd.ParentID)
+	}
+	unlock := m.lockChannels(lockedChannelIDs...)
+	defer unlock()
 
 	tx, err := m.store.DB().BeginTx(ctx, nil)
 	if err != nil {
@@ -452,50 +761,72 @@ func (m *ChannelManager) UpdateChannel(ctx context.Context, channelID int64, upd
 	if err != nil {
 		return fmt.Errorf("updating channel: %w", err)
 	}
-	if rows, _ := res.RowsAffected(); rows == 0 {
+	rows, rowsErr := m.resultRowsAffected(res)
+	if rowsErr != nil {
+		return fmt.Errorf("reading updated channel row count: %w", rowsErr)
+	}
+	if rows == 0 {
 		return ErrChannelNotFound
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("committing channel update: %w", err)
+	commit := tx.Commit
+	if hook := m.testHooks.commitUpdate; hook != nil {
+		commit = func() error { return hook(tx) }
+	}
+	if err := commit(); err != nil {
+		commitErr := fmt.Errorf("committing channel update: %w", err)
+		channel, reconcileErr := m.reconcilePersistedChannel(ctx, channelID)
+		if reconcileErr != nil {
+			return errors.Join(commitErr, fmt.Errorf("reconciling ambiguous channel update commit: %w", reconcileErr))
+		}
+		m.reconcileCleanupWatcherLocked(channelID)
+		if upd.ParentID != nil {
+			for _, parentID := range mergeChannelIDs(
+				[]int64{oldParentID, *upd.ParentID, channel.ParentID},
+			) {
+				m.reconcileCleanupWatcherLocked(parentID)
+			}
+		}
+		if !channelMatchesUpdate(channel, upd) {
+			return commitErr
+		}
+		m.logger.Warn("channel update commit returned an error but was confirmed committed",
+			zap.Int64("channel_id", channelID),
+			zap.Error(err),
+		)
+		return nil
+	}
+	if hook := m.testHooks.afterUpdateCommit; hook != nil {
+		hook(channelID)
 	}
 
-	// Mirror the change into the in-memory state.
-	if ch, ok := m.state.GetChannel(channelID); ok {
-		if upd.Topic != nil {
-			ch.Topic = *upd.Topic
+	// Mirror the change into the in-memory state through its ownership
+	// boundary; GetChannel returns a snapshot and is never a mutation handle.
+	reloaded, err := m.mirrorChannelUpdate(ctx, channelID, state.ChannelUpdate{
+		ParentID:           upd.ParentID,
+		Topic:              upd.Topic,
+		OrderIndex:         upd.OrderIndex,
+		MaxClients:         upd.MaxClients,
+		NeededJoinPower:    upd.NeededJoinPower,
+		OpusBitrate:        upd.OpusBitrate,
+		OpusFEC:            upd.OpusFEC,
+		OpusDTX:            upd.OpusDTX,
+		OpusStereo:         upd.OpusStereo,
+		SlowModeSeconds:    upd.SlowModeSeconds,
+		Description:        upd.Description,
+		InheritPermissions: upd.InheritPermissions,
+	})
+	if err != nil {
+		return fmt.Errorf("channel update committed but state reconciliation failed: %w", err)
+	}
+	if reloaded {
+		m.reconcileCleanupWatcherLocked(channelID)
+	}
+	if upd.ParentID != nil {
+		if oldParentID != 0 && oldParentID != *upd.ParentID {
+			m.reconcileCleanupWatcherLocked(oldParentID)
 		}
-		if upd.MaxClients != nil {
-			ch.MaxClients = *upd.MaxClients
-		}
-		if upd.OpusBitrate != nil {
-			ch.OpusBitrate = *upd.OpusBitrate
-		}
-		if upd.OpusFEC != nil {
-			ch.OpusFEC = *upd.OpusFEC
-		}
-		if upd.OpusDTX != nil {
-			ch.OpusDTX = *upd.OpusDTX
-		}
-		if upd.OpusStereo != nil {
-			ch.OpusStereo = *upd.OpusStereo
-		}
-		if upd.SlowModeSeconds != nil {
-			ch.SlowModeSeconds = *upd.SlowModeSeconds
-		}
-		if upd.Description != nil {
-			ch.Description = *upd.Description
-		}
-		if upd.NeededJoinPower != nil {
-			ch.NeededJoinPower = *upd.NeededJoinPower
-		}
-		if upd.OrderIndex != nil {
-			ch.OrderIndex = *upd.OrderIndex
-		}
-		if upd.ParentID != nil {
-			ch.ParentID = *upd.ParentID
-		}
-		if upd.InheritPermissions != nil {
-			ch.InheritPermissions = *upd.InheritPermissions
+		if *upd.ParentID != 0 {
+			m.reconcileCleanupWatcherLocked(*upd.ParentID)
 		}
 	}
 
@@ -506,25 +837,140 @@ func (m *ChannelManager) UpdateChannel(ctx context.Context, channelID int64, upd
 	return nil
 }
 
-// OnClientJoinedChannel cancels any pending cleanup timer for the channel, as
-// a client is now present and the channel should not be deleted.
-func (m *ChannelManager) OnClientJoinedChannel(channelID int64) {
-	m.CancelCleanup(channelID)
+// MoveClient atomically moves a client in state and updates cleanup ownership
+// for both the source and target channels. Holding the target lifecycle lock
+// across the state mutation and timer cancellation makes a successful join
+// linearizable with temporary-channel deletion: either cleanup deletes first
+// and the move fails, or the move cancels cleanup before deletion can claim.
+func (m *ChannelManager) MoveClient(clientID string, targetChannelID int64) (int64, error) {
+	return m.MoveClientWithLifecycle(clientID, targetChannelID, nil)
+}
+
+// MoveClientWithLifecycle moves a client and invokes afterMove before
+// releasing the client, channel, and tree lifecycle locks. The callback is
+// for non-reentrant external consequences (voice membership, key delivery,
+// and event publication) that must be ordered before a competing subtree
+// deletion. It must not call back into ChannelManager.
+func (m *ChannelManager) MoveClientWithLifecycle(clientID string, targetChannelID int64, afterMove func(oldChannelID int64)) (int64, error) {
+	m.treeMu.RLock()
+	defer m.treeMu.RUnlock()
+	unlockClient := m.clientLocks.lock(clientID)
+	defer unlockClient()
+
+	oldChannelID, _, ok := m.state.ClientChannelState(clientID)
+	if !ok {
+		return 0, state.ErrClientNotFound
+	}
+	unlockChannels := m.lockChannels(oldChannelID, targetChannelID)
+	defer unlockChannels()
+
+	if err := m.state.MoveClient(clientID, targetChannelID); err != nil {
+		return oldChannelID, err
+	}
+	m.cancelCleanupLocked(targetChannelID)
+	if oldChannelID != 0 && oldChannelID != targetChannelID {
+		m.reconcileCleanupWatcherLocked(oldChannelID)
+	}
+	if afterMove != nil {
+		afterMove(oldChannelID)
+	}
+	return oldChannelID, nil
+}
+
+// LeaveClient atomically removes a client from its current channel and
+// reconciles temporary-channel cleanup under the same lifecycle locks used by
+// MoveClient.
+func (m *ChannelManager) LeaveClient(clientID string) (int64, error) {
+	m.treeMu.RLock()
+	defer m.treeMu.RUnlock()
+	unlockClient := m.clientLocks.lock(clientID)
+	defer unlockClient()
+
+	oldChannelID, _, ok := m.state.ClientChannelState(clientID)
+	if !ok {
+		return 0, state.ErrClientNotFound
+	}
+	if oldChannelID == 0 {
+		return 0, state.ErrNotInChannel
+	}
+	unlockChannel := m.lockChannels(oldChannelID)
+	defer unlockChannel()
+	if hook := m.testHooks.beforeLeaveClient; hook != nil {
+		hook(clientID)
+	}
+	if err := m.state.LeaveChannel(clientID); err != nil {
+		return oldChannelID, err
+	}
+	m.reconcileCleanupWatcherLocked(oldChannelID)
+	return oldChannelID, nil
+}
+
+// RemoveClient atomically removes a disconnected client from state and
+// reconciles the actual channel it occupied at removal time.
+func (m *ChannelManager) RemoveClient(clientID string) (*state.Client, error) {
+	m.treeMu.RLock()
+	defer m.treeMu.RUnlock()
+	unlockClient := m.clientLocks.lock(clientID)
+	defer unlockClient()
+
+	snapshot, ok := m.state.GetClient(clientID)
+	if !ok {
+		return nil, state.ErrClientNotFound
+	}
+	unlockChannel := m.lockChannels(snapshot.ChannelID)
+	defer unlockChannel()
+	if hook := m.testHooks.beforeRemoveClient; hook != nil {
+		hook(clientID)
+	}
+	removed, ok := m.state.RemoveClient(clientID)
+	if !ok {
+		return nil, state.ErrClientNotFound
+	}
+	if removed.ChannelID != 0 {
+		m.reconcileCleanupWatcherLocked(removed.ChannelID)
+	}
+	return removed, nil
+}
+
+// WithChannelLifecycle runs a bounded channel-specific operation while
+// deletion and same-channel lifecycle mutation are excluded. Asset handlers
+// use this to keep filesystem writes/reads linearizable with subtree removal.
+// The callback must not re-enter ChannelManager.
+func (m *ChannelManager) WithChannelLifecycle(channelID int64, operation func() error) error {
+	if operation == nil {
+		return fmt.Errorf("%w: channel lifecycle operation is nil", ErrInvalidSpec)
+	}
+	m.treeMu.RLock()
+	defer m.treeMu.RUnlock()
+	unlock := m.lockChannels(channelID)
+	defer unlock()
+	if _, ok := m.state.GetChannel(channelID); !ok {
+		return ErrChannelNotFound
+	}
+	return operation()
 }
 
 // OnClientLeftChannel starts a cleanup timer if the channel is temporary and
 // now has zero members.
 func (m *ChannelManager) OnClientLeftChannel(channelID int64) {
+	m.treeMu.RLock()
+	defer m.treeMu.RUnlock()
+	unlock := m.lockChannels(channelID)
+	defer unlock()
+	m.reconcileCleanupWatcherLocked(channelID)
+}
+
+// reconcileCleanupWatcherLocked mirrors the current state into timer
+// ownership. The caller must hold the channel lifecycle lock.
+func (m *ChannelManager) reconcileCleanupWatcherLocked(channelID int64) {
 	ch, ok := m.state.GetChannel(channelID)
-	if !ok {
+	if ok && ch.ChannelType == int(ChannelTypeTemporary) &&
+		len(m.state.ChannelMembers(channelID)) == 0 &&
+		len(m.stateChannelSubtreeIDs(channelID)) == 1 {
+		m.startCleanupWatcherLocked(channelID)
 		return
 	}
-	if ch.ChannelType != int(ChannelTypeTemporary) {
-		return
-	}
-	if len(m.state.ChannelMembers(channelID)) == 0 {
-		m.StartCleanupWatcher(channelID)
-	}
+	m.cancelCleanupLocked(channelID)
 }
 
 // StartCleanupWatcher schedules a cleanup timer for the given temporary
@@ -532,68 +978,103 @@ func (m *ChannelManager) OnClientLeftChannel(channelID int64) {
 // the channel is still temporary and still empty, and only then deletes it.
 // If a timer is already running for the channel it is cancelled and replaced.
 func (m *ChannelManager) StartCleanupWatcher(channelID int64) {
+	m.treeMu.RLock()
+	defer m.treeMu.RUnlock()
+	unlock := m.lockChannels(channelID)
+	defer unlock()
+	m.reconcileCleanupWatcherLocked(channelID)
+}
+
+// startCleanupWatcherLocked replaces the active token for channelID. The
+// caller must hold the channel lifecycle lock.
+func (m *ChannelManager) startCleanupWatcherLocked(channelID int64) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	// Cancel any existing timer for this channel.
 	if existing, ok := m.timers[channelID]; ok {
 		existing.timer.Stop()
-		delete(m.timers, channelID)
 	}
 
 	delay := m.cleanupDelayLocked()
-	t := time.AfterFunc(delay, func() {
-		m.cleanupCallback(channelID)
+	m.nextCleanupGeneration++
+	entry := &cleanupTimer{generation: m.nextCleanupGeneration}
+	m.timers[channelID] = entry
+	entry.timer = time.AfterFunc(delay, func() {
+		m.cleanupCallback(channelID, entry)
 	})
-	m.timers[channelID] = &cleanupTimer{timer: t}
+	m.mu.Unlock()
 
 	m.logger.Debug("cleanup watcher scheduled",
 		zap.Int64("channel_id", channelID),
 		zap.Duration("delay", delay),
+		zap.Uint64("generation", entry.generation),
 	)
 }
 
 // CancelCleanup cancels any pending cleanup timer for the channel.
 func (m *ChannelManager) CancelCleanup(channelID int64) {
+	m.treeMu.RLock()
+	defer m.treeMu.RUnlock()
+	unlock := m.lockChannels(channelID)
+	defer unlock()
+	m.cancelCleanupLocked(channelID)
+}
+
+// cancelCleanupLocked invalidates the exact active timer token. The caller
+// must hold the channel lifecycle lock.
+func (m *ChannelManager) cancelCleanupLocked(channelID int64) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if existing, ok := m.timers[channelID]; ok {
 		existing.timer.Stop()
 		delete(m.timers, channelID)
+		m.mu.Unlock()
 		m.logger.Debug("cleanup watcher cancelled", zap.Int64("channel_id", channelID))
+		return
 	}
+	m.mu.Unlock()
 }
 
 // cleanupCallback is invoked by a cleanup timer when the grace period elapses.
-// It re-checks emptiness and type under the lock before deleting the channel.
-func (m *ChannelManager) cleanupCallback(channelID int64) {
-	// Re-check under the lock that the timer is still the active one (it may
-	// have been cancelled and replaced) and remove it from the map.
-	m.mu.Lock()
-	if _, ok := m.timers[channelID]; !ok {
+// It claims only its own token and keeps the tree write lock through the final
+// leaf/emptiness check and database/state deletion. External notification runs
+// only after that lock is released.
+func (m *ChannelManager) cleanupCallback(channelID int64, expected *cleanupTimer) {
+	result, err := func() (DeleteResult, error) {
+		m.treeMu.Lock()
+		defer m.treeMu.Unlock()
+
+		m.mu.Lock()
+		active, ok := m.timers[channelID]
+		if expected == nil || !ok || active != expected || active.generation != expected.generation {
+			m.mu.Unlock()
+			return DeleteResult{}, nil
+		}
+		delete(m.timers, channelID)
 		m.mu.Unlock()
-		return
-	}
-	delete(m.timers, channelID)
-	m.mu.Unlock()
 
-	// Re-check that the channel is still temporary and still empty.
-	ch, ok := m.state.GetChannel(channelID)
-	if !ok {
-		return
-	}
-	if ch.ChannelType != int(ChannelTypeTemporary) {
-		return
-	}
-	if len(m.state.ChannelMembers(channelID)) != 0 {
-		// A client joined before the timer fired; reschedule nothing — the
-		// join handler will manage timers from here.
-		return
-	}
+		// A temporary parent is not an automatically deletable leaf. This avoids
+		// cascading cleanup through permanent or occupied descendants.
+		ch, ok := m.state.GetChannel(channelID)
+		if !ok || ch.ChannelType != int(ChannelTypeTemporary) ||
+			len(m.state.ChannelMembers(channelID)) != 0 ||
+			len(m.stateChannelSubtreeIDs(channelID)) != 1 {
+			return DeleteResult{}, nil
+		}
+		if hook := m.testHooks.beforeCleanupDelete; hook != nil {
+			hook(channelID)
+		}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := m.DeleteChannel(ctx, channelID); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		result, err := m.deleteChannelLocked(ctx, channelID)
+		if err != nil && !errors.Is(err, ErrChannelNotFound) {
+			// Keep an empty temporary leaf convergent after a transient database
+			// failure by installing a fresh token for a later retry.
+			m.reconcileCleanupWatcherLocked(channelID)
+		}
+		return result, err
+	}()
+	if err != nil {
 		if !errors.Is(err, ErrChannelNotFound) {
 			m.logger.Warn("cleanup watcher failed to delete channel",
 				zap.Int64("channel_id", channelID),
@@ -602,9 +1083,13 @@ func (m *ChannelManager) cleanupCallback(channelID int64) {
 		}
 		return
 	}
+	if result.RootID == 0 {
+		return
+	}
 	m.logger.Info("cleanup watcher deleted empty temporary channel",
 		zap.Int64("channel_id", channelID),
 	)
+	m.notifyCleanupDelete(result)
 }
 
 // Close cancels all pending cleanup timers. It should be called on server
@@ -624,6 +1109,249 @@ func (m *ChannelManager) CleanupTimersCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.timers)
+}
+
+type channelSubtree struct {
+	IDs          []int64
+	RootParentID int64
+}
+
+func (m *ChannelManager) loadChannelSubtree(ctx context.Context, channelID int64) (channelSubtree, error) {
+	const q = `WITH RECURSIVE subtree(id, root_parent_id) AS (
+	              SELECT id, COALESCE(parent_id, 0) FROM channels WHERE id = $1
+	              UNION
+	              SELECT child.id, parent.root_parent_id
+	              FROM channels child
+	              JOIN subtree parent ON child.parent_id = parent.id
+	          )
+	          SELECT id, root_parent_id FROM subtree ORDER BY id`
+	rows, err := m.store.DB().QueryContext(ctx, q, channelID)
+	if err != nil {
+		return channelSubtree{}, fmt.Errorf("discovering channel subtree: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var subtree channelSubtree
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id, &subtree.RootParentID); err != nil {
+			return channelSubtree{}, fmt.Errorf("scanning channel subtree: %w", err)
+		}
+		subtree.IDs = append(subtree.IDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		return channelSubtree{}, fmt.Errorf("iterating channel subtree: %w", err)
+	}
+	return subtree, nil
+}
+
+// reconcileStateOnlyDescendants distinguishes genuinely deleted database rows
+// from live rows whose in-memory parent is stale. A successful but ambiguously
+// reported reparent can leave the latter behind; blindly unioning every state
+// descendant into a later deletion would remove a live channel from state.
+// The caller holds treeMu for writing, so these repairs and timer updates are
+// serialized with every supported channel lifecycle operation.
+func (m *ChannelManager) reconcileStateOnlyDescendants(
+	ctx context.Context,
+	databaseIDs, stateIDs []int64,
+) ([]int64, error) {
+	databaseSet := make(map[int64]struct{}, len(databaseIDs))
+	for _, id := range databaseIDs {
+		databaseSet[id] = struct{}{}
+	}
+	missingIDs := make([]int64, 0)
+	timerIDs := make([]int64, 0)
+	for _, id := range stateIDs {
+		if _, inSubtree := databaseSet[id]; inSubtree {
+			continue
+		}
+		before, _ := m.state.GetChannel(id)
+		persisted, err := m.loadChannelState(ctx, id)
+		if errors.Is(err, ErrChannelNotFound) {
+			missingIDs = append(missingIDs, id)
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("checking state-only channel %d before subtree deletion: %w", id, err)
+		}
+		m.mirrorPersistedChannel(persisted)
+		timerIDs = append(timerIDs, id, persisted.ParentID)
+		if before != nil {
+			timerIDs = append(timerIDs, before.ParentID)
+		}
+	}
+	for _, id := range mergeChannelIDs(timerIDs) {
+		m.reconcileCleanupWatcherLocked(id)
+	}
+	return missingIDs, nil
+}
+
+func (m *ChannelManager) stateChannelSubtreeIDs(channelID int64) []int64 {
+	children := make(map[int64][]int64)
+	present := make(map[int64]struct{})
+	for _, channel := range m.state.ListChannels() {
+		present[channel.ChannelID] = struct{}{}
+		children[channel.ParentID] = append(children[channel.ParentID], channel.ChannelID)
+	}
+	ids := make([]int64, 0, 1)
+	queue := []int64{channelID}
+	seen := make(map[int64]struct{})
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		if _, ok := present[id]; ok {
+			ids = append(ids, id)
+		}
+		queue = append(queue, children[id]...)
+	}
+	return ids
+}
+
+func mergeChannelIDs(groups ...[]int64) []int64 {
+	seen := make(map[int64]struct{})
+	for _, group := range groups {
+		for _, id := range group {
+			if id > 0 {
+				seen[id] = struct{}{}
+			}
+		}
+	}
+	ids := make([]int64, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+// reconcilePersistedChannel reloads authoritative persisted fields after an
+// indeterminate commit result without overwriting derived membership/icon
+// state on an existing channel.
+func (m *ChannelManager) reconcilePersistedChannel(ctx context.Context, channelID int64) (*state.Channel, error) {
+	reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	channel, err := m.loadChannelState(reconcileCtx, channelID)
+	if err != nil {
+		return nil, err
+	}
+	m.mirrorPersistedChannel(channel)
+	return channel, nil
+}
+
+func (m *ChannelManager) mirrorPersistedChannel(channel *state.Channel) {
+	channelType := channel.ChannelType
+	hasPassword := channel.PasswordHash != ""
+	if !m.state.UpdateChannel(channel.ChannelID, state.ChannelUpdate{
+		ParentID:           &channel.ParentID,
+		Name:               &channel.Name,
+		Topic:              &channel.Topic,
+		OrderIndex:         &channel.OrderIndex,
+		ChannelType:        &channelType,
+		MaxClients:         &channel.MaxClients,
+		PasswordHash:       &channel.PasswordHash,
+		HasPassword:        &hasPassword,
+		NeededJoinPower:    &channel.NeededJoinPower,
+		OpusBitrate:        &channel.OpusBitrate,
+		OpusFEC:            &channel.OpusFEC,
+		OpusDTX:            &channel.OpusDTX,
+		OpusStereo:         &channel.OpusStereo,
+		SlowModeSeconds:    &channel.SlowModeSeconds,
+		Description:        &channel.Description,
+		InheritPermissions: &channel.InheritPermissions,
+	}) {
+		m.state.AddChannel(channel)
+	}
+}
+
+func channelMatchesUpdate(channel *state.Channel, update ChannelUpdate) bool {
+	if channel == nil {
+		return false
+	}
+	return (update.ParentID == nil || channel.ParentID == *update.ParentID) &&
+		(update.Topic == nil || channel.Topic == *update.Topic) &&
+		(update.OrderIndex == nil || channel.OrderIndex == *update.OrderIndex) &&
+		(update.MaxClients == nil || channel.MaxClients == *update.MaxClients) &&
+		(update.NeededJoinPower == nil || channel.NeededJoinPower == *update.NeededJoinPower) &&
+		(update.OpusBitrate == nil || channel.OpusBitrate == *update.OpusBitrate) &&
+		(update.OpusFEC == nil || channel.OpusFEC == *update.OpusFEC) &&
+		(update.OpusDTX == nil || channel.OpusDTX == *update.OpusDTX) &&
+		(update.OpusStereo == nil || channel.OpusStereo == *update.OpusStereo) &&
+		(update.SlowModeSeconds == nil || channel.SlowModeSeconds == *update.SlowModeSeconds) &&
+		(update.Description == nil || channel.Description == *update.Description) &&
+		(update.InheritPermissions == nil || channel.InheritPermissions == *update.InheritPermissions)
+}
+
+// mirrorChannelUpdate applies a patch to state and reloads the authoritative
+// database row if state unexpectedly lacks the channel after the commit. The
+// reconciliation uses a short context detached from request cancellation: the
+// database write is already durable, so abandoning the state repair would
+// knowingly leave the two representations divergent.
+func (m *ChannelManager) mirrorChannelUpdate(
+	ctx context.Context,
+	channelID int64,
+	update state.ChannelUpdate,
+) (bool, error) {
+	if m.state.UpdateChannel(channelID, update) {
+		return false, nil
+	}
+	reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	channel, err := m.loadChannelState(reconcileCtx, channelID)
+	if err != nil {
+		return false, err
+	}
+	m.state.AddChannel(channel)
+	if _, ok := m.state.GetChannel(channelID); !ok {
+		return false, errors.New("reloaded channel is still absent from state")
+	}
+	return true, nil
+}
+
+func (m *ChannelManager) loadChannelState(ctx context.Context, channelID int64) (*state.Channel, error) {
+	const q = `SELECT id, COALESCE(parent_id, 0), name, COALESCE(topic, ''),
+	          order_index, channel_type, COALESCE(max_clients, 0), created_at,
+	          COALESCE(password_hash, ''), COALESCE(needed_join_power, 0),
+	          opus_bitrate, opus_fec, opus_dtx, opus_stereo, slow_mode_seconds,
+	          COALESCE(description, ''), inherit_permissions
+	          FROM channels WHERE id = $1`
+	var (
+		channel     state.Channel
+		channelType int16
+	)
+	err := m.store.DB().QueryRowContext(ctx, q, channelID).Scan(
+		&channel.ChannelID,
+		&channel.ParentID,
+		&channel.Name,
+		&channel.Topic,
+		&channel.OrderIndex,
+		&channelType,
+		&channel.MaxClients,
+		&channel.CreatedAt,
+		&channel.PasswordHash,
+		&channel.NeededJoinPower,
+		&channel.OpusBitrate,
+		&channel.OpusFEC,
+		&channel.OpusDTX,
+		&channel.OpusStereo,
+		&channel.SlowModeSeconds,
+		&channel.Description,
+		&channel.InheritPermissions,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrChannelNotFound
+		}
+		return nil, fmt.Errorf("loading committed channel: %w", err)
+	}
+	parsedType, err := ParseChannelType(int(channelType))
+	if err != nil {
+		return nil, fmt.Errorf("channel %d has invalid stored type %d: %w", channelID, channelType, err)
+	}
+	channel.ChannelType = int(parsedType)
+	return &channel, nil
 }
 
 // validateMoveTx checks that channelID may be re-parented under newParentID

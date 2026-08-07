@@ -12,8 +12,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -23,6 +25,7 @@ import (
 	"voicx/internal/channels"
 	"voicx/internal/netproto"
 	"voicx/internal/permissions"
+	"voicx/internal/recorder"
 	"voicx/internal/state"
 )
 
@@ -38,6 +41,8 @@ const (
 	eventChannelUpdated = "channel_updated"
 )
 
+const maxConcurrentDeletedRecorderStops = 8
+
 // userEvent is the payload of user_joined / user_left / user_moved events.
 type userEvent struct {
 	ClientID  string `json:"client_id"`
@@ -48,9 +53,10 @@ type userEvent struct {
 
 // channelEvent is the payload of channel_created / channel_deleted events.
 type channelEvent struct {
-	ChannelID int64  `json:"channel_id"`
-	Name      string `json:"name,omitempty"`
-	ParentID  int64  `json:"parent_id,omitempty"`
+	ChannelID  int64   `json:"channel_id"`
+	ChannelIDs []int64 `json:"channel_ids,omitempty"`
+	Name       string  `json:"name,omitempty"`
+	ParentID   int64   `json:"parent_id,omitempty"`
 }
 
 // channelUpdatedEvent is the payload of channel_updated events, carrying the
@@ -797,11 +803,8 @@ func (s *TCPServer) handleDeleteChannel(ctx context.Context, client *Client, f *
 		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyChannelDelete))
 	}
 
-	// (312) taken before the delete: removing the channel from the state
-	// manager is what drops its subscriptions, leaving nobody to notify.
-	subscribers := s.subscriberIDsOf(msg.ChannelID)
-
-	if err := s.deps.Channels.DeleteChannel(ctx, msg.ChannelID); err != nil {
+	result, err := s.deps.Channels.DeleteChannelSubtree(ctx, msg.ChannelID)
+	if err != nil {
 		if errors.Is(err, channels.ErrChannelNotFound) {
 			return s.sendError(client, errCodeNotFound, "channel not found")
 		}
@@ -813,13 +816,98 @@ func (s *TCPServer) handleDeleteChannel(ctx context.Context, client *Client, f *
 		return s.sendError(client, errCodeUnavailable, "delete channel failed")
 	}
 
-	s.broadcastEvent(eventChannelDeleted, channelEvent{ChannelID: msg.ChannelID})
-	s.pushSubscriptionStateTo(subscribers)
+	if result.RootID == 0 {
+		result.RootID = msg.ChannelID
+	}
+	s.ApplyChannelDeletion(result)
 	s.audit(ctx, client.UniqueID, "channel_delete", fmt.Sprintf("%d", msg.ChannelID), "")
+	return nil
+}
+
+// ApplyChannelDeletion publishes every side effect shared by explicit and
+// automatic channel-subtree deletion. ChannelManager releases its lifecycle
+// lock before invoking this method as the temporary-cleanup sink.
+func (s *TCPServer) ApplyChannelDeletion(result channels.DeleteResult) {
+	if s == nil || s.deps == nil || len(result.ChannelIDs) == 0 {
+		return
+	}
+	// Revoke every subtree capability before any potentially blocking voice,
+	// recorder, filesystem, or notification work. This closes the authorization
+	// boundary before the committed deletion becomes externally visible.
+	if s.deps.FileTransfer != nil {
+		for _, channelID := range result.ChannelIDs {
+			if err := s.deps.FileTransfer.TombstoneChannelData(channelID); err != nil {
+				s.logger.Warn("tombstoning deleted channel files failed",
+					zap.Int64("channel_id", channelID),
+					zap.Error(err),
+				)
+			}
+		}
+	}
+	s.broadcastEvent(eventChannelDeleted, channelEvent{
+		ChannelID:  result.RootID,
+		ChannelIDs: result.ChannelIDs,
+	})
+	if s.deps.Voice != nil {
+		for _, member := range result.Members {
+			s.deps.Voice.LeaveChannel(member.ClientID, member.ChannelID)
+		}
+	}
+	// State-facing consequences must not sit behind filesystem cleanup. A file
+	// mutation can legitimately hold its lifecycle read lock while finishing a
+	// database/blob move; clients, metrics, and recorders still need to observe
+	// the committed deletion immediately.
+	s.pushSubscriptionStateTo(result.SubscriberIDs)
 	if s.deps.State != nil {
 		s.metricsSink().SetChannelsActive(s.deps.State.ChannelCount())
 	}
-	return nil
+	s.stopDeletedChannelRecordings(result.ChannelIDs)
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cleanupCancel()
+	for _, channelID := range result.ChannelIDs {
+		if s.deps.FileTransfer != nil {
+			if err := s.deps.FileTransfer.DeleteChannelData(cleanupCtx, channelID); err != nil {
+				s.logger.Warn("removing deleted channel files failed",
+					zap.Int64("channel_id", channelID),
+					zap.Error(err),
+				)
+			}
+		}
+		if _, err := s.assets().removeImage("icons", strconv.FormatInt(channelID, 10)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			s.logger.Warn("removing deleted channel icon failed",
+				zap.Int64("channel_id", channelID),
+				zap.Error(err),
+			)
+		}
+	}
+}
+
+func (s *TCPServer) stopDeletedChannelRecordings(channelIDs []int64) {
+	if s.deps.Recorder == nil || len(channelIDs) == 0 {
+		return
+	}
+	workers := min(maxConcurrentDeletedRecorderStops, len(channelIDs))
+	jobs := make(chan int64)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for channelID := range jobs {
+				if err := s.deps.Recorder.Stop(channelID); err != nil && !errors.Is(err, recorder.ErrNotRecording) {
+					s.logger.Warn("stopping deleted channel recording failed",
+						zap.Int64("channel_id", channelID),
+						zap.Error(err),
+					)
+				}
+			}
+		}()
+	}
+	for _, channelID := range channelIDs {
+		jobs <- channelID
+	}
+	close(jobs)
+	wg.Wait()
 }
 
 // handleChannelEdit edits a channel's settings (topic, max clients, Opus
@@ -1318,6 +1406,30 @@ func remoteIP(conn net.Conn) string {
 // temp-channel cleanup bookkeeping for the source and target channels, keeps
 // the voice router's membership in sync, and announces the move.
 func (s *TCPServer) moveClient(clientID string, channelID int64) error {
+	afterMove := func(previousChannelID int64) {
+		if s.deps.Voice != nil {
+			if previousChannelID != 0 && previousChannelID != channelID {
+				s.deps.Voice.LeaveChannel(clientID, previousChannelID)
+			}
+			s.deps.Voice.JoinChannel(clientID, channelID)
+		}
+		// Chat keys (4b): the client gets the new channel's key; the channel it
+		// left rotates so ex-members cannot read new messages.
+		if previousChannelID != 0 && previousChannelID != channelID {
+			s.rotateScopeKey(context.Background(), previousChannelID)
+		}
+		if client, ok := s.clientByID(clientID); ok {
+			_ = s.deliverScopeKey(context.Background(), client, channelID)
+			// (312) the channel a client stands in is implicitly subscribed, so a
+			// move changes the authoritative set even though nothing was asked.
+			_ = s.sendSubscriptionState(client)
+		}
+		s.broadcastEvent(eventUserMoved, userEvent{ClientID: clientID, ChannelID: channelID})
+	}
+	if s.deps.Channels != nil {
+		_, err := s.deps.Channels.MoveClientWithLifecycle(clientID, channelID, afterMove)
+		return err
+	}
 	var oldChannelID int64
 	if sc, ok := s.deps.State.GetClient(clientID); ok {
 		oldChannelID = sc.ChannelID
@@ -1325,30 +1437,7 @@ func (s *TCPServer) moveClient(clientID string, channelID int64) error {
 	if err := s.deps.State.MoveClient(clientID, channelID); err != nil {
 		return err
 	}
-	if s.deps.Channels != nil {
-		if oldChannelID != 0 && oldChannelID != channelID {
-			s.deps.Channels.OnClientLeftChannel(oldChannelID)
-		}
-		s.deps.Channels.OnClientJoinedChannel(channelID)
-	}
-	if s.deps.Voice != nil {
-		if oldChannelID != 0 && oldChannelID != channelID {
-			s.deps.Voice.LeaveChannel(clientID, oldChannelID)
-		}
-		s.deps.Voice.JoinChannel(clientID, channelID)
-	}
-	// Chat keys (4b): the client gets the new channel's key; the channel it
-	// left rotates so ex-members cannot read new messages.
-	if oldChannelID != 0 && oldChannelID != channelID {
-		s.rotateScopeKey(context.Background(), oldChannelID)
-	}
-	if client, ok := s.clientByID(clientID); ok {
-		_ = s.deliverScopeKey(context.Background(), client, channelID)
-		// (312) the channel a client stands in is implicitly subscribed, so a
-		// move changes the authoritative set even though nothing was asked.
-		_ = s.sendSubscriptionState(client)
-	}
-	s.broadcastEvent(eventUserMoved, userEvent{ClientID: clientID, ChannelID: channelID})
+	afterMove(oldChannelID)
 	return nil
 }
 

@@ -118,3 +118,8 @@ recording:
   format: webm
   video_args: ["-c:v", "copy"]
   audio_args: ["-c:a", "copy"]
+  # Hard process/memory budget: starting and active sessions both count.
+  max_concurrent: 4
+  # Windows only: pre-create recording.dir, apply a restricted inheritable
+  # NTFS DACL, then set true. Recording fails closed without both.
+  windows_acl_ready: false

@@ -7,11 +7,14 @@ package server
 
 import (
 	"context"
+	"errors"
 
 	"go.uber.org/zap"
 
+	"voicx/internal/channels"
 	"voicx/internal/netproto"
 	"voicx/internal/permissions"
+	"voicx/internal/recorder"
 	"voicx/internal/webrtc"
 )
 
@@ -310,9 +313,23 @@ func (s *TCPServer) handleRecordingControl(ctx context.Context, client *Client, 
 
 	switch msg.Action {
 	case "start":
-		session, err := s.deps.Recorder.Start(ctx, msg.ChannelID, s.deps.Voice)
+		if s.deps.Channels == nil {
+			return s.sendError(client, errCodeUnavailable, "channel backend unavailable")
+		}
+		var session *recorder.Session
+		err := s.deps.Channels.WithChannelLifecycle(msg.ChannelID, func() error {
+			var startErr error
+			session, startErr = s.deps.Recorder.Start(ctx, msg.ChannelID, s.deps.Voice)
+			return startErr
+		})
 		if err != nil {
+			if errors.Is(err, channels.ErrChannelNotFound) {
+				return s.sendError(client, errCodeNotFound, "channel not found")
+			}
 			return s.sendError(client, errCodeUnavailable, "recording start failed: "+err.Error())
+		}
+		if session == nil {
+			return s.sendError(client, errCodeUnavailable, "recording start failed: empty session")
 		}
 		s.logger.Info("recording started",
 			zap.String("client_id", client.ID),

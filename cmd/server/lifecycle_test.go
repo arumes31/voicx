@@ -3,9 +3,12 @@ package main
 import (
 	"errors"
 	"net"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"voicx/internal/config"
 )
 
 func TestStartServiceReportsEveryExit(t *testing.T) {
@@ -57,5 +60,30 @@ func TestJoinShutdownError(t *testing.T) {
 	}
 	if !strings.Contains(got.Error(), "shutting down UDP") {
 		t.Fatalf("joined shutdown error lacks service context: %v", got)
+	}
+}
+
+func TestRecorderConfigWiring(t *testing.T) {
+	input := config.RecordingConfig{
+		Enabled:         true,
+		Dir:             "recordings-private",
+		FFmpegPath:      "ffmpeg-custom",
+		Format:          "mp4",
+		VideoArgs:       []string{"-c:v", "copy"},
+		AudioArgs:       []string{"-c:a", "aac"},
+		MaxConcurrent:   9,
+		WindowsACLReady: true,
+	}
+	got := recorderConfig(input)
+	if !got.Enabled || got.Dir != input.Dir || got.FFmpegPath != input.FFmpegPath ||
+		got.Format != input.Format || got.MaxConcurrent != input.MaxConcurrent ||
+		got.WindowsACLReady != input.WindowsACLReady ||
+		!reflect.DeepEqual(got.VideoArgs, input.VideoArgs) || !reflect.DeepEqual(got.AudioArgs, input.AudioArgs) {
+		t.Fatalf("recorderConfig() = %+v, want all application recording fields", got)
+	}
+	input.VideoArgs[1] = "mutated"
+	input.AudioArgs[1] = "mutated"
+	if got.VideoArgs[1] != "copy" || got.AudioArgs[1] != "aac" {
+		t.Fatal("recorderConfig retained mutable application argument slices")
 	}
 }

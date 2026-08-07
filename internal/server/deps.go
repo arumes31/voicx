@@ -40,9 +40,12 @@ type AuthBackend interface {
 // ChannelBackend is the subset of channels.ChannelManager the TCP server needs.
 type ChannelBackend interface {
 	CreateChannel(ctx context.Context, spec channels.ChannelSpec) (int64, error)
-	DeleteChannel(ctx context.Context, channelID int64) error
+	DeleteChannelSubtree(ctx context.Context, channelID int64) (channels.DeleteResult, error)
 	UpdateChannel(ctx context.Context, channelID int64, upd channels.ChannelUpdate) error
-	OnClientJoinedChannel(channelID int64)
+	MoveClientWithLifecycle(clientID string, channelID int64, afterMove func(oldChannelID int64)) (oldChannelID int64, err error)
+	LeaveClient(clientID string) (oldChannelID int64, err error)
+	RemoveClient(clientID string) (*state.Client, error)
+	WithChannelLifecycle(channelID int64, operation func() error) error
 	OnClientLeftChannel(channelID int64)
 }
 
@@ -135,6 +138,12 @@ type FileTransferBackend interface {
 	MoveFile(ctx context.Context, channelID int64, folder, name string, newChannelID int64, newFolder, newName string) error
 	ChannelQuota(ctx context.Context, channelID int64) (used, quota int64, err error)
 	CreateLink(ctx context.Context, channelID int64, folder, name string) (token string, expires time.Time, err error)
+	// TombstoneChannelData immediately rejects new work and revokes every
+	// outstanding capability without waiting for physical cleanup.
+	TombstoneChannelData(channelID int64) error
+	// DeleteChannelData revokes all capabilities for a deleted channel and
+	// removes its physical file subtree. It is idempotent.
+	DeleteChannelData(ctx context.Context, channelID int64) error
 	Port() int
 	// Fingerprint is the SHA-256 of the certificate the data port presents,
 	// "" when its TLS is off. It travels in FileTransferInitResponse so the

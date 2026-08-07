@@ -278,8 +278,20 @@ func (s *Store) UserUniqueID(ctx context.Context, userID int64) (string, error) 
 // SetGroupIcon marks a server group's icon file name (surfaced in GroupList).
 func (s *Store) SetGroupIcon(ctx context.Context, groupID int64, icon string) error {
 	const q = `UPDATE server_groups SET icon = $1 WHERE id = $2`
-	if _, err := s.db.ExecContext(ctx, q, icon, groupID); err != nil {
+	result, err := s.db.ExecContext(ctx, q, icon, groupID)
+	if err != nil {
 		return fmt.Errorf("setting group icon: %w", err)
+	}
+	return checkGroupIconUpdate(result)
+}
+
+func checkGroupIconUpdate(result sql.Result) error {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("reading group icon update result: %w", err)
+	}
+	if affected == 0 {
+		return errors.New("group not found")
 	}
 	return nil
 }

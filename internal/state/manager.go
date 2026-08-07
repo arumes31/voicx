@@ -70,22 +70,26 @@ func (m *Manager) AddClient(c *Client) {
 	if c == nil {
 		return
 	}
+	stored := cloneClient(c)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.clients[c.ClientID] = c
-	m.logger.Debug("state: client added", zap.String("client_id", c.ClientID))
+	m.clients[stored.ClientID] = stored
+	m.logger.Debug("state: client added", zap.String("client_id", stored.ClientID))
 }
 
 // RemoveClient removes a client from the manager, leaving any channel it was
-// a member of and clearing its speaking state.
-func (m *Manager) RemoveClient(clientID string) {
+// a member of and clearing its speaking state. It returns the final snapshot
+// removed under the same lock, so lifecycle coordinators do not have to race a
+// separate GetClient call against a move.
+func (m *Manager) RemoveClient(clientID string) (*Client, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	c, ok := m.clients[clientID]
 	if !ok {
-		return
+		return nil, false
 	}
+	removed := cloneClient(c)
 
 	// Leave channel membership if any.
 	if c.ChannelID != 0 {
@@ -106,6 +110,7 @@ func (m *Manager) RemoveClient(clientID string) {
 	m.dropSubsLocked(clientID)
 	delete(m.clients, clientID)
 	m.logger.Debug("state: client removed", zap.String("client_id", clientID))
+	return removed, true
 }
 
 // GetClient returns a snapshot of the client with the given id and whether it
@@ -177,18 +182,72 @@ func (m *Manager) AddChannel(ch *Channel) {
 	if ch == nil {
 		return
 	}
+	stored := cloneChannel(ch)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.channels[ch.ChannelID] = ch
-	m.logger.Debug("state: channel added", zap.Int64("channel_id", ch.ChannelID), zap.String("name", ch.Name))
+	m.channels[stored.ChannelID] = stored
+	m.logger.Debug("state: channel added", zap.Int64("channel_id", stored.ChannelID), zap.String("name", stored.Name))
 }
 
-// RemoveChannel removes a channel. All clients still in the channel have their
-// ChannelID reset to 0, and the channel's membership set is dropped.
+// RemoveChannel removes one channel. All clients still in the channel have
+// their ChannelID reset to 0, and the channel's membership set is dropped.
 func (m *Manager) RemoveChannel(channelID int64) {
+	_ = m.RemoveChannels([]int64{channelID})
+}
+
+// RemovedChannelMember records a client displaced by channel deletion.
+type RemovedChannelMember struct {
+	ClientID  string
+	ChannelID int64
+}
+
+// RemoveChannelsResult captures state that protocol and voice consumers must
+// invalidate after an atomic channel-subtree removal.
+type RemoveChannelsResult struct {
+	Members       []RemovedChannelMember
+	SubscriberIDs []string
+}
+
+// RemoveChannels atomically removes a set of channels and all of their
+// membership, speaking, and subscription state. ChannelManager uses this for
+// database-cascaded subtree deletion so readers never observe a half-removed
+// tree in memory. It returns the de-duplicated client IDs whose explicit
+// subscriptions changed, allowing the server to publish their new snapshot.
+func (m *Manager) RemoveChannels(channelIDs []int64) RemoveChannelsResult {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	affectedSubscribers := make(map[string]struct{})
+	var removedMembers []RemovedChannelMember
+	for _, channelID := range channelIDs {
+		for clientID := range m.subsByChannel[channelID] {
+			affectedSubscribers[clientID] = struct{}{}
+		}
+		for clientID := range m.membership[channelID] {
+			removedMembers = append(removedMembers, RemovedChannelMember{
+				ClientID:  clientID,
+				ChannelID: channelID,
+			})
+		}
+		m.removeChannelLocked(channelID)
+	}
+	clientIDs := make([]string, 0, len(affectedSubscribers))
+	for clientID := range affectedSubscribers {
+		clientIDs = append(clientIDs, clientID)
+	}
+	sort.Strings(clientIDs)
+	sort.Slice(removedMembers, func(i, j int) bool {
+		if removedMembers[i].ChannelID != removedMembers[j].ChannelID {
+			return removedMembers[i].ChannelID < removedMembers[j].ChannelID
+		}
+		return removedMembers[i].ClientID < removedMembers[j].ClientID
+	})
+	return RemoveChannelsResult{
+		Members:       removedMembers,
+		SubscriberIDs: clientIDs,
+	}
+}
 
+func (m *Manager) removeChannelLocked(channelID int64) {
 	members, ok := m.membership[channelID]
 	if ok {
 		for clientID := range members {
@@ -231,7 +290,122 @@ func (m *Manager) GetChannel(channelID int64) (*Channel, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	ch, ok := m.channels[channelID]
-	return ch, ok
+	if !ok {
+		return nil, false
+	}
+	return cloneChannel(ch), true
+}
+
+// ChannelUpdate describes mutable, non-derived channel fields. Pointer fields
+// distinguish "leave unchanged" from setting a field to its zero value. The
+// Manager copies values while holding its lock and never retains these
+// pointers.
+type ChannelUpdate struct {
+	ParentID           *int64
+	Name               *string
+	Topic              *string
+	OrderIndex         *int
+	ChannelType        *int
+	MaxClients         *int
+	PasswordHash       *string
+	NeededJoinPower    *int
+	HasIcon            *bool
+	HasPassword        *bool
+	OpusBitrate        *int
+	OpusFEC            *bool
+	OpusDTX            *bool
+	OpusStereo         *bool
+	SlowModeSeconds    *int
+	Description        *string
+	InheritPermissions *bool
+}
+
+// UpdateChannel applies a field patch while holding the manager lock. It
+// returns false when channelID is unknown.
+func (m *Manager) UpdateChannel(channelID int64, update ChannelUpdate) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	channel, ok := m.channels[channelID]
+	if !ok {
+		return false
+	}
+	if update.ParentID != nil {
+		channel.ParentID = *update.ParentID
+	}
+	if update.Name != nil {
+		channel.Name = *update.Name
+	}
+	if update.Topic != nil {
+		channel.Topic = *update.Topic
+	}
+	if update.OrderIndex != nil {
+		channel.OrderIndex = *update.OrderIndex
+	}
+	if update.ChannelType != nil {
+		channel.ChannelType = *update.ChannelType
+	}
+	if update.MaxClients != nil {
+		channel.MaxClients = *update.MaxClients
+	}
+	if update.PasswordHash != nil {
+		channel.PasswordHash = *update.PasswordHash
+	}
+	if update.NeededJoinPower != nil {
+		channel.NeededJoinPower = *update.NeededJoinPower
+	}
+	if update.HasIcon != nil {
+		channel.HasIcon = *update.HasIcon
+	}
+	if update.HasPassword != nil {
+		channel.HasPassword = *update.HasPassword
+	}
+	if update.OpusBitrate != nil {
+		channel.OpusBitrate = *update.OpusBitrate
+	}
+	if update.OpusFEC != nil {
+		channel.OpusFEC = *update.OpusFEC
+	}
+	if update.OpusDTX != nil {
+		channel.OpusDTX = *update.OpusDTX
+	}
+	if update.OpusStereo != nil {
+		channel.OpusStereo = *update.OpusStereo
+	}
+	if update.SlowModeSeconds != nil {
+		channel.SlowModeSeconds = *update.SlowModeSeconds
+	}
+	if update.Description != nil {
+		channel.Description = *update.Description
+	}
+	if update.InheritPermissions != nil {
+		channel.InheritPermissions = *update.InheritPermissions
+	}
+	return true
+}
+
+func cloneChannel(channel *Channel) *Channel {
+	if channel == nil {
+		return nil
+	}
+	cloned := *channel
+	return &cloned
+}
+
+// SetChannelHasIcon updates a channel's icon marker while holding the manager
+// lock. Callers must not mutate the pointer returned by GetChannel.
+func (m *Manager) SetChannelHasIcon(channelID int64, hasIcon bool) bool {
+	return m.UpdateChannel(channelID, ChannelUpdate{HasIcon: &hasIcon})
+}
+
+// ChannelHasIcon returns a lock-protected value snapshot for one channel.
+func (m *Manager) ChannelHasIcon(channelID int64) (hasIcon bool, found bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	channel, ok := m.channels[channelID]
+	if !ok {
+		return false, false
+	}
+	return channel.HasIcon, true
 }
 
 // ChannelCount returns the number of registered channels.
@@ -247,7 +421,7 @@ func (m *Manager) ListChannels() []*Channel {
 	defer m.mu.RUnlock()
 	out := make([]*Channel, 0, len(m.channels))
 	for _, ch := range m.channels {
-		out = append(out, ch)
+		out = append(out, cloneChannel(ch))
 	}
 	return out
 }
@@ -259,7 +433,7 @@ func (m *Manager) ChannelTree() []*Channel {
 	defer m.mu.RUnlock()
 	out := make([]*Channel, 0, len(m.channels))
 	for _, ch := range m.channels {
-		out = append(out, ch)
+		out = append(out, cloneChannel(ch))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].ParentID != out[j].ParentID {
@@ -375,7 +549,7 @@ func (m *Manager) ChannelMembers(channelID int64) []*Client {
 	out := make([]*Client, 0, len(members))
 	for clientID := range members {
 		if c, ok := m.clients[clientID]; ok {
-			out = append(out, c)
+			out = append(out, cloneClient(c))
 		}
 	}
 	return out
@@ -623,7 +797,8 @@ func (m *Manager) SpeakingClients() []*SpeakingState {
 	defer m.mu.RUnlock()
 	out := make([]*SpeakingState, 0, len(m.speaking))
 	for _, ss := range m.speaking {
-		out = append(out, ss)
+		cloned := *ss
+		out = append(out, &cloned)
 	}
 	return out
 }

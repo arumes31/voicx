@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -74,6 +73,33 @@ func hasFlag(name string) bool {
 func syncLogger(logger *zap.Logger) {
 	if err := logger.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) {
 		fmt.Fprintf(os.Stderr, "voicx: syncing logger: %v\n", err)
+	}
+}
+
+func markChannelIcons(fileRoot string, manager *state.Manager) (int, error) {
+	ids, err := server.DiscoverChannelIconIDs(fileRoot)
+	if err != nil {
+		return 0, err
+	}
+	marked := 0
+	for _, id := range ids {
+		if manager.SetChannelHasIcon(id, true) {
+			marked++
+		}
+	}
+	return marked, nil
+}
+
+func recorderConfig(cfg config.RecordingConfig) recorder.Config {
+	return recorder.Config{
+		Enabled:         cfg.Enabled,
+		Dir:             cfg.Dir,
+		FFmpegPath:      cfg.FFmpegPath,
+		Format:          cfg.Format,
+		VideoArgs:       append([]string(nil), cfg.VideoArgs...),
+		AudioArgs:       append([]string(nil), cfg.AudioArgs...),
+		MaxConcurrent:   cfg.MaxConcurrent,
+		WindowsACLReady: cfg.WindowsACLReady,
 	}
 }
 
@@ -243,6 +269,9 @@ func resetChatKeys(ctx context.Context, dbStore *store.Store, logger *zap.Logger
 }
 
 func run() (retErr error) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
@@ -286,7 +315,10 @@ func run() (retErr error) {
 		}
 	}()
 
-	if err := dbStore.Migrate(); err != nil {
+	migrationCtx, cancelMigration := context.WithTimeout(ctx, 5*time.Minute)
+	err = dbStore.MigrateContext(migrationCtx)
+	cancelMigration()
+	if err != nil {
 		return fmt.Errorf("running migrations: %w", err)
 	}
 	piiCipher, err := store.LoadOrCreatePIICipher(cfg.PIIKeyFile)
@@ -443,8 +475,6 @@ func run() (retErr error) {
 	permResolver := permissions.NewResolver()
 	logger.Info("permissions ready")
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	go func() {
 		run := func() {
 			count, err := dbStore.CompressPermissionAudit(ctx, time.Now().AddDate(0, 0, -30))
@@ -499,15 +529,12 @@ func run() (retErr error) {
 
 	// Initialize the recorder. It manages ffmpeg subprocesses that record
 	// channel streams; it is inert unless recording.enabled is set.
-	rec := recorder.New(recorder.Config{
-		Enabled:    cfg.Recording.Enabled,
-		Dir:        cfg.Recording.Dir,
-		FFmpegPath: cfg.Recording.FFmpegPath,
-		Format:     cfg.Recording.Format,
-		VideoArgs:  cfg.Recording.VideoArgs,
-		AudioArgs:  cfg.Recording.AudioArgs,
-	}, logger)
-	defer rec.Close()
+	rec := recorder.New(recorderConfig(cfg.Recording), logger)
+	defer func() {
+		if err := rec.Close(); err != nil {
+			logger.Warn("recorder shutdown error", zap.Error(err))
+		}
+	}()
 
 	// Initialize the Redis client when enabled. Redis backs later-phase
 	// features (pub/sub, rate limiting); when it is unreachable the server
@@ -628,17 +655,20 @@ func run() (retErr error) {
 		serverPasswordHash = hash
 		logger.Info("server password enabled")
 	}
+	for _, warning := range server.AssetStorageSecurityWarnings() {
+		logger.Error("ASSET STORAGE SECURITY LIMITATION", zap.String("warning", warning))
+	}
 
-	// Flag channels that have an icon on disk so snapshots reflect it.
-	if entries, err := os.ReadDir(filepath.Join(cfg.FileRoot, "icons")); err == nil {
-		for _, e := range entries {
-			name := e.Name()
-			if id, err := strconv.ParseInt(strings.TrimSuffix(name, filepath.Ext(name)), 10, 64); err == nil {
-				if ch, ok := stateManager.GetChannel(id); ok {
-					ch.HasIcon = true
-				}
-			}
-		}
+	// Resolve any group-icon transaction left by a process crash before the
+	// control server can serve files or accept a competing update.
+	if err := server.RecoverGroupIconTransactions(context.Background(), cfg.FileRoot, dbStore); err != nil {
+		return fmt.Errorf("recovering group icon transactions: %w", err)
+	}
+
+	// Flag only confined, supported, regular channel icons so snapshots do not
+	// trust arbitrary directory entries at startup.
+	if _, err := markChannelIcons(cfg.FileRoot, stateManager); err != nil {
+		logger.Warn("channel icon discovery failed", zap.Error(err))
 	}
 
 	// (215) one rules service for both readers: ServerQuery edits the wording
@@ -679,6 +709,23 @@ func run() (retErr error) {
 		DefaultGuestGroupID:  defaultGuestGroupID,
 		DefaultMemberGroupID: defaultMemberGroupID,
 	})
+	channelMgr.SetCleanupDeleteHandler(tcpServer.ApplyChannelDeletion)
+	// Reconcile only after the cleanup callback is installed. LoadIntoState
+	// starts temporary-channel timers: deletions that commit before this point
+	// are now visible as orphans, while concurrent/later deletions invoke the
+	// callback. No listener is accepting file work yet.
+	liveChannels := stateManager.ListChannels()
+	liveChannelIDs := make([]int64, 0, len(liveChannels))
+	for _, channel := range liveChannels {
+		liveChannelIDs = append(liveChannelIDs, channel.ChannelID)
+	}
+	reconciledChannels, err := ftServer.ReconcileChannelData(context.Background(), liveChannelIDs)
+	if err != nil {
+		return fmt.Errorf("reconciling orphaned channel files: %w", err)
+	}
+	if reconciledChannels > 0 {
+		logger.Info("orphaned channel file directories removed", zap.Int("count", reconciledChannels))
+	}
 	if cfg.TLSEnabled {
 		tcpServer.UseTLSMaterial(tlsCert, tlsFP)
 	}
@@ -1042,8 +1089,12 @@ func (q *queryBackend) CreateChannel(ctx context.Context, name, topic string, ch
 }
 
 func (q *queryBackend) DeleteChannel(ctx context.Context, channelID int64) error {
-	if err := q.channelMgr.DeleteChannel(ctx, channelID); err != nil {
+	result, err := q.channelMgr.DeleteChannelSubtree(ctx, channelID)
+	if err != nil {
 		return err
+	}
+	if q.tcp != nil {
+		q.tcp.ApplyChannelDeletion(result)
 	}
 	q.db.Audit(ctx, "serverquery", "channel_delete", strconv.FormatInt(channelID, 10), "")
 	return nil

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -172,6 +173,11 @@ type RecordingConfig struct {
 	VideoArgs []string `mapstructure:"video_args"`
 	// AudioArgs are the ffmpeg audio output options.
 	AudioArgs []string `mapstructure:"audio_args"`
+	// MaxConcurrent bounds starting plus active ffmpeg subprocesses.
+	MaxConcurrent int `mapstructure:"max_concurrent"`
+	// WindowsACLReady acknowledges that Dir was provisioned with a restricted,
+	// inheritable NTFS DACL; chmod alone cannot enforce it on Windows.
+	WindowsACLReady bool `mapstructure:"windows_acl_ready"`
 }
 
 // TURNConfig holds TURN server settings (coturn REST API auth, 445/446).
@@ -292,6 +298,8 @@ func Load() (*Config, error) {
 	v.SetDefault("recording.format", "webm")
 	v.SetDefault("recording.video_args", []string{"-c:v", "copy"})
 	v.SetDefault("recording.audio_args", []string{"-c:a", "copy"})
+	v.SetDefault("recording.max_concurrent", 4)
+	v.SetDefault("recording.windows_acl_ready", false)
 
 	// config.yaml: the working directory wins; /etc/voicx is the system
 	// location used by the Docker image. The first file found is used.
@@ -520,6 +528,14 @@ func (c *Config) Validate() error {
 		}
 		if strings.TrimSpace(c.Recording.FFmpegPath) == "" {
 			errs = append(errs, errors.New("recording.ffmpeg_path must not be empty when recording is enabled"))
+		}
+		if c.Recording.MaxConcurrent < 1 || c.Recording.MaxConcurrent > 64 {
+			errs = append(errs, fmt.Errorf("recording.max_concurrent %d must be between 1 and 64", c.Recording.MaxConcurrent))
+		}
+		if runtime.GOOS == "windows" && !c.Recording.WindowsACLReady {
+			errs = append(errs, errors.New(
+				"recording.windows_acl_ready must be true after provisioning a restricted inheritable NTFS DACL",
+			))
 		}
 	}
 

@@ -72,6 +72,11 @@ var ErrTooLarge = errors.New("filetransfer: file too large")
 // ErrInvalidName is returned when a file name fails sanitization.
 var ErrInvalidName = errors.New("filetransfer: invalid file name")
 
+// ErrChannelDeleted is returned when work is requested for a channel whose
+// deletion cleanup has started. Channel IDs are never reused, so the
+// tombstone is intentionally permanent for the lifetime of the server.
+var ErrChannelDeleted = errors.New("filetransfer: channel deleted")
+
 // ErrEncryptedAttachment is returned when an expiring download link (267) is
 // requested for a client-encrypted chat attachment.
 var ErrEncryptedAttachment = errors.New("encrypted chat attachment — open it in the client")
@@ -181,6 +186,21 @@ type transfer struct {
 	Expires   time.Time
 }
 
+// activeTransfer lets channel deletion revoke transfers that already
+// consumed their single-use token. Closing conn interrupts both upload and
+// download I/O; done closes only after any partial upload has been removed.
+type activeTransfer struct {
+	transferID string
+	channelID  int64
+	conn       net.Conn
+	done       chan struct{}
+}
+
+type channelCleanup struct {
+	done chan struct{}
+	err  error
+}
+
 // Server is the file-transfer listener and token registry.
 type Server struct {
 	cfg    Config
@@ -194,6 +214,9 @@ type Server struct {
 	// moveBlobFn is injectable in tests so metadata rollback can be exercised
 	// without depending on the host's volume layout.
 	moveBlobFn func(*os.Root, string, string) error
+	// removeChannelDataFn is injectable in tests so cleanup retry semantics can
+	// be verified without relying on platform-specific filesystem failures.
+	removeChannelDataFn func(int64) error
 
 	// OnTransferComplete, when set, is called with the direction and result
 	// ("ok"/"error") when a transfer finishes (metrics).
@@ -208,8 +231,15 @@ type Server struct {
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
 
-	mu        sync.Mutex
-	transfers map[string]*transfer // keyed by token
+	// fileOpsMu makes filesystem-producing mutations linearizable with a
+	// channel tombstone. Deletion takes the write side only long enough to
+	// drain prior mutations and publish the tombstone; later operations acquire
+	// the read side, observe it, and fail before touching disk or metadata.
+	fileOpsMu       sync.RWMutex
+	mu              sync.Mutex
+	transfers       map[string]*transfer // keyed by token digest
+	activeTransfers map[string]*activeTransfer
+	deletedChannels map[int64]*channelCleanup
 }
 
 // New constructs a Server. The listener is created lazily in Start.
@@ -221,16 +251,20 @@ func New(cfg Config, st FileStore, logger *zap.Logger) *Server {
 	if _, p, err := net.SplitHostPort(cfg.Addr); err == nil {
 		port, _ = strconv.Atoi(p)
 	}
-	return &Server{
-		cfg:        cfg,
-		store:      st,
-		logger:     logger,
-		port:       port,
-		links:      NewLinkRegistry(cfg.RootDir),
-		moveBlobFn: moveBlob,
-		stopCh:     make(chan struct{}),
-		transfers:  make(map[string]*transfer),
+	s := &Server{
+		cfg:             cfg,
+		store:           st,
+		logger:          logger,
+		port:            port,
+		links:           NewLinkRegistry(cfg.RootDir),
+		moveBlobFn:      moveBlob,
+		stopCh:          make(chan struct{}),
+		transfers:       make(map[string]*transfer),
+		activeTransfers: make(map[string]*activeTransfer),
+		deletedChannels: make(map[int64]*channelCleanup),
 	}
+	s.removeChannelDataFn = s.removeChannelData
+	return s
 }
 
 // Port returns the configured file-transfer port (0 when the address has no
@@ -415,6 +449,11 @@ func (s *Server) MoveFile(ctx context.Context, channelID int64, folder, name str
 	if newChannelID == 0 {
 		newChannelID = channelID
 	}
+	s.fileOpsMu.RLock()
+	defer s.fileOpsMu.RUnlock()
+	if s.channelDeleted(channelID) || s.channelDeleted(newChannelID) {
+		return ErrChannelDeleted
+	}
 	if channelID == newChannelID && folder == newFolder && name == newName {
 		return errors.New("nothing to rename")
 	}
@@ -575,6 +614,118 @@ func (s *Server) CreateLink(ctx context.Context, channelID int64, folder, name s
 	return s.links.Create(blobPath(channelID, folder, name), name)
 }
 
+// TombstoneChannelData permanently rejects new work for a deleted channel and
+// immediately revokes all of its pending and active capabilities. Physical
+// cleanup continues asynchronously so callers can tombstone an entire subtree
+// before waiting on slower recorder or filesystem teardown.
+func (s *Server) TombstoneChannelData(channelID int64) error {
+	_, err := s.beginChannelCleanup(channelID)
+	return err
+}
+
+// DeleteChannelData tombstones a deleted channel and waits for its confined
+// on-disk directory to be removed. A context deadline only bounds the wait;
+// cleanup continues asynchronously and a later call can observe completion or
+// retry a failed cleanup.
+func (s *Server) DeleteChannelData(ctx context.Context, channelID int64) error {
+	cleanup, err := s.beginChannelCleanup(channelID)
+	if err != nil {
+		return err
+	}
+	select {
+	case <-cleanup.done:
+		return cleanup.err
+	case <-ctx.Done():
+		return fmt.Errorf("waiting for channel %d file cleanup: %w", channelID, ctx.Err())
+	}
+}
+
+func (s *Server) beginChannelCleanup(channelID int64) (*channelCleanup, error) {
+	if channelID <= 0 {
+		return nil, fmt.Errorf("%w: invalid channel id %d", ErrChannelDeleted, channelID)
+	}
+
+	s.mu.Lock()
+	cleanup, exists := s.deletedChannels[channelID]
+	startCleanup := !exists
+	if exists {
+		select {
+		case <-cleanup.done:
+			// A successful cleanup is permanently idempotent. A failed cleanup
+			// remains a tombstone but receives a fresh worker on the next call.
+			if cleanup.err != nil {
+				cleanup = &channelCleanup{done: make(chan struct{})}
+				s.deletedChannels[channelID] = cleanup
+				startCleanup = true
+			}
+		default:
+		}
+	}
+	if !exists {
+		cleanup = &channelCleanup{done: make(chan struct{})}
+		s.deletedChannels[channelID] = cleanup
+	}
+	for digest, tr := range s.transfers {
+		if tr.ChannelID == channelID {
+			delete(s.transfers, digest)
+		}
+	}
+	active := make([]*activeTransfer, 0)
+	for _, tr := range s.activeTransfers {
+		if tr.channelID == channelID {
+			active = append(active, tr)
+		}
+	}
+	s.mu.Unlock()
+
+	// Capability revocation deliberately precedes the potentially blocking
+	// drain. A wedged pre-delete move may delay physical reclamation, but it
+	// cannot keep a bearer link or transfer token valid after this call starts.
+	s.links.RevokeChannel(channelID)
+	for _, tr := range active {
+		_ = tr.conn.Close()
+	}
+	if startCleanup {
+		go s.finishChannelCleanup(channelID, active, cleanup)
+	}
+	return cleanup, nil
+}
+
+func (s *Server) finishChannelCleanup(channelID int64, active []*activeTransfer, cleanup *channelCleanup) {
+	for _, tr := range active {
+		<-tr.done
+	}
+	// A queued writer prevents later readers from starving cleanup. Operations
+	// already holding the read side finish first; they began before the
+	// tombstone and their output is removed below. Later operations observe the
+	// tombstone immediately after acquiring the read side and fail closed.
+	// Short bounded retries absorb transient sharing violations and delayed
+	// network-volume visibility without holding the global writer while asleep.
+	retryDelays := [...]time.Duration{25 * time.Millisecond, 100 * time.Millisecond, 250 * time.Millisecond}
+	for attempt := 0; ; attempt++ {
+		s.fileOpsMu.Lock()
+		cleanup.err = s.removeChannelDataFn(channelID)
+		s.fileOpsMu.Unlock()
+		if cleanup.err == nil || attempt == len(retryDelays) {
+			break
+		}
+		time.Sleep(retryDelays[attempt])
+	}
+	close(cleanup.done)
+}
+
+func (s *Server) removeChannelData(channelID int64) error {
+	root, err := s.openBlobRoot()
+	if err != nil {
+		return fmt.Errorf("opening file root for channel cleanup: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	if err := root.RemoveAll(strconv.FormatInt(channelID, 10)); err != nil {
+		return fmt.Errorf("removing channel %d files: %w", channelID, err)
+	}
+	return nil
+}
+
 // register creates a transfer ID and token and records the pending transfer.
 func (s *Server) register(tr *transfer) (string, string, error) {
 	id, err := randomHex(8)
@@ -590,6 +741,10 @@ func (s *Server) register(tr *transfer) (string, string, error) {
 	tr.Expires = time.Now().Add(tokenTTL)
 
 	s.mu.Lock()
+	if _, deleted := s.deletedChannels[tr.ChannelID]; deleted {
+		s.mu.Unlock()
+		return "", "", ErrChannelDeleted
+	}
 	s.transfers[tokenDigest(token)] = tr
 	s.mu.Unlock()
 	return id, token, nil
@@ -604,15 +759,55 @@ func (s *Server) consume(token, transferID string) (*transfer, error) {
 	if ok {
 		delete(s.transfers, digest)
 	}
+	deleted := ok && s.channelDeletedLocked(tr.ChannelID)
 	s.mu.Unlock()
 
 	if !ok || !constantTimeStringEqual(tr.ID, transferID) {
 		return nil, errors.New("invalid transfer token")
 	}
+	if deleted {
+		return nil, ErrChannelDeleted
+	}
 	if time.Now().After(tr.Expires) {
 		return nil, errors.New("transfer token expired")
 	}
 	return tr, nil
+}
+
+func (s *Server) activateTransfer(tr *transfer, conn net.Conn) (*activeTransfer, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.channelDeletedLocked(tr.ChannelID) {
+		return nil, ErrChannelDeleted
+	}
+	active := &activeTransfer{
+		transferID: tr.ID,
+		channelID:  tr.ChannelID,
+		conn:       conn,
+		done:       make(chan struct{}),
+	}
+	s.activeTransfers[tr.ID] = active
+	return active, nil
+}
+
+func (s *Server) deactivateTransfer(active *activeTransfer) {
+	s.mu.Lock()
+	if current := s.activeTransfers[active.transferID]; current == active {
+		delete(s.activeTransfers, active.transferID)
+	}
+	s.mu.Unlock()
+	close(active.done)
+}
+
+func (s *Server) channelDeletedLocked(channelID int64) bool {
+	_, deleted := s.deletedChannels[channelID]
+	return deleted
+}
+
+func (s *Server) channelDeleted(channelID int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.channelDeletedLocked(channelID)
 }
 
 func tokenDigest(token string) string {

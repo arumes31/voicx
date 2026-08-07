@@ -27,6 +27,7 @@ import (
 	"voicx/internal/config"
 	"voicx/internal/metrics"
 	"voicx/internal/netproto"
+	"voicx/internal/state"
 	"voicx/internal/tlscert"
 )
 
@@ -759,11 +760,16 @@ func (s *TCPServer) onDisconnect(client *Client) {
 	var channelID int64
 	var wasInvisible bool
 	if s.deps.State != nil {
-		if sc, ok := s.deps.State.GetClient(client.ID); ok {
-			channelID = sc.ChannelID
-			wasInvisible = sc.Status == "invisible"
+		var removed *state.Client
+		if s.deps.Channels != nil {
+			removed, _ = s.deps.Channels.RemoveClient(client.ID)
+		} else {
+			removed, _ = s.deps.State.RemoveClient(client.ID)
 		}
-		s.deps.State.RemoveClient(client.ID)
+		if removed != nil {
+			channelID = removed.ChannelID
+			wasInvisible = removed.Status == "invisible"
+		}
 	}
 
 	if s.deps.Broadcast != nil {
@@ -783,10 +789,6 @@ func (s *TCPServer) onDisconnect(client *Client) {
 				Nickname: client.Username,
 			})
 		}
-	}
-
-	if channelID != 0 && s.deps.Channels != nil {
-		s.deps.Channels.OnClientLeftChannel(channelID)
 	}
 
 	// Rotate the chat key of the channel the client left (4b).
