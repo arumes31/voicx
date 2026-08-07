@@ -3,11 +3,15 @@ package broadcast
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 
 	"voicx/internal/state"
 )
@@ -199,6 +203,85 @@ loop:
 	if count != clientBufferSize {
 		t.Fatalf("drained %d messages, want %d", count, clientBufferSize)
 	}
+	stats := b.Stats()
+	if stats.Delivered != clientBufferSize || stats.Dropped != 1 || stats.Clients != 1 {
+		t.Fatalf("broadcast stats = %+v", stats)
+	}
+}
+
+func TestBroadcastPayloadOwnership(t *testing.T) {
+	b, sm := newTestBroadcaster(t)
+	defer b.Close()
+	sm.AddChannel(&state.Channel{ChannelID: 10, Name: "shared", CreatedAt: time.Now()})
+	for _, id := range []string{"c1", "c2"} {
+		sm.AddClient(&state.Client{ClientID: id, ConnectedAt: time.Now()})
+		if err := sm.JoinChannel(id, 10); err != nil {
+			t.Fatalf("JoinChannel(%s): %v", id, err)
+		}
+	}
+	first, _ := b.Register("c1")
+	second, _ := b.Register("c2")
+	payload := []byte("immutable")
+	b.BroadcastToChannel(10, payload)
+	payload[0] = 'X'
+
+	firstPayload := <-first
+	firstPayload[1] = 'Y'
+	if got := string(<-second); got != "immutable" {
+		t.Fatalf("second client payload was aliased: %q", got)
+	}
+}
+
+func TestConcurrentBroadcastsHaveConsistentRecipientOrder(t *testing.T) {
+	b, sm := newTestBroadcaster(t)
+	defer b.Close()
+	sm.AddChannel(&state.Channel{ChannelID: 10, Name: "shared", CreatedAt: time.Now()})
+	for _, id := range []string{"c1", "c2"} {
+		sm.AddClient(&state.Client{ClientID: id, ConnectedAt: time.Now()})
+		if err := sm.JoinChannel(id, 10); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, _ := b.Register("c1")
+	second, _ := b.Register("c2")
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < clientBufferSize; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			<-start
+			b.BroadcastToChannel(10, []byte(fmt.Sprintf("event-%02d", id)))
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i := 0; i < clientBufferSize; i++ {
+		one, two := string(<-first), string(<-second)
+		if one != two {
+			t.Fatalf("recipient order diverged at %d: %q != %q", i, one, two)
+		}
+	}
+}
+
+func TestDropWarningsAreLogarithmicallyBounded(t *testing.T) {
+	core, observed := observer.New(zapcore.WarnLevel)
+	b := New(zap.New(core), state.New(zap.NewNop()))
+	defer b.Close()
+	_, _ = b.Register("stalled")
+	for i := 0; i < clientBufferSize+17; i++ {
+		_ = b.BroadcastToClient("stalled", []byte("message"))
+	}
+
+	const wantWarnings = 5 // client drop counts 1, 2, 4, 8, and 16.
+	if got := observed.FilterMessage("broadcast: client channel full, dropping message").Len(); got != wantWarnings {
+		t.Fatalf("drop warning count = %d, want %d", got, wantWarnings)
+	}
+	if got := b.Stats().Dropped; got != 17 {
+		t.Fatalf("drop metric = %d, want 17", got)
+	}
 }
 
 func TestBroadcastEventEnvelope(t *testing.T) {
@@ -250,7 +333,10 @@ func TestCloseClearsRegistry(t *testing.T) {
 	}
 
 	// Register after close should error.
-	if _, err := b.Register("c2"); err == nil {
-		t.Fatal("Register after Close should error")
+	if _, err := b.Register("c2"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Register after Close error = %v, want ErrClosed", err)
+	}
+	if err := b.BroadcastToClient("c1", nil); !errors.Is(err, ErrClosed) {
+		t.Fatalf("BroadcastToClient after Close error = %v, want ErrClosed", err)
 	}
 }
