@@ -4,6 +4,7 @@
 // buddy-online watcher (383), keyword highlights (388), channel watch
 // (389), and the alpha notice (215).
 import { playEvent, play } from "./sounds.js";
+import { closeDialog, isCurrentServerDialog, mountDialog, mountServerDialog } from "./modal.js";
 
 const V = () => window.__voicx;
 const App = () => window.go.main.App;
@@ -77,16 +78,28 @@ function overrideAllows(channelID, className, defaultOn) {
     return defaultOn;
 }
 
+// Read-only policy check used by live chat announcements so assistive output
+// follows the same DND, channel override and matrix preferences as toasts.
+export function notificationOutputAllowed(event, ctx = {}, output = "toast") {
+    if (window.__voicxPolish?.dndActive?.()) return false;
+    if (!overrideAllows(ctx.channelID, ctx.className || "messages", true)) return false;
+    return !!matrixRow(event)[output];
+}
+
 // notify is the single dispatch point for user-facing notifications:
 // DND → record-only; muted/overridden channels → filtered; matrix → which
-// outputs fire. ctx: {channelID, uid, className ("messages"|"mentions"|"joins"), noSound}.
+// outputs fire. ctx: {channelID, uid, className ("messages"|"mentions"|"joins"), noSound, announce}.
 export function notify(event, text, ctx = {}) {
     // (346) always record in the notification center (even under DND).
     window.__voicxPolish?.recordNotification(event, text, ctx);
     if (window.__voicxPolish?.dndActive?.()) return;
     if (!overrideAllows(ctx.channelID, ctx.className || "messages", true)) return;
     const row = matrixRow(event);
-    if (row.toast) V().toast(text, ctx.kind || "info", ctx.category || TOAST_CATEGORY[event] || "alert");
+    if (row.toast) {
+        const kind = ctx.kind || "info";
+        V().toast(text, kind, ctx.category || TOAST_CATEGORY[event] || "alert", { announce: false, record: false });
+        if (ctx.announce !== false) V().announceLive(text, kind === "warn" ? "assertive" : "polite");
+    }
     if (row.sound && !ctx.noSound) playEventSound(event);
     if (row.flash) App().FlashWindow();
     if (row.native && !document.hasFocus()) App().Notify("voicx " + event, text.slice(0, 200));
@@ -191,7 +204,7 @@ let rulesHash = "";
 // away from. If the newly active tab also has pending rules, its journaled
 // server_rules frame immediately creates the correct gate again.
 export function resetServerRules() {
-    if (rulesOverlay) rulesOverlay.remove();
+    if (rulesOverlay) closeDialog(rulesOverlay);
     rulesOverlay = null;
     rulesHash = "";
 }
@@ -247,7 +260,17 @@ export function showServerRules(json) {
     dlg.appendChild(status);
     dlg.appendChild(buttons);
     overlay.appendChild(dlg);
-    document.body.appendChild(overlay);
+    let responseTimer = null;
+    mountServerDialog(overlay, {
+        onClose: () => {
+            if (responseTimer) clearTimeout(responseTimer);
+            responseTimer = null;
+            if (rulesOverlay === overlay) {
+                rulesOverlay = null;
+                rulesHash = "";
+            }
+        },
+    });
     rulesOverlay = overlay;
 
     decline.onclick = async () => {
@@ -255,7 +278,7 @@ export function showServerRules(json) {
         accept.disabled = true;
         status.textContent = "disconnecting…";
         await App().Disconnect();
-        resetServerRules();
+        if (isCurrentServerDialog(overlay)) resetServerRules();
     };
     accept.onclick = async () => {
         decline.disabled = true;
@@ -263,6 +286,7 @@ export function showServerRules(json) {
         status.textContent = "recording acceptance…";
         const acceptedHash = rulesHash;
         const err = await App().AcceptServerRules(acceptedHash);
+        if (!isCurrentServerDialog(overlay)) return;
         if (err) {
             status.textContent = err;
             decline.disabled = false;
@@ -271,7 +295,7 @@ export function showServerRules(json) {
         }
         // Success is acknowledged by an empty ServerRules frame. A timeout
         // keeps a dropped response from stranding the user behind dead buttons.
-        setTimeout(() => {
+        responseTimer = setTimeout(() => {
             if (rulesOverlay === overlay && rulesHash === acceptedHash) {
                 status.textContent = "no response from server — try again";
                 decline.disabled = false;
@@ -309,7 +333,7 @@ export function maybeAlphaNotice(force = false) {
         }
         overlay.remove();
     };
-    document.body.appendChild(overlay);
+    mountDialog(overlay);
 }
 
 // ---------------------------------------------------------------------------
@@ -364,14 +388,14 @@ export async function maybeIdentityBackupNag(force = false) {
         backupNagSnoozed = true;
         overlay.remove();
     };
-    document.body.appendChild(overlay);
+    mountDialog(overlay);
 }
 
 export function initNotifications() {
     window.__voicxNotify = {
         notify, checkBuddyOnline, resetBuddyWatch, matchKeyword,
         checkChannelWatch, channelOverride, saveChannelOverride, maybeAlphaNotice,
-        maybeIdentityBackupNag, resetServerRules,
+        maybeIdentityBackupNag, resetServerRules, notificationOutputAllowed,
     };
     window.runtime.EventsOn("server_rules", showServerRules);
     const badge = document.getElementById("alpha-badge");

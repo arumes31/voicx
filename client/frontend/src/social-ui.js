@@ -5,6 +5,8 @@
 // channels (320), tree filter + collapse/expand wiring (302/319), and
 // multi-select batch actions (306).
 import { humanBytes } from "./clientinfo.js";
+import { isCurrentServerDialog, mountServerDialog } from "./modal.js";
+import { setSafeImage } from "./safe-media.js";
 
 const V = () => window.__voicx;
 const App = () => window.go.main.App;
@@ -35,15 +37,7 @@ function initTreeTools() {
         const row = e.target.closest(".channel");
         if (!row) return;
         const id = Number(row.dataset.chid);
-        if (window.__voicxPolish?.virtualizeEnabled?.()) {
-            if (state.expandedVirtual.has(id)) state.expandedVirtual.delete(id);
-            else state.expandedVirtual.add(id);
-        } else if (state.collapsedChannels.has(id)) {
-            state.collapsedChannels.delete(id);
-        } else {
-            state.collapsedChannels.add(id);
-        }
-        V().renderTree();
+        V().setChannelExpanded(id, row.getAttribute("aria-expanded") !== "true");
     });
 }
 
@@ -75,10 +69,12 @@ function openStatusPicker() {
     const sel = overlay.querySelector(".st-sel");
     sel.value = state.myStatus || "online";
     overlay.querySelector(".dlg-ok").onclick = async () => {
+        const generation = state.serverGeneration;
         const status = sel.value;
         const msg = overlay.querySelector(".st-msg").value.trim();
         overlay.remove();
         const err = await App().SetStatus(status, msg);
+        if (generation !== state.serverGeneration) return;
         if (err) V().toast("status failed: " + err, "warn");
         else {
             state.myStatus = status === "online" ? "" : status;
@@ -87,7 +83,7 @@ function openStatusPicker() {
     };
     overlay.querySelector(".dlg-cancel").onclick = () => overlay.remove();
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-    document.body.appendChild(overlay);
+    mountServerDialog(overlay);
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +119,7 @@ function openContacts() {
             watch.onclick = async () => {
                 c.notify_online = !c.notify_online;
                 await App().SaveSettings(s);
+                if (!isCurrentServerDialog(overlay)) return;
                 render();
             };
             row.insertBefore(watch, row.querySelector(".ct-block"));
@@ -133,11 +130,13 @@ function openContacts() {
                 if (blocked) s.blocked_users = (s.blocked_users || []).filter((u) => u !== c.unique_id);
                 else s.blocked_users = [...(s.blocked_users || []), c.unique_id];
                 await App().SaveSettings(s);
+                if (!isCurrentServerDialog(overlay)) return;
                 render();
             };
             row.querySelector(".ct-del").onclick = async () => {
                 s.contacts = contacts.filter((x) => x !== c);
                 await App().SaveSettings(s);
+                if (!isCurrentServerDialog(overlay)) return;
                 render();
             };
             list.appendChild(row);
@@ -163,13 +162,14 @@ function openContacts() {
         }
         s.contacts = [...(s.contacts || []), { unique_id: uid, label: overlay.querySelector(".ct-label").value.trim() }];
         await App().SaveSettings(s);
+        if (!isCurrentServerDialog(overlay)) return;
         overlay.querySelector(".ct-uid").value = "";
         overlay.querySelector(".ct-label").value = "";
         render();
     };
     overlay.querySelector(".dlg-ok").onclick = () => overlay.remove();
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-    document.body.appendChild(overlay);
+    mountServerDialog(overlay);
     render();
 }
 
@@ -180,11 +180,15 @@ function openContacts() {
 let hoverCard = null;
 let hoverTimer = null;
 
-function showHoverCard(x, y, html) {
+function showHoverCard(x, y, html, avatarURL = null) {
     hideHoverCard();
     hoverCard = document.createElement("div");
     hoverCard.className = "hover-card";
     hoverCard.innerHTML = html;
+    const avatarSlot = hoverCard.querySelector(".hc-avatar-slot");
+    if (avatarSlot) {
+        if (!setSafeImage(avatarSlot, avatarURL, { className: "hc-av" })) avatarSlot.remove();
+    }
     hoverCard.style.left = Math.min(x, window.innerWidth - 260) + "px";
     hoverCard.style.top = Math.min(y, window.innerHeight - 160) + "px";
     document.body.appendChild(hoverCard);
@@ -219,13 +223,13 @@ function initHoverCards() {
                 const av = V().state.avatars.get(c.unique_id);
                 showHoverCard(e.clientX + 12, e.clientY + 12, `
                     <div class="hc-head">
-                        ${av ? `<img class="hc-av" src="${av}">` : ""}
+                        <span class="hc-avatar-slot"></span>
                         <b>${esc(c.nickname || c.unique_id)}</b>
                     </div>
                     <div class="hc-line mono">${esc((c.unique_id || "").slice(0, 20))}…</div>
                     ${g ? `<div class="hc-line">group: ${esc(g.name)}</div>` : ""}
                     ${c.status ? `<div class="hc-line">status: ${esc(c.status)}${c.status_message ? " — " + esc(c.status_message) : ""}</div>` : ""}
-                    <div class="hc-line">channel: ${esc(V().state.channels.find((x) => x.ChannelID === c.channel_id)?.Name || "none")}</div>`);
+                    <div class="hc-line">channel: ${esc(V().state.channels.find((x) => x.ChannelID === c.channel_id)?.Name || "none")}</div>`, av);
             }, 500);
         } else if (chRow) {
             const ch = V().state.channels.find((x) => x.ChannelID === Number(chRow.dataset.chid));
@@ -270,7 +274,7 @@ function openPoke(client) {
     };
     overlay.querySelector(".dlg-cancel").onclick = () => overlay.remove();
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-    document.body.appendChild(overlay);
+    mountServerDialog(overlay);
     overlay.querySelector(".poke-msg").focus();
 }
 
@@ -280,19 +284,21 @@ function openPoke(client) {
 
 async function refreshNews() {
     const area = document.getElementById("news-area");
+    const generation = V().state.serverGeneration;
     if (!V().state.myClientID) {
         area.innerHTML = `<div class="empty-state">offline</div>`;
         return;
     }
     try {
-        const info = await App().ServerInfo();
-        const motd = await App().MOTD();
+        const [info, motd] = await Promise.all([App().ServerInfo(), App().MOTD()]);
+        if (generation !== V().state.serverGeneration) return;
         const up = Math.floor(info.uptime_seconds / 60);
         area.innerHTML = `
             <div class="news-line"><b>${esc(info.name)}</b></div>
             <div class="news-line mono">${esc(info.version)} · ${info.clients_online}/${info.max_clients} clients · ${info.channels_online} channels · up ${up}m</div>
             ${motd ? `<div class="news-motd">${esc(motd)}</div>` : ""}`;
     } catch {
+        if (generation !== V().state.serverGeneration) return;
         area.innerHTML = `<div class="empty-state">server info unavailable</div>`;
     }
 }
@@ -305,9 +311,16 @@ async function refreshNews() {
 function avatarLightbox(dataUrl) {
     const overlay = document.createElement("div");
     overlay.className = "dlg-overlay";
-    overlay.innerHTML = `<div class="dlg avatar-full"><img src="${dataUrl}" alt=""></div>`;
+    overlay.innerHTML = `<div class="dlg avatar-full"></div>`;
+    if (!setSafeImage(overlay.querySelector(".avatar-full"), dataUrl)) return;
     overlay.onclick = () => overlay.remove();
-    document.body.appendChild(overlay);
+    mountServerDialog(overlay);
+}
+
+function resetServerView() {
+    hideHoverCard();
+    const area = document.getElementById("news-area");
+    if (area) area.innerHTML = `<div class="empty-state">loading server…</div>`;
 }
 
 // userNote loads/saves the local per-user note (315).
@@ -331,7 +344,7 @@ export function initSocialUI() {
     initTreeTools();
     initHoverCards();
     window.__voicxSocial = {
-        openStatusPicker, openContacts, openPoke, refreshNews,
+        openStatusPicker, openContacts, openPoke, refreshNews, resetServerView,
         avatarLightbox, userNote, saveUserNote, esc,
     };
 }

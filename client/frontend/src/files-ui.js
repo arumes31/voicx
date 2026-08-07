@@ -6,6 +6,9 @@
 // virtual (derived from file rows — empty folders do not persist).
 import { humanBytes } from "./clientinfo.js";
 import { pickIcon } from "./image-tools.js";
+import { closeDialog, isCurrentServerDialog, mountServerDialog } from "./modal.js";
+import { wrappedIndex } from "./a11y.js";
+import { imageDataURL } from "./safe-media.js";
 
 const V = () => window.__voicx;
 const App = () => window.go.main.App;
@@ -19,6 +22,7 @@ const fb = {
     quota: 0,
     open: false,
 };
+let serverViewGeneration = 0;
 
 // ---------------------------------------------------------------------------
 // Transfers registry (278) + sparkline data (277)
@@ -78,20 +82,33 @@ function fmtDate(ts) {
 // refreshFiles reloads the current folder listing.
 async function refreshFiles() {
     const pane = document.getElementById("files-pane");
+    const list = pane.querySelector(".fb-list");
     if (!fb.channelID) {
-        pane.querySelector(".fb-list").innerHTML = `<div class="empty-state">Join a channel to browse its files</div>`;
+        list.removeAttribute("aria-busy");
+        list.innerHTML = `<div class="empty-state">Join a channel to browse its files</div>`;
         renderFbChrome();
         return;
     }
+    const generation = serverViewGeneration;
+    const channelID = fb.channelID;
+    const folder = fb.folder;
+    list.setAttribute("aria-busy", "true");
+    list.innerHTML = `<div class="empty-state" role="status">Loading channel files…</div>`;
     try {
-        const resp = await App().FileList(fb.channelID, fb.folder);
+        const resp = await App().FileList(channelID, folder);
+        if (generation !== serverViewGeneration || channelID !== fb.channelID || folder !== fb.folder) return;
         fb.entries = resp.entries || [];
         fb.folders = resp.folders || [];
         fb.used = resp.used_bytes || 0;
         fb.quota = resp.quota_bytes || 0;
     } catch (err) {
-        pane.querySelector(".fb-list").innerHTML = `<div class="empty-state">file list failed: ${esc(err)}</div>`;
+        if (generation !== serverViewGeneration || channelID !== fb.channelID || folder !== fb.folder) return;
+        list.innerHTML = `<div class="empty-state" role="alert">File list failed: ${esc(err)}</div>`;
         return;
+    } finally {
+        if (generation === serverViewGeneration && channelID === fb.channelID && folder === fb.folder) {
+            list.removeAttribute("aria-busy");
+        }
     }
     renderFbChrome();
     renderFbList();
@@ -118,8 +135,9 @@ function renderFbChrome() {
     crumb.innerHTML = "";
     const mk = (label, folder) => {
         const a = document.createElement("a");
+        a.href = "#";
         a.textContent = label;
-        a.onclick = () => { fb.folder = folder; refreshFiles(); };
+        a.onclick = (event) => { event.preventDefault(); fb.folder = folder; refreshFiles(); };
         crumb.appendChild(a);
         crumb.appendChild(document.createTextNode(" / "));
     };
@@ -134,10 +152,18 @@ function renderFbChrome() {
         const pct = Math.min(100, Math.round(fb.used / fb.quota * 100));
         q.innerHTML = `<div class="fb-quota-fill${pct > 90 ? " hot" : ""}" style="width:${pct}%"></div>`;
         q.title = `${humanBytes(fb.used)} of ${humanBytes(fb.quota)} used (${pct}%)`;
+        q.setAttribute("role", "progressbar");
+        q.setAttribute("aria-label", "Channel file storage used");
+        q.setAttribute("aria-valuemin", "0");
+        q.setAttribute("aria-valuemax", "100");
+        q.setAttribute("aria-valuenow", String(pct));
         q.classList.remove("hidden");
     } else {
         q.classList.add("hidden");
         q.title = `${humanBytes(fb.used)} used (no quota)`;
+        for (const attr of ["role", "aria-label", "aria-valuemin", "aria-valuemax", "aria-valuenow"]) {
+            q.removeAttribute(attr);
+        }
     }
 }
 
@@ -159,8 +185,13 @@ function renderFbList() {
         tr.className = "fb-folder";
         tr.innerHTML = `<td colspan="6">📁 <a class="fb-folder-link"></a></td>`;
         const link = tr.querySelector(".fb-folder-link");
+        link.href = "#";
         link.textContent = sub + "/";
-        link.onclick = () => { fb.folder = (fb.folder ? fb.folder + "/" : "") + sub; refreshFiles(); };
+        link.onclick = (event) => {
+            event.preventDefault();
+            fb.folder = (fb.folder ? fb.folder + "/" : "") + sub;
+            refreshFiles();
+        };
         tbody.appendChild(tr);
     }
 
@@ -236,8 +267,11 @@ let xferSeq = 0;
 // transfer list can retry it — a retry into the same destination resumes from
 // the partial file rather than starting over (259).
 async function startDownload(args, id) {
+    if (args.generation !== undefined && args.generation !== serverViewGeneration) return;
+    const generation = serverViewGeneration;
     id = id || `dl-${++xferSeq}`;
     const err = await App().DownloadFileProgress(id, args.channelID, args.folder, args.name, args.path, args.size || 0);
+    if (generation !== serverViewGeneration) return;
     if (err) {
         V().toast("download failed: " + err, "warn");
         return;
@@ -250,37 +284,51 @@ async function startDownload(args, id) {
 const downloadArgs = new Map();
 
 async function downloadFile(e) {
+    const generation = serverViewGeneration;
+    const channelID = fb.channelID;
+    const folder = fb.folder;
     // The configured download folder (Downloads settings) wins; only fall back
     // to the save dialog when the user has not set one.
     let path = await App().DownloadPath(e.name);
+    if (generation !== serverViewGeneration) return;
     if (!path) path = await App().PickSavePath(e.name);
-    if (!path) return;
-    startDownload({ channelID: fb.channelID, folder: fb.folder, name: e.name, path, size: e.size || 0 });
+    if (!path || generation !== serverViewGeneration) return;
+    startDownload({ channelID, folder, name: e.name, path, size: e.size || 0, generation });
 }
 
 async function linkFile(e) {
+    const generation = serverViewGeneration;
+    const channelID = fb.channelID;
+    const folder = fb.folder;
+    const host = (V().state.lastConnect?.addr || location.host).split(":")[0];
     try {
-        const resp = await App().FileLink(fb.channelID, fb.folder, e.name);
+        const resp = await App().FileLink(channelID, folder, e.name);
+        if (generation !== serverViewGeneration) return;
         // The client builds the URL from its own control host (the server
         // cannot know its published address behind Docker/NAT).
-        const host = (V().state.lastConnect?.addr || location.host).split(":")[0];
         const url = `http://${host}:${resp.health_port}${resp.path}`;
         await navigator.clipboard.writeText(url);
+        if (generation !== serverViewGeneration) return;
         V().toast("download link copied (valid until " + fmtDate(resp.expires_at * 1000) + ")");
     } catch (err) {
-        V().toast("link failed: " + err, "warn");
+        if (generation === serverViewGeneration) V().toast("link failed: " + err, "warn");
     }
 }
 
 async function verifyFile(e, tr) {
+    const generation = serverViewGeneration;
+    const channelID = fb.channelID;
+    const folder = fb.folder;
     const sha = tr.querySelector(".fb-sha");
     sha.textContent = "…";
     try {
-        const ok = await App().VerifyFile(fb.channelID, fb.folder, e.name, e.sha256);
+        const ok = await App().VerifyFile(channelID, folder, e.name, e.sha256);
+        if (generation !== serverViewGeneration || !tr.isConnected) return;
         sha.textContent = ok ? "✓ ok" : "✗ BAD";
         sha.className = "mono fb-sha " + (ok ? "verify-ok" : "verify-bad");
         setTimeout(() => { sha.textContent = e.sha256.slice(0, 8); sha.className = "mono fb-sha"; }, 4000);
     } catch (err) {
+        if (generation !== serverViewGeneration || !tr.isConnected) return;
         sha.textContent = "err";
         V().toast("verify failed: " + err, "warn");
     }
@@ -296,8 +344,12 @@ async function toggleVersions(e, tr) {
     vr.className = "fb-versions";
     vr.innerHTML = `<td colspan="6"><div class="fb-ver-list">loading…</div></td>`;
     tr.after(vr);
+    const generation = serverViewGeneration;
+    const channelID = fb.channelID;
+    const folder = fb.folder;
     try {
-        const resp = await App().FileVersions(fb.channelID, fb.folder, e.name);
+        const resp = await App().FileVersions(channelID, folder, e.name);
+        if (generation !== serverViewGeneration || !vr.isConnected) return;
         const list = vr.querySelector(".fb-ver-list");
         if (!resp.entries || resp.entries.length === 0) {
             list.textContent = "no old versions";
@@ -318,6 +370,7 @@ async function toggleVersions(e, tr) {
             list.appendChild(row);
         }
     } catch (err) {
+        if (generation !== serverViewGeneration || !vr.isConnected) return;
         vr.querySelector(".fb-ver-list").textContent = "versions failed: " + err;
     }
 }
@@ -332,7 +385,11 @@ async function renameFile(e) {
         newFolder = name.slice(0, i);
         newName = name.slice(i + 1);
     }
-    const err = await App().FileRename(fb.channelID, fb.folder, e.name, newFolder, newName, 0);
+    const generation = serverViewGeneration;
+    const channelID = fb.channelID;
+    const folder = fb.folder;
+    const err = await App().FileRename(channelID, folder, e.name, newFolder, newName, 0);
+    if (generation !== serverViewGeneration) return;
     if (err) V().toast("rename failed: " + err, "warn");
     setTimeout(refreshFiles, 400);
 }
@@ -372,20 +429,30 @@ async function moveToChannel(e) {
     overlay.querySelector(".dlg-cancel").onclick = close;
     overlay.onclick = (ev) => { if (ev.target === overlay) close(); };
     overlay.querySelector(".dlg-ok").onclick = async () => {
+        if (!isCurrentServerDialog(overlay)) return;
         const target = parseInt(sel.value, 10);
         const folder = overlay.querySelector(".fb-move-folder").value.replace(/^\/+|\/+$/g, "");
+        const sourceChannelID = fb.channelID;
+        const sourceFolder = fb.folder;
+        const generation = serverViewGeneration;
+        const targetName = sel.options[sel.selectedIndex].textContent;
         close();
-        const err = await App().FileRename(fb.channelID, fb.folder, e.name, folder, e.name, target);
+        const err = await App().FileRename(sourceChannelID, sourceFolder, e.name, folder, e.name, target);
+        if (generation !== serverViewGeneration) return;
         if (err) V().toast("move failed: " + err, "warn");
-        else V().toast(`moved ${e.name} to ${sel.options[sel.selectedIndex].textContent}`);
+        else V().toast(`moved ${e.name} to ${targetName}`);
         setTimeout(refreshFiles, 400);
     };
-    document.body.appendChild(overlay);
+    mountServerDialog(overlay);
 }
 
 async function deleteFile(e) {
     if (!confirm(`Delete ${e.name}?`)) return;
-    const err = await App().FileDelete(fb.channelID, fb.folder, e.name);
+    const generation = serverViewGeneration;
+    const channelID = fb.channelID;
+    const folder = fb.folder;
+    const err = await App().FileDelete(channelID, folder, e.name);
+    if (generation !== serverViewGeneration) return;
     if (err) V().toast("delete failed: " + err, "warn");
     setTimeout(refreshFiles, 400);
 }
@@ -414,7 +481,7 @@ function queueUploads(files) {
             V().toast(`${f.name} is too large to drop (${humanBytes(f.size)}) — use ⬆ to upload it`, "warn");
             continue;
         }
-        uploadQueue.push({ file: f, folder: fb.folder });
+        uploadQueue.push({ file: f, channelID: fb.channelID, folder: fb.folder, generation: serverViewGeneration });
         queued++;
     }
     if (queued) V().toast(queued + " file(s) queued for upload");
@@ -427,16 +494,22 @@ function queueUploadPaths(paths) {
         V().toast("join a channel first", "warn");
         return;
     }
-    for (const p of paths) uploadQueue.push({ path: p, folder: fb.folder });
+    for (const p of paths) uploadQueue.push({ path: p, channelID: fb.channelID, folder: fb.folder, generation: serverViewGeneration });
     V().toast(paths.length + " file(s) queued for upload");
     pumpUploads();
 }
 
 // awaitUpload keeps the queue sequential (260): the next file starts only once
 // this one has left the active state.
-function awaitUpload(id) {
+function awaitUpload(id, generation) {
     const deadline = Date.now() + UPLOAD_WAIT_TIMEOUT_MS;
     const check = setInterval(() => {
+        if (generation !== serverViewGeneration) {
+            clearInterval(check);
+            uploadActive = false;
+            pumpUploads();
+            return;
+        }
         const t = transfers.get(id);
         if (t && t.status !== "active") {
             clearInterval(check);
@@ -464,17 +537,32 @@ function bytesToBase64(bytes) {
 async function pumpUploads() {
     if (uploadActive || uploadQueue.length === 0) return;
     uploadActive = true;
-    const { file, path, folder } = uploadQueue.shift();
+    const { file, path, channelID, folder, generation } = uploadQueue.shift();
+    if (generation !== serverViewGeneration) {
+        uploadActive = false;
+        pumpUploads();
+        return;
+    }
     const id = `up-${++xferSeq}`;
     const label = path ? path.split(/[\\/]/).pop() : file.name;
     try {
         let err;
         if (path) {
-            err = await App().UploadPathProgress(id, fb.channelID, folder, path);
+            err = await App().UploadPathProgress(id, channelID, folder, path);
         } else {
             const buf = await file.arrayBuffer();
+            if (generation !== serverViewGeneration) {
+                uploadActive = false;
+                pumpUploads();
+                return;
+            }
             const b64 = bytesToBase64(new Uint8Array(buf));
-            err = await App().UploadFileProgress(id, fb.channelID, folder, file.name, b64);
+            err = await App().UploadFileProgress(id, channelID, folder, file.name, b64);
+        }
+        if (generation !== serverViewGeneration) {
+            uploadActive = false;
+            pumpUploads();
+            return;
         }
         if (err) {
             V().toast("upload " + label + " failed: " + err, "warn");
@@ -482,7 +570,7 @@ async function pumpUploads() {
             pumpUploads();
             return;
         }
-        awaitUpload(id);
+        awaitUpload(id, generation);
     } catch (err) {
         V().toast("reading " + label + " failed: " + err, "warn");
         uploadActive = false;
@@ -510,8 +598,15 @@ function openTransfers() {
         </div>`;
     trWin.overlay = overlay;
     overlay.querySelector(".tr-close").onclick = closeTransfers;
-    overlay.onclick = (e) => { if (e.target === overlay) closeTransfers(); };
-    document.body.appendChild(overlay);
+    overlay.onclick = (e) => { if (e.target === overlay) closeDialog(overlay, "cancel"); };
+    mountServerDialog(overlay, {
+        onClose: () => {
+            trWin.open = false;
+            if (sparkTimer) clearInterval(sparkTimer);
+            sparkTimer = null;
+            if (trWin.overlay === overlay) trWin.overlay = null;
+        },
+    });
     renderTransfers();
     sparkTimer = setInterval(() => {
         sparkSamples.push(activeBps());
@@ -522,9 +617,7 @@ function openTransfers() {
 
 function closeTransfers() {
     if (!trWin.open) return;
-    trWin.open = false;
-    clearInterval(sparkTimer);
-    trWin.overlay.remove();
+    closeDialog(trWin.overlay);
 }
 
 function drawSpark() {
@@ -600,19 +693,28 @@ function renderTransfers() {
 // --- server icon + banner (270) ------------------------------------------------
 
 async function loadServerIcon() {
+    const generation = serverViewGeneration;
     try {
         const data = await App().ServerIconGet();
+        if (generation !== serverViewGeneration) return;
         const el = document.getElementById("server-icon");
-        if (data && data.data_base64) {
-            el.src = `data:${data.content_type};base64,${data.data_base64}`;
+        const url = imageDataURL(data);
+        if (url) {
+            el.src = url;
             el.classList.remove("hidden");
         } else {
+            el.removeAttribute("src");
             el.classList.add("hidden");
         }
-    } catch { /* no icon */ }
+    } catch {
+        if (generation !== serverViewGeneration) return;
+        const el = document.getElementById("server-icon");
+        el.removeAttribute("src");
+        el.classList.add("hidden");
+    }
     // Both halves of the server's branding load on the same trigger (connect
     // and menu refresh), so the banner rides along here.
-    loadServerBanner();
+    if (generation === serverViewGeneration) loadServerBanner();
 }
 
 // bannerEl returns the banner image, creating it under the sidebar brand on
@@ -634,18 +736,23 @@ function bannerEl() {
 }
 
 async function loadServerBanner() {
+    const generation = serverViewGeneration;
     const el = bannerEl();
     if (!el) return;
     try {
         const data = await App().ServerBannerGet();
-        if (data && data.data_base64) {
-            el.src = `data:${data.content_type};base64,${data.data_base64}`;
+        if (generation !== serverViewGeneration) return;
+        const url = imageDataURL(data);
+        if (url) {
+            el.src = url;
             el.style.display = "";
         } else {
             el.removeAttribute("src");
             el.style.display = "none";
         }
     } catch {
+        if (generation !== serverViewGeneration) return;
+        el.removeAttribute("src");
         el.style.display = "none";
     }
 }
@@ -655,9 +762,11 @@ async function loadServerBanner() {
 async function setServerBanner() {
     // Banners are wide, so allow more pixels than a 256px icon; the quality
     // loop still keeps it under the server's 256 KiB cap (274).
+    const generation = serverViewGeneration;
     const img = await pickIcon(1600, 0.85);
-    if (!img) return;
+    if (!img || generation !== serverViewGeneration) return;
     const err = await App().ServerBannerSet(img.dataBase64);
+    if (generation !== serverViewGeneration) return;
     if (err) {
         V().toast("banner failed: " + err, "warn");
         return;
@@ -682,10 +791,13 @@ function decorateChannelIcons() {
         const slot = row.querySelector(".ch-icon");
         if (!slot || slot.dataset.iconFor === String(id)) continue;
         if (!channelIcons.has(id)) {
+            const generation = serverViewGeneration;
             channelIcons.set(id, null); // claim it so concurrent passes do not refetch
             App().ChannelIconGet(id).then((d) => {
-                if (d && d.data_base64) {
-                    channelIcons.set(id, `data:${d.content_type};base64,${d.data_base64}`);
+                if (generation !== serverViewGeneration) return;
+                const url = imageDataURL(d);
+                if (url) {
+                    channelIcons.set(id, url);
                     decorateChannelIcons();
                 }
             }).catch(() => { /* no icon */ });
@@ -716,6 +828,28 @@ function watchChannelIcons() {
     decorateChannelIcons();
 }
 
+function resetServerView() {
+    serverViewGeneration++;
+    channelIcons.clear();
+    fb.channelID = 0;
+    fb.folder = "";
+    fb.folders = [];
+    fb.entries = [];
+    fb.used = 0;
+    fb.quota = 0;
+    const icon = document.getElementById("server-icon");
+    if (icon) {
+        icon.removeAttribute("src");
+        icon.classList.add("hidden");
+    }
+    const banner = document.getElementById("server-banner");
+    if (banner) {
+        banner.removeAttribute("src");
+        banner.style.display = "none";
+    }
+    if (fb.open) refreshFiles();
+}
+
 // --- emoji manager (272) --------------------------------------------------------
 
 // The picker and its quick-upload live in the chat pane; this is the full
@@ -739,7 +873,7 @@ async function openEmojiManager() {
     overlay.querySelector(".em-close").onclick = close;
     overlay.onclick = (e) => { if (e.target === overlay) close(); };
     overlay.querySelector(".em-add").onclick = () => addEmoji(overlay);
-    document.body.appendChild(overlay);
+    mountServerDialog(overlay);
     renderEmojiList(overlay);
 }
 
@@ -749,9 +883,11 @@ async function renderEmojiList(overlay) {
     try {
         resp = await App().EmojiList();
     } catch (err) {
+        if (!isCurrentServerDialog(overlay)) return;
         list.textContent = "emoji list failed: " + err;
         return;
     }
+    if (!isCurrentServerDialog(overlay)) return;
     const emojis = resp.emojis || [];
     if (emojis.length === 0) {
         list.innerHTML = `<div class="empty-state">No custom emoji yet</div>`;
@@ -765,8 +901,13 @@ async function renderEmojiList(overlay) {
         const img = document.createElement("img");
         img.style.cssText = "width:24px;height:24px;object-fit:contain";
         img.alt = e.name;
+        const generation = serverViewGeneration;
         App().EmojiGet(e.name)
-            .then((d) => { if (d && d.data_base64) img.src = `data:${d.content_type};base64,${d.data_base64}`; })
+            .then((d) => {
+                if (generation !== serverViewGeneration) return;
+                const url = imageDataURL(d);
+                if (url) img.src = url;
+            })
             .catch(() => { /* preview is optional */ });
         const name = document.createElement("span");
         name.className = "mono";
@@ -777,9 +918,11 @@ async function renderEmojiList(overlay) {
         ren.textContent = "✎";
         ren.title = "rename (messages already sent keep the old name)";
         ren.onclick = async () => {
+            if (!isCurrentServerDialog(overlay)) return;
             const next = prompt("New emoji name (a-z 0-9 _ -):", e.name);
             if (!next || next === e.name) return;
             const err = await App().EmojiRename(e.name, next);
+            if (!isCurrentServerDialog(overlay)) return;
             if (err) V().toast("rename failed: " + err, "warn");
             setTimeout(() => renderEmojiList(overlay), 400);
         };
@@ -788,8 +931,10 @@ async function renderEmojiList(overlay) {
         del.textContent = "🗑";
         del.title = "delete";
         del.onclick = async () => {
+            if (!isCurrentServerDialog(overlay)) return;
             if (!confirm(`Delete :${e.name}:?`)) return;
             const err = await App().EmojiDelete(e.name);
+            if (!isCurrentServerDialog(overlay)) return;
             if (err) V().toast("delete failed: " + err, "warn");
             setTimeout(() => renderEmojiList(overlay), 400);
         };
@@ -802,8 +947,9 @@ async function addEmoji(overlay) {
     const name = prompt("Emoji name (a-z 0-9 _ -):");
     if (!name) return;
     const img = await pickIcon(128, 0.9);
-    if (!img) return;
+    if (!img || !isCurrentServerDialog(overlay)) return;
     const err = await App().EmojiUpload(name, img.dataBase64);
+    if (!isCurrentServerDialog(overlay)) return;
     if (err) {
         V().toast("upload failed: " + err, "warn");
         return;
@@ -819,15 +965,15 @@ export function initFilesUI() {
         <div class="fb-toolbar">
             <span class="fb-crumb"></span>
             <span class="fb-spacer"></span>
-            <button class="icon-btn fb-refresh" title="Refresh">⟳</button>
+            <button class="icon-btn fb-refresh" title="Refresh" aria-label="Refresh files">⟳</button>
             <button class="icon-btn fb-upload" title="Upload files"><span aria-hidden="true">⬆</span><span>Upload</span></button>
-            <button class="icon-btn fb-mkdir" title="New folder (virtual — persists only while it contains files)">📁+</button>
-            <button class="icon-btn fb-emoji" title="Custom emoji manager (272)">😀</button>
-            <button class="icon-btn fb-banner" title="Set the server banner (admin, 270)">🖼</button>
-            <button class="icon-btn fb-transfers" title="Transfers">⇅</button>
+            <button class="icon-btn fb-mkdir" title="New folder (virtual — persists only while it contains files)" aria-label="Create folder">📁+</button>
+            <button class="icon-btn fb-emoji" title="Custom emoji manager (272)" aria-label="Manage custom emoji">😀</button>
+            <button class="icon-btn fb-banner" title="Set the server banner (admin, 270)" aria-label="Set server banner">🖼</button>
+            <button class="icon-btn fb-transfers" title="Transfers" aria-label="Open transfers">⇅</button>
         </div>
         <div class="fb-quota hidden"><div class="fb-quota-fill"></div></div>
-        <div class="fb-list"></div>`;
+        <div class="fb-list" aria-label="Channel files"></div>`;
 
     pane.querySelector(".fb-refresh").onclick = refreshFiles;
     pane.querySelector(".fb-transfers").onclick = openTransfers;
@@ -836,8 +982,9 @@ export function initFilesUI() {
     pane.querySelector(".fb-upload").onclick = async () => {
         // Native picker, not <input type=file>: it yields paths, which upload
         // by streaming instead of by base64 blob (259).
+        const generation = serverViewGeneration;
         const paths = await App().PickUploadPaths();
-        if (paths && paths.length) queueUploadPaths(paths);
+        if (generation === serverViewGeneration && paths && paths.length) queueUploadPaths(paths);
     };
     pane.querySelector(".fb-mkdir").onclick = () => {
         const name = prompt("New folder name (virtual — persists only while it contains files):");
@@ -872,6 +1019,9 @@ export function initFilesUI() {
         document.getElementById("center").classList.toggle("files-active", files);
         tabChat.classList.toggle("active", !files);
         tabFiles.classList.toggle("active", files);
+        tabChat.setAttribute("aria-pressed", String(!files));
+        tabFiles.setAttribute("aria-pressed", String(files));
+        pane.setAttribute("aria-hidden", String(!files));
         if (files) {
             fb.channelID = V().state.myChannelID;
             refreshFiles();
@@ -879,6 +1029,15 @@ export function initFilesUI() {
     };
     tabChat.onclick = () => setTab(false);
     tabFiles.onclick = () => setTab(true);
+    [tabChat, tabFiles].forEach((tab, index, tabs) => {
+        tab.addEventListener("keydown", (event) => {
+            if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+            event.preventDefault();
+            const next = wrappedIndex(index, tabs.length, event.key === "ArrowRight" ? 1 : -1);
+            tabs[next].focus();
+            tabs[next].click();
+        });
+    });
     document.getElementById("tab-transfers").onclick = openTransfers;
 
     window.runtime.EventsOn("ft_progress", trackTransfer);
@@ -906,7 +1065,7 @@ export function initFilesUI() {
     watchChannelIcons();
 
     window.__voicxFiles = {
-        refreshFiles, openTransfers, loadServerIcon,
+        refreshFiles, openTransfers, loadServerIcon, resetServerView,
         // Follows channel changes (256): browsing follows the channel I'm in.
         onChannelChanged() {
             if (fb.open) {

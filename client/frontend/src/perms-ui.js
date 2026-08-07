@@ -3,6 +3,8 @@
 // icons), the audit log viewer, and the ban list dialog. All views degrade
 // gracefully for non-privileged users (read-only notice instead of controls).
 import { pickIcon } from "./image-tools.js";
+import { closeDialog, isCurrentServerDialog, mountServerDialog, registerDialogLifecycle } from "./modal.js";
+import { imageDataURL } from "./safe-media.js";
 
 const V = () => window.__voicx;
 const App = () => window.go.main.App;
@@ -78,13 +80,15 @@ function modal(cls, html) {
     o.innerHTML = `<div class="dlg ${cls}"></div>`;
     const d = o.firstElementChild;
     d.innerHTML = html;
-    o.onclick = (e) => { if (e.target === o) o.remove(); };
-    document.body.appendChild(o);
+    o.onclick = (e) => { if (e.target === o) closeDialog(o, "cancel"); };
+    mountServerDialog(o);
     return { overlay: o, dlg: d, q: (sel) => d.querySelector(sel) };
 }
 
 function confirmDlg(title, bodyHtml, okLabel, danger) {
     return new Promise((resolve) => {
+        let result = false;
+        let settled = false;
         const { overlay, dlg, q } = modal("confirm-dlg", `
             <h3></h3>
             <div class="dlg-text confirm-body"></div>
@@ -95,8 +99,16 @@ function confirmDlg(title, bodyHtml, okLabel, danger) {
         dlg.querySelector("h3").textContent = title;
         q(".confirm-body").innerHTML = bodyHtml;
         q(".dlg-ok").textContent = okLabel;
-        q(".dlg-ok").onclick = () => { overlay.remove(); resolve(true); };
-        q(".dlg-cancel").onclick = () => { overlay.remove(); resolve(false); };
+        registerDialogLifecycle(overlay, {
+            onCancel: () => { result = false; },
+            onClose: () => {
+                if (settled) return;
+                settled = true;
+                resolve(result);
+            },
+        });
+        q(".dlg-ok").onclick = () => { result = true; closeDialog(overlay); };
+        q(".dlg-cancel").onclick = () => closeDialog(overlay, "cancel");
     });
 }
 
@@ -122,23 +134,32 @@ function fmtTime(unix) {
 // sort_id). Called on connect and after group events.
 async function refreshGroups() {
     const { state } = V();
+    const generation = state.serverGeneration;
     try {
         const list = await App().GroupList("server");
-        state.serverGroups = list.groups || [];
+        if (generation !== state.serverGeneration) return;
+        const groups = list.groups || [];
         const byUID = new Map();
-        for (const g of state.serverGroups) {
+        for (const g of groups) {
             if (g.member_count === 0) continue;
             try {
                 const members = await App().GroupMembers("server", g.id, 0);
+                if (generation !== state.serverGeneration) return;
                 for (const m of members.members || []) {
                     if (!byUID.has(m.unique_id)) byUID.set(m.unique_id, []);
                     byUID.get(m.unique_id).push(g);
                 }
-            } catch { /* member listing is best-effort */ }
+            } catch {
+                if (generation !== state.serverGeneration) return;
+                // Member listing is best-effort for the active server.
+            }
         }
         for (const arr of byUID.values()) arr.sort((a, b) => a.sort_id - b.sort_id);
+        if (generation !== state.serverGeneration) return;
+        state.serverGroups = groups;
         state.groupByUID = byUID;
     } catch {
+        if (generation !== state.serverGeneration) return;
         state.serverGroups = [];
         state.groupByUID = new Map();
     }
@@ -171,14 +192,17 @@ function hoistedGroups() {
 // groupIconURL fetches+caches a group icon as a data URL (state.groupIcons).
 async function groupIconURL(groupID) {
     const { state } = V();
+    const generation = state.serverGeneration;
     if (!state.groupIcons) state.groupIcons = new Map();
     if (state.groupIcons.has(groupID)) return state.groupIcons.get(groupID);
     try {
         const data = await App().GroupIconGet(groupID);
-        const url = data && data.data_base64 ? `data:${data.content_type};base64,${data.data_base64}` : null;
+        if (generation !== state.serverGeneration) return null;
+        const url = imageDataURL(data);
         state.groupIcons.set(groupID, url);
         return url;
     } catch {
+        if (generation !== state.serverGeneration) return null;
         state.groupIcons.set(groupID, null);
         return null;
     }
@@ -188,6 +212,10 @@ async function groupIconURL(groupID) {
 
 // pm holds the open manager's state (null when closed).
 let pm = null;
+
+function currentManager(manager) {
+    return !!manager && pm === manager && isCurrentServerDialog(manager.overlay);
+}
 
 function openPermissionManager() {
     if (pm) return;
@@ -230,6 +258,11 @@ function openPermissionManager() {
     pm.overlay = overlay;
     pm.dlg = dlg;
     pm.q = q;
+    registerDialogLifecycle(overlay, {
+        onClose: () => {
+            if (pm?.overlay === overlay) pm = null;
+        },
+    });
     q(".pm-close").onclick = () => closePermissionManager();
     q(".pm-filter").oninput = (e) => { pm.filter = e.target.value.trim().toLowerCase(); renderGrid(); };
     q(".pm-matrix").onclick = () => openChannelPermissionMatrix();
@@ -252,15 +285,15 @@ function openPermissionManager() {
 
 function closePermissionManager() {
     if (!pm) return;
-    pm.overlay.remove();
-    pm = null;
+    closeDialog(pm.overlay);
 }
 
 // openChannelPermissionMatrix compares a selected client's effective values
 // across several channel contexts. Each cell comes from the server's trace
 // resolver, so inherited tiers and overrides match enforcement exactly.
 async function openChannelPermissionMatrix() {
-    const uid = pm?.target?.uniqueID || "";
+    const manager = pm;
+    const uid = manager?.target?.uniqueID || "";
     if (!uid) return V().toast("select a client target first", "warn");
     const channels = [...(V().state.channels || [])].sort((a, b) =>
         (a.ParentID - b.ParentID) || (a.OrderIndex - b.OrderIndex) || (a.ChannelID - b.ChannelID));
@@ -273,7 +306,7 @@ async function openChannelPermissionMatrix() {
         <textarea class="dlg-input pm-matrix-keys" rows="3"></textarea>
         <div class="pm-matrix-result"></div>
         <div class="dlg-buttons"><button class="dlg-cancel">Close</button><button class="dlg-ok">Compare</button></div>`);
-    q(".pm-matrix-who").textContent = pm.target.label + " — values include inherited permissions";
+    q(".pm-matrix-who").textContent = manager.target.label + " — values include inherited permissions";
     const chooser = q(".pm-matrix-channels");
     const current = V().state.myChannelID || 0;
     const defaults = new Set(channels.filter((ch) => ch.ChannelID === current || ch.ParentID === current).slice(0, 8).map((ch) => ch.ChannelID));
@@ -291,7 +324,7 @@ async function openChannelPermissionMatrix() {
     const common = ["i_channel_join_power", "i_client_talk_power", "i_client_whisper_power",
         "b_client_use_channel_command", "b_client_video_publish", "b_client_issue_screenshare_1080p",
         "i_ft_file_upload_power", "i_ft_file_download_power", "b_channel_modify", "b_channel_delete"];
-    q(".pm-matrix-keys").value = [...new Set([...pm.entries.keys(), ...common])].slice(0, 20).join(", ");
+    q(".pm-matrix-keys").value = [...new Set([...manager.entries.keys(), ...common])].slice(0, 20).join(", ");
     q(".dlg-cancel").onclick = () => overlay.remove();
     q(".dlg-ok").onclick = async () => {
         const selected = [...chooser.querySelectorAll("input:checked")].map((x) => Number(x.value)).slice(0, 12);
@@ -304,16 +337,20 @@ async function openChannelPermissionMatrix() {
         let next = 0;
         const worker = async () => {
             while (next < pending.length) {
+                if (!isCurrentServerDialog(overlay)) return;
                 const { channelID, key } = pending[next++];
                 try {
                     const trace = await App().PermTrace(uid, key, channelID);
+                    if (!isCurrentServerDialog(overlay)) return;
                     values.set(channelID + ":" + key, { value: trace.effective, tier: trace.effective_tier || "unset" });
                 } catch {
+                    if (!isCurrentServerDialog(overlay)) return;
                     values.set(channelID + ":" + key, { value: "?", tier: "error" });
                 }
             }
         };
         await Promise.all(Array.from({ length: Math.min(6, pending.length) }, worker));
+        if (!isCurrentServerDialog(overlay)) return;
         let html = `<table class="perm-grid trace-grid"><thead><tr><th>permission</th>`;
         for (const id of selected) html += `<th>${esc(channels.find((ch) => ch.ChannelID === id)?.Name || id)}</th>`;
         html += "</tr></thead><tbody>";
@@ -340,9 +377,11 @@ function tabTier(tab) {
 }
 
 async function renderTargets() {
-    const list = pm.q(".pm-targets");
-    const actions = pm.q(".pm-actions");
-    const members = pm.q(".pm-members");
+    const manager = pm;
+    if (!currentManager(manager)) return;
+    const list = manager.q(".pm-targets");
+    const actions = manager.q(".pm-actions");
+    const members = manager.q(".pm-members");
     list.innerHTML = `<div class="empty-state">loading…</div>`;
     actions.innerHTML = "";
     members.innerHTML = "";
@@ -355,6 +394,7 @@ async function renderTargets() {
             const resp = await App().GroupList(type);
             groups = resp.groups || [];
         } catch { /* handled below */ }
+        if (!currentManager(manager)) return;
         list.innerHTML = groups.length ? "" : `<div class="empty-state">No ${type} groups</div>`;
         for (const g of groups) {
             const row = document.createElement("div");
@@ -419,15 +459,20 @@ function selectTarget(t) {
 
 // loadEntries reads the target's current entries via PermList (6b read path).
 async function loadEntries() {
-    pm.entries = new Map();
+    const manager = pm;
+    if (!currentManager(manager)) return;
+    manager.entries = new Map();
     renderGrid();
-    if (!pm.target || !canPermManage()) return;
+    if (!manager.target || !canPermManage()) return;
+    const target = manager.target;
+    let entries = [];
     try {
-        const resp = await App().PermList(pm.target.tier, pm.target.groupID || 0, pm.target.uniqueID || "", pm.target.channelID || 0);
-        for (const e of resp.entries || []) {
-            pm.entries.set(e.key, { value: e.value, grant: e.grant, skip: !!e.skip, negate: !!e.negate });
-        }
+        const resp = await App().PermList(target.tier, target.groupID || 0, target.uniqueID || "", target.channelID || 0);
+        entries = resp.entries || [];
     } catch { /* stale/unknown target: show empty grid */ }
+    if (!currentManager(manager) || manager.target !== target) return;
+    manager.entries = new Map(entries.map((e) => [e.key,
+        { value: e.value, grant: e.grant, skip: !!e.skip, negate: !!e.negate }]));
     renderGrid();
 }
 
@@ -453,16 +498,39 @@ function renderGrid() {
         const e = pm.entries.get(key);
         const tr = document.createElement("tr");
         tr.className = (e ? "set" : "unset") + (pm.editKey === key ? " editing" : "");
-        tr.innerHTML = `
-            <td class="mono">${key}</td>
-            <td>${e ? `<span class="pill-val">${e.value}</span>` : '<span class="pm-dim">—</span>'}</td>
-            <td>${e && e.grant ? `<span class="pill-val grant">${e.grant}</span>` : '<span class="pm-dim">—</span>'}</td>
-            <td title="${e?.negate ? "negate is an explicit denial and wins over positive lower tiers" : e?.skip ? "skip locks this value against lower-tier overrides" : ""}">${e ? [e.skip ? "skip" : "", e.negate ? "negate" : ""].filter(Boolean).join(",") : ""}</td>`;
+        const keyCell = document.createElement("td");
+        keyCell.className = "mono";
+        keyCell.textContent = key;
+
+        const valueCell = document.createElement("td");
+        valueCell.appendChild(permissionValue(e ? e.value : null, !!e));
+
+        const grantCell = document.createElement("td");
+        grantCell.appendChild(permissionValue(e?.grant, !!e?.grant, "grant"));
+
+        const flagsCell = document.createElement("td");
+        flagsCell.title = e?.negate
+            ? "negate is an explicit denial and wins over positive lower tiers"
+            : e?.skip
+                ? "skip locks this value against lower-tier overrides"
+                : "";
+        flagsCell.textContent = e
+            ? [e.skip ? "skip" : "", e.negate ? "negate" : ""].filter(Boolean).join(",")
+            : "";
+
+        tr.append(keyCell, valueCell, grantCell, flagsCell);
         tr.onclick = () => { pm.editKey = pm.editKey === key ? "" : key; renderGrid(); };
         tbody.appendChild(tr);
         if (pm.editKey === key) tbody.appendChild(editorRow(key, e));
     }
     grid.appendChild(table);
+}
+
+function permissionValue(value, present, extraClass = "") {
+    const span = document.createElement("span");
+    span.className = present ? `pill-val${extraClass ? " " + extraClass : ""}` : "pm-dim";
+    span.textContent = present ? value : "—";
+    return span;
 }
 
 // editorRow is the inline value editor (136/152/153): value + grant inputs,
@@ -473,26 +541,45 @@ function editorRow(key, e) {
     tr.className = "pm-editor-row";
     const td = document.createElement("td");
     td.colSpan = 4;
-    td.innerHTML = `
-        <div class="pm-editor">
-            <label>value <input type="number" class="dlg-input pe-value" value="${e ? e.value : 0}" /></label>
-            <label title="grant value: a non-admin may only set values ≤ their own grant for this key (TS3-lite)">grant
-                <input type="number" class="dlg-input pe-grant" value="${e ? e.grant : 0}" /></label>
-            <label title="skip: locks this entry against lower-tier overrides; use only when inheritance must stop here">
-                <input type="checkbox" class="pe-skip" ${e && e.skip ? "checked" : ""} /> skip</label>
-            <label title="negate: an explicit denial; it forces effective value 0 and overrides positive lower tiers">
-                <input type="checkbox" class="pe-negate" ${e && e.negate ? "checked" : ""} /> negate</label>
-            <button class="dlg-ok pe-set">Set</button>
-            <button class="dlg-cancel pe-unset" ${e ? "" : "disabled"}>Unset</button>
-            ${pm.tab === "clients" ? '<button class="dlg-cancel pe-trace">Trace</button>' : ""}
-        </div>`;
+    const editor = document.createElement("div");
+    editor.className = "pm-editor";
+
+    const valueInput = numberEditor("value", "pe-value", e ? e.value : 0);
+    const grantInput = numberEditor(
+        "grant",
+        "pe-grant",
+        e ? e.grant : 0,
+        "grant value: a non-admin may only set values ≤ their own grant for this key (TS3-lite)",
+    );
+    const skipInput = checkboxEditor(
+        "skip",
+        "pe-skip",
+        !!e?.skip,
+        "skip: locks this entry against lower-tier overrides; use only when inheritance must stop here",
+    );
+    const negateInput = checkboxEditor(
+        "negate",
+        "pe-negate",
+        !!e?.negate,
+        "negate: an explicit denial; it forces effective value 0 and overrides positive lower tiers",
+    );
+    const setButton = editorButton("dlg-ok pe-set", "Set");
+    const unsetButton = editorButton("dlg-cancel pe-unset", "Unset");
+    unsetButton.disabled = !e;
+    editor.append(valueInput, grantInput, skipInput, negateInput, setButton, unsetButton);
+    if (pm.tab === "clients") editor.appendChild(editorButton("dlg-cancel pe-trace", "Trace"));
+    td.appendChild(editor);
+
     const t = pm.target;
+    const manager = pm;
     td.querySelector(".pe-set").onclick = async () => {
+        if (!currentManager(manager) || manager.target !== t) return;
         const value = parseInt(td.querySelector(".pe-value").value, 10) || 0;
         const grant = parseInt(td.querySelector(".pe-grant").value, 10) || 0;
         const skip = td.querySelector(".pe-skip").checked;
         const negate = td.querySelector(".pe-negate").checked;
         const err = await App().PermSet(t.tier, t.groupID || 0, t.uniqueID || "", t.channelID || 0, key, value, grant, skip, negate);
+        if (!currentManager(manager) || manager.target !== t) return;
         if (err) V().toast("perm set failed: " + err, "warn");
         // Writes are fire-and-forget; grant-cap/permission errors arrive as
         // servererror toasts. Refresh shortly after (and once more to be sure).
@@ -500,7 +587,9 @@ function editorRow(key, e) {
         setTimeout(loadEntries, 1500);
     };
     td.querySelector(".pe-unset").onclick = async () => {
+        if (!currentManager(manager) || manager.target !== t) return;
         const err = await App().PermUnset(t.tier, t.groupID || 0, t.uniqueID || "", t.channelID || 0, key);
+        if (!currentManager(manager) || manager.target !== t) return;
         if (err) V().toast("perm unset failed: " + err, "warn");
         setTimeout(loadEntries, 400);
         setTimeout(loadEntries, 1500);
@@ -511,18 +600,54 @@ function editorRow(key, e) {
     return tr;
 }
 
+function numberEditor(labelText, inputClass, value, title = "") {
+    const label = document.createElement("label");
+    label.title = title;
+    label.appendChild(document.createTextNode(labelText + " "));
+    const input = document.createElement("input");
+    input.type = "number";
+    input.className = `dlg-input ${inputClass}`;
+    input.value = String(value);
+    label.appendChild(input);
+    return label;
+}
+
+function checkboxEditor(labelText, inputClass, checked, title) {
+    const label = document.createElement("label");
+    label.title = title;
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.className = inputClass;
+    input.checked = checked;
+    label.append(input, document.createTextNode(" " + labelText));
+    return label;
+}
+
+function editorButton(className, text) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = className;
+    button.textContent = text;
+    return button;
+}
+
 // renderTrace shows the "why" view (137/155): winning tier highlighted, every
 // tier's contribution in resolver order.
 async function renderTrace(key) {
-    const area = pm.q(".pm-trace");
+    const manager = pm;
+    if (!currentManager(manager)) return;
+    const target = manager.target;
+    const area = manager.q(".pm-trace");
     area.innerHTML = `<div class="empty-state">tracing…</div>`;
     let resp;
     try {
-        resp = await App().PermTrace(pm.target.uniqueID || "", key, pm.target.channelID || 0);
+        resp = await App().PermTrace(target.uniqueID || "", key, target.channelID || 0);
     } catch (err) {
+        if (!currentManager(manager) || manager.target !== target) return;
         area.innerHTML = `<div class="empty-state">trace failed: ${esc(err)}</div>`;
         return;
     }
+    if (!currentManager(manager) || manager.target !== target) return;
     const byTier = new Map((resp.entries || []).map((x) => [x.tier, x]));
     let html = `<div class="trace-head">why <span class="mono">${esc(key)}</span> = <span class="pill-val">${resp.effective}</span>`;
     html += resp.effective_tier ? ` (from <b>${esc(resp.effective_tier)}</b>)` : " (not set anywhere)";
@@ -552,12 +677,13 @@ function csvCell(v) {
 // exportPerms saves the current target's grid (148). JSON round-trips into an
 // importer; CSV is the shape a spreadsheet or a diff of two servers wants.
 async function exportPerms(format) {
-    if (!pm.target) {
+    const manager = pm;
+    if (!currentManager(manager) || !manager.target) {
         V().toast("select a target first", "warn");
         return;
     }
-    const t = pm.target;
-    const rows = [...pm.entries.entries()].map(([key, e]) => ({ key, ...e }));
+    const t = manager.target;
+    const rows = [...manager.entries.entries()].map(([key, e]) => ({ key, ...e }));
     const base = "permissions-" + (t.label || "target").replace(/[^a-z0-9_-]+/gi, "_");
     let name, body;
     if (format === "csv") {
@@ -579,6 +705,7 @@ async function exportPerms(format) {
         }, null, 2);
     }
     const err = await App().ExportChat(name, body);
+    if (!currentManager(manager) || manager.target !== t) return;
     if (err) V().toast("export failed: " + err, "warn");
     else V().toast("permissions exported (" + (format === "csv" ? "CSV" : "JSON") + ")");
 }
@@ -586,6 +713,7 @@ async function exportPerms(format) {
 // --- group management ----------------------------------------------------------
 
 function renderGroupActions(actions, type) {
+    const manager = pm;
     const manage = canGroupManage(type);
     if (!manage) {
         actions.innerHTML = denyNotice(type === "channel" ? "b_channel_group_manage" : "b_server_group_manage");
@@ -601,51 +729,61 @@ function renderGroupActions(actions, type) {
     renderCopyButton(actions);
 
     actions.querySelector(".ga-new").onclick = async () => {
+        if (!currentManager(manager)) return;
         const name = prompt("Group name:");
         if (!name) return;
         try {
             await App().GroupCreate(type, name, 0);
+            if (!currentManager(manager)) return;
             toastAudit("group created");
             renderTargets();
             refreshGroups().then(() => V().renderTree());
-        } catch (err) { V().toast("group create failed: " + err, "warn"); }
+        } catch (err) {
+            if (currentManager(manager)) V().toast("group create failed: " + err, "warn");
+        }
     };
     actions.querySelector(".ga-rename").onclick = async () => {
-        if (!pm.target?.groupID) return V().toast("select a group first", "warn");
-        const name = prompt("New name:", pm.target.label);
+        if (!currentManager(manager) || !manager.target?.groupID) return V().toast("select a group first", "warn");
+        const target = manager.target;
+        const name = prompt("New name:", target.label);
         if (!name) return;
-        const err = await App().GroupRename(type, pm.target.groupID, name);
+        const err = await App().GroupRename(type, target.groupID, name);
+        if (!currentManager(manager) || manager.target !== target) return;
         if (err) return V().toast("rename failed: " + err, "warn");
         setTimeout(() => { renderTargets(); refreshGroups().then(() => V().renderTree()); }, 400);
     };
     actions.querySelector(".ga-delete").onclick = async () => {
-        if (!pm.target?.groupID) return V().toast("select a group first", "warn");
-        const g = pm.target.group;
+        if (!currentManager(manager) || !manager.target?.groupID) return V().toast("select a group first", "warn");
+        const target = manager.target;
+        const g = target.group;
         const forceNote = g && g.member_count > 0
             ? `<p class="warn">Group "${esc(g.name)}" has ${g.member_count} member(s) — deleting requires force.</p>`
             : "";
         const ok = await confirmDlg("Delete group",
-            `<p>Delete ${type} group <b>${esc(pm.target.label)}</b>?</p>` + forceNote,
+            `<p>Delete ${type} group <b>${esc(target.label)}</b>?</p>` + forceNote,
             "Delete", true);
-        if (!ok) return;
-        const err = await App().GroupDelete(type, pm.target.groupID, !!(g && g.member_count > 0));
+        if (!ok || !currentManager(manager) || manager.target !== target) return;
+        const err = await App().GroupDelete(type, target.groupID, !!(g && g.member_count > 0));
+        if (!currentManager(manager) || manager.target !== target) return;
         if (err) return V().toast("delete failed: " + err, "warn");
-        pm.target = null;
+        manager.target = null;
         setTimeout(() => { renderTargets(); renderGrid(); refreshGroups().then(() => V().renderTree()); }, 400);
     };
     actions.querySelector(".ga-icon").onclick = async () => {
-        if (!pm.target?.groupID) return V().toast("select a group first", "warn");
+        if (!currentManager(manager) || !manager.target?.groupID) return V().toast("select a group first", "warn");
+        const target = manager.target;
         const img = await pickIcon();
-        if (!img) return;
-        const err = await App().GroupIconSet(pm.target.groupID, img.dataBase64);
+        if (!img || !currentManager(manager) || manager.target !== target) return;
+        const err = await App().GroupIconSet(target.groupID, img.dataBase64);
+        if (!currentManager(manager) || manager.target !== target) return;
         if (err) V().toast("icon failed: " + err, "warn");
         else V().toast("group icon updated");
     };
     const lookBtn = actions.querySelector(".ga-look");
     if (lookBtn) {
         lookBtn.onclick = () => {
-            if (!pm.target?.groupID) return V().toast("select a group first", "warn");
-            openGroupAppearance(pm.target.group);
+            if (!currentManager(manager) || !manager.target?.groupID) return V().toast("select a group first", "warn");
+            openGroupAppearance(manager.target.group);
         };
     }
 }
@@ -686,6 +824,7 @@ function openGroupAppearance(group) {
     q(".ga-look-clear").onclick = () => { hex.value = ""; };
     q(".dlg-cancel").onclick = () => overlay.remove();
     q(".dlg-ok").onclick = async () => {
+        if (!isCurrentServerDialog(overlay)) return;
         const color = hex.value.trim().toLowerCase();
         // The server rejects anything else with errCodeMalformed; catching it
         // here keeps the dialog open with the bad value still visible.
@@ -696,8 +835,10 @@ function openGroupAppearance(group) {
             await App().GroupEdit(g.id, color, q(".ga-look-hoist").checked,
                 parseInt(q(".ga-look-sort").value, 10) || 0);
         } catch (err) {
-            return V().toast("group appearance failed: " + err, "warn");
+            if (isCurrentServerDialog(overlay)) V().toast("group appearance failed: " + err, "warn");
+            return;
         }
+        if (!isCurrentServerDialog(overlay)) return;
         overlay.remove();
         toastAudit("group appearance updated");
         renderTargets();
@@ -751,7 +892,7 @@ async function openPermCopy(fromKind, fromID, fromLabel) {
                 <option value="channelgroup">channel group</option>
                 <option value="client">client (unique ID)</option>
             </select>
-            <select class="dlg-input pc-group"></select>
+            <select class="dlg-input pc-group" aria-label="Destination group"></select>
             <input class="dlg-input pc-uid hidden" placeholder="destination unique ID" />
             <label class="dlg-label">Channel scope (channel groups, and the per-channel client tier on both sides)</label>
             <select class="dlg-input pc-channel">
@@ -787,6 +928,7 @@ async function openPermCopy(fromKind, fromID, fromLabel) {
         let groups = [];
         try {
             const resp = await App().GroupList(kindSel.value === "channelgroup" ? "channel" : "server");
+            if (!isCurrentServerDialog(overlay)) return;
             groups = resp.groups || [];
         } catch { /* leave the select empty */ }
         for (const g of groups) {
@@ -801,6 +943,7 @@ async function openPermCopy(fromKind, fromID, fromLabel) {
 
     q(".dlg-cancel").onclick = () => overlay.remove();
     q(".dlg-ok").onclick = async () => {
+        if (!isCurrentServerDialog(overlay)) return;
         const toKind = kindSel.value;
         const toID = toKind === "client" ? q(".pc-uid").value.trim() : groupSel.value;
         if (!toID) return V().toast("pick a destination", "warn");
@@ -809,6 +952,7 @@ async function openPermCopy(fromKind, fromID, fromLabel) {
             return V().toast("source and destination are the same target", "warn");
         }
         const err = await App().PermCopy(fromKind, fromID, toKind, toID, channelID, q(".pc-replace").checked);
+        if (!isCurrentServerDialog(overlay)) return;
         overlay.remove();
         if (err) return V().toast("copy failed: " + err, "warn");
         toastAudit("permissions copied");
@@ -822,15 +966,18 @@ function renderTemplateButton(actions, tier) {
     btn.textContent = "Template…";
     btn.title = "Apply a built-in permission template (142)";
     btn.onclick = async () => {
-        if (!pm.target) return V().toast("select a target first", "warn");
+        const manager = pm;
+        if (!currentManager(manager) || !manager.target) return V().toast("select a target first", "warn");
+        const target = manager.target;
         const pick = await templatePicker();
-        if (!pick) return;
+        if (!pick || !currentManager(manager) || manager.target !== target) return;
         const ok = await confirmDlg("Apply template",
-            `<p>Apply the <b>${pick}</b> template to <b>${esc(pm.target.label)}</b>?</p>
+            `<p>Apply the <b>${pick}</b> template to <b>${esc(target.label)}</b>?</p>
              <p class="pm-dim">This writes the template's permission bundle through the normal write path (audited).</p>`,
             "Apply", false);
-        if (!ok) return;
-        const err = await App().PermTemplateApply(pick, tier, pm.target.groupID || 0, pm.target.uniqueID || "");
+        if (!ok || !currentManager(manager) || manager.target !== target) return;
+        const err = await App().PermTemplateApply(pick, tier, target.groupID || 0, target.uniqueID || "");
+        if (!currentManager(manager) || manager.target !== target) return;
         if (err) return V().toast("template failed: " + err, "warn");
         toastAudit("template applied");
         setTimeout(loadEntries, 500);
@@ -840,10 +987,12 @@ function renderTemplateButton(actions, tier) {
 
 function templatePicker() {
     return new Promise((resolve) => {
+        let result = null;
+        let settled = false;
         const { overlay, dlg, q } = modal("confirm-dlg", `
             <h3>Permission template</h3>
             <div class="dlg-text">
-                <select class="dlg-input tpl-select">
+                <select class="dlg-input tpl-select" aria-label="Permission template">
                     ${TEMPLATES.map((t) => `<option value="${t}">${t}</option>`).join("")}
                 </select>
             </div>
@@ -851,8 +1000,16 @@ function templatePicker() {
                 <button class="dlg-cancel">Cancel</button>
                 <button class="dlg-ok">Select</button>
             </div>`);
-        q(".dlg-ok").onclick = () => { const v = q(".tpl-select").value; overlay.remove(); resolve(v); };
-        q(".dlg-cancel").onclick = () => { overlay.remove(); resolve(null); };
+        registerDialogLifecycle(overlay, {
+            onCancel: () => { result = null; },
+            onClose: () => {
+                if (settled) return;
+                settled = true;
+                resolve(result);
+            },
+        });
+        q(".dlg-ok").onclick = () => { result = q(".tpl-select").value; closeDialog(overlay); };
+        q(".dlg-cancel").onclick = () => closeDialog(overlay, "cancel");
     });
 }
 
@@ -864,29 +1021,31 @@ function toastAudit(what) {
 // renderMembers shows the selected group's members with assign/unassign and
 // the drag & drop target (140/141) plus timed assigns (145).
 async function renderMembers() {
-    const area = pm.q(".pm-members");
-    const g = pm.target?.group;
+    const manager = pm;
+    if (!currentManager(manager)) return;
+    const area = manager.q(".pm-members");
+    const g = manager.target?.group;
     if (!g) {
         area.innerHTML = "";
         return;
     }
-    const type = pm.tab === "server" ? "server" : "channel";
+    const type = manager.tab === "server" ? "server" : "channel";
     let channelID = 0;
     let channelPicker = "";
     if (type === "channel") {
         // Channel-group membership is channel-scoped: pick the channel.
-        channelPicker = `<select class="dlg-input mem-channel">
+        channelPicker = `<select class="dlg-input mem-channel" aria-label="Channel for membership">
             <option value="0">— pick a channel for membership —</option>
-            ${V().state.channels.map((c) => `<option value="${c.ChannelID}" ${pm.channelGroupChan === c.ChannelID ? "selected" : ""}>${esc(c.Name)}</option>`).join("")}
+            ${V().state.channels.map((c) => `<option value="${c.ChannelID}" ${manager.channelGroupChan === c.ChannelID ? "selected" : ""}>${esc(c.Name)}</option>`).join("")}
         </select>`;
-        channelID = pm.channelGroupChan;
+        channelID = manager.channelGroupChan;
     }
     area.innerHTML = `
         <div class="pm-members-head">Members</div>
         ${channelPicker}
         <div class="pm-member-list"><div class="empty-state">loading…</div></div>
         <div class="pm-assign">
-            <select class="dlg-input mem-user">
+            <select class="dlg-input mem-user" aria-label="Online user to assign">
                 <option value="">— online user —</option>
                 ${V().state.clients.filter((c) => c.unique_id).map((c) =>
                     `<option value="${esc(c.unique_id)}">${esc(c.nickname || c.unique_id)}</option>`).join("")}
@@ -900,7 +1059,8 @@ async function renderMembers() {
     const chanSel = area.querySelector(".mem-channel");
     if (chanSel) {
         chanSel.onchange = () => {
-            pm.channelGroupChan = parseInt(chanSel.value, 10) || 0;
+            if (!currentManager(manager)) return;
+            manager.channelGroupChan = parseInt(chanSel.value, 10) || 0;
             renderMembers();
         };
         if (!channelID) {
@@ -912,6 +1072,7 @@ async function renderMembers() {
     if (type === "server" || channelID) {
         try {
             const resp = await App().GroupMembers(type, g.id, channelID);
+            if (!currentManager(manager) || manager.target?.group !== g) return;
             const members = resp.members || [];
             listEl.innerHTML = members.length ? "" : `<div class="empty-state">no members</div>`;
             for (const m of members) {
@@ -923,13 +1084,16 @@ async function renderMembers() {
                 row.querySelector(".pm-member-name").textContent = m.nickname || m.unique_id;
                 row.title = m.unique_id;
                 row.querySelector(".mem-del").onclick = async () => {
+                    if (!currentManager(manager) || manager.target?.group !== g) return;
                     const err = await App().GroupUnassign(type, g.id, m.unique_id, channelID);
+                    if (!currentManager(manager) || manager.target?.group !== g) return;
                     if (err) V().toast("unassign failed: " + err, "warn");
                     setTimeout(() => { renderMembers(); refreshGroups().then(() => V().renderTree()); }, 400);
                 };
                 listEl.appendChild(row);
             }
         } catch {
+            if (!currentManager(manager) || manager.target?.group !== g) return;
             listEl.innerHTML = `<div class="empty-state">member list unavailable</div>`;
         }
     }
@@ -938,6 +1102,7 @@ async function renderMembers() {
         if (!uid) return;
         const minutes = parseInt(area.querySelector(".mem-min").value, 10) || 0;
         const err = await App().GroupAssign(type, g.id, uid, channelID, minutes * 60);
+        if (!currentManager(manager) || manager.target?.group !== g) return;
         if (err) V().toast("assign failed: " + err, "warn");
         else toastAudit("assigned to " + g.name);
         setTimeout(() => { renderMembers(); renderTargets(); refreshGroups().then(() => V().renderTree()); }, 400);
@@ -1006,6 +1171,7 @@ async function openAuditViewer() {
     const load = async () => {
         try {
             const resp = await App().AuditLog(state.oldest, 50);
+            if (!isCurrentServerDialog(overlay)) return;
             const entries = resp.entries || [];
             if (entries.length === 0) {
                 q(".audit-older").disabled = true;
@@ -1015,7 +1181,7 @@ async function openAuditViewer() {
             state.entries = state.entries.concat(entries);
             renderRows();
         } catch (err) {
-            V().toast("audit load failed: " + err, "warn");
+            if (isCurrentServerDialog(overlay)) V().toast("audit load failed: " + err, "warn");
         }
     };
     q(".audit-filter").oninput = (e) => { state.filter = e.target.value.trim(); renderRows(); };
@@ -1075,8 +1241,11 @@ async function openChatFilters() {
     };
     const load = async () => {
         try {
-            fill(await App().ChatFilterGet());
+            const response = await App().ChatFilterGet();
+            if (!isCurrentServerDialog(overlay)) return;
+            fill(response);
         } catch (err) {
+            if (!isCurrentServerDialog(overlay)) return;
             q(".cf-source").textContent = "loading filters failed: " + err;
         }
     };
@@ -1089,12 +1258,14 @@ async function openChatFilters() {
         const saveBtn = q(".cf-save");
         saveBtn.disabled = true;
         try {
-            fill(await App().ChatFilterSet(q(".cf-words").value, q(".cf-black").value, q(".cf-white").value));
+            const response = await App().ChatFilterSet(q(".cf-words").value, q(".cf-black").value, q(".cf-white").value);
+            if (!isCurrentServerDialog(overlay)) return;
+            fill(response);
             toastAudit("chat filters updated");
         } catch (err) {
-            V().toast("chat filter save failed: " + err, "warn");
+            if (isCurrentServerDialog(overlay)) V().toast("chat filter save failed: " + err, "warn");
         } finally {
-            saveBtn.disabled = false;
+            if (isCurrentServerDialog(overlay)) saveBtn.disabled = false;
         }
     };
     load();
@@ -1115,12 +1286,15 @@ async function openBanList() {
         return;
     }
     const render = async () => {
+        if (!isCurrentServerDialog(overlay)) return;
         const list = q(".ban-list");
         let bans = [];
         try {
             const resp = await App().BanList();
+            if (!isCurrentServerDialog(overlay)) return;
             bans = resp.bans || [];
         } catch (err) {
+            if (!isCurrentServerDialog(overlay)) return;
             list.innerHTML = `<div class="empty-state">ban list failed: ${esc(err)}</div>`;
             return;
         }
@@ -1140,11 +1314,15 @@ async function openBanList() {
                 <td class="mono">${b.expires_at ? fmtTime(b.expires_at) : "permanent"}</td>
                 <td><button class="mem-del ban-lift" title="Lift ban">✕</button></td>`;
             tr.querySelector(".ban-lift").onclick = async () => {
+                if (!isCurrentServerDialog(overlay)) return;
                 const ok = await confirmDlg("Lift ban", `<p>Lift the ban on <span class="mono">${esc(b.value.slice(0, 24))}…</span>?</p>`, "Lift", true);
-                if (!ok) return;
+                if (!ok || !isCurrentServerDialog(overlay)) return;
                 const err = await App().BanRemove(b.id);
+                if (!isCurrentServerDialog(overlay)) return;
                 if (err) V().toast("ban lift failed: " + err, "warn");
-                setTimeout(render, 400);
+                setTimeout(() => {
+                    if (isCurrentServerDialog(overlay)) render();
+                }, 400);
             };
             tbody.appendChild(tr);
         }
@@ -1204,15 +1382,20 @@ async function openComplaints() {
     };
     const clear = async (target, from) => {
         try {
-            render((await App().ComplaintClear(target, from)).entries || []);
+            const response = await App().ComplaintClear(target, from);
+            if (!isCurrentServerDialog(overlay)) return;
+            render(response.entries || []);
             toastAudit("complaints cleared");
         } catch (err) {
-            V().toast("clear failed: " + err, "warn");
+            if (isCurrentServerDialog(overlay)) V().toast("clear failed: " + err, "warn");
         }
     };
     try {
-        render((await App().ComplaintList()).entries || []);
+        const response = await App().ComplaintList();
+        if (!isCurrentServerDialog(overlay)) return;
+        render(response.entries || []);
     } catch (err) {
+        if (!isCurrentServerDialog(overlay)) return;
         q(".cp-list").innerHTML = `<div class="empty-state">complaint list failed: ${esc(err)}</div>`;
     }
 }
@@ -1632,11 +1815,12 @@ async function openTokenManager() {
                     if (!ok) return;
                     try {
                         const resp = await App().TokenDelete(e.token);
+                        if (!isCurrentServerDialog(overlay)) return;
                         known = new Set((resp.entries || []).map((x) => x.token));
                         render(resp.entries || []);
                         toastAudit("privilege key revoked");
                     } catch (err) {
-                        V().toast("revoke failed: " + err, "warn");
+                        if (isCurrentServerDialog(overlay)) V().toast("revoke failed: " + err, "warn");
                     }
                 };
             }
@@ -1647,12 +1831,14 @@ async function openTokenManager() {
 
     if (canTokenAdd()) {
         q(".tk-add").innerHTML = `
-            <select class="dlg-input tk-new-group"><option value="0">server admin (admin only)</option></select>
-            <select class="dlg-input tk-new-chan"><option value="0">— no channel —</option></select>
+            <select class="dlg-input tk-new-group" aria-label="Group granted by key"><option value="0">server admin (admin only)</option></select>
+            <select class="dlg-input tk-new-chan" aria-label="Channel restriction"><option value="0">— no channel —</option></select>
             <input class="dlg-input tk-new-desc" placeholder="note (optional)" />
             <button class="tk-new">+ Create key</button>`;
         try {
-            for (const g of (await App().GroupList("server")).groups || []) {
+            const response = await App().GroupList("server");
+            if (!isCurrentServerDialog(overlay)) return;
+            for (const g of response.groups || []) {
                 const opt = document.createElement("option");
                 opt.value = g.id;
                 opt.textContent = g.name;
@@ -1672,8 +1858,10 @@ async function openTokenManager() {
             try {
                 resp = await App().TokenAdd(groupID, chanID, q(".tk-new-desc").value.trim());
             } catch (err) {
-                return V().toast("key creation failed: " + err, "warn");
+                if (isCurrentServerDialog(overlay)) V().toast("key creation failed: " + err, "warn");
+                return;
             }
+            if (!isCurrentServerDialog(overlay)) return;
             const entries = resp.entries || [];
             // The reply is the whole list, oldest-first: the new key is the
             // one that was not there before.
@@ -1688,9 +1876,11 @@ async function openTokenManager() {
 
     try {
         const resp = await App().TokenList();
+        if (!isCurrentServerDialog(overlay)) return;
         known = new Set((resp.entries || []).map((e) => e.token));
         render(resp.entries || []);
     } catch (err) {
+        if (!isCurrentServerDialog(overlay)) return;
         q(".tk-list").innerHTML = `<div class="empty-state">key list failed: ${esc(err)}</div>`;
     }
 }

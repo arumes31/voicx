@@ -3,6 +3,8 @@ import { t } from "./i18n.js";
 import { calibrateMic, startLoopback } from "./audio.js";
 import { play, SOUND_EVENTS, testAll } from "./sounds.js";
 import { MATRIX_EVENTS, defaultMatrixRow } from "./notifications.js";
+import { associateControlLabel, wrappedIndex } from "./a11y.js";
+import { closeDialog, mountDialog } from "./modal.js";
 
 const V = () => window.__voicx;
 
@@ -45,11 +47,17 @@ async function commit() {
 function row(label, control) {
     const el = document.createElement("div");
     el.className = "set-row";
-    const l = document.createElement("span");
+    const l = document.createElement("label");
     l.className = "set-label";
     l.textContent = label;
     el.appendChild(l);
     el.appendChild(control);
+    let target = control.matches?.("input:not([type=hidden]), select, textarea") ? control : null;
+    if (!target) {
+        const nested = control.querySelectorAll?.("input:not([type=hidden]), select, textarea") || [];
+        if (nested.length === 1) [target] = nested;
+    }
+    if (target) associateControlLabel(l, target);
     return el;
 }
 
@@ -581,6 +589,12 @@ function pagePlayback() {
 // hkErrors tracks the last activation error per action (301 conflict
 // detection), fed by hotkey_status events.
 const hkErrors = new Map();
+let stopActiveHotkeyCapture = null;
+
+function cancelHotkeyCapture() {
+    stopActiveHotkeyCapture?.();
+    stopActiveHotkeyCapture = null;
+}
 
 // hotkeyCapture builds a click-to-rebind button (shared by the map rows).
 function hotkeyCapture(initial, oncapture) {
@@ -588,6 +602,7 @@ function hotkeyCapture(initial, oncapture) {
     b.className = "hotkey-capture";
     b.textContent = initial || "Click and press a key";
     b.onclick = () => {
+        cancelHotkeyCapture();
         b.textContent = "press keys…";
         b.classList.add("capturing");
         const onKey = (e) => {
@@ -603,11 +618,16 @@ function hotkeyCapture(initial, oncapture) {
             if (!["Control", "Alt", "Shift", "Meta"].includes(e.key)) {
                 parts.push(key);
                 b.textContent = parts.join("+");
-                b.classList.remove("capturing");
-                document.removeEventListener("keydown", onKey, true);
+                stopCapture();
                 oncapture(parts.join("+"));
             }
         };
+        const stopCapture = () => {
+            document.removeEventListener("keydown", onKey, true);
+            b.classList.remove("capturing");
+            if (stopActiveHotkeyCapture === stopCapture) stopActiveHotkeyCapture = null;
+        };
+        stopActiveHotkeyCapture = stopCapture;
         document.addEventListener("keydown", onKey, true);
     };
     return b;
@@ -1167,10 +1187,15 @@ const PAGE_BUILDERS = {
 };
 
 function renderPage(id) {
+    cancelHotkeyCapture();
     document.querySelectorAll(".settings-nav-item").forEach((n) => {
-        n.classList.toggle("active", n.dataset.page === id);
+        const active = n.dataset.page === id;
+        n.classList.toggle("active", active);
+        n.setAttribute("aria-selected", String(active));
+        n.tabIndex = active ? 0 : -1;
     });
     const container = document.getElementById("settings-content");
+    container.setAttribute("aria-labelledby", `settings-page-${id}`);
     container.innerHTML = "";
     container.appendChild(PAGE_BUILDERS[id]());
 }
@@ -1179,17 +1204,19 @@ function openSettings(pageId = "application") {
     draft = JSON.parse(JSON.stringify(V().state.settings || {}));
 
     let overlay = document.getElementById("settings-overlay");
-    if (overlay) overlay.remove();
+    if (overlay) closeDialog(overlay, "cancel");
 
     overlay = document.createElement("div");
     overlay.id = "settings-overlay";
     overlay.className = "dlg-overlay";
     overlay.innerHTML = `
         <div class="settings-dialog">
-            <div class="settings-nav"></div>
+            <h2 id="settings-title" class="sr-only">Settings</h2>
+            <div class="settings-nav" role="tablist" aria-label="Settings sections" aria-orientation="vertical"></div>
             <div class="settings-main">
-                <input id="settings-search" class="dlg-input" placeholder="" />
-                <div id="settings-content"></div>
+                <label class="sr-only" for="settings-search">Search settings</label>
+                <input id="settings-search" class="dlg-input" placeholder="" autocomplete="off" />
+                <div id="settings-content" role="tabpanel"></div>
                 <div class="settings-footer">
                     <button id="set-ok">OK</button>
                     <button id="set-cancel">Cancel</button>
@@ -1224,7 +1251,8 @@ function openSettings(pageId = "application") {
             return;
         }
         for (const h of hits.slice(0, 40)) {
-            const row = document.createElement("div");
+            const row = document.createElement("button");
+            row.type = "button";
             row.className = "set-search-hit";
             row.innerHTML = `<span class="mono set-search-page"></span><span class="set-search-label"></span>`;
             row.querySelector(".set-search-page").textContent = h.page;
@@ -1245,11 +1273,25 @@ function openSettings(pageId = "application") {
 
     const nav = overlay.querySelector(".settings-nav");
     for (const p of PAGES) {
-        const item = document.createElement("div");
+        const item = document.createElement("button");
+        item.type = "button";
         item.className = "settings-nav-item";
         item.dataset.page = p.id;
+        item.id = `settings-page-${p.id}`;
+        item.setAttribute("role", "tab");
+        item.setAttribute("aria-controls", "settings-content");
+        item.setAttribute("aria-selected", "false");
+        item.tabIndex = -1;
         item.innerHTML = `<span class="nav-icon">${p.icon}</span><span>${t(p.label)}</span>`;
         item.onclick = () => renderPage(p.id);
+        item.addEventListener("keydown", (event) => {
+            if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+            event.preventDefault();
+            const items = [...nav.querySelectorAll(".settings-nav-item")];
+            const next = wrappedIndex(items.indexOf(item), items.length, event.key === "ArrowDown" ? 1 : -1);
+            items[next].focus();
+            items[next].click();
+        });
         nav.appendChild(item);
     }
 
@@ -1264,17 +1306,19 @@ function openSettings(pageId = "application") {
     };
 
     overlay.querySelector("#set-ok").onclick = async () => {
-        if (await applyAll()) overlay.remove();
+        if (await applyAll()) closeDialog(overlay);
     };
-    const cancel = () => {
-        overlay.remove();
-        revertLivePreview();
-    };
+    const cancel = () => closeDialog(overlay, "cancel");
     overlay.querySelector("#set-cancel").onclick = cancel;
     overlay.querySelector("#set-apply").onclick = applyAll;
     overlay.onclick = (e) => { if (e.target === overlay) cancel(); };
 
-    document.body.appendChild(overlay);
+    mountDialog(overlay, {
+        onClose: () => {
+            cancelHotkeyCapture();
+            revertLivePreview();
+        },
+    });
     renderPage(pageId);
 }
 

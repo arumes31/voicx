@@ -4,6 +4,8 @@
 // backend (tabs.go) owns one connManager per tab and replays journaled
 // state frames on activation, so the frontend keeps its single-state model:
 // on "tab_reset" we clear chat/tree and the replay rebuilds them.
+import { closeServerDialogs } from "./modal.js";
+
 const V = () => window.__voicx;
 const App = () => window.go.main.App;
 let activeTabID = "";
@@ -27,13 +29,17 @@ function renderTabs(tabs) {
         V().showLogin();
         renderRecents();
     } else if (tabs.some((t) => t.connected)) {
-        document.getElementById("login-overlay").classList.add("hidden");
-        document.getElementById("app").classList.remove("hidden");
+        V().showWorkspace(false);
     }
     for (const t of tabs || []) {
         const el = document.createElement("div");
         el.className = "srv-tab" + (t.active ? " active" : "") + (t.connected ? "" : " offline");
         el.dataset.tabId = t.id;
+        const select = document.createElement("button");
+        select.type = "button";
+        select.className = "srv-tab-select";
+        select.setAttribute("aria-current", t.active ? "page" : "false");
+        el.appendChild(select);
         // (284) bookmark colour: the dot identifies the server at a glance and
         // the underline of the active tab picks the same colour up.
         const bm = bookmarkFor(t);
@@ -43,37 +49,47 @@ function renderTabs(tabs) {
             dot.className = "srv-tab-dot";
             dot.style.background = bm.color;
             dot.title = "bookmark: " + bm.name;
-            el.appendChild(dot);
+            select.appendChild(dot);
         }
         const label = document.createElement("span");
         label.className = "srv-tab-label";
         label.textContent = (t.nickname || "?") + " @ " + (t.addr || "?");
         label.title = t.id + (t.connected ? "" : " (offline)");
-        el.appendChild(label);
+        select.appendChild(label);
+        select.setAttribute("aria-label", label.textContent + (t.connected ? "" : ", offline"));
         if (t.mentions > 0) {
             const b = document.createElement("span");
             b.className = "srv-badge mention";
             b.textContent = t.mentions;
             b.title = t.mentions + " unread mention(s)";
-            el.appendChild(b);
+            select.appendChild(b);
         } else if (t.unread > 0) {
             const b = document.createElement("span");
             b.className = "srv-badge";
             b.textContent = t.unread > 99 ? "99+" : t.unread;
             b.title = t.unread + " unread message(s)";
-            el.appendChild(b);
+            select.appendChild(b);
         }
         const x = document.createElement("button");
         x.className = "srv-tab-x";
+        x.type = "button";
         x.textContent = "✕";
         x.title = "disconnect and close tab";
+        x.setAttribute("aria-label", "Disconnect and close " + label.textContent);
         x.onclick = (e) => {
             e.stopPropagation();
             App().CloseTab(t.id);
         };
         el.appendChild(x);
-        el.onclick = () => {
+        const activate = () => {
             if (!t.active) App().SetActiveTab(t.id);
+        };
+        select.onclick = (event) => {
+            event.stopPropagation();
+            activate();
+        };
+        el.onclick = () => {
+            activate();
         };
         bar.appendChild(el);
     }
@@ -83,6 +99,7 @@ function renderTabs(tabs) {
     plus.className = "srv-tab plus";
     plus.textContent = "+";
     plus.title = "connect to another server (new tab)";
+    plus.setAttribute("aria-label", "Connect to another server");
     plus.onclick = () => V().showLogin();
     bar.appendChild(plus);
 }
@@ -145,21 +162,49 @@ async function refreshTabIdentity(tabID) {
 function onTabReset(tabID) {
     const { state, $ } = V();
     activeTabID = tabID || "";
+    const preserveReconnectAnnouncements = !!state.reconnectInFlight;
+    state.serverGeneration = (state.serverGeneration || 0) + 1;
+    closeServerDialogs();
     // Voice is active-tab only: fully tear down capture and WebRTC before the
     // replayed channel state automatically starts the new tab's session.
     V().resetVoiceSession();
     state.channels = [];
     state.clients = [];
+    state.myClientID = "";
+    state.myNickname = "";
+    state.myPerms = new Map();
+    state.serverGroups = [];
+    state.groupByUID = new Map();
+    state.groupIcons = new Map();
+    state.avatars = new Map();
+    state.avatarPending = new Set();
+    state.isAdmin = false;
+    state.isGuest = true;
+    state.myPriority = false;
+    state.myStatus = "";
     window.__voicxNotify?.resetBuddyWatch(); // (383) buddy alerts re-arm per connect
     window.__voicxNotify?.resetServerRules?.(); // (216) gate belongs to one server tab
     state.myChannelID = 0;
     state.selectedClientID = "";
     V().setDetailsOpen(false);
     state.trackUsers.clear();
-    window.__voicxChat?.resetView?.();
+    state.multiSelect.clear();
+    state.collapsedChannels.clear();
+    state.expandedVirtual.clear();
+    state.lastConnect = state.tabConnects.get(tabID) || null;
+    window.__voicxChat?.resetView?.({ preserveReconnectAnnouncements });
+    window.__voicxFiles?.resetServerView?.();
+    window.__voicxSocial?.resetServerView?.();
     V().renderTree();
     V().refreshPermissions();
-    refreshTabIdentity(tabID);
+    window.__voicxPerms?.refreshGroups?.().then(() => {
+        if (activeTabID === tabID) V().renderTree();
+    });
+    refreshTabIdentity(tabID).then(() => {
+        if (activeTabID !== tabID) return;
+        window.__voicxFiles?.loadServerIcon?.();
+        window.__voicxSocial?.refreshNews?.();
+    });
 }
 
 // autoConnect fires flagged bookmarks at startup (286). Passwords are never
@@ -222,14 +267,17 @@ function renderRecents() {
         const row = document.createElement("div");
         row.className = "recent-row";
         const starred = bms.some((b) => b.addr === r.addr && b.nickname === r.nickname);
-        row.innerHTML = `<button class="recent-star" title="bookmark">${starred ? "★" : "☆"}</button>
-            <span class="recent-label"></span>`;
+        row.innerHTML = `<button type="button" class="recent-star" title="bookmark">${starred ? "★" : "☆"}</button>
+            <button type="button" class="recent-label"></button>`;
         row.querySelector(".recent-label").textContent = (r.nickname || "?") + " @ " + r.addr;
         row.querySelector(".recent-label").onclick = () => {
             document.getElementById("login-addr").value = r.addr;
             document.getElementById("login-nick").value = r.nickname || "";
         };
-        row.querySelector(".recent-star").onclick = async () => {
+        const star = row.querySelector(".recent-star");
+        star.setAttribute("aria-label", `${starred ? "Remove" : "Add"} bookmark for ${r.nickname || "server"} at ${r.addr}`);
+        star.setAttribute("aria-pressed", String(starred));
+        star.onclick = async () => {
             if (starred) {
                 s.bookmarks = bms.filter((b) => !(b.addr === r.addr && b.nickname === r.nickname));
             } else {

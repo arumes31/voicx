@@ -28,14 +28,22 @@ import { initTabs } from "./tabs.js";
 import { initSocialUI } from "./social-ui.js";
 import { initMetaUI } from "./meta-ui.js";
 import { initPolishUI } from "./polish-ui.js";
+import { imageDataURL, setSafeImage } from "./safe-media.js";
 import { initNotifications } from "./notifications.js";
 import { setLanguage, applyStaticLabels } from "./i18n.js";
 import { extractPresentedFingerprint } from "./security.js";
+import { isActivationKey } from "./a11y.js";
+import { createLiveAnnouncementQueue } from "./live-announcer.js";
+import { dialogFocusableSelector, initModalSystem, mountServerDialog } from "./modal.js";
 
 const P = () => window.__voicxPerms;
 window.__voicxChat = chatUI;
 
 const $ = (id) => document.getElementById(id);
+
+const liveAnnouncements = createLiveAnnouncementQueue({
+    resolveRegion: (priority) => $(priority === "assertive" ? "alert-announcer" : "chat-announcer"),
+});
 
 const state = {
     channels: [],   // flat: {ChannelID, ParentID, Name, HasIcon, Topic, MaxClients, OpusBitrate, OpusFEC, OpusDTX, OpusStereo, SlowModeSeconds}
@@ -69,12 +77,14 @@ const state = {
     whisperPrev: null,    // (33) {clients, channels, active} the hotkey replaced
     avatars: new Map(),  // unique_id -> data url | null
     avatarPending: new Set(),
+    serverGeneration: 0, // invalidates async responses when the active server tab changes
     settings: null,
     lastConnect: null,   // {addr, nick, pw, spw, bookmark} for reconnect-on-loss
     tabConnects: new Map(), // (281) tab ID -> its own lastConnect record
     pendingBookmark: null, // (334) {name, addr} of the bookmark loaded into the login dialog
     reconnectAttempts: 0,
     reconnectTimer: null,
+    reconnectInFlight: false,
     vadMonitor: null,
     audioCtx: null,
     trackUsers: new Map(), // media track ID -> {client_id, unique_id, nickname} (per-publisher tracks; wave-3 video tiles)
@@ -96,7 +106,15 @@ const state = {
 // (385) "social" means join/leave only: the notify_join_leave toggle is
 // labelled "Toasts for join/leave", so untagged callers default to "alert"
 // and are never swallowed by it.
-function toast(text, kind = "info", category = "alert") {
+function announceLive(text, priority = "polite") {
+    return liveAnnouncements.announce(text, priority);
+}
+
+function toast(text, kind = "info", category = "alert", options = {}) {
+    if (typeof category === "object") {
+        options = category;
+        category = "alert";
+    }
     const s = state.settings;
     if (s) {
         if (category === "social" && !s.notify_join_leave) return;
@@ -104,11 +122,15 @@ function toast(text, kind = "info", category = "alert") {
     }
     // (346) record into the notification center; (347/348) DND suppresses
     // visible toasts but still records them silently.
-    window.__voicxPolish?.recordNotification(kind, text, {});
+    if (options.record !== false) window.__voicxPolish?.recordNotification(kind, text, {});
     if (window.__voicxPolish?.dndActive?.()) return;
+    if (options.announce !== false) announceLive(text, kind === "warn" ? "assertive" : "polite");
     const el = document.createElement("div");
     el.className = "toast " + kind;
     el.textContent = text;
+    // The static live regions own announcements. Keep this visual copy out of
+    // the accessibility tree so the same update is never spoken twice.
+    el.setAttribute("aria-hidden", "true");
     $("toasts").appendChild(el);
     setTimeout(() => {
         el.classList.add("out");
@@ -190,13 +212,51 @@ function showLogin() {
     // different account (callers loading a bookmark stash after this call).
     state.pendingBookmark = null;
     $("login-overlay").classList.remove("hidden");
+    $("login-overlay").setAttribute("aria-hidden", "false");
     $("app").classList.add("hidden");
+    $("app").setAttribute("aria-hidden", "true");
     $("conn-lock").classList.add("hidden");
+    requestAnimationFrame(() => $("login-addr").focus({ preventScroll: true }));
 }
 
-$("login-connect").onclick = () => connectFromLogin();
+function showWorkspace(focus = true) {
+    const login = $("login-overlay");
+    const leavingLogin = !login.classList.contains("hidden") || login.contains(document.activeElement);
+    login.classList.add("hidden");
+    login.setAttribute("aria-hidden", "true");
+    $("app").classList.remove("hidden");
+    $("app").setAttribute("aria-hidden", "false");
+    if (focus || leavingLogin) requestAnimationFrame(() => $("center").focus({ preventScroll: true }));
+}
+
+// The login is a full-screen application state rather than a body-level
+// modal. Keep its keyboard focus local while it is visible and explicitly
+// place focus there on initial load and every return to login.
+$("login-overlay").addEventListener("keydown", (event) => {
+    if (event.key !== "Tab" || $("login-overlay").classList.contains("hidden")) return;
+    const items = [...$("login-overlay").querySelectorAll(dialogFocusableSelector)]
+        .filter((element) => !element.disabled && element.tabIndex >= 0 && element.getClientRects().length > 0);
+    if (items.length === 0) return;
+    const index = items.indexOf(document.activeElement);
+    const next = event.shiftKey
+        ? (index <= 0 ? items.length - 1 : index - 1)
+        : (index < 0 || index === items.length - 1 ? 0 : index + 1);
+    event.preventDefault();
+    items[next].focus();
+});
+
+document.querySelector(".login-card").addEventListener("submit", (event) => {
+    event.preventDefault();
+    connectFromLogin();
+});
 
 async function connectFromLogin() {
+    const submit = $("login-connect");
+    if (submit.disabled) return;
+    const submitLabel = submit.textContent;
+    submit.disabled = true;
+    submit.textContent = "CONNECTING…";
+    document.querySelector(".login-card").setAttribute("aria-busy", "true");
     const addr = $("login-addr").value.trim();
     const nick = $("login-nick").value.trim();
     const pw = $("login-password").value;
@@ -238,8 +298,7 @@ async function connectFromLogin() {
         $("conn-pill").textContent = addr;
         $("conn-pill").classList.add("up");
         $("conn-lock").classList.remove("hidden");
-        $("login-overlay").classList.add("hidden");
-        $("app").classList.remove("hidden");
+        showWorkspace();
         refreshPermissions();
         applyWhisperSettings();
         startupAutoCheck();
@@ -257,6 +316,10 @@ async function connectFromLogin() {
         } catch { /* best-effort */ }
     } catch (e) {
         $("login-error").textContent = String(e);
+    } finally {
+        submit.disabled = false;
+        submit.textContent = submitLabel;
+        document.querySelector(".login-card").removeAttribute("aria-busy");
     }
 }
 
@@ -295,7 +358,7 @@ async function showFingerprintWarning(addr, detail) {
         }
         connectFromLogin();
     };
-    document.body.appendChild(overlay);
+    mountServerDialog(overlay, { initialFocus: ".dlg-cancel" });
 }
 
 // rememberTabConnect files the credential record under the tab it belongs to
@@ -315,6 +378,8 @@ async function disconnect() {
         clearTimeout(state.reconnectTimer);
         state.reconnectTimer = null;
     }
+    state.reconnectInFlight = false;
+    chatUI.cancelReconnectAnnouncementBatch();
     await window.go.main.App.Disconnect();
 }
 
@@ -338,6 +403,7 @@ window.runtime.EventsOn("disconnected", () => {
     // Reconnect on connection loss (Application setting): 5 tries, 5s apart.
     if (state.settings?.reconnect_on_loss && state.lastConnect && state.reconnectAttempts < 5) {
         state.reconnectAttempts++;
+        chatUI.beginReconnectAnnouncementBatch();
         sysMsg(`reconnecting in 5s (attempt ${state.reconnectAttempts}/5)…`);
         // (332) reconnect timeline in the status pill.
         $("conn-pill").textContent = `retry ${state.reconnectAttempts}/5 in 5s…`;
@@ -351,9 +417,21 @@ window.runtime.EventsOn("disconnected", () => {
         }, 1000);
         state.reconnectTimer = setTimeout(async () => {
             clearInterval(tick);
+            state.reconnectTimer = null;
             const c = state.lastConnect;
-            if (!c) return;
-            const err = await window.go.main.App.ConnectBookmarkTab(c.bookmark || "", c.addr, c.nick, c.pw, c.spw);
+            if (!c) {
+                chatUI.cancelReconnectAnnouncementBatch();
+                return;
+            }
+            state.reconnectInFlight = true;
+            let err;
+            try {
+                err = await window.go.main.App.ConnectBookmarkTab(c.bookmark || "", c.addr, c.nick, c.pw, c.spw);
+            } catch (cause) {
+                err = String(cause || "reconnect failed");
+            } finally {
+                state.reconnectInFlight = false;
+            }
             if (err === "") {
                 // (281) the retry opened a NEW tab: the record has to move with it.
                 await rememberTabConnect(c);
@@ -369,12 +447,13 @@ window.runtime.EventsOn("disconnected", () => {
                 P()?.redeemPendingToken?.();
                 $("conn-pill").textContent = c.addr;
                 $("conn-pill").classList.add("up");
-                $("login-overlay").classList.add("hidden");
-                $("app").classList.remove("hidden");
+                showWorkspace();
                 refreshPermissions();
                 applyWhisperSettings();
                 chatUI.onConnect();
                 P().refreshGroups().then(() => renderTree());
+            } else {
+                chatUI.cancelReconnectAnnouncementBatch();
             }
         }, 5000);
         return;
@@ -679,10 +758,57 @@ window.runtime.EventsOn("event", (json) => {
         case "channel_created":
             state.channels.push({ ChannelID: d.channel_id, ParentID: d.parent_id || 0, Name: d.name, HasIcon: false });
             break;
-        case "channel_deleted":
-            state.channels = state.channels.filter((c) => c.ChannelID !== d.channel_id);
-            chatUI.refreshHeader();
+        case "channel_deleted": {
+            // New servers include the complete cascaded subtree; older ones
+            // send only channel_id. Seed from every payload ID, then expand
+            // through the cached tree so legacy and partial payloads remove
+            // the same complete subtree. Normalize string IDs at the event
+            // boundary before any state cleanup.
+            const deleted = new Set([d.channel_id, ...(Array.isArray(d.channel_ids) ? d.channel_ids : [])]
+                .map(Number).filter((id) => id > 0));
+            if (deleted.size === 0) break;
+            const childrenByParent = new Map();
+            for (const channel of state.channels) {
+                const channelID = Number(channel.ChannelID);
+                const parentID = Number(channel.ParentID || 0);
+                if (channelID <= 0) continue;
+                if (!childrenByParent.has(parentID)) childrenByParent.set(parentID, []);
+                childrenByParent.get(parentID).push(channelID);
+            }
+            const queue = [...deleted];
+            for (let index = 0; index < queue.length; index++) {
+                for (const childID of childrenByParent.get(queue[index]) || []) {
+                    if (deleted.has(childID)) continue;
+                    deleted.add(childID);
+                    queue.push(childID);
+                }
+            }
+            state.channels = state.channels.filter((channel) => !deleted.has(Number(channel.ChannelID)));
+            let selfDisplaced = deleted.has(Number(state.myChannelID));
+            for (const client of state.clients) {
+                const channelID = Number(client.channel_id ?? client.ChannelID ?? 0);
+                if (!deleted.has(channelID)) continue;
+                client.channel_id = 0;
+                if ("ChannelID" in client) client.ChannelID = 0;
+                if (client.client_id === state.myClientID) selfDisplaced = true;
+            }
+            for (const [clientID, channelID] of lastKnownChannel) {
+                if (deleted.has(Number(channelID))) lastKnownChannel.delete(clientID);
+            }
+            for (const channelID of deleted) {
+                state.collapsedChannels.delete(channelID);
+                state.expandedVirtual.delete(channelID);
+            }
+            if (selfDisplaced) state.myChannelID = 0;
+            chatUI.onChannelsDeleted([...deleted]);
+            if (selfDisplaced) {
+                chatUI.onMyChannelChanged();
+                window.__voicxFiles?.onChannelChanged?.();
+                ensureVoiceForChannel();
+            }
+            recomputeDucking();
             break;
+        }
         case "channel_updated": {
             const ch = state.channels.find((c) => c.ChannelID === d.channel_id);
             if (ch) {
@@ -711,6 +837,7 @@ window.runtime.EventsOn("event", (json) => {
             if (d.client_id === state.myClientID) {
                 state.myPriority = d.active;
                 $("voice-prio").classList.toggle("active", d.active);
+                $("voice-prio").setAttribute("aria-pressed", String(!!d.active));
             }
             sysMsg(clientName(d.client_id) + (d.active ? " is now a priority speaker" : " is no longer a priority speaker"));
             recomputeDucking();
@@ -866,6 +993,7 @@ function expandMyBranch() {
 function renderTree() {
     recomputeClientCounts();
     const root = $("channel-tree");
+    const focusState = captureTreeFocus(root);
     root.innerHTML = "";
     // (179) Hoisted server groups render as their own sections above the
     // channels; (177) section headers carry the group icon; (178) nickname
@@ -880,7 +1008,7 @@ function renderTree() {
         if (h.group.color) head.style.color = h.group.color;
         if (h.group.icon) {
             P().groupIconURL(h.group.id).then((url) => {
-                if (url) head.querySelector(".hoist-icon").innerHTML = `<img src="${url}" alt="">`;
+                if (url) setSafeImage(head.querySelector(".hoist-icon"), url);
             });
         }
         sec.appendChild(head);
@@ -923,9 +1051,48 @@ function renderTree() {
         }
     }
     for (const ch of byParent.get(0) || []) renderChannel(root, ch, byParent, 0);
+    if (state.treeFilter && !root.querySelector(".channel, .client")) {
+        const empty = document.createElement("div");
+        empty.className = "empty-state";
+        empty.setAttribute("role", "status");
+        empty.textContent = "No matching channels or users";
+        root.appendChild(empty);
+    }
     renderDirectTargets();
     renderClientCard();
     chatUI.refreshHeader(); // (111) topic/title follows tree + channel updates
+    restoreTreeFocus(root, focusState);
+}
+
+function captureTreeFocus(root) {
+    const active = document.activeElement;
+    if (!(active instanceof HTMLElement) || !root.contains(active)) return null;
+    const kind = active.classList.contains("channel") ? "channel" : active.classList.contains("client") ? "client" : "";
+    if (!kind) return null;
+    const dataKey = kind === "channel" ? "chid" : "clid";
+    const key = active.dataset[dataKey];
+    const matches = [...root.querySelectorAll(`.${kind}`)].filter((row) => row.dataset[dataKey] === key);
+    return { kind, key, occurrence: Math.max(0, matches.indexOf(active)) };
+}
+
+function restoreTreeFocus(root, focusState) {
+    if (!focusState) return;
+    const dataKey = focusState.kind === "channel" ? "chid" : "clid";
+    const matches = [...root.querySelectorAll(`.${focusState.kind}`)]
+        .filter((row) => row.dataset[dataKey] === focusState.key);
+    const target = matches[focusState.occurrence] || matches.at(-1);
+    target?.focus({ preventScroll: true });
+}
+
+function setChannelExpanded(channelID, expanded) {
+    if (expanded) {
+        state.collapsedChannels.delete(channelID);
+        state.expandedVirtual.add(channelID);
+    } else {
+        state.collapsedChannels.add(channelID);
+        state.expandedVirtual.delete(channelID);
+    }
+    renderTree();
 }
 
 function renderChannel(parentEl, ch, byParent, depth) {
@@ -1017,9 +1184,13 @@ function renderChannel(parentEl, ch, byParent, depth) {
     // the user explicitly expanded it (double-click).
     let collapsed = state.collapsedChannels.has(ch.ChannelID);
     if (window.__voicxPolish?.virtualizeEnabled?.()) {
-        collapsed = !window.__voicxPolish.myBranchIDs().has(ch.ChannelID) &&
-            !state.expandedVirtual.has(ch.ChannelID);
+        collapsed = state.collapsedChannels.has(ch.ChannelID) ||
+            (!window.__voicxPolish.myBranchIDs().has(ch.ChannelID) &&
+                !state.expandedVirtual.has(ch.ChannelID));
     }
+    const expandable = state.clients.some((c) => c.channel_id === ch.ChannelID) ||
+        (byParent.get(ch.ChannelID) || []).length > 0;
+    if (expandable) el.setAttribute("aria-expanded", String(!collapsed));
     if (!collapsed) {
         const members = state.clients.filter((c) => c.channel_id === ch.ChannelID);
         if (members.length > 0) {
@@ -1034,6 +1205,8 @@ function renderChannel(parentEl, ch, byParent, depth) {
         if (children.length > 0) {
             const branch = document.createElement("div");
             branch.className = "channel-children";
+            branch.setAttribute("role", "group");
+            branch.setAttribute("aria-label", ch.Name + " subchannels");
             for (const child of children) renderChannel(branch, child, byParent, depth + 1);
             node.appendChild(branch);
         }
@@ -1071,6 +1244,7 @@ function clientRow(c) {
     row.dataset.clid = c.client_id;
     row.tabIndex = 0; // (298) keyboard navigation
     row.setAttribute("role", "treeitem"); // (343)
+    row.setAttribute("aria-selected", String(state.multiSelect.has(c.client_id)));
     row.setAttribute("aria-label", (c.nickname || c.unique_id || "user") +
         (c.status ? ", " + c.status : "") + (speakingHere ? ", speaking" : "") +
         (c.priority_speaker ? ", priority speaker" : "") +
@@ -1090,7 +1264,7 @@ function clientRow(c) {
     av.dataset.uid = c.unique_id;
     const dataUrl = state.avatars.get(c.unique_id);
     if (dataUrl) {
-        av.innerHTML = `<img src="${dataUrl}" alt="">`;
+        setSafeImage(av, dataUrl);
     } else {
         av.textContent = initials(c.nickname || c.unique_id || "?");
         fetchAvatar(c.unique_id);
@@ -1114,7 +1288,7 @@ function clientRow(c) {
         gi.title = "group: " + g.name;
         if (g.icon) {
             P().groupIconURL(g.id).then((url) => {
-                if (url) gi.innerHTML = `<img src="${url}" alt="">`;
+                if (url) setSafeImage(gi, url);
                 else gi.textContent = g.name;
             });
         } else {
@@ -1275,21 +1449,21 @@ window.addEventListener("focus", () => window.go.main.App.TrayClearMentions());
 
 async function fetchAvatar(uniqueID) {
     if (!uniqueID || state.avatars.has(uniqueID) || state.avatarPending.has(uniqueID)) return;
+    const generation = state.serverGeneration;
     state.avatarPending.add(uniqueID);
     try {
         const data = await window.go.main.App.GetAvatar(uniqueID);
-        if (data && data.data_base64) {
-            state.avatars.set(uniqueID, `data:${data.content_type};base64,${data.data_base64}`);
-        } else {
-            state.avatars.set(uniqueID, null);
-        }
+        if (generation !== state.serverGeneration) return;
+        state.avatars.set(uniqueID, imageDataURL(data));
     } catch {
+        if (generation !== state.serverGeneration) return;
         state.avatars.set(uniqueID, null);
+    } finally {
+        if (generation === state.serverGeneration) state.avatarPending.delete(uniqueID);
     }
-    state.avatarPending.delete(uniqueID);
     document.querySelectorAll(`.avatar[data-uid="${CSS.escape(uniqueID)}"]`).forEach((el) => {
         const url = state.avatars.get(uniqueID);
-        if (url) el.innerHTML = `<img src="${url}" alt="">`;
+        if (url) setSafeImage(el, url);
     });
     renderClientCard();
 }
@@ -1308,13 +1482,17 @@ function renderClientCard() {
     const ch = state.channels.find((x) => x.ChannelID === c.channel_id);
     const dataUrl = state.avatars.get(c.unique_id);
     el.innerHTML = `
-        <div class="card-avatar ${c.is_speaking ? "speaking" : ""}">
-            ${dataUrl ? `<img src="${dataUrl}" alt="">` : `<span>${initials(c.nickname || c.unique_id || "?")}</span>`}
-        </div>
+        <div class="card-avatar ${c.is_speaking ? "speaking" : ""}"></div>
         <div class="card-nick"></div>
         <div class="card-uid mono"></div>
         <div class="card-channel"></div>
         <div class="card-groups"></div>`;
+    const cardAvatar = el.querySelector(".card-avatar");
+    if (!setSafeImage(cardAvatar, dataUrl)) {
+        const fallback = document.createElement("span");
+        fallback.textContent = initials(c.nickname || c.unique_id || "?");
+        cardAvatar.appendChild(fallback);
+    }
     el.querySelector(".card-nick").textContent = c.nickname || c.unique_id;
     el.querySelector(".card-uid").textContent = (c.unique_id || "").slice(0, 16) + "…";
     el.querySelector(".card-channel").textContent = ch ? "in " + ch.Name : "no channel";
@@ -1363,7 +1541,6 @@ function addChat(d) {
     }
     // File logging per scope (Chat setting) — kept from the pre-5b renderer.
     const scope = d.channel_id ? "channel" : (d.offline ? "dm · offline" : d.e2e ? "dm" : "chat");
-    const self = d.from === state.myNickname;
     const s = state.settings;
     if (s) {
         const line = `[${scope}] ${d.from}: ${d.text}`;
@@ -1373,20 +1550,19 @@ function addChat(d) {
             window.go.main.App.LogChat(line);
         }
     }
-    // Whisper/mention sound for direct messages, plus taskbar flash (32).
-    // Track the last whisperer for the Ctrl+R whisper-reply hotkey (33).
-    if (!d.channel_id && !self) {
+    // Rendering, tabs, notification classification, badges, and receipts live
+    // in chat-ui.js. Only a successfully routed E2EE message is a DM; global
+    // chat also has no channel_id and must never enter the direct path.
+    const result = chatUI.addChat(d);
+    if (result?.incomingDM) {
+        // Track the last DM sender for the Ctrl+R whisper-reply hotkey (33).
         if (d.from_client_id) {
             const sender = state.clients.find((c) => c.client_id === d.from_client_id);
             if (sender) state.lastWhispererUID = sender.unique_id;
         }
-        // (385) DMs dispatch through the notification matrix.
         trayMention(); // (290)
-        window.__voicxNotify?.notify("dm", (d.from || "someone") + ": " + (d.text || "").slice(0, 80),
-            { uid: d.from_unique_id, className: "messages", kind: "warn", noSound: !state.settings?.whisper_sound });
     }
-    // Rendering, tabs, badges, receipts etc. live in chat-ui.js (wave 5b).
-    chatUI.addChat(d);
+    if (result?.announcement) announceLive(result.announcement);
 }
 
 function sysMsg(text) {
@@ -1747,6 +1923,7 @@ $("voice-prio").onclick = async () => {
     }
     state.myPriority = !state.myPriority;
     $("voice-prio").classList.toggle("active", state.myPriority);
+    $("voice-prio").setAttribute("aria-pressed", String(state.myPriority));
 };
 
 // (59) ICE restart ladder: on failed/disconnected, re-offer with iceRestart
@@ -1824,6 +2001,7 @@ function teardownVoice() {
         state.screenSharing = false;
         window.go.main.App.SetScreenShare(false);
         $("voice-screen").classList.remove("active");
+        $("voice-screen").setAttribute("aria-pressed", "false");
     }
     // the transceiver belongs to the peer connection being closed: keeping the
     // reference would make the next session's share replaceTrack a dead sender.
@@ -1859,8 +2037,10 @@ function resetVoiceUI() {
     setVoiceStatus("voice off");
     state.pttActive = false;
     $("ptt-btn").classList.remove("live");
+    $("ptt-btn").setAttribute("aria-pressed", "false");
     state.myPriority = false;
     $("voice-prio").classList.remove("active");
+    $("voice-prio").setAttribute("aria-pressed", "false");
     updateTalkBanner();
 }
 
@@ -2232,6 +2412,7 @@ function setPTT(active) {
         if (state.pttActive === effective) return;
         state.pttActive = effective;
         $("ptt-btn").classList.toggle("live", effective);
+        $("ptt-btn").setAttribute("aria-pressed", String(effective));
         window.go.main.App.SetPTT(effective);
         applyVoiceState();
         updateTalkBanner();
@@ -2240,10 +2421,22 @@ function setPTT(active) {
 
 $("ptt-btn").addEventListener("mousedown", (e) => { e.preventDefault(); setPTT(true); });
 ["mouseup", "mouseleave"].forEach((ev) => $("ptt-btn").addEventListener(ev, () => setPTT(false)));
+$("ptt-btn").addEventListener("keydown", (event) => {
+    if (!isActivationKey(event.key) || event.repeat) return;
+    event.preventDefault();
+    setPTT(true);
+});
+$("ptt-btn").addEventListener("keyup", (event) => {
+    if (!isActivationKey(event.key)) return;
+    event.preventDefault();
+    setPTT(false);
+});
+$("ptt-btn").addEventListener("blur", () => setPTT(false));
 
 $("voice-mute").onclick = () => {
     state.muted = !state.muted;
     $("voice-mute").classList.toggle("active", state.muted);
+    $("voice-mute").setAttribute("aria-pressed", String(state.muted));
     window.go.main.App.SetMuted(state.muted);
     if (state.muted) playEvent("mic_off");
     else playEvent("mic_on");
@@ -2332,17 +2525,6 @@ function toggleCompact() {
 // arrow keys move through the channel tree; Enter joins the focused channel.
 document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
-        const dlg = [...document.querySelectorAll(".dlg-overlay")].pop();
-        if (dlg) {
-            if (dlg.dataset.blocking === "true") {
-                e.preventDefault();
-                e.stopPropagation();
-                return;
-            }
-            dlg.remove();
-            e.stopPropagation();
-            return;
-        }
         const ctx = document.querySelector(".ctx-menu");
         if (ctx) {
             ctx.remove();
@@ -2352,17 +2534,44 @@ document.addEventListener("keydown", (e) => {
         return;
     }
     // Arrow navigation in the channel tree (when it or a row has focus).
-    if (!["ArrowUp", "ArrowDown", "Enter"].includes(e.key)) return;
+    if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Enter", " "].includes(e.key)) return;
     const tree = $("channel-tree");
     const rows = [...tree.querySelectorAll(".channel, .client")];
     if (rows.length === 0) return;
     const activeEl = document.activeElement;
     const idx = rows.indexOf(activeEl);
-    if (e.key === "Enter") {
-        if (idx >= 0 && activeEl.classList.contains("channel")) activeEl.click();
+    if (isActivationKey(e.key)) {
+        if (idx >= 0) {
+            e.preventDefault();
+            activeEl.click();
+        }
         return;
     }
     if (!tree.contains(activeEl) && idx < 0) return;
+    if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && idx >= 0) {
+        e.preventDefault();
+        if (activeEl.classList.contains("channel")) {
+            const channelID = Number(activeEl.dataset.chid);
+            const expanded = activeEl.getAttribute("aria-expanded");
+            if (e.key === "ArrowRight" && expanded === "false") {
+                setChannelExpanded(channelID, true);
+                tree.querySelector(`.channel[data-chid="${channelID}"]`)?.focus();
+            } else if (e.key === "ArrowRight" && expanded === "true") {
+                activeEl.closest(".channel-node")?.querySelector(
+                    ":scope > .channel-members > .client, :scope > .channel-children > .channel-node > .channel")?.focus();
+            } else if (e.key === "ArrowLeft" && expanded === "true") {
+                setChannelExpanded(channelID, false);
+                tree.querySelector(`.channel[data-chid="${channelID}"]`)?.focus();
+            } else if (e.key === "ArrowLeft") {
+                activeEl.closest(".channel-children")?.closest(".channel-node")
+                    ?.querySelector(":scope > .channel")?.focus();
+            }
+        } else if (e.key === "ArrowLeft") {
+            activeEl.closest(".channel-members")?.closest(".channel-node")
+                ?.querySelector(":scope > .channel")?.focus();
+        }
+        return;
+    }
     e.preventDefault();
     const next = e.key === "ArrowDown" ? Math.min(rows.length - 1, idx + 1) : Math.max(0, idx - 1);
     rows[next < 0 ? 0 : next].focus();
@@ -2412,23 +2621,42 @@ function applyWhisperSettings() {
 
 async function refreshPermissions() {
     const area = $("perm-area");
+    const generation = state.serverGeneration;
     try {
         const entries = await window.go.main.App.GetPermissions();
+        if (generation !== state.serverGeneration) return;
         // (6b) keep the resolved set for UI gating (kick/ban/group menus).
         state.myPerms = new Map((entries || []).map((e) => [e.key, e]));
         if (!entries || entries.length === 0) {
             area.innerHTML = `<div class="empty-state">No permissions — guest default</div>`;
             return;
         }
-        let html = `<table class="perm-grid"><thead><tr><th>key</th><th>value</th><th>flags</th></tr></thead><tbody>`;
+        const table = document.createElement("table");
+        table.className = "perm-grid";
+        table.innerHTML = "<thead><tr><th>key</th><th>value</th><th>flags</th></tr></thead><tbody></tbody>";
+        const body = table.querySelector("tbody");
         for (const e of entries) {
             const flags = [e.skip ? "skip" : "", e.negate ? "negate" : ""].filter(Boolean).join(",");
-            const inherited = e.inherited ? " inherited" : "";
             const source = e.source_tier ? `effective from ${e.source_tier}${e.inherited ? " (inherited)" : ""}` : "effective permission";
-            html += `<tr class="${inherited}" title="${source}"><td class="mono">${e.key}</td><td><span class="pill-val">${e.value}</span></td><td>${flags}${e.source_tier ? ` · ${e.source_tier}` : ""}</td></tr>`;
+            const row = document.createElement("tr");
+            row.classList.toggle("inherited", !!e.inherited);
+            row.title = source;
+            const key = document.createElement("td");
+            key.className = "mono";
+            key.textContent = String(e.key ?? "");
+            const value = document.createElement("td");
+            const valuePill = document.createElement("span");
+            valuePill.className = "pill-val";
+            valuePill.textContent = String(e.value ?? "");
+            value.appendChild(valuePill);
+            const flagCell = document.createElement("td");
+            flagCell.textContent = flags + (e.source_tier ? ` · ${e.source_tier}` : "");
+            row.append(key, value, flagCell);
+            body.appendChild(row);
         }
-        area.innerHTML = html + "</tbody></table>";
+        area.replaceChildren(table);
     } catch {
+        if (generation !== state.serverGeneration) return;
         area.innerHTML = `<div class="empty-state">Permissions unavailable</div>`;
     }
 }
@@ -2438,10 +2666,10 @@ async function refreshPermissions() {
 // ---------------------------------------------------------------------------
 
 window.__voicx = {
-    state, $, toast, sysMsg, beep, showLogin, disconnect, sendChat, setPTT,
+    state, $, toast, announceLive, sysMsg, beep, showLogin, showWorkspace, disconnect, sendChat, setPTT,
     setDeafened, refreshPermissions, applyVoiceState, applyOutputSettings,
     startVADMonitor: startVoiceMonitor, stopVADMonitor: stopVoiceMonitor,
-    connectFromLogin, renderTree, setDetailsOpen, setDirectTargetVisible,
+    connectFromLogin, renderTree, setChannelExpanded, setDetailsOpen, setDirectTargetVisible,
     clientName, initials, fetchAvatar,
     applyAppearance, toggleCompact, recentChannels, syncOwnChannel,
     ensureVoiceForChannel, resetVoiceSession,
@@ -2466,6 +2694,7 @@ window.__voicx = {
     },
 };
 
+initModalSystem();
 initMenu();
 initSettingsUI();
 initClientInfo();

@@ -9,102 +9,107 @@
 <body class="details-collapsed">
     <!-- Login overlay -->
     <div id="login-overlay">
-        <div class="login-card">
-            <h1 class="wordmark">voicx</h1>
+        <form class="login-card" aria-labelledby="login-title">
+            <h1 id="login-title" class="wordmark">voicx</h1>
             <p class="tagline">voice ops console</p>
-            <label>SERVER <input id="login-addr" value="127.0.0.1:12333" /></label>
-            <label>NICKNAME <input id="login-nick" placeholder="nickname or unique id" /></label>
-            <label>PASSWORD <input id="login-password" type="password" placeholder="optional — account login" /></label>
-            <label>SERVER PASSWORD <input id="login-serverpw" type="password" placeholder="if required" /></label>
-            <button id="login-connect">CONNECT</button>
-            <div id="login-error"></div>
+            <label for="login-addr">SERVER <input id="login-addr" value="127.0.0.1:12333" autocomplete="url" spellcheck="false" /></label>
+            <label for="login-nick">NICKNAME <input id="login-nick" placeholder="nickname or unique id" autocomplete="username" /></label>
+            <label for="login-password">PASSWORD <input id="login-password" type="password" placeholder="optional — account login" autocomplete="current-password" /></label>
+            <label for="login-serverpw">SERVER PASSWORD <input id="login-serverpw" type="password" placeholder="if required" autocomplete="off" /></label>
+            <button id="login-connect" type="submit">CONNECT</button>
+            <div id="login-error" role="alert" aria-live="assertive"></div>
             <div class="pane-head">RECENT SERVERS</div>
-            <div id="login-recents"></div>
+            <div id="login-recents" role="region" aria-label="Recent servers"></div>
             <div class="identity-footnote">
                 Identity auto-generated — stored locally
                 <span class="mono" id="login-identity"></span>
                 <span class="mono version-foot" id="login-version"></span>
             </div>
-        </div>
+        </form>
     </div>
 
-    <div id="toasts"></div>
+    <div id="toasts" role="region" aria-label="Notifications"></div>
 
     <!-- Main three-pane layout -->
     <div id="app" class="hidden">
-        <nav id="menubar"></nav>
-        <div id="server-tabs"></div>
+        <a class="skip-link" href="#chat-text">Skip to message composer</a>
+        <nav id="menubar" aria-label="Application menu"></nav>
+        <nav id="server-tabs" aria-label="Server connections"></nav>
         <div id="app-body">
-        <aside id="sidebar">
+        <aside id="sidebar" aria-labelledby="channels-heading">
             <div class="brand">
                 <img id="server-icon" class="hidden" alt="" title="server icon" />
                 <span class="wordmark">voicx</span>
                 <span id="alpha-badge" title="alpha software — click for details">α</span>
                 <span id="conn-lock" class="hidden" title="control channel TLS + chat payload encryption on">🔒</span>
-                <button id="notif-bell" class="icon-btn" title="Notifications (346)" aria-label="notifications">🔔<span id="notif-badge" class="hidden"></span></button>
+                <button id="notif-bell" class="icon-btn" title="Notifications (346)" aria-label="Notifications">🔔<span id="notif-badge" class="hidden"></span></button>
                 <span id="conn-pill" class="pill">offline</span>
             </div>
-            <div class="pane-head sidebar-head"><span>CHANNELS</span><button id="channel-create-btn" class="icon-btn pane-head-btn" title="Create channel">+</button></div>
+            <div class="pane-head sidebar-head"><h2 id="channels-heading">CHANNELS</h2><button id="channel-create-btn" class="icon-btn pane-head-btn" title="Create channel" aria-label="Create channel">+</button></div>
             <div id="tree-tools">
-                <input id="tree-filter" placeholder="filter… (319)" />
-                <button id="tree-collapse" class="icon-btn" title="Collapse all (302)">▾</button>
-                <button id="tree-expand" class="icon-btn" title="Expand all (302)">▸</button>
+                <label class="sr-only" for="tree-filter">Filter channels and users</label>
+                <input id="tree-filter" placeholder="filter… (319)" autocomplete="off" />
+                <button id="tree-collapse" class="icon-btn" title="Collapse all (302)" aria-label="Collapse all channels">▾</button>
+                <button id="tree-expand" class="icon-btn" title="Expand all (302)" aria-label="Expand all channels">▸</button>
             </div>
             <div id="channel-tree"></div>
         </aside>
 
-        <main id="center">
-            <div id="center-tabs">
-                <button id="tab-chat" class="active">Chat</button>
-                <button id="tab-files">Files</button>
-                <button id="tab-transfers" class="icon-btn" title="Transfers">⇅</button>
+        <main id="center" tabindex="-1" aria-label="Voice and chat workspace">
+            <div id="center-tabs" role="group" aria-label="Workspace views">
+                <button id="tab-chat" class="active" aria-pressed="true">Chat</button>
+                <button id="tab-files" aria-pressed="false" aria-controls="files-pane">Files</button>
+                <button id="tab-transfers" class="icon-btn" title="Transfers" aria-label="Open transfers">⇅</button>
             </div>
             <div id="banner-box"></div>
-            <div id="voice-bar">
-                <button id="ptt-btn" title="Hold to talk (configure PTT in Settings)">🎙</button>
+            <div id="voice-bar" role="group" aria-label="Voice controls">
+                <button id="ptt-btn" title="Hold to talk (configure PTT in Settings)" aria-label="Push to talk" aria-pressed="false">🎙</button>
                 <div class="voice-buttons">
-                    <button id="voice-mute" class="icon-btn" title="Mute">🔇</button>
-                    <button id="voice-prio" class="icon-btn" title="Priority speaker (duck others while you talk)">PRIO</button>
-                    <button id="voice-video" class="icon-btn" title="Camera on/off">📷</button>
-                    <button id="voice-screen" class="icon-btn" title="Share screen">🖥</button>
-                    <button id="voice-lowbw" class="icon-btn" title="Low-bandwidth mode (receive low quality, send 150 kbps)">📶</button>
+                    <button id="voice-mute" class="icon-btn" title="Mute" aria-label="Mute microphone" aria-pressed="false">🔇</button>
+                    <button id="voice-prio" class="icon-btn" title="Priority speaker (duck others while you talk)" aria-label="Priority speaker" aria-pressed="false">PRIO</button>
+                    <button id="voice-video" class="icon-btn" title="Camera on/off" aria-label="Camera" aria-pressed="false">📷</button>
+                    <button id="voice-screen" class="icon-btn" title="Share screen" aria-label="Share screen" aria-pressed="false">🖥</button>
+                    <button id="voice-lowbw" class="icon-btn" title="Low-bandwidth mode (receive low quality, send 150 kbps)" aria-label="Low-bandwidth mode" aria-pressed="false">📶</button>
                 </div>
                 <div class="voice-info">
-                    <div id="voice-status">voice off</div>
-                    <div id="mic-status" class="warn"></div>
+                    <div id="voice-status" role="status" aria-live="polite">voice off</div>
+                    <div id="mic-status" class="warn" role="status" aria-live="polite"></div>
                     <div id="mic-meter" class="hidden"><div class="mic-fill cool"></div></div>
                 </div>
-                <span id="hotkey-status" title="global hotkey status"></span>
+                <span id="hotkey-status" title="global hotkey status" role="status" aria-live="polite"></span>
             </div>
-            <div id="talk-banner" class="hidden">● TALKING</div>
+            <div id="talk-banner" class="hidden" role="status" aria-live="assertive">● TALKING</div>
             <div id="video-grid" class="hidden"></div>
             <div id="chat-head">
-                <span id="chat-head-title">Chat</span>
+                <span id="chat-head-title" role="heading" aria-level="2">Chat</span>
                 <span id="chat-topic" class="hidden" title=""></span>
                 <span id="chat-slowmode" class="hidden" title=""></span>
                 <span id="chat-head-actions">
-                    <button id="chat-search-btn" class="icon-btn" title="Search chat (Ctrl+F)">🔍</button>
-                    <button id="chat-pins-btn" class="icon-btn" title="Pinned messages">📌</button>
-                    <button id="chat-info-btn" class="icon-btn hidden" title="Channel description">ⓘ</button>
-                    <button id="chat-e2ee-btn" class="icon-btn" title="Encryption diagnostics">🔒</button>
-                    <button id="chat-export-btn" class="icon-btn" title="Export the full stored history (not just what is loaded)">⬇</button>
+                    <button id="chat-search-btn" class="icon-btn" title="Search chat (Ctrl+F)" aria-label="Search chat">🔍</button>
+                    <button id="chat-pins-btn" class="icon-btn" title="Pinned messages" aria-label="Pinned messages">📌</button>
+                    <button id="chat-info-btn" class="icon-btn hidden" title="Channel description" aria-label="Channel description">ⓘ</button>
+                    <button id="chat-e2ee-btn" class="icon-btn" title="Encryption diagnostics" aria-label="Encryption diagnostics">🔒</button>
+                    <button id="chat-export-btn" class="icon-btn" title="Export the full stored history (not just what is loaded)" aria-label="Export chat history">⬇</button>
                 </span>
             </div>
             <div id="chat-search-row" class="hidden">
-                <input id="chat-search" placeholder="filter loaded messages… (Esc closes)" />
+                <label class="sr-only" for="chat-search">Filter loaded messages</label>
+                <input id="chat-search" placeholder="filter loaded messages… (Esc closes)" autocomplete="off" />
                 <button id="chat-search-server" title="Decrypt and scan the whole scope history in this client">search all history</button>
-                <button id="chat-search-close" class="icon-btn" title="Close search">✕</button>
+                <button id="chat-search-close" class="icon-btn" title="Close search" aria-label="Close chat search">✕</button>
             </div>
             <div id="pm-tabs" class="hidden"></div>
             <div id="chat-wrap">
-                <div id="chat-log"></div>
-                <button id="chat-newpill" class="hidden"></button>
+                <div id="chat-log" aria-labelledby="chat-head-title"></div>
+                <div id="chat-announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+                <div id="alert-announcer" class="sr-only" role="alert" aria-live="assertive" aria-atomic="true"></div>
+                <button id="chat-newpill" class="hidden" aria-label="Jump to new messages"></button>
             </div>
-            <div id="chat-typing" class="hidden"></div>
+            <div id="chat-typing" class="hidden" role="status" aria-live="polite"></div>
             <div id="reply-bar" class="hidden"></div>
             <div id="file-preview-row" class="hidden"></div>
             <div id="chat-input-row">
-                <select id="chat-scope">
+                <select id="chat-scope" aria-label="Message scope">
                     <option value="channel">channel</option>
                     <option value="global">global</option>
                     <option value="direct">direct</option>
@@ -114,20 +119,20 @@
                     <button id="chat-target-toggle" type="button" aria-label="Show connected members" title="Show connected members">⌄</button>
                     <div id="chat-target-options" class="hidden" role="listbox"></div>
                 </div>
-                <input id="chat-text" placeholder="message…" />
-                <input id="chat-file" type="file" multiple class="hidden" />
-                <button id="chat-attach" class="icon-btn" title="Attach files (or paste / drop them here)">📎</button>
-                <button id="chat-emoji" class="icon-btn" title="Emoji picker">😊</button>
+                <input id="chat-text" placeholder="message…" aria-label="Message" autocomplete="off" />
+                <input id="chat-file" type="file" multiple class="hidden" aria-label="Choose attachments" />
+                <button id="chat-attach" class="icon-btn" title="Attach files (or paste / drop them here)" aria-label="Attach files">📎</button>
+                <button id="chat-emoji" class="icon-btn" title="Emoji picker" aria-label="Open emoji picker">😊</button>
                 <button id="chat-send">SEND</button>
             </div>
-            <div id="files-pane"></div>
-            <video id="remote-video" autoplay playsinline class="hidden"></video>
-            <video id="local-video" autoplay playsinline muted class="hidden"></video>
+            <div id="files-pane" role="region" aria-label="Channel files" aria-hidden="true"></div>
+            <video id="remote-video" autoplay playsinline class="hidden" aria-label="Remote video"></video>
+            <video id="local-video" autoplay playsinline muted class="hidden" aria-label="Local camera preview"></video>
         </main>
 
         <aside id="details" aria-hidden="true">
             <div class="details-head">
-                <div class="pane-head">DETAILS</div>
+                <h2 class="pane-head">DETAILS</h2>
                 <button id="details-close" class="icon-btn" title="Close details" aria-label="Close details">✕</button>
             </div>
             <div id="client-card"></div>
