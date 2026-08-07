@@ -1,9 +1,14 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -13,13 +18,24 @@ import (
 )
 
 func main() {
-	if err := run(); err != nil {
+	timeout := flag.Duration("timeout", 5*time.Minute,
+		"maximum time to wait for the migration lock and apply migrations")
+	flag.Parse()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, *timeout); err != nil {
 		fmt.Fprintf(os.Stderr, "voicx-migrate: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run() (runErr error) {
+func run(ctx context.Context, timeout time.Duration) (runErr error) {
+	if ctx == nil {
+		return errors.New("migration context is nil")
+	}
+	if timeout <= 0 {
+		return fmt.Errorf("migration timeout must be positive, got %s", timeout)
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
@@ -51,7 +67,10 @@ func run() (runErr error) {
 		}
 	}()
 
-	if err := s.Migrate(); err != nil {
+	migrationCtx, cancelMigration := context.WithTimeout(ctx, timeout)
+	err = s.MigrateContext(migrationCtx)
+	cancelMigration()
+	if err != nil {
 		return fmt.Errorf("applying migrations: %w", err)
 	}
 

@@ -2,7 +2,7 @@
 //
 // Usage:
 //
-//	adduser -nickname <name> -password <pw> [-admin] [-db <dsn>]
+//	adduser -nickname <name> -password <pw> [-admin] [-db <dsn>] [-migration-timeout 5m]
 //
 // The database DSN comes from -db, then VOICX_DATABASE_URL. Migrations are
 // applied (idempotent). With -admin the user gets the is_admin flag
@@ -19,6 +19,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"go.uber.org/zap"
@@ -32,6 +34,8 @@ func main() {
 	password := flag.String("password", "", "user password (required)")
 	admin := flag.Bool("admin", false, "grant server admin (users.is_admin)")
 	dsn := flag.String("db", "", "database DSN (default: VOICX_DATABASE_URL; required when unset)")
+	migrationTimeout := flag.Duration("migration-timeout", 5*time.Minute,
+		"maximum time to wait for the migration lock and apply migrations")
 	flag.Parse()
 
 	if *nickname == "" || *password == "" {
@@ -39,7 +43,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(*nickname, *password, *admin, *dsn); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, *nickname, *password, *admin, *dsn, *migrationTimeout); err != nil {
 		if errors.Is(err, auth.ErrUserExists) {
 			fmt.Printf("user %q already exists (no changes made)\n", *nickname)
 			return
@@ -49,7 +55,19 @@ func main() {
 	}
 }
 
-func run(nickname, password string, admin bool, dsn string) error {
+func run(
+	ctx context.Context,
+	nickname, password string,
+	admin bool,
+	dsn string,
+	migrationTimeout time.Duration,
+) error {
+	if ctx == nil {
+		return errors.New("command context is nil")
+	}
+	if migrationTimeout <= 0 {
+		return fmt.Errorf("migration timeout must be positive, got %s", migrationTimeout)
+	}
 	dsn, err := databaseDSN(dsn)
 	if err != nil {
 		return err
@@ -71,11 +89,14 @@ func run(nickname, password string, admin bool, dsn string) error {
 		}
 	}()
 
-	if err := dbStore.Migrate(); err != nil {
+	migrationCtx, cancelMigration := context.WithTimeout(ctx, migrationTimeout)
+	err = dbStore.MigrateContext(migrationCtx)
+	cancelMigration()
+	if err != nil {
 		return fmt.Errorf("running migrations: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	authSvc := auth.New(dbStore, logger)
