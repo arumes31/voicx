@@ -90,6 +90,10 @@ export function CheckForUpdate() {
   return window['go']['main']['App']['CheckForUpdate']();
 }
 
+export function CertificateClockWarning() {
+  return window['go']['main']['App']['CertificateClockWarning']();
+}
+
 export function ClientID() {
   return window['go']['main']['App']['ClientID']();
 }

@@ -3,6 +3,61 @@
 // limiter/per-user normalizer, and the per-user volume/mute registry.
 const V = () => window.__voicx;
 
+// Keep the voice-bar action aligned with what the next activation will do.
+// A pressed mute button offers "Unmute" to both pointer and screen-reader
+// users instead of continuing to announce the state-changing action as Mute.
+export function syncMuteButton(button, muted) {
+    if (!button) return;
+    button.classList.toggle("active", !!muted);
+    button.setAttribute("aria-pressed", String(!!muted));
+    button.textContent = muted ? "🔊" : "🔇";
+    button.title = muted ? "Unmute" : "Mute";
+    button.setAttribute("aria-label", muted ? "Unmute microphone" : "Mute microphone");
+}
+
+// Render microphone capture failures with an in-context recovery action. The
+// callback remains with main.js because recovery can renegotiate the live
+// voice session; this helper owns only the compact status interaction.
+export function renderMicStatus(container, micState, onRetry, videoOnly = true, successFocus = null) {
+    if (!container) return null;
+    container.replaceChildren();
+    const suffix = videoOnly ? " — video only" : "";
+    const message = micState === "denied"
+        ? `Microphone access denied${suffix}`
+        : micState === "none" ? `No microphone found${suffix}` : "";
+    if (!message) return null;
+
+    const text = document.createElement("span");
+    text.textContent = message;
+    container.appendChild(text);
+
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "mic-retry";
+    retry.textContent = "Retry microphone access";
+    retry.onclick = async () => {
+        const retryHadFocus = document.activeElement === retry;
+        let recovered = false;
+        retry.disabled = true;
+        retry.textContent = "Retrying…";
+        try {
+            recovered = !!(await onRetry?.());
+        } finally {
+            if (recovered && retryHadFocus && !retry.isConnected) {
+                successFocus?.focus?.({ preventScroll: true });
+            }
+            // Success replaces the entire status row. Restore only the still-
+            // mounted failure case so the user can make another attempt.
+            if (retry.isConnected) {
+                retry.disabled = false;
+                retry.textContent = "Retry microphone access";
+            }
+        }
+    };
+    container.appendChild(retry);
+    return retry;
+}
+
 // ---------------------------------------------------------------------------
 // Mic level meter (3) — animated level bar driven by an AnalyserNode on the
 // local stream. The element #mic-meter exists in the voice bar.

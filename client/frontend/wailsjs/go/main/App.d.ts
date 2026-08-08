@@ -47,6 +47,8 @@ export function ChatSearch(arg1:number,arg2:string,arg3:number):Promise<main.Cha
 
 export function CheckForUpdate():Promise<main.UpdateInfo>;
 
+export function CertificateClockWarning():Promise<string>;
+
 export function ClientID():Promise<string>;
 
 export function ClientVersion():Promise<string>;

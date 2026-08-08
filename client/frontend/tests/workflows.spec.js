@@ -44,6 +44,11 @@ test.beforeEach(async ({ page }) => {
                     (window.__callArgs[method] ||= []).push(structuredClone(args));
                     if (method === "GetSettings") return structuredClone(initialSettings);
                     if (method === "SaveSettings") { window.__savedSettings = structuredClone(args[0]); return ""; }
+                    if (method === "CertificateClockWarning") return window.__certificateClockWarning || "";
+                    if (method === "ConnectBookmarkTab" && window.__connectBookmarkGate) {
+                        await window.__connectBookmarkGate;
+                        return window.__connectBookmarkResult || "";
+                    }
                     if (method === "ListTabs") return structuredClone(window.__tabs);
                     if (method === "ClientID") {
                         if (window.__clientIDGate) await window.__clientIDGate;
@@ -103,12 +108,13 @@ test.beforeEach(async ({ page }) => {
             },
         });
         window.go = { main: { App: app } };
+        window.__mediaDevices = [
+            { kind: "audioinput", deviceId: "mic-built-in", label: "Built-in Mic" },
+            { kind: "audioinput", deviceId: "mic-usb", label: "USB Mic" },
+            { kind: "audiooutput", deviceId: "speaker-usb", label: "USB Speakers" },
+        ];
         Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: {
-            enumerateDevices: async () => [
-                { kind: "audioinput", deviceId: "mic-built-in", label: "Built-in Mic" },
-                { kind: "audioinput", deviceId: "mic-usb", label: "USB Mic" },
-                { kind: "audiooutput", deviceId: "speaker-usb", label: "USB Speakers" },
-            ],
+            enumerateDevices: async () => structuredClone(window.__mediaDevices),
             getUserMedia: async () => { throw new Error("not needed by this workflow"); },
         }});
     }, { initialSettings: settings });
@@ -170,6 +176,394 @@ test("switches the capture device and persists it", async ({ page }) => {
     await select.selectOption("mic-usb");
     await page.getByRole("button", { name: "Apply", exact: true }).click();
     await expect.poll(() => page.evaluate(() => window.__savedSettings?.capture_device_id)).toBe("mic-usb");
+});
+
+test("refreshes capture and playback device lists on demand", async ({ page }) => {
+    await page.evaluate(() => window.__voicx.openSettings("capture"));
+    const captureRow = page.locator("#settings-content .set-row").filter({ hasText: "Capture device" });
+    const captureSelect = captureRow.locator("select");
+    await expect(captureSelect).toHaveAccessibleName("Capture device");
+    await expect(captureSelect.getByRole("option", { name: "USB Mic" })).toHaveCount(1);
+    await captureSelect.selectOption("mic-usb");
+
+    await page.evaluate(() => window.__mediaDevices.push({
+        kind: "audioinput", deviceId: "mic-studio", label: "Studio Mic",
+    }));
+    await expect(captureSelect.getByRole("option", { name: "Studio Mic" })).toHaveCount(0);
+    await captureRow.getByRole("button", { name: "Refresh capture devices" }).click();
+    await expect(captureSelect).toHaveAccessibleName("Capture device");
+    await expect(captureSelect.getByRole("option", { name: "Studio Mic" })).toHaveCount(1);
+    await expect(captureSelect).toHaveValue("mic-usb");
+
+    await page.getByRole("tab", { name: /Playback/ }).click();
+    const playbackRow = page.locator("#settings-content .set-row").filter({ hasText: "Output device" });
+    const playbackSelect = playbackRow.locator("select");
+    await expect(playbackSelect).toHaveAccessibleName("Output device");
+    await expect(playbackSelect.getByRole("option", { name: "USB Speakers" })).toHaveCount(1);
+
+    await page.evaluate(() => window.__mediaDevices.push({
+        kind: "audiooutput", deviceId: "speaker-bt", label: "Bluetooth Speakers",
+    }));
+    await expect(playbackSelect.getByRole("option", { name: "Bluetooth Speakers" })).toHaveCount(0);
+    await playbackRow.getByRole("button", { name: "Refresh playback devices" }).click();
+    await expect(playbackSelect).toHaveAccessibleName("Output device");
+    await expect(playbackSelect.getByRole("option", { name: "Bluetooth Speakers" })).toHaveCount(1);
+});
+
+test("mute control switches to an unmute affordance and back", async ({ page }) => {
+    await page.evaluate(() => window.__voicx.showWorkspace(false));
+    const mute = page.getByRole("button", { name: "Mute microphone" });
+    await expect(mute).toHaveText("🔇");
+    await expect(mute).toHaveAttribute("title", "Mute");
+    await expect(mute).toHaveAttribute("aria-pressed", "false");
+
+    await mute.click();
+    const unmute = page.getByRole("button", { name: "Unmute microphone" });
+    await expect(unmute).toHaveText("🔊");
+    await expect(unmute).toHaveAttribute("title", "Unmute");
+    await expect(unmute).toHaveAttribute("aria-pressed", "true");
+
+    await unmute.click();
+    await expect(page.getByRole("button", { name: "Mute microphone" })).toHaveText("🔇");
+});
+
+test("retries a missing microphone without interrupting video or screen sharing", async ({ page }) => {
+    await page.evaluate(() => {
+        window.__voicx.showWorkspace(false);
+        window.__getUserMediaCalls = 0;
+        window.__allowMicrophone = false;
+        window.__shareTracksStopped = 0;
+
+        const canvas = document.createElement("canvas");
+        const videoStream = canvas.captureStream(1);
+        window.__cameraTrack = videoStream.getVideoTracks()[0];
+        const audioContext = new AudioContext();
+        window.__retryAudioContext = audioContext;
+        const audioStream = audioContext.createMediaStreamDestination().stream;
+        navigator.mediaDevices.getUserMedia = async (constraints) => {
+            window.__getUserMediaCalls++;
+            if (constraints.audio && !window.__allowMicrophone) {
+                throw new DOMException("test permission denial", "NotAllowedError");
+            }
+            if (constraints.video) return videoStream;
+            if (constraints.audio) return audioStream;
+            return new MediaStream();
+        };
+
+        class FakePeerConnection {
+            constructor() {
+                this.senders = [];
+                this.transceivers = [];
+                this.iceConnectionState = "connected";
+            }
+            addTransceiver(track, options = {}) {
+                const sender = {
+                    track,
+                    getParameters: () => ({ encodings: [{}] }),
+                    setParameters: async () => {},
+                    replaceTrack: async (nextTrack) => { sender.track = nextTrack; },
+                };
+                const transceiver = {
+                    sender,
+                    receiver: { track: null },
+                    direction: options.direction || "sendrecv",
+                    currentDirection: options.direction || "sendrecv",
+                };
+                this.senders.push(sender);
+                this.transceivers.push(transceiver);
+                return transceiver;
+            }
+            getSenders() { return this.senders; }
+            getTransceivers() { return this.transceivers; }
+            async createOffer() { return { type: "offer", sdp: "test-offer" }; }
+            async setLocalDescription(description) { this.localDescription = description; }
+            async setRemoteDescription(description) { this.remoteDescription = description; }
+            async addIceCandidate() {}
+            close() { this.iceConnectionState = "closed"; }
+        }
+        window.RTCPeerConnection = FakePeerConnection;
+        window.__voicx.state.myClientID = "client-a";
+        window.__voicx.state.myChannelID = 0;
+        window.__voicx.state.channels = [{ ChannelID: 42, Name: "Lobby" }];
+        window.__voicx.state.clients = [{
+            client_id: "client-a", unique_id: "user-a", nickname: "Alice",
+            channel_id: 0, is_speaking: false,
+        }];
+        const moved = JSON.stringify({ type: "user_moved", data: { client_id: "client-a", channel_id: 42 } });
+        for (const callback of window.__events.event || []) callback(moved);
+    });
+
+    await expect(page.locator("#voice-status")).toHaveText("voice on");
+    await expect(page.locator("#mic-status > span")).toHaveText("Microphone access denied — video only");
+    const retry = page.getByRole("button", { name: "Retry microphone access" });
+    await expect(retry).toBeVisible();
+
+    await page.evaluate(() => {
+        const state = window.__voicx.state;
+        window.__pcBeforeMicRetry = state.pc;
+        state.screenSharing = true;
+        state.shareStream = {
+            getTracks: () => [{ stop: () => { window.__shareTracksStopped++; } }],
+        };
+        window.__allowMicrophone = true;
+    });
+
+    await retry.click();
+
+    await expect(page.locator("#mic-status")).toBeEmpty();
+    await expect(page.locator("#ptt-btn")).toBeEnabled();
+    await expect(page.locator("#ptt-btn")).toBeFocused();
+    await expect.poll(() => page.evaluate(() => ({
+        samePeerConnection: window.__voicx.state.pc === window.__pcBeforeMicRetry,
+        audioTracks: window.__voicx.state.localStream.getAudioTracks().length,
+        cameraLive: window.__cameraTrack.readyState === "live",
+        sharing: window.__voicx.state.screenSharing,
+        shareTracksStopped: window.__shareTracksStopped,
+        unpublishedShare: window.__calls.SetScreenShare || 0,
+        slots: window.__callArgs.WebRTCOffer.at(-1)[1].map(({ slot }) => slot),
+    }))).toEqual({
+        samePeerConnection: true,
+        audioTracks: 1,
+        cameraLive: true,
+        sharing: true,
+        shareTracksStopped: 0,
+        unpublishedShare: 0,
+        slots: ["cam", "mic"],
+    });
+});
+
+test("edits a recent server in the login form and focuses its address", async ({ page }) => {
+    await page.evaluate(() => {
+        window.__voicx.state.settings.recents = [{
+            addr: "voice.example:12333",
+            nickname: "Alice",
+            last_used: 123,
+        }];
+        window.__voicxTabs.renderRecents();
+    });
+
+    const row = page.locator("#login-recents .recent-row");
+    const label = row.locator(".recent-label");
+    await expect(label).toHaveText("Alice @ voice.example:12333");
+    await label.click();
+    await expect(page.locator("#login-addr")).toHaveValue("voice.example:12333");
+    await expect(page.locator("#login-nick")).toHaveValue("Alice");
+
+    const edit = page.getByRole("button", {
+        name: "Edit recent server Alice at voice.example:12333",
+    });
+    await expect(edit).toContainText("Edit");
+    await page.locator("#login-addr").fill("wrong.example:12333");
+    await page.locator("#login-nick").fill("Wrong nickname");
+    await edit.click();
+
+    await expect(page.locator("#login-addr")).toHaveValue("voice.example:12333");
+    await expect(page.locator("#login-nick")).toHaveValue("Alice");
+    await expect(page.locator("#login-addr")).toBeFocused();
+    await expect.poll(() => page.locator("#login-addr").evaluate((input) => ({
+        start: input.selectionStart,
+        end: input.selectionEnd,
+    }))).toEqual({ start: 0, end: "voice.example:12333".length });
+});
+
+test("shows connection-quality sample age and clears stale RTT on disconnect", async ({ page }) => {
+    await page.evaluate(() => {
+        const { state } = window.__voicx;
+        state.myClientID = "client-a";
+        const pill = document.getElementById("conn-pill");
+        pill.textContent = "voice.example:12333";
+        pill.classList.add("up");
+        window.__voicx.showWorkspace(false);
+        window.__voicx.startQualitySampler();
+    });
+
+    const pill = page.locator("#conn-pill");
+    await expect(pill).toHaveAttribute("data-quality", "good");
+    await expect(pill).toHaveAttribute(
+        "title",
+        /connection quality: good \(RTT 12 ms, sampled (?:just now|\d+ seconds? ago)\)/,
+    );
+
+    await page.evaluate(() => {
+        window.__voicx.state.settings.reconnect_on_loss = false;
+        for (const callback of window.__events.disconnected || []) callback();
+    });
+    await expect(pill).not.toHaveAttribute("data-quality", /.+/);
+    await expect(pill).toHaveAttribute("title", "Offline — no current RTT sample");
+});
+
+test("clears RTT while switching tabs and only samples a connected active tab", async ({ page }) => {
+    await page.evaluate(() => {
+        const { state } = window.__voicx;
+        state.myClientID = "client-a";
+        const pill = document.getElementById("conn-pill");
+        pill.textContent = "first.example:12333";
+        pill.classList.add("up");
+        window.__voicx.showWorkspace(false);
+        window.__voicx.startQualitySampler();
+    });
+    const pill = page.locator("#conn-pill");
+    await expect(pill).toHaveAttribute("data-quality", "good");
+
+    await page.evaluate(() => {
+        window.__tabs = [{
+            id: "offline-tab", addr: "offline.example:12333", nickname: "Alice",
+            connected: false, active: true, unread: 0, mentions: 0,
+        }];
+        for (const callback of window.__events.tab_reset || []) callback("offline-tab");
+    });
+
+    await expect(pill).not.toHaveAttribute("data-quality", /.+/);
+    await expect(pill).not.toHaveClass(/\bup\b/);
+    await expect(pill).toHaveAttribute("title", "Offline — no current RTT sample");
+});
+
+test("warns after connect when the local clock is outside certificate validity", async ({ page }) => {
+    await page.evaluate(() => {
+        window.__certificateClockWarning = "Local clock may be inaccurate; check date, time, and time zone.";
+    });
+    await page.locator("#login-addr").fill("voice.example:12333");
+    await page.locator("#login-nick").fill("Alice");
+    await page.getByRole("button", { name: "Connect" }).click();
+
+    await expect(page.locator("#toasts")).toContainText(
+        "Local clock may be inaccurate; check date, time, and time zone.",
+    );
+    await expect.poll(() => page.evaluate(() => window.__calls.CertificateClockWarning || 0)).toBe(1);
+});
+
+test("warns about certificate timing after a guest quick-connect", async ({ page }) => {
+    await page.evaluate(async () => {
+        window.__certificateClockWarning = "Local clock may be inaccurate; check date, time, and time zone.";
+        window.__voicx.state.settings.recents = [{
+            addr: "quick.example:12333", nickname: "Alice", last_used: 123,
+        }];
+        await window.__voicxTabs.quickConnectLast();
+    });
+
+    await expect(page.locator("#alert-announcer")).toContainText(
+        "Certificate timing warning for quick.example:12333",
+    );
+    expect(await page.evaluate(() => window.__calls.ConnectGuestBookmarkTab)).toBe(1);
+    expect(await page.evaluate(() => window.__calls.CertificateClockWarning)).toBe(1);
+});
+
+test("reconnects the last server from the tray only while disconnected", async ({ page }) => {
+    await page.evaluate(() => {
+        const { state } = window.__voicx;
+        state.settings.reconnect_on_loss = false;
+        state.lastConnect = null;
+        state.lastSuccessfulConnect = {
+            addr: "voice.example:12333", nick: "Alice", pw: "secret", spw: "", bookmark: "Work",
+        };
+        const pill = document.getElementById("conn-pill");
+        pill.textContent = "offline";
+        pill.classList.remove("up");
+        for (const callback of window.__events.tray_reconnect || []) callback();
+    });
+
+    await expect.poll(() => page.evaluate(() => window.__calls.ConnectBookmarkTab || 0)).toBe(1);
+    await expect(page.locator("#conn-pill")).toHaveClass(/\bup\b/);
+    expect(await page.evaluate(() => window.__callArgs.ConnectBookmarkTab[0])).toEqual([
+        "Work", "voice.example:12333", "Alice", "secret", "",
+    ]);
+
+    await page.evaluate(() => {
+        for (const callback of window.__events.tray_reconnect || []) callback();
+    });
+    await page.waitForTimeout(50);
+    expect(await page.evaluate(() => window.__calls.ConnectBookmarkTab)).toBe(1);
+});
+
+test("keeps an automatic reconnect pinned to the server that dropped", async ({ page }) => {
+    await page.evaluate(() => {
+        const state = window.__voicx.state;
+        state.settings.reconnect_on_loss = true;
+        state.lastConnect = {
+            addr: "dropped.example:12333", nick: "Alice", pw: "secret", spw: "", bookmark: "Dropped",
+        };
+        for (const callback of window.__events.disconnected || []) callback();
+        state.lastConnect = {
+            addr: "switched.example:12333", nick: "Bob", pw: "other", spw: "", bookmark: "Switched",
+        };
+    });
+
+    await expect.poll(
+        () => page.evaluate(() => window.__calls.ConnectBookmarkTab || 0),
+        { timeout: 7000 },
+    ).toBe(1);
+    expect(await page.evaluate(() => window.__callArgs.ConnectBookmarkTab[0])).toEqual([
+        "Dropped", "dropped.example:12333", "Alice", "secret", "",
+    ]);
+});
+
+test("does not finish an in-flight reconnect after an intentional disconnect", async ({ page }) => {
+    await page.evaluate(() => {
+        const { state } = window.__voicx;
+        state.settings.reconnect_on_loss = true;
+        state.lastSuccessfulConnect = {
+            addr: "voice.example:12333", nick: "Alice", pw: "secret", spw: "", bookmark: "Work",
+        };
+        window.__connectBookmarkGate = new Promise((resolve) => {
+            window.__releaseConnectBookmark = resolve;
+        });
+        for (const callback of window.__events.tray_reconnect || []) callback();
+    });
+    await expect.poll(() => page.evaluate(() => window.__calls.ConnectBookmarkTab || 0)).toBe(1);
+
+    await page.evaluate(() => {
+        for (const callback of window.__events.tray_disconnect || []) callback();
+        window.__releaseConnectBookmark();
+    });
+
+    await expect.poll(() => page.evaluate(() => window.__calls.Disconnect || 0)).toBe(2);
+    await expect(page.locator("#conn-pill")).not.toHaveClass(/\bup\b/);
+    expect(await page.evaluate(() => window.__voicx.state.lastConnect)).toBeNull();
+});
+
+test("labels screen-share controls and explains low-bandwidth data use", async ({ page }) => {
+    await page.evaluate(() => window.__voicx.showWorkspace(false));
+    const shareButton = page.locator("#voice-screen");
+    const lowBandwidthButton = page.locator("#voice-lowbw");
+
+    await expect(shareButton).toHaveAttribute("title", "Start sharing");
+    await expect(shareButton).toHaveAccessibleName("Start sharing");
+    await expect(lowBandwidthButton).toHaveAttribute("title", /150 kbps camera or screen-share cap.*incoming data are additional/);
+    await expect(lowBandwidthButton).toHaveAccessibleDescription(
+        /outgoing video.*68 MB\/hour.*Voice, protocol overhead, and incoming data are additional/,
+    );
+    await expect(lowBandwidthButton).toHaveAttribute("aria-describedby", "voice-lowbw-estimate");
+    await expect(page.locator("#voice-lowbw-estimate")).toBeVisible();
+    await expect(page.locator("#voice-lowbw-estimate")).toHaveText("≤68 MB/h video send");
+
+    await lowBandwidthButton.click();
+    await expect(page.locator("#voice-lowbw-estimate")).toBeVisible();
+    await expect(page.locator("#voice-lowbw-estimate")).toHaveText("≤68 MB/h video send");
+    await expect(page.locator("#voice-lowbw-estimate")).toHaveClass(/active/);
+
+    await shareButton.click();
+    const shareDialog = page.getByRole("dialog", { name: "Share screen" });
+    await expect(shareDialog.getByRole("group", { name: "Source" })).toBeVisible();
+    await expect(shareDialog.getByRole("radio")).toHaveCount(3);
+    await expect(shareDialog.getByRole("combobox", { name: "Quality preset" })).toBeVisible();
+    await expect(shareDialog.getByRole("checkbox", { name: "Include system audio" })).toBeVisible();
+    await auditAccessibility(page, "screen-share dialog");
+
+    await page.evaluate(() => {
+        const videoTrack = { kind: "video", contentHint: "", stop() {}, onended: null };
+        navigator.mediaDevices.getDisplayMedia = async () => ({
+            getVideoTracks: () => [videoTrack],
+            getAudioTracks: () => [],
+            getTracks: () => [videoTrack],
+        });
+    });
+    await shareDialog.getByRole("button", { name: "Start sharing" }).click();
+    await expect(shareButton).toHaveAttribute("title", "Stop sharing");
+    await expect(shareButton).toHaveAccessibleName("Stop sharing");
+
+    await shareButton.click();
+    await expect(shareButton).toHaveAttribute("title", "Start sharing");
+    await expect(shareButton).toHaveAccessibleName("Start sharing");
 });
 
 test("switches active server tabs without retaining stale identity", async ({ page }) => {
@@ -389,6 +783,8 @@ test("starts voice and plays the local cue when joining or switching channels", 
     await expect.poll(() => page.evaluate(
         () => window.__playedMedia.some((src) => src.includes("channel_join")),
     )).toBe(true);
+    await expect(page.locator("#voice-status")).toHaveText("voice unavailable");
+    await expect(page.locator("#mic-status > span")).toHaveText("Microphone access denied");
 
     const firstCueCount = await page.evaluate(() => window.__playedMedia.length);
     await page.evaluate(() => {
@@ -406,6 +802,11 @@ test("starts voice and plays the local cue when joining or switching channels", 
         for (const cb of window.__events.event || []) cb(moved);
     });
     await expect.poll(() => page.evaluate(() => window.__playedMedia.length)).toBe(firstCueCount + 1);
+    await page.evaluate(() => {
+        const moved = JSON.stringify({ type: "user_moved", data: { client_id: "client-a", channel_id: 0 } });
+        for (const cb of window.__events.event || []) cb(moved);
+    });
+    await expect(page.locator("#mic-status")).toBeEmpty();
 });
 
 test("shows the files toolbar and opens the upload picker", async ({ page }) => {
@@ -859,7 +1260,7 @@ test("preserves reconnect batching across the tab created by a real reconnect", 
 test("keeps reconnect countdown changes visual and announces the failure once", async ({ page }) => {
     await page.evaluate(() => {
         window.__voicx.showWorkspace(false);
-        window.__voicx.state.settings.reconnect_on_loss = true;
+        delete window.__voicx.state.settings.reconnect_on_loss;
         window.__voicx.state.settings.notify_connection = true;
         window.__voicx.state.lastConnect = { addr: "voice.example:12333", nick: "Alice", pw: "", spw: "" };
         for (const callback of window.__events.disconnected || []) callback();

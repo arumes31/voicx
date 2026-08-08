@@ -4,6 +4,7 @@ import { calibrateMic, startLoopback } from "./audio.js";
 import { play, SOUND_EVENTS, testAll } from "./sounds.js";
 import { MATRIX_EVENTS, defaultMatrixRow } from "./notifications.js";
 import { associateControlLabel, wrappedIndex } from "./a11y.js";
+import { createMediaDeviceInventory } from "./media-devices.js";
 import { closeDialog, mountDialog } from "./modal.js";
 
 const V = () => window.__voicx;
@@ -109,14 +110,13 @@ function revertLivePreview() {
 
 // --- device enumeration --------------------------------------------------------
 
-async function listDevices(kind) {
-    try {
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        return devices.filter((d) => d.kind === kind);
-    } catch {
-        return [];
+const deviceInventory = createMediaDeviceInventory(() => {
+    const mediaDevices = globalThis.navigator?.mediaDevices;
+    if (typeof mediaDevices?.enumerateDevices !== "function") {
+        throw new Error("media device discovery is not available");
     }
-}
+    return mediaDevices.enumerateDevices();
+});
 
 function deviceSelect(devices, selectedId, onchange) {
     const sel = document.createElement("select");
@@ -133,6 +133,86 @@ function deviceSelect(devices, selectedId, onchange) {
     sel.value = selectedId || "";
     sel.onchange = () => onchange(sel.value);
     return sel;
+}
+
+function devicePicker(kind, selectedId, onchange, label) {
+    const wrap = document.createElement("div");
+    wrap.className = "device-picker";
+
+    let currentId = selectedId || "";
+    let select = deviceSelect([], currentId, (value) => {
+        currentId = value;
+        onchange(value);
+    });
+    select.disabled = true;
+
+    const refreshBtn = document.createElement("button");
+    refreshBtn.type = "button";
+    refreshBtn.className = "device-refresh";
+    refreshBtn.textContent = "Refresh devices";
+    refreshBtn.setAttribute("aria-label", `Refresh ${label.toLowerCase()}`);
+
+    const status = document.createElement("span");
+    status.className = "set-hint device-status";
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+
+    let loaded = false;
+    const deviceType = kind === "audioinput" ? "capture" : "playback";
+    const refresh = async (force = false) => {
+        currentId = select.value || currentId;
+        if (!loaded) select.disabled = true;
+        refreshBtn.disabled = true;
+        refreshBtn.textContent = "Refreshing…";
+        wrap.setAttribute("aria-busy", "true");
+        status.classList.remove("warn");
+        status.textContent = force ? "Refreshing audio devices…" : "Loading audio devices…";
+
+        try {
+            const inventory = await deviceInventory.load(force);
+            const devices = inventory.filter((device) => device.kind === kind);
+            const next = deviceSelect(devices, currentId, (value) => {
+                currentId = value;
+                onchange(value);
+            });
+            if (currentId && !devices.some((device) => device.deviceId === currentId)) {
+                const unavailable = document.createElement("option");
+                unavailable.value = currentId;
+                unavailable.textContent = "Saved device (currently unavailable)";
+                next.appendChild(unavailable);
+                next.value = currentId;
+            }
+            // row() associates the initial select with its visible label.
+            // Preserve that ID so the replacement remains labelled.
+            next.id = select.id;
+            select.replaceWith(next);
+            select = next;
+            loaded = true;
+            status.textContent = force
+                ? `Devices refreshed — ${devices.length} ${deviceType} device${devices.length === 1 ? "" : "s"} found.`
+                : "";
+            if (devices.length === 0) {
+                status.textContent = `No ${deviceType} devices found. Check the connection and media permissions, then refresh.`;
+            }
+        } catch (error) {
+            if (!loaded) {
+                select.options[0].textContent = "Devices unavailable";
+                select.disabled = true;
+            }
+            status.classList.add("warn");
+            const detail = error?.message || error?.name || "unknown error";
+            status.textContent = `Could not list audio devices: ${detail}. Check media permissions, then retry.`;
+        } finally {
+            refreshBtn.disabled = false;
+            refreshBtn.textContent = "Refresh devices";
+            wrap.removeAttribute("aria-busy");
+        }
+    };
+
+    refreshBtn.onclick = () => refresh(true);
+    wrap.append(select, refreshBtn, status);
+    refresh();
+    return wrap;
 }
 
 // --- pages ---------------------------------------------------------------------
@@ -416,11 +496,12 @@ function themeEditor(s) {
 function pageCapture() {
     const s = settings();
     const el = document.createElement("div");
-    const deviceRow = row("Capture device", document.createElement("span"));
-    el.appendChild(deviceRow);
-    listDevices("audioinput").then((devs) => {
-        deviceRow.replaceChild(deviceSelect(devs, s.capture_device_id, (v) => { s.capture_device_id = v; }), deviceRow.lastChild);
-    });
+    el.appendChild(row("Capture device", devicePicker(
+        "audioinput",
+        s.capture_device_id,
+        (v) => { s.capture_device_id = v; },
+        "Capture devices",
+    )));
 
     // Activation mode.
     const modeWrap = document.createElement("div");
@@ -564,11 +645,12 @@ function pageCapture() {
 function pagePlayback() {
     const s = settings();
     const el = document.createElement("div");
-    const deviceRow = row("Output device", document.createElement("span"));
-    el.appendChild(deviceRow);
-    listDevices("audiooutput").then((devs) => {
-        deviceRow.replaceChild(deviceSelect(devs, s.playback_device_id, (v) => { s.playback_device_id = v; }), deviceRow.lastChild);
-    });
+    el.appendChild(row("Output device", devicePicker(
+        "audiooutput",
+        s.playback_device_id,
+        (v) => { s.playback_device_id = v; },
+        "Playback devices",
+    )));
     el.appendChild(row("Voice volume", slider(s.volume, 0, 200, (v) => {
         s.volume = v;
         const rv = document.getElementById("remote-video");
@@ -1202,6 +1284,7 @@ function renderPage(id) {
 
 function openSettings(pageId = "application") {
     draft = JSON.parse(JSON.stringify(V().state.settings || {}));
+    deviceInventory.invalidate();
 
     let overlay = document.getElementById("settings-overlay");
     if (overlay) closeDialog(overlay, "cancel");

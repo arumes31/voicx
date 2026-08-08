@@ -95,6 +95,9 @@ func (a *App) relayTabEvent(tabID, name string, payload any) {
 	}
 	a.tabsMu.Unlock()
 
+	if active && name == "disconnected" {
+		traySetConnected(false)
+	}
 	if mention {
 		// (290) mention in a background tab: flash the taskbar + badge.
 		a.FlashWindow()
@@ -190,9 +193,11 @@ func (a *App) activate(tabID string) {
 	a.tabsMu.Lock()
 	ts := a.tabs[tabID]
 	a.activeID = tabID
+	var activeCM *connManager
 	var journal []journalEntry
 	if ts != nil {
 		a.cmStore(ts.cm)
+		activeCM = ts.cm
 		ts.info.Unread = 0
 		ts.info.Mentions = 0
 		journal = append(journal, ts.journal...)
@@ -200,6 +205,7 @@ func (a *App) activate(tabID string) {
 		a.cmStore(nil)
 	}
 	a.tabsMu.Unlock()
+	traySetConnected(activeCM != nil && activeCM.connected())
 
 	// The frontend clears chat/tree on tab_reset; the replay below rebuilds
 	// state from the journaled frames in order.

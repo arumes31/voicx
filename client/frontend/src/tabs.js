@@ -154,6 +154,7 @@ async function refreshTabIdentity(tabID) {
         if (info) state.tabConnects.set(tabID, state.lastConnect);
     }
     state.myNickname = state.lastConnect ? state.lastConnect.nick : "";
+    if (state.lastConnect) state.lastSuccessfulConnect = { ...state.lastConnect };
     V().renderTree();
 }
 
@@ -164,6 +165,15 @@ function onTabReset(tabID) {
     activeTabID = tabID || "";
     const preserveReconnectAnnouncements = !!state.reconnectInFlight;
     state.serverGeneration = (state.serverGeneration || 0) + 1;
+    // RTT belongs to one server identity. Clear the old sample before replay
+    // and restart only after the new tab's identity has been resolved.
+    V().stopQualitySampler?.();
+    const connectionPill = $("conn-pill");
+    connectionPill.classList.remove("up");
+    connectionPill.textContent = tabID ? "switching…" : "offline";
+    connectionPill.title = tabID
+        ? "Connection status is refreshing"
+        : "Offline — no current RTT sample";
     closeServerDialogs();
     // Voice is active-tab only: fully tear down capture and WebRTC before the
     // replayed channel state automatically starts the new tab's session.
@@ -200,8 +210,23 @@ function onTabReset(tabID) {
     window.__voicxPerms?.refreshGroups?.().then(() => {
         if (activeTabID === tabID) V().renderTree();
     });
-    refreshTabIdentity(tabID).then(() => {
+    refreshTabIdentity(tabID).then(async () => {
         if (activeTabID !== tabID) return;
+        let connected = false;
+        try { connected = !!(await App().Connected()); } catch { /* disconnected */ }
+        if (activeTabID !== tabID) return;
+        if (connected && state.myClientID) {
+            connectionPill.textContent = state.lastConnect?.addr || "connected";
+            connectionPill.classList.add("up");
+            connectionPill.title = "";
+            V().startQualitySampler?.();
+        } else {
+            connectionPill.textContent = state.lastConnect?.addr
+                ? `${state.lastConnect.addr} (offline)`
+                : "offline";
+            connectionPill.classList.remove("up");
+            V().stopQualitySampler?.();
+        }
         window.__voicxFiles?.loadServerIcon?.();
         window.__voicxSocial?.refreshNews?.();
     });
@@ -224,6 +249,8 @@ async function autoConnectBookmarks() {
             $("login-nick").value = nick;
             V().state.pendingBookmark = { name: b.name, addr: b.addr };
             V().sysMsg?.("auto-connect needs your password for " + b.addr);
+        } else {
+            await V().checkCertificateClock?.(b.addr);
         }
     }
 }
@@ -251,6 +278,8 @@ async function quickConnectLast() {
         // stashed after showLogin, which drops the previous login's stash: a
         // recent has no bookmark name and must leave none behind (334).
         if (target.name) V().state.pendingBookmark = { name: target.name, addr: target.addr };
+    } else {
+        await V().checkCertificateClock?.(target.addr);
     }
 }
 
@@ -268,11 +297,26 @@ function renderRecents() {
         row.className = "recent-row";
         const starred = bms.some((b) => b.addr === r.addr && b.nickname === r.nickname);
         row.innerHTML = `<button type="button" class="recent-star" title="bookmark">${starred ? "★" : "☆"}</button>
-            <button type="button" class="recent-label"></button>`;
-        row.querySelector(".recent-label").textContent = (r.nickname || "?") + " @ " + r.addr;
-        row.querySelector(".recent-label").onclick = () => {
+            <button type="button" class="recent-label"></button>
+            <button type="button" class="recent-edit">Edit</button>`;
+        const label = row.querySelector(".recent-label");
+        const serverLabel = (r.nickname || "?") + " @ " + r.addr;
+        label.textContent = serverLabel;
+        label.onclick = () => {
             document.getElementById("login-addr").value = r.addr;
             document.getElementById("login-nick").value = r.nickname || "";
+        };
+        const edit = row.querySelector(".recent-edit");
+        edit.title = "Edit recent server";
+        edit.setAttribute("aria-label", `Edit recent server ${r.nickname || "server"} at ${r.addr}`);
+        edit.onclick = (event) => {
+            event.stopPropagation();
+            const addr = document.getElementById("login-addr");
+            addr.value = r.addr;
+            document.getElementById("login-nick").value = r.nickname || "";
+            V().state.pendingBookmark = null;
+            addr.focus();
+            addr.select();
         };
         const star = row.querySelector(".recent-star");
         star.setAttribute("aria-label", `${starred ? "Remove" : "Add"} bookmark for ${r.nickname || "server"} at ${r.addr}`);

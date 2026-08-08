@@ -96,7 +96,7 @@ type HotkeyProfile struct {
 // serialized default changes, and add the repair to migrateSettings:
 // loading merges the file ONTO the defaults, so a field an older client always
 // wrote wins over the new default unless it is explicitly repaired.
-const settingsVersion = 5
+const settingsVersion = 6
 
 // Settings holds all user preferences.
 type Settings struct {
@@ -254,6 +254,7 @@ func DefaultSettings() Settings {
 		NotifyConnection:      true,
 		WhisperSound:          true,
 		ChatNotificationLevel: "all",
+		ReconnectOnLoss:       true,
 		UpdatesAutoCheck:      true,
 
 		PTTReleaseDelayMs: 0,
@@ -363,6 +364,12 @@ func migrateSettings(s Settings) Settings {
 		// registered key system-wide on Windows, so old untouched defaults made
 		// spaces unavailable in every application while voicx was running.
 		s.HotkeyPTT = ""
+	}
+	if s.SettingsVersion < 6 {
+		// Version 6 makes reconnect-on-loss the safe default. Older files always
+		// serialized false unless the user opted in, so migrate them to the new
+		// behavior. A current-version false remains an explicit opt-out.
+		s.ReconnectOnLoss = true
 	}
 	s.SettingsVersion = settingsVersion
 	return s

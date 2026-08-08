@@ -286,10 +286,53 @@ func TestDefaultsThatMustNotBeZero(t *testing.T) {
 	if err := json.Unmarshal(raw, &m); err != nil {
 		t.Fatalf("unmarshal defaults: %v", err)
 	}
-	for _, key := range []string{"play_sounds", "warn_muted_talking", "warn_empty_channel", "voice_limiter"} {
+	for _, key := range []string{
+		"play_sounds",
+		"reconnect_on_loss",
+		"warn_muted_talking",
+		"warn_empty_channel",
+		"voice_limiter",
+	} {
 		if m[key] != true {
 			t.Errorf("%s default = %v, want true", key, m[key])
 		}
+	}
+}
+
+// TestReconnectOnLossDefaultAndMigration pins the version-6 default and
+// migration while preserving a current-version opt-out.
+func TestReconnectOnLossDefaultAndMigration(t *testing.T) {
+	if !DefaultSettings().ReconnectOnLoss {
+		t.Fatal("reconnect on loss should default on")
+	}
+
+	missingPath := filepath.Join(t.TempDir(), "missing-field.json")
+	if err := os.WriteFile(missingPath, []byte(`{"settings_version":5}`), 0o600); err != nil {
+		t.Fatalf("write settings without reconnect field: %v", err)
+	}
+	if got := loadSettingsAt(missingPath); !got.ReconnectOnLoss {
+		t.Error("settings without reconnect_on_loss did not inherit the enabled default")
+	}
+
+	legacyPath := filepath.Join(t.TempDir(), "legacy-disabled.json")
+	if err := os.WriteFile(
+		legacyPath,
+		[]byte(`{"settings_version":5,"reconnect_on_loss":false}`),
+		0o600,
+	); err != nil {
+		t.Fatalf("write legacy reconnect setting: %v", err)
+	}
+	if got := loadSettingsAt(legacyPath); !got.ReconnectOnLoss {
+		t.Error("legacy settings did not migrate reconnect_on_loss to enabled")
+	}
+
+	currentPath := filepath.Join(t.TempDir(), "current-opt-out.json")
+	currentJSON := []byte(`{"settings_version":6,"reconnect_on_loss":false}`)
+	if err := os.WriteFile(currentPath, currentJSON, 0o600); err != nil {
+		t.Fatalf("write current reconnect opt-out: %v", err)
+	}
+	if got := loadSettingsAt(currentPath); got.ReconnectOnLoss {
+		t.Error("migration overrode a current reconnect_on_loss opt-out")
 	}
 }
 

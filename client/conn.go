@@ -91,10 +91,15 @@ type connManager struct {
 	allowPlaintext bool
 	knownServers   *knownServers
 	// tlsUsed/fingerprint/newServer describe the current connection for the
-	// UI ("connected via TLS, fingerprint …, first seen").
-	tlsUsed     bool
-	fingerprint string
-	newServer   bool
+	// UI ("connected via TLS, fingerprint …, first seen"). The certificate
+	// validity window is retained separately so the UI can warn about a local
+	// clock that is too far outside it without weakening TOFU verification.
+	tlsUsed             bool
+	fingerprint         string
+	newServer           bool
+	certNotBefore       time.Time
+	certNotAfter        time.Time
+	certValidityTrusted bool
 
 	// pending maps message types to one-shot response waiters
 	// (PermissionsQuery, WebRTCOffer).
@@ -137,9 +142,19 @@ func (m *connManager) identity() (*identity, error) {
 func (m *connManager) dialTransport(addr string) (net.Conn, error) {
 	m.mu.Lock()
 	ks := m.knownServers
+	// A failed redial must not leave certificate metadata from an earlier
+	// transport available to diagnostics.
+	m.tlsUsed = false
+	m.fingerprint = ""
+	m.newServer = false
+	m.certNotBefore = time.Time{}
+	m.certNotAfter = time.Time{}
+	m.certValidityTrusted = false
 	m.mu.Unlock()
 	var fingerprint string
 	var firstSeen bool
+	var certNotBefore time.Time
+	var certNotAfter time.Time
 	tlsConf := &tls.Config{
 		// #nosec G402 -- VerifyConnection enforces the TOFU pin on every full or resumed handshake.
 		InsecureSkipVerify: true,
@@ -148,7 +163,10 @@ func (m *connManager) dialTransport(addr string) (net.Conn, error) {
 			if len(state.PeerCertificates) == 0 {
 				return fmt.Errorf("server presented no TLS certificate")
 			}
-			fingerprint = tlscert.FingerprintDER(state.PeerCertificates[0].Raw)
+			leaf := state.PeerCertificates[0]
+			fingerprint = tlscert.FingerprintDER(leaf.Raw)
+			certNotBefore = leaf.NotBefore
+			certNotAfter = leaf.NotAfter
 			if ks == nil {
 				return nil
 			}
@@ -175,6 +193,12 @@ func (m *connManager) dialTransport(addr string) (net.Conn, error) {
 		m.tlsUsed = true
 		m.fingerprint = fingerprint
 		m.newServer = firstSeen
+		m.certNotBefore = certNotBefore
+		m.certNotAfter = certNotAfter
+		// Retain dates only when the certificate fingerprint was accepted by
+		// the TOFU store. Pinning authenticates continuity, not the dates as a
+		// time source; the dates are used only for a conditional advisory.
+		m.certValidityTrusted = ks != nil
 		m.mu.Unlock()
 		return conn, nil
 	}
@@ -184,6 +208,9 @@ func (m *connManager) dialTransport(addr string) (net.Conn, error) {
 		m.tlsUsed = true
 		m.fingerprint = fingerprint
 		m.newServer = false
+		m.certNotBefore = certNotBefore
+		m.certNotAfter = certNotAfter
+		m.certValidityTrusted = false
 		m.mu.Unlock()
 		return nil, errFingerprintMismatch
 	}
@@ -199,6 +226,9 @@ func (m *connManager) dialTransport(addr string) (net.Conn, error) {
 	m.tlsUsed = false
 	m.fingerprint = ""
 	m.newServer = false
+	m.certNotBefore = time.Time{}
+	m.certNotAfter = time.Time{}
+	m.certValidityTrusted = false
 	m.mu.Unlock()
 	return net.DialTimeout("tcp", addr, 5*time.Second)
 }
@@ -209,6 +239,14 @@ func (m *connManager) securitySnapshot() (tlsUsed bool, fingerprint string, newS
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.tlsUsed, m.fingerprint, m.newServer
+}
+
+// certificateValiditySnapshot reports the peer certificate's validity window
+// and whether the fingerprint-pinned transport authenticated that metadata.
+func (m *connManager) certificateValiditySnapshot() (notBefore, notAfter time.Time, trusted bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.certNotBefore, m.certNotAfter, m.certValidityTrusted
 }
 
 // connect dials and authenticates. With a password it is an account login
@@ -400,6 +438,12 @@ func (m *connManager) openMOTD(resp netproto.AuthResponse) string {
 func (m *connManager) disconnectLocked() {
 	m.iceServers = nil
 	m.motd = ""
+	m.tlsUsed = false
+	m.fingerprint = ""
+	m.newServer = false
+	m.certNotBefore = time.Time{}
+	m.certNotAfter = time.Time{}
+	m.certValidityTrusted = false
 	// (312) subscriptions are per connection and the server forgets them on
 	// disconnect, so keeping the cached set would show tabs that no longer
 	// receive anything.

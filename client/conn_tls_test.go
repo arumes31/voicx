@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -57,6 +58,101 @@ func TestDialTransportPreservesFingerprintMismatch(t *testing.T) {
 	if !tlsUsed || gotFingerprint != presentedFingerprint || firstSeen {
 		t.Fatalf("security snapshot = (%v, %q, %v), want (true, %q, false)",
 			tlsUsed, gotFingerprint, firstSeen, presentedFingerprint)
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse TLS certificate: %v", err)
+	}
+	notBefore, notAfter, trusted := manager.certificateValiditySnapshot()
+	if !notBefore.Equal(leaf.NotBefore) || !notAfter.Equal(leaf.NotAfter) {
+		t.Fatalf(
+			"certificate validity snapshot = (%v, %v), want (%v, %v)",
+			notBefore,
+			notAfter,
+			leaf.NotBefore,
+			leaf.NotAfter,
+		)
+	}
+	if trusted {
+		t.Fatal("fingerprint-mismatched certificate validity was marked trusted")
+	}
+
+	_ = listener.Close()
+	select {
+	case <-serverDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("TLS test server did not stop")
+	}
+}
+
+func TestDialTransportRetainsAcceptedCertificateValidity(t *testing.T) {
+	cert, presentedFingerprint, err := tlscert.Ensure(t.TempDir(), "", "", nil)
+	if err != nil {
+		t.Fatalf("create TLS certificate: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse TLS certificate: %v", err)
+	}
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS13,
+	})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		if tlsConn, ok := conn.(*tls.Conn); ok {
+			_ = tlsConn.Handshake()
+		}
+		_ = conn.Close()
+	}()
+
+	addr := listener.Addr().String()
+	store := loadKnownServersAt(filepath.Join(t.TempDir(), "known_servers.json"))
+	manager := newConnManager(context.Background())
+	manager.knownServers = store
+	conn, err := manager.dialTransport(addr)
+	if err != nil {
+		t.Fatalf("dial first-seen TLS server: %v", err)
+	}
+	manager.mu.Lock()
+	manager.conn = conn
+	manager.mu.Unlock()
+
+	notBefore, notAfter, trusted := manager.certificateValiditySnapshot()
+	if !trusted || !notBefore.Equal(leaf.NotBefore) || !notAfter.Equal(leaf.NotAfter) {
+		t.Fatalf(
+			"accepted certificate validity = (%v, %v, %v), want (%v, %v, true)",
+			notBefore,
+			notAfter,
+			trusted,
+			leaf.NotBefore,
+			leaf.NotAfter,
+		)
+	}
+	if got := store.verify(addr, presentedFingerprint); got != trustOK {
+		t.Fatalf("first-seen fingerprint status = %v, want trustOK", got)
+	}
+	app := appWithCM(manager)
+	if warning := app.CertificateClockWarning(); warning != "" {
+		t.Fatalf("currently valid accepted certificate warning = %q", warning)
+	}
+
+	manager.disconnect()
+	notBefore, notAfter, trusted = manager.certificateValiditySnapshot()
+	if !notBefore.IsZero() || !notAfter.IsZero() || trusted {
+		t.Fatalf("disconnect retained certificate validity = (%v, %v, %v)", notBefore, notAfter, trusted)
+	}
+	if warning := app.CertificateClockWarning(); warning != "" {
+		t.Fatalf("disconnected certificate warning = %q", warning)
 	}
 
 	_ = listener.Close()

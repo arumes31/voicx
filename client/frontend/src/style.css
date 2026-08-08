@@ -257,6 +257,11 @@ body:not(.details-collapsed) #details-toggle { display: none; }
     transform: scale(1.07);
 }
 .voice-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+.lowbw-estimate {
+    align-self: center; white-space: nowrap;
+    color: var(--text-faint); font: 600 0.6429rem/1.15 var(--font-mono);
+}
+.lowbw-estimate.active { color: var(--warn, #f0b35a); }
 .icon-btn {
     width: 36px; height: 36px; border-radius: 8px;
     border: 1px solid var(--border); background: var(--bg-hover);
@@ -273,7 +278,14 @@ body:not(.details-collapsed) #details-toggle { display: none; }
 #voice-prio { width: auto; padding: 0 8px; font-size: 0.7143rem; font-weight: 700; letter-spacing: .06em; }
 .voice-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 #voice-status { font-size: 0.9286rem; color: var(--text-dim); }
+#mic-status { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 #mic-status:empty { display: none; }
+#mic-status .mic-retry {
+    padding: 2px 7px; border: 1px solid var(--border); border-radius: 5px;
+    background: var(--bg-hover); color: var(--text); cursor: pointer;
+    font: 600 0.7143rem var(--font-body);
+}
+#mic-status .mic-retry:disabled { opacity: .55; cursor: progress; }
 #hotkey-status { margin-left: auto; font-size: 0.8571rem; color: var(--text-faint); }
 #hotkey-status.err { color: var(--warn); }
 
@@ -529,6 +541,18 @@ body:not(.details-collapsed) #details-toggle { display: none; }
     min-width: 180px; padding: 6px 8px; border-radius: 6px;
     border: 1px solid var(--border); background: var(--bg); color: var(--text); outline: none;
 }
+.device-picker {
+    display: grid; grid-template-columns: minmax(180px, 1fr) auto; align-items: center;
+    gap: 5px 7px; min-width: min(100%, 330px);
+}
+.device-picker select { min-width: 0; width: 100%; }
+.device-refresh {
+    padding: 6px 9px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--bg-hover); color: var(--text); cursor: pointer; white-space: nowrap;
+}
+.device-refresh:hover:not(:disabled) { border-color: var(--border-accent); }
+.device-refresh:disabled { cursor: wait; opacity: 0.65; }
+.device-status { grid-column: 1 / -1; margin: 0; text-align: right; }
 .set-slider { display: flex; align-items: center; gap: 10px; }
 .set-slider input[type="range"] { width: 180px; accent-color: var(--accent); }
 .set-slider .mono { min-width: 34px; text-align: right; color: var(--text-dim); font-size: 0.8571rem; }
@@ -716,7 +740,12 @@ body:not(.details-collapsed) #details-toggle { display: none; }
 
 /* ---------------------------------------------------------------- share dialog (69-72) */
 .share-dlg h3 { margin: 0 0 10px; }
-.share-sources { display: flex; gap: 14px; margin-bottom: 10px; flex-wrap: wrap; }
+.share-sources {
+    display: flex; gap: 14px; flex-wrap: wrap; min-width: 0;
+    margin: 0 0 10px; padding: 10px 12px 12px;
+    border: 1px solid var(--border); border-radius: 6px;
+}
+.share-sources > legend { margin: 0; padding: 0 5px; }
 .share-sources label { display: flex; align-items: center; gap: 5px; color: var(--text-dim); font-size: 0.9286rem; }
 .share-audio { display: flex; align-items: center; gap: 6px; margin: 10px 0; color: var(--text-dim); font-size: 0.9286rem; }
 .dlg-text { color: var(--text-dim); font-size: 1rem; margin: 0 0 14px; }
@@ -1440,6 +1469,11 @@ mark { background: var(--warn); color: #3a2a05; border-radius: 2px; padding: 0 1
 }
 .recent-label:hover { color: var(--accent); }
 .recent-star { background: none; border: none; color: var(--warn); cursor: pointer; font-size: 1rem; }
+.recent-edit {
+    border: 1px solid var(--border); border-radius: 5px; background: var(--bg-hover);
+    color: var(--text-dim); cursor: pointer; font: 600 0.7143rem var(--font-body); padding: 3px 7px;
+}
+.recent-edit:hover { border-color: var(--border-accent); color: var(--accent); }
 
 /* (283/284) bookmark manager */
 .bm-folder { font: 600 0.7857rem var(--font-body); letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-dim); margin: 8px 0 2px; }

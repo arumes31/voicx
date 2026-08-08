@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -39,6 +40,9 @@ func TestAppOfflineContracts(t *testing.T) {
 	if got := a.ServerFingerprint(); got != "" {
 		t.Fatalf("ServerFingerprint = %q", got)
 	}
+	if got := a.CertificateClockWarning(); got != "" {
+		t.Fatalf("CertificateClockWarning = %q", got)
+	}
 	if got := a.ConnectionSecurity(); got != "offline" {
 		t.Fatalf("ConnectionSecurity = %q", got)
 	}
@@ -66,6 +70,10 @@ func TestAppOfflineContracts(t *testing.T) {
 	if got := a.SetVideoQuality("high"); got != "not connected" {
 		t.Fatalf("SetVideoQuality offline = %q", got)
 	}
+	// Global mute/PTT hotkeys remain available while offline; they must update
+	// tray state without dereferencing a missing active connection.
+	a.SetMuted(true)
+	a.SetPTT(true)
 	if got := a.SendChat("global", "", ""); got != "empty message" {
 		t.Fatalf("SendChat empty = %q", got)
 	}
@@ -79,6 +87,110 @@ func TestAppOfflineContracts(t *testing.T) {
 	a.SetAlwaysOnTop(true)
 	if !a.settings.AlwaysOnTop {
 		t.Fatal("SetAlwaysOnTop did not update settings")
+	}
+}
+
+func TestCertificateClockWarning(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.August, 8, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name             string
+		currentTime      time.Time
+		notBefore        time.Time
+		notAfter         time.Time
+		expectedFragment string
+	}{
+		{
+			name:      "missing current time",
+			notBefore: now.Add(-time.Hour),
+			notAfter:  now.Add(time.Hour),
+		},
+		{
+			name: "missing certificate window",
+		},
+		{
+			name:        "currently valid",
+			currentTime: now,
+			notBefore:   now.Add(-time.Hour),
+			notAfter:    now.Add(time.Hour),
+		},
+		{
+			name:        "early skew at tolerance is accepted",
+			currentTime: now,
+			notBefore:   now.Add(certificateClockSkewTolerance),
+			notAfter:    now.Add(time.Hour),
+		},
+		{
+			name:             "early skew beyond tolerance warns",
+			currentTime:      now,
+			notBefore:        now.Add(certificateClockSkewTolerance + time.Nanosecond),
+			notAfter:         now.Add(time.Hour),
+			expectedFragment: "The local system clock may be inaccurate",
+		},
+		{
+			name:        "late skew at tolerance is accepted",
+			currentTime: now,
+			notBefore:   now.Add(-time.Hour),
+			notAfter:    now.Add(-certificateClockSkewTolerance),
+		},
+		{
+			name:             "late skew beyond tolerance warns",
+			currentTime:      now,
+			notBefore:        now.Add(-time.Hour),
+			notAfter:         now.Add(-certificateClockSkewTolerance - time.Nanosecond),
+			expectedFragment: "server certificate may be expired",
+		},
+		{
+			name:             "invalid validity window",
+			currentTime:      now,
+			notBefore:        now.Add(time.Hour),
+			notAfter:         now.Add(-time.Hour),
+			expectedFragment: "invalid validity window",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := certificateClockWarning(tt.currentTime, tt.notBefore, tt.notAfter)
+			if tt.expectedFragment == "" && got != "" {
+				t.Fatalf("certificateClockWarning() = %q, want no warning", got)
+			}
+			if tt.expectedFragment != "" && !strings.Contains(got, tt.expectedFragment) {
+				t.Fatalf("certificateClockWarning() = %q, want fragment %q", got, tt.expectedFragment)
+			}
+		})
+	}
+}
+
+func TestCertificateClockWarningRequiresPinnedCertificate(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	clientConn, serverConn := net.Pipe()
+	t.Cleanup(func() {
+		_ = clientConn.Close()
+		_ = serverConn.Close()
+	})
+	cm := &connManager{
+		conn:          clientConn,
+		tlsUsed:       true,
+		fingerprint:   "AA:BB",
+		certNotBefore: now.Add(time.Hour),
+		certNotAfter:  now.Add(2 * time.Hour),
+	}
+	app := &App{}
+	app.cmStore(cm)
+	if got := app.CertificateClockWarning(); got != "" {
+		t.Fatalf("unverified certificate produced clock warning %q", got)
+	}
+
+	cm.mu.Lock()
+	cm.certValidityTrusted = true
+	cm.mu.Unlock()
+	if got := app.CertificateClockWarning(); !strings.Contains(got, "The local system clock may be inaccurate") {
+		t.Fatalf("pinned certificate warning = %q", got)
 	}
 }
 

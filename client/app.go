@@ -182,7 +182,8 @@ func (a *App) Disconnect() {
 
 // Connected reports whether the client is connected.
 func (a *App) Connected() bool {
-	return a.cmLoad() != nil && a.cmLoad().connected()
+	cm := a.cmLoad()
+	return cm != nil && cm.connected()
 }
 
 // JoinChannel joins (moves into) a channel.
@@ -213,11 +214,57 @@ func (a *App) GetICEServers() []netproto.ICEServer {
 // ServerFingerprint returns the SHA-256 fingerprint of the current (or last
 // attempted) server's control-channel certificate, or "" for plaintext.
 func (a *App) ServerFingerprint() string {
-	if a.cmLoad() == nil {
+	cm := a.cmLoad()
+	if cm == nil {
 		return ""
 	}
-	_, fp, _ := a.cmLoad().securitySnapshot()
+	_, fp, _ := cm.securitySnapshot()
 	return fp
+}
+
+const certificateClockSkewTolerance = 10 * time.Minute
+
+// CertificateClockWarning returns an advisory warning when the local system
+// time is well outside the peer certificate's validity window. Fingerprint
+// verification remains authoritative; this warning never changes trust state.
+func (a *App) CertificateClockWarning() string {
+	cm := a.cmLoad()
+	if cm == nil || !cm.connected() {
+		return ""
+	}
+	notBefore, notAfter, trusted := cm.certificateValiditySnapshot()
+	if !trusted {
+		return ""
+	}
+	return certificateClockWarning(time.Now(), notBefore, notAfter)
+}
+
+func certificateClockWarning(now, notBefore, notAfter time.Time) string {
+	const trustContext = "VoicX connected using fingerprint pinning; certificate dates did not decide trust. "
+	if now.IsZero() || notBefore.IsZero() || notAfter.IsZero() {
+		return ""
+	}
+	if !notAfter.After(notBefore) {
+		return trustContext + "The server certificate has an invalid validity window; " +
+			"certificate-validity checks are unreliable"
+	}
+	// Certificate dates come from the peer, not an authenticated time source.
+	// Keep the diagnosis conditional and advisory; TOFU remains authoritative.
+	if now.Before(notBefore.Add(-certificateClockSkewTolerance)) {
+		return fmt.Sprintf(
+			trustContext+"The local system clock may be inaccurate, or the server certificate dates may be unusual: "+
+				"certificate validity starts at %s; check date, time, and time zone before relying on certificate validity",
+			notBefore.UTC().Format(time.RFC3339),
+		)
+	}
+	if now.After(notAfter.Add(certificateClockSkewTolerance)) {
+		return fmt.Sprintf(
+			trustContext+"The local system clock may be inaccurate, or the server certificate may be expired: "+
+				"certificate validity ended at %s; check date, time, and time zone before relying on certificate validity",
+			notAfter.UTC().Format(time.RFC3339),
+		)
+	}
+	return ""
 }
 
 // TrustServerFingerprint pins fp for addr in the TOFU store (explicit user
@@ -460,13 +507,17 @@ func (a *App) SetVideoQuality(quality string) string {
 // track toggling happens in the frontend).
 func (a *App) SetMuted(muted bool) {
 	traySetMuted(muted)
-	a.cmLoad().emit("muted", muted)
+	if cm := a.cmLoad(); cm != nil {
+		cm.emit("muted", muted)
+	}
 }
 
 // SetPTT records the push-to-talk state.
 func (a *App) SetPTT(active bool) {
 	traySetPTT(active)
-	a.cmLoad().emit("ptt", active)
+	if cm := a.cmLoad(); cm != nil {
+		cm.emit("ptt", active)
+	}
 }
 
 // SetAvatar uploads an avatar image (base64).
