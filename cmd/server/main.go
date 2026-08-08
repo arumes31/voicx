@@ -9,9 +9,9 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -35,6 +35,7 @@ import (
 	"voicx/internal/recorder"
 	"voicx/internal/redisx"
 	"voicx/internal/rules"
+	"voicx/internal/safecast"
 	"voicx/internal/server"
 	"voicx/internal/state"
 	"voicx/internal/store"
@@ -67,10 +68,73 @@ func hasFlag(name string) bool {
 	return false
 }
 
+// syncLogger flushes buffered log entries. Zap commonly gets EINVAL when
+// syncing a console stream, which is not a durability failure.
+func syncLogger(logger *zap.Logger) {
+	if err := logger.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) {
+		fmt.Fprintf(os.Stderr, "voicx: syncing logger: %v\n", err)
+	}
+}
+
+func markChannelIcons(fileRoot string, manager *state.Manager) (int, error) {
+	ids, err := server.DiscoverChannelIconIDs(fileRoot)
+	if err != nil {
+		return 0, err
+	}
+	marked := 0
+	for _, id := range ids {
+		if manager.SetChannelHasIcon(id, true) {
+			marked++
+		}
+	}
+	return marked, nil
+}
+
+func recorderConfig(cfg config.RecordingConfig) recorder.Config {
+	return recorder.Config{
+		Enabled:         cfg.Enabled,
+		Dir:             cfg.Dir,
+		FFmpegPath:      cfg.FFmpegPath,
+		Format:          cfg.Format,
+		VideoArgs:       append([]string(nil), cfg.VideoArgs...),
+		AudioArgs:       append([]string(nil), cfg.AudioArgs...),
+		MaxConcurrent:   cfg.MaxConcurrent,
+		WindowsACLReady: cfg.WindowsACLReady,
+	}
+}
+
+type serviceExit struct {
+	name string
+	err  error
+}
+
+// startService reports every service exit, including an unexpected nil error.
+// The caller provides a channel large enough for every launched service so
+// shutdown cannot strand a reporter after the first exit wins the select.
+func startService(exits chan<- serviceExit, name string, start func() error) {
+	go func() {
+		exits <- serviceExit{name: name, err: start()}
+	}()
+}
+
+func unexpectedServiceExit(exit serviceExit) error {
+	if exit.err == nil {
+		return fmt.Errorf("%s exited unexpectedly", exit.name)
+	}
+	return fmt.Errorf("%s exited unexpectedly: %w", exit.name, exit.err)
+}
+
+func joinShutdownError(current error, service string, err error) error {
+	if err == nil || errors.Is(err, net.ErrClosed) {
+		return current
+	}
+	return errors.Join(current, fmt.Errorf("shutting down %s: %w", service, err))
+}
+
 // rewrapChatKeys re-wraps every stored scope key generation under the newest
 // KEK. It is the ONLY thing that ever rewrites wrapped_key: the scope keys
 // themselves are unchanged, so every stored message still opens (91).
-func rewrapChatKeys() error {
+func rewrapChatKeys() (retErr error) {
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
@@ -79,14 +143,18 @@ func rewrapChatKeys() error {
 	if err != nil {
 		return fmt.Errorf("initializing logger: %w", err)
 	}
-	defer logger.Sync()
+	defer syncLogger(logger)
 
 	dbStore, err := store.New(cfg.DatabaseURL, logger,
 		cfg.DBMaxOpenConns, cfg.DBMaxIdleConns, cfg.DBConnMaxLifetime)
 	if err != nil {
 		return fmt.Errorf("opening store: %w", err)
 	}
-	defer dbStore.Close()
+	defer func() {
+		if err := dbStore.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("closing store: %w", err))
+		}
+	}()
 
 	ring, err := chatcrypto.LoadKEKRing(cfg.ChatMasterKeyFile, os.Getenv("VOICX_CHAT_MASTER_KEY"), false)
 	if err != nil {
@@ -94,39 +162,50 @@ func rewrapChatKeys() error {
 	}
 	newest := ring.NewestID()
 
-	ctx := context.Background()
-	rows, err := dbStore.DB().QueryContext(ctx,
-		`SELECT scope_id, key_id, wrapped_key, kek_id FROM chat_scope_keys WHERE kek_id <> $1`, int16(newest))
-	if err != nil {
-		return fmt.Errorf("listing scope keys: %w", err)
-	}
 	type pending struct {
 		scope int64
 		keyID int64
 		key   [32]byte
 	}
-	var todo []pending
-	for rows.Next() {
-		var (
-			p       pending
-			wrapped []byte
-			kekID   int16
-		)
-		if err := rows.Scan(&p.scope, &p.keyID, &wrapped, &kekID); err != nil {
-			rows.Close()
-			return fmt.Errorf("scanning scope key: %w", err)
-		}
-		key, err := ring.Unwrap(uint16(kekID), wrapped)
+	ctx := context.Background()
+	todo, err := func() (out []pending, retErr error) {
+		rows, err := dbStore.DB().QueryContext(ctx,
+			`SELECT scope_id, key_id, wrapped_key, kek_id FROM chat_scope_keys WHERE kek_id <> $1`, int32(newest))
 		if err != nil {
-			rows.Close()
-			return fmt.Errorf("unwrapping scope %d generation %d: %w", p.scope, p.keyID, err)
+			return nil, fmt.Errorf("listing scope keys: %w", err)
 		}
-		p.key = key
-		todo = append(todo, p)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("listing scope keys: %w", err)
+		defer func() {
+			if err := rows.Close(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("closing scope key rows: %w", err))
+			}
+		}()
+		for rows.Next() {
+			var (
+				p       pending
+				wrapped []byte
+				kekID   int64
+			)
+			if err := rows.Scan(&p.scope, &p.keyID, &wrapped, &kekID); err != nil {
+				return nil, fmt.Errorf("scanning scope key: %w", err)
+			}
+			storedKEKID, err := safecast.Int64ToUint16(kekID)
+			if err != nil {
+				return nil, fmt.Errorf("scope %d generation %d has invalid kek id %d: %w", p.scope, p.keyID, kekID, err)
+			}
+			key, err := ring.Unwrap(storedKEKID, wrapped)
+			if err != nil {
+				return nil, fmt.Errorf("unwrapping scope %d generation %d: %w", p.scope, p.keyID, err)
+			}
+			p.key = key
+			out = append(out, p)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("listing scope keys: %w", err)
+		}
+		return out, nil
+	}()
+	if err != nil {
+		return err
 	}
 
 	for _, p := range todo {
@@ -136,7 +215,7 @@ func rewrapChatKeys() error {
 		}
 		if _, err := dbStore.DB().ExecContext(ctx,
 			`UPDATE chat_scope_keys SET wrapped_key = $1, kek_id = $2 WHERE scope_id = $3 AND key_id = $4`,
-			wrapped, int16(kekID), p.scope, p.keyID); err != nil {
+			wrapped, int32(kekID), p.scope, p.keyID); err != nil {
 			return fmt.Errorf("rewrapping scope %d generation %d: %w", p.scope, p.keyID, err)
 		}
 	}
@@ -189,7 +268,10 @@ func resetChatKeys(ctx context.Context, dbStore *store.Store, logger *zap.Logger
 	return nil
 }
 
-func run() error {
+func run() (retErr error) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
@@ -199,7 +281,7 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("initializing logger: %w", err)
 	}
-	defer logger.Sync()
+	defer func() { syncLogger(logger) }()
 
 	// (223) tee log lines into the in-memory ring buffer for `logview`.
 	logger = logger.WithOptions(logging.Tee())
@@ -212,11 +294,14 @@ func run() error {
 		zap.String("tcp_addr", cfg.TCPAddr),
 		zap.String("udp_addr", cfg.UDPAddr),
 		zap.String("grpc_addr", cfg.GRPCAddr),
-		zap.String("database_url", cfg.DatabaseURL),
-		zap.String("redis_addr", cfg.RedisAddr),
+		zap.String("database_url", cfg.RedactedDatabaseURL()),
+		zap.String("redis_addr", cfg.RedactedRedisAddr()),
 		zap.Int("max_clients", cfg.MaxClients),
 	)
 	logger.Info("config summary", zap.String("config", cfg.Summary()))
+	for _, warning := range cfg.Warnings() {
+		logger.Warn("unsafe configuration", zap.String("warning", warning))
+	}
 
 	// Initialize the PostgreSQL store and run migrations on startup.
 	dbStore, err := store.New(cfg.DatabaseURL, logger,
@@ -224,9 +309,16 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("opening store: %w", err)
 	}
-	defer dbStore.Close()
+	defer func() {
+		if err := dbStore.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("closing store: %w", err))
+		}
+	}()
 
-	if err := dbStore.Migrate(); err != nil {
+	migrationCtx, cancelMigration := context.WithTimeout(ctx, 5*time.Minute)
+	err = dbStore.MigrateContext(migrationCtx)
+	cancelMigration()
+	if err != nil {
 		return fmt.Errorf("running migrations: %w", err)
 	}
 	piiCipher, err := store.LoadOrCreatePIICipher(cfg.PIIKeyFile)
@@ -383,8 +475,6 @@ func run() error {
 	permResolver := permissions.NewResolver()
 	logger.Info("permissions ready")
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	go func() {
 		run := func() {
 			count, err := dbStore.CompressPermissionAudit(ctx, time.Now().AddDate(0, 0, -30))
@@ -439,15 +529,12 @@ func run() error {
 
 	// Initialize the recorder. It manages ffmpeg subprocesses that record
 	// channel streams; it is inert unless recording.enabled is set.
-	rec := recorder.New(recorder.Config{
-		Enabled:    cfg.Recording.Enabled,
-		Dir:        cfg.Recording.Dir,
-		FFmpegPath: cfg.Recording.FFmpegPath,
-		Format:     cfg.Recording.Format,
-		VideoArgs:  cfg.Recording.VideoArgs,
-		AudioArgs:  cfg.Recording.AudioArgs,
-	}, logger)
-	defer rec.Close()
+	rec := recorder.New(recorderConfig(cfg.Recording), logger)
+	defer func() {
+		if err := rec.Close(); err != nil {
+			logger.Warn("recorder shutdown error", zap.Error(err))
+		}
+	}()
 
 	// Initialize the Redis client when enabled. Redis backs later-phase
 	// features (pub/sub, rate limiting); when it is unreachable the server
@@ -459,13 +546,17 @@ func run() error {
 		cancel()
 		if pingErr != nil {
 			logger.Warn("redis unavailable, continuing without it",
-				zap.String("addr", cfg.RedisAddr),
+				zap.String("addr", cfg.RedactedRedisAddr()),
 				zap.Error(pingErr),
 			)
 			_ = rdb.Close()
 		} else {
-			logger.Info("redis connected", zap.String("addr", cfg.RedisAddr))
-			defer rdb.Close()
+			logger.Info("redis connected", zap.String("addr", cfg.RedactedRedisAddr()))
+			defer func() {
+				if err := rdb.Close(); err != nil {
+					logger.Warn("redis close error", zap.Error(err))
+				}
+			}()
 		}
 	} else {
 		logger.Info("redis disabled")
@@ -476,22 +567,36 @@ func run() error {
 	m := metrics.New()
 	m.RegisterDBPool(dbStore.DB())
 	voiceRouter.SetForwardObserver(m.IncRTPForwarded)
-	healthServer := health.New(cfg.HealthAddr, logger, func(context.Context) error {
+	var servingReady atomic.Bool
+	healthServer := health.New(cfg.HealthAddr, logger, func(ctx context.Context) error {
+		if !servingReady.Load() {
+			return errors.New("server startup is not complete")
+		}
 		// Retry once on transient pool errors (e.g. "driver: bad connection"
 		// right after the database container restarts).
-		err := dbStore.Ping()
+		err := dbStore.DB().PingContext(ctx)
 		if err != nil && strings.Contains(err.Error(), "bad connection") {
-			time.Sleep(100 * time.Millisecond)
-			err = dbStore.Ping()
+			timer := time.NewTimer(100 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				err = dbStore.DB().PingContext(ctx)
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 		return err
 	})
-	healthServer.Handle("/metrics", m.Handler())
+	if cfg.MetricsAllowRemote {
+		healthServer.HandleGET("/metrics", m.Handler())
+	} else {
+		healthServer.HandleLocalGET("/metrics", m.Handler())
+	}
 	healthServer.Handle("/api/v1/schema/version", health.SchemaVersionHandler(dbStore.SchemaVersion))
-	healthErr := make(chan error, 1)
-	go func() {
-		healthErr <- healthServer.Start()
-	}()
+	// At most seven services are launched below. The spare slot ensures every
+	// reporter can finish even after the first exit initiates shutdown.
+	serviceExits := make(chan serviceExit, 8)
+	startService(serviceExits, "health HTTP server", healthServer.Start)
 
 	// TLS material is minted ONCE here and handed to both listeners: the data
 	// port must present the same certificate as the control channel so the
@@ -550,17 +655,20 @@ func run() error {
 		serverPasswordHash = hash
 		logger.Info("server password enabled")
 	}
+	for _, warning := range server.AssetStorageSecurityWarnings() {
+		logger.Error("ASSET STORAGE SECURITY LIMITATION", zap.String("warning", warning))
+	}
 
-	// Flag channels that have an icon on disk so snapshots reflect it.
-	if entries, err := os.ReadDir(filepath.Join(cfg.FileRoot, "icons")); err == nil {
-		for _, e := range entries {
-			name := e.Name()
-			if id, err := strconv.ParseInt(strings.TrimSuffix(name, filepath.Ext(name)), 10, 64); err == nil {
-				if ch, ok := stateManager.GetChannel(id); ok {
-					ch.HasIcon = true
-				}
-			}
-		}
+	// Resolve any group-icon transaction left by a process crash before the
+	// control server can serve files or accept a competing update.
+	if err := server.RecoverGroupIconTransactions(context.Background(), cfg.FileRoot, dbStore); err != nil {
+		return fmt.Errorf("recovering group icon transactions: %w", err)
+	}
+
+	// Flag only confined, supported, regular channel icons so snapshots do not
+	// trust arbitrary directory entries at startup.
+	if _, err := markChannelIcons(cfg.FileRoot, stateManager); err != nil {
+		logger.Warn("channel icon discovery failed", zap.Error(err))
 	}
 
 	// (215) one rules service for both readers: ServerQuery edits the wording
@@ -601,6 +709,23 @@ func run() error {
 		DefaultGuestGroupID:  defaultGuestGroupID,
 		DefaultMemberGroupID: defaultMemberGroupID,
 	})
+	channelMgr.SetCleanupDeleteHandler(tcpServer.ApplyChannelDeletion)
+	// Reconcile only after the cleanup callback is installed. LoadIntoState
+	// starts temporary-channel timers: deletions that commit before this point
+	// are now visible as orphans, while concurrent/later deletions invoke the
+	// callback. No listener is accepting file work yet.
+	liveChannels := stateManager.ListChannels()
+	liveChannelIDs := make([]int64, 0, len(liveChannels))
+	for _, channel := range liveChannels {
+		liveChannelIDs = append(liveChannelIDs, channel.ChannelID)
+	}
+	reconciledChannels, err := ftServer.ReconcileChannelData(context.Background(), liveChannelIDs)
+	if err != nil {
+		return fmt.Errorf("reconciling orphaned channel files: %w", err)
+	}
+	if reconciledChannels > 0 {
+		logger.Info("orphaned channel file directories removed", zap.Int("count", reconciledChannels))
+	}
 	if cfg.TLSEnabled {
 		tcpServer.UseTLSMaterial(tlsCert, tlsFP)
 	}
@@ -616,12 +741,7 @@ func run() error {
 		return fmt.Errorf("encrypting legacy chat history: %w", err)
 	}
 
-	serverErr := make(chan error, 1)
-	go func() {
-		if err := tcpServer.Start(ctx); err != nil {
-			serverErr <- err
-		}
-	}()
+	startService(serviceExits, "TCP control server", func() error { return tcpServer.Start(ctx) })
 
 	// Timed group memberships (145): reap expired rows every 60s, invalidate
 	// the permission cache, and notify affected online users.
@@ -657,7 +777,11 @@ func run() error {
 			} else {
 				logger.Warn("serverstop via ServerQuery: shutting down gracefully")
 			}
-			shutdownReq <- restart
+			select {
+			case shutdownReq <- restart:
+			default:
+				logger.Debug("shutdown request already pending")
+			}
 		},
 		startedAt:  time.Now(),
 		serverName: cfg.ServerName,
@@ -665,12 +789,7 @@ func run() error {
 		rules:      rulesSvc,
 	}
 	queryServer := query.New(cfg.QueryAddr, logger, qBackend)
-	queryErr := make(chan error, 1)
-	go func() {
-		if err := queryServer.Start(ctx); err != nil {
-			queryErr <- err
-		}
-	}()
+	startService(serviceExits, "ServerQuery server", func() error { return queryServer.Start(ctx) })
 
 	// (231) the event stream for bots, on the health listener next to
 	// /metrics. Same credentials as ServerQuery: the stream reveals who is
@@ -681,94 +800,59 @@ func run() error {
 	// (232) the gRPC API on the reserved port: same backend, same
 	// admin-only credentials, plus Events.Subscribe on the event bus.
 	grpcServer := grpcserver.New(cfg.GRPCAddr, qBackend, events, logger, queryServer)
-	grpcErr := make(chan error, 1)
-	go func() {
-		if err := grpcServer.Start(ctx); err != nil {
-			grpcErr <- err
-		}
-	}()
+	startService(serviceExits, "gRPC server", func() error { return grpcServer.Start(ctx) })
 
 	// (224) the same command set over SSH, opt-in.
 	var sshQuery *query.SSHServer
 	if cfg.QuerySSHEnabled {
 		sshQuery = query.NewSSH(cfg.QuerySSHAddr, cfg.QuerySSHHostKey, queryServer)
-		go func() {
-			if err := sshQuery.Start(ctx); err != nil {
-				queryErr <- err
-			}
-		}()
+		startService(serviceExits, "ServerQuery SSH server", func() error { return sshQuery.Start(ctx) })
 	}
 
 	// Start the file-transfer listener.
-	ftErr := make(chan error, 1)
-	go func() {
-		if err := ftServer.Start(ctx); err != nil {
-			ftErr <- err
-		}
-	}()
+	startService(serviceExits, "file-transfer server", func() error { return ftServer.Start(ctx) })
 
 	// Start the UDP media/signaling listener.
 	udpServer := server.NewUDP(cfg, logger)
 	udpServer.Metrics = m
-	udpErr := make(chan error, 1)
-	go func() {
-		if err := udpServer.Start(ctx); err != nil {
-			udpErr <- err
-		}
-	}()
+	startService(serviceExits, "UDP media server", func() error { return udpServer.Start(ctx) })
 
+	servingReady.Store(true)
 	logger.Info("voicx server running, waiting for shutdown signal")
+	var runErr error
 	select {
 	case <-ctx.Done():
 		logger.Info("voicx server shutting down")
 	case restart := <-shutdownReq:
 		logger.Info("voicx server shutting down via ServerQuery", zap.Bool("restart", restart))
-	case err := <-serverErr:
-		logger.Error("TCP server exited unexpectedly", zap.Error(err))
-	case err := <-udpErr:
-		logger.Error("UDP server exited unexpectedly", zap.Error(err))
-	case err := <-healthErr:
-		logger.Error("health server exited unexpectedly", zap.Error(err))
-	case err := <-queryErr:
-		logger.Error("query server exited unexpectedly", zap.Error(err))
-	case err := <-ftErr:
-		logger.Error("file transfer server exited unexpectedly", zap.Error(err))
-	case err := <-grpcErr:
-		logger.Error("gRPC server exited unexpectedly", zap.Error(err))
+	case exit := <-serviceExits:
+		runErr = unexpectedServiceExit(exit)
 	}
+	servingReady.Store(false)
+	stop()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := healthServer.Shutdown(shutdownCtx); err != nil {
-		logger.Warn("health server shutdown error", zap.Error(err))
+		runErr = joinShutdownError(runErr, "health HTTP server", err)
 	}
 
-	if err := tcpServer.Shutdown(); err != nil && !errors.Is(err, net.ErrClosed) {
-		logger.Warn("TCP server shutdown error", zap.Error(err))
-	}
-	if err := queryServer.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-		logger.Warn("query server shutdown error", zap.Error(err))
-	}
+	runErr = joinShutdownError(runErr, "TCP control server", tcpServer.Shutdown())
+	runErr = joinShutdownError(runErr, "ServerQuery server", queryServer.Close())
 	if sshQuery != nil {
-		if err := sshQuery.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			logger.Warn("query ssh server shutdown error", zap.Error(err))
-		}
+		runErr = joinShutdownError(runErr, "ServerQuery SSH server", sshQuery.Close())
 	}
 	// Event subscriptions are open-ended, so this cannot wait for them.
 	grpcServer.Stop()
-	if err := ftServer.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-		logger.Warn("file transfer server shutdown error", zap.Error(err))
-	}
-	if err := udpServer.Shutdown(); err != nil && !errors.Is(err, net.ErrClosed) {
-		logger.Warn("UDP server shutdown error", zap.Error(err))
-	}
+	runErr = joinShutdownError(runErr, "file-transfer server", ftServer.Close())
+	runErr = joinShutdownError(runErr, "UDP media server", udpServer.Shutdown())
 	stats := udpServer.Stats()
 	logger.Info("udp server stats",
 		zap.Uint64("packets_received", stats.PacketsReceived),
 		zap.Uint64("packets_dropped", stats.PacketsDropped),
 		zap.Uint64("packets_processed", stats.PacketsProcessed),
 	)
-	return nil
+	return runErr
 }
 
 // ensureServerGroup returns the ID of the named server group, creating it
@@ -988,10 +1072,14 @@ func (q *queryBackend) SendText(_ context.Context, targetMode int, target, msg s
 }
 
 func (q *queryBackend) CreateChannel(ctx context.Context, name, topic string, channelType int) (int64, error) {
+	parsedType, err := channels.ParseChannelType(channelType)
+	if err != nil {
+		return 0, err
+	}
 	id, err := q.channelMgr.CreateChannel(ctx, channels.ChannelSpec{
 		Name:  name,
 		Topic: topic,
-		Type:  channels.ChannelType(channelType),
+		Type:  parsedType,
 	})
 	if err != nil {
 		return 0, err
@@ -1001,8 +1089,12 @@ func (q *queryBackend) CreateChannel(ctx context.Context, name, topic string, ch
 }
 
 func (q *queryBackend) DeleteChannel(ctx context.Context, channelID int64) error {
-	if err := q.channelMgr.DeleteChannel(ctx, channelID); err != nil {
+	result, err := q.channelMgr.DeleteChannelSubtree(ctx, channelID)
+	if err != nil {
 		return err
+	}
+	if q.tcp != nil {
+		q.tcp.ApplyChannelDeletion(result)
 	}
 	q.db.Audit(ctx, "serverquery", "channel_delete", strconv.FormatInt(channelID, 10), "")
 	return nil

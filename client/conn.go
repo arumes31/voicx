@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -113,17 +114,6 @@ func newConnManager(wailsCtx context.Context) *connManager {
 	}
 }
 
-// appOf returns the App this manager belongs to, or nil for a test or
-// headless manager. The tab sink is the only back-channel a connManager has,
-// and read-state pushes (121) arrive on the read loop but have to land in the
-// App's settings.
-func (m *connManager) appOf() *App {
-	if s, ok := m.sink.(tabSink); ok {
-		return s.app
-	}
-	return nil
-}
-
 // identity returns the client's key pair, loading or generating it lazily.
 func (m *connManager) identity() (*identity, error) {
 	m.mu.Lock()
@@ -145,41 +135,58 @@ func (m *connManager) identity() (*identity, error) {
 // (errFingerprintMismatch). When the server does not speak TLS, it falls
 // back to plaintext only if allowPlaintext is set.
 func (m *connManager) dialTransport(addr string) (net.Conn, error) {
+	m.mu.Lock()
+	ks := m.knownServers
+	m.mu.Unlock()
+	var fingerprint string
+	var firstSeen bool
 	tlsConf := &tls.Config{
-		InsecureSkipVerify: true, // TOFU: verified via fingerprint pinning below
-		MinVersion:         tls.VersionTLS12,
+		// #nosec G402 -- VerifyConnection enforces the TOFU pin on every full or resumed handshake.
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS13,
+		VerifyConnection: func(state tls.ConnectionState) error {
+			if len(state.PeerCertificates) == 0 {
+				return fmt.Errorf("server presented no TLS certificate")
+			}
+			fingerprint = tlscert.FingerprintDER(state.PeerCertificates[0].Raw)
+			if ks == nil {
+				return nil
+			}
+			switch ks.verify(addr, fingerprint) {
+			case trustUnknown:
+				firstSeen = true
+				return nil
+			case trustMismatch:
+				return errFingerprintMismatch
+			default:
+				return nil
+			}
+		},
 	}
 	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", addr, tlsConf)
 	if err == nil {
-		var fp string
-		if pc := conn.ConnectionState().PeerCertificates; len(pc) > 0 {
-			fp = tlscert.FingerprintDER(pc[0].Raw)
+		if ks != nil && firstSeen {
+			if err := ks.trust(addr, fingerprint); err != nil {
+				_ = conn.Close()
+				return nil, fmt.Errorf("pinning server fingerprint: %w", err)
+			}
 		}
 		m.mu.Lock()
 		m.tlsUsed = true
-		m.fingerprint = fp
-		m.newServer = false
-		ks := m.knownServers
+		m.fingerprint = fingerprint
+		m.newServer = firstSeen
 		m.mu.Unlock()
-
-		if ks != nil && fp != "" {
-			switch ks.verify(addr, fp) {
-			case trustUnknown:
-				if err := ks.trust(addr, fp); err != nil {
-					_ = conn.Close()
-					return nil, fmt.Errorf("pinning server fingerprint: %w", err)
-				}
-				m.mu.Lock()
-				m.newServer = true
-				m.mu.Unlock()
-			case trustMismatch:
-				_ = conn.Close()
-				return nil, errFingerprintMismatch
-			}
-		}
 		return conn, nil
 	}
 	tlsErr := err
+	if errors.Is(tlsErr, errFingerprintMismatch) {
+		m.mu.Lock()
+		m.tlsUsed = true
+		m.fingerprint = fingerprint
+		m.newServer = false
+		m.mu.Unlock()
+		return nil, errFingerprintMismatch
+	}
 
 	m.mu.Lock()
 	allowPlain := m.allowPlaintext

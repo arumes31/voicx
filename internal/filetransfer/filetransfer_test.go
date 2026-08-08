@@ -161,7 +161,7 @@ func (f *fakeFileStore) FindFileBySHA(_ context.Context, channelID int64, sha256
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, rec := range f.files {
-		if rec.ChannelID == channelID && rec.SHA256 == sha256 && !(rec.Folder == exclFolder && rec.Name == exclName) {
+		if rec.ChannelID == channelID && rec.SHA256 == sha256 && (rec.Folder != exclFolder || rec.Name != exclName) {
 			cp := rec
 			return &cp, nil
 		}
@@ -266,10 +266,38 @@ func TestSanitizeName(t *testing.T) {
 			t.Errorf("sanitizeName(%q) = %v, want nil", name, err)
 		}
 	}
-	invalid := []string{"", ".", "..", "../etc/passwd", "a/b", `a\b`, "a..b", "/abs/path"}
+	invalid := []string{
+		"", ".", "..", "../etc/passwd", `..\etc\passwd`, "a/b", `a\b`,
+		"a..b", "/abs/path", `C:\Windows\win.ini`, `\\server\share\file`,
+	}
 	for _, name := range invalid {
 		if _, err := sanitizeName(name); !errors.Is(err, ErrInvalidName) {
 			t.Errorf("sanitizeName(%q) = %v, want ErrInvalidName", name, err)
+		}
+	}
+}
+
+func TestBlobRootRejectsTraversal(t *testing.T) {
+	base := t.TempDir()
+	rootDir := filepath.Join(base, "root")
+	if err := os.Mkdir(rootDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(base, "outside.txt")
+	if err := os.WriteFile(outside, []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := New(Config{Addr: ":0", RootDir: rootDir}, newFakeFileStore(), nil)
+	root, err := s.openBlobRoot()
+	if err != nil {
+		t.Fatalf("openBlobRoot: %v", err)
+	}
+	defer func() { _ = root.Close() }()
+
+	for _, name := range []string{filepath.Join("..", "outside.txt"), outside} {
+		if f, err := openRegularBlob(root, name); err == nil {
+			_ = f.Close()
+			t.Errorf("openRegularBlob(%q) escaped the root", name)
 		}
 	}
 }
@@ -456,7 +484,7 @@ func TestMoveFileRollsBackMetadataWhenBlobMoveFails(t *testing.T) {
 	if err := fs.AddFile(ctx, store.FileRecord{ChannelID: 7, Name: "doc.txt"}); err != nil {
 		t.Fatal(err)
 	}
-	s.moveBlobFn = func(string, string) error { return errors.New("injected blob failure") }
+	s.moveBlobFn = func(*os.Root, string, string) error { return errors.New("injected blob failure") }
 
 	if err := s.MoveFile(ctx, 7, "", "doc.txt", 8, "shared", "doc.txt"); err == nil {
 		t.Fatal("MoveFile succeeded despite blob failure")
@@ -481,7 +509,12 @@ func TestMoveBlobCrossVolumeFallback(t *testing.T) {
 	if err := os.WriteFile(src, []byte("payload"), 0o600); err != nil {
 		t.Fatalf("write src: %v", err)
 	}
-	if err := copyBlobAndRemove(src, dst, errors.New("injected cross-volume rename failure")); err != nil {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("OpenRoot: %v", err)
+	}
+	defer func() { _ = root.Close() }()
+	if err := copyBlobAndRemove(root, "src.bin", "dst.bin", errors.New("injected cross-volume rename failure")); err != nil {
 		t.Fatalf("copyBlobAndRemove: %v", err)
 	}
 	if got, err := os.ReadFile(dst); err != nil || string(got) != "payload" {
@@ -491,7 +524,7 @@ func TestMoveBlobCrossVolumeFallback(t *testing.T) {
 		t.Error("source left behind")
 	}
 	// A missing source is not an error: the row is the record of truth.
-	if err := moveBlob(filepath.Join(dir, "gone.bin"), filepath.Join(dir, "x.bin")); err != nil {
+	if err := moveBlob(root, "gone.bin", "x.bin"); err != nil {
 		t.Errorf("moveBlob on a missing source = %v, want nil", err)
 	}
 }

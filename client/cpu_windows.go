@@ -24,6 +24,7 @@ func filetimeValue(t windows.Filetime) uint64 {
 // sample. The first sample returns -1 because it has no interval yet.
 func (a *App) SystemCPUPercent() float64 {
 	var idle, kernel, user windows.Filetime
+	// #nosec G103 -- GetSystemTimes requires three writable FILETIME pointers.
 	ok, _, _ := getSystemTimes.Call(uintptr(unsafe.Pointer(&idle)), uintptr(unsafe.Pointer(&kernel)), uintptr(unsafe.Pointer(&user)))
 	if ok == 0 {
 		return -1

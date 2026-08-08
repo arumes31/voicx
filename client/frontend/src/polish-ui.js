@@ -4,6 +4,8 @@
 // announcements (343), notification center (346), DND (347/348), and tree
 // virtualization (349).
 import { setIdleQualityOverride } from "./video.js";
+import { isActivationKey } from "./a11y.js";
+import { mountDialog } from "./modal.js";
 
 const V = () => window.__voicx;
 const App = () => window.go.main.App;
@@ -17,6 +19,8 @@ function initResizablePanes() {
     const details = document.getElementById("details");
     const body = document.getElementById("app-body");
     const s = V().state.settings || {};
+    const handles = new Map();
+    let keyboardSaveTimer = null;
 
     const setPaneWidth = (field, width) => {
         const variable = field === "sidebar_width" ? "--sidebar-width" : "--details-width";
@@ -28,12 +32,31 @@ function initResizablePanes() {
         const w = V().state.settings || {};
         setPaneWidth("sidebar_width", w.sidebar_width);
         setPaneWidth("details_width", w.details_width);
+        requestAnimationFrame(() => {
+            for (const { element, handle } of handles.values()) {
+                handle.setAttribute("aria-valuenow", String(Math.round(element.getBoundingClientRect().width)));
+            }
+        });
+    };
+
+    const scheduleKeyboardSave = () => {
+        clearTimeout(keyboardSaveTimer);
+        keyboardSaveTimer = setTimeout(() => App().SaveSettings(V().state.settings), 250);
     };
 
     const makeHandle = (el, field, invert) => {
         const h = document.createElement("div");
         h.className = "pane-handle" + (invert ? " right" : "");
         h.title = "drag to resize · double-click to reset";
+        h.tabIndex = 0;
+        h.setAttribute("role", "separator");
+        h.setAttribute("aria-orientation", "vertical");
+        h.setAttribute("aria-label", `Resize ${el.id === "sidebar" ? "channels" : "details"} pane`);
+        h.setAttribute("aria-valuemin", "160");
+        h.setAttribute("aria-valuemax", "560");
+        const updateValue = (width) => h.setAttribute("aria-valuenow", String(Math.round(width)));
+        handles.set(field, { element: el, handle: h });
+        updateValue(el.getBoundingClientRect().width);
         let startX = 0, startW = 0;
         h.addEventListener("mousedown", (e) => {
             e.preventDefault();
@@ -42,6 +65,7 @@ function initResizablePanes() {
             const onMove = (ev) => {
                 const w = Math.max(160, Math.min(560, startW + (invert ? startX - ev.clientX : ev.clientX - startX)));
                 setPaneWidth(field, w);
+                updateValue(w);
                 (V().state.settings ||= {})[field] = Math.round(w);
             };
             const onUp = () => {
@@ -54,14 +78,27 @@ function initResizablePanes() {
         });
         h.addEventListener("dblclick", () => {
             V().state.settings[field] = 0;
-            App().SaveSettings(V().state.settings);
+            scheduleKeyboardSave();
             apply();
+            updateValue(el.getBoundingClientRect().width);
+        });
+        h.addEventListener("keydown", (event) => {
+            if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+            event.preventDefault();
+            const direction = event.key === "ArrowRight" ? 1 : -1;
+            const current = el.getBoundingClientRect().width;
+            const width = Math.max(160, Math.min(560, current + direction * (invert ? -16 : 16)));
+            setPaneWidth(field, width);
+            updateValue(width);
+            (V().state.settings ||= {})[field] = Math.round(width);
+            scheduleKeyboardSave();
         });
         el.appendChild(h);
     };
     makeHandle(sidebar, "sidebar_width", false);
     makeHandle(details, "details_width", true);
     apply();
+    window.runtime.EventsOn("settings_update", apply);
     void s;
 }
 
@@ -94,7 +131,7 @@ function toggleChatPopout() {
     }
     chatPop = document.createElement("div");
     chatPop.className = "chat-popout";
-    chatPop.innerHTML = `<div class="chat-pop-head">chat — drag me <button class="icon-btn chat-pop-close">✕</button></div>`;
+    chatPop.innerHTML = `<div class="chat-pop-head">chat — drag me <button class="icon-btn chat-pop-close" aria-label="Close chat popout">✕</button></div>`;
     const wrap = document.getElementById("chat-wrap");
     const inputRow = document.getElementById("chat-input-row");
     const wrapMarker = document.createComment("chat-wrap-marker");
@@ -178,64 +215,26 @@ function initIdleVideoPause() {
 // Screen reader (343)
 // ---------------------------------------------------------------------------
 
-// trapFocus keeps Tab inside a modal (298). Dialogs are appended to <body>
-// over the app rather than replacing it, so without a trap the second Tab
-// walks out of the dialog into the tree and chat behind it.
-function trapFocus(overlay) {
-    const focusables = () => [...overlay.querySelectorAll(
-        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')]
-        .filter((el) => !el.disabled && el.offsetParent !== null);
-    // Only claim focus when the dialog did not already place it itself.
-    if (!overlay.contains(document.activeElement)) focusables()[0]?.focus();
-    overlay.addEventListener("keydown", (e) => {
-        if (e.key !== "Tab") return;
-        const items = focusables();
-        if (items.length === 0) return;
-        e.preventDefault();
-        const idx = items.indexOf(document.activeElement);
-        const next = e.shiftKey
-            ? (idx <= 0 ? items.length - 1 : idx - 1)
-            : (idx < 0 || idx === items.length - 1 ? 0 : idx + 1);
-        items[next].focus();
-    });
-}
-
 function initA11y() {
     const tree = document.getElementById("channel-tree");
     tree.setAttribute("role", "tree");
     tree.setAttribute("aria-label", "channels and users");
     const chatLog = document.getElementById("chat-log");
     chatLog.setAttribute("role", "log");
-    chatLog.setAttribute("aria-live", "polite");
-    // Dialogs announce themselves as dialogs (343).
-    new MutationObserver((mutations) => {
-        for (const m of mutations) {
-            for (const node of m.addedNodes) {
-                if (node.nodeType === 1 && node.classList?.contains("dlg-overlay")) {
-                    const dlg = node.querySelector(".dlg");
-                    if (dlg) {
-                        dlg.setAttribute("role", "dialog");
-                        dlg.setAttribute("aria-modal", "true");
-                    }
-                    trapFocus(node); // (298)
-                }
-            }
-        }
-    }).observe(document.body, { childList: true });
-    // Visually-hidden announcement region (speaking events).
-    if (!document.getElementById("sr-announcer")) {
-        const sr = document.createElement("div");
-        sr.id = "sr-announcer";
-        sr.className = "sr-only";
-        sr.setAttribute("aria-live", "polite");
-        document.body.appendChild(sr);
+    // History is rerendered for filters, pagination and tab switches. Keep it
+    // silent and announce only messages that arrive live via #chat-announcer.
+    chatLog.setAttribute("aria-live", "off");
+    const login = document.querySelector(".login-card");
+    login.setAttribute("role", "dialog");
+    login.setAttribute("aria-modal", "true");
+    if (!document.getElementById("login-overlay").classList.contains("hidden")) {
+        requestAnimationFrame(() => document.getElementById("login-addr")?.focus({ preventScroll: true }));
     }
 }
 
-// announce posts a message to the screen-reader live region (343).
+// Speaking events share the application's single polite live region (343).
 function announce(text) {
-    const sr = document.getElementById("sr-announcer");
-    if (sr) sr.textContent = text;
+    V().announceLive(text, "polite");
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +256,8 @@ function updateBellBadge() {
     const n = notifHistory.filter((x) => !x.read).length;
     badge.textContent = n > 0 ? (n > 9 ? "9+" : n) : "";
     badge.classList.toggle("hidden", n === 0);
+    document.getElementById("notif-bell")?.setAttribute(
+        "aria-label", n > 0 ? `Notifications, ${n} unread` : "Notifications");
 }
 
 // dndActive reports whether DND is on (toggle or quiet hours, 347/348).
@@ -294,16 +295,27 @@ function openNotifCenter() {
             // Click-through: jump to the channel or PM tab (346).
             if (n.uid && window.__voicx.openPM) {
                 row.classList.add("clickable");
+                row.tabIndex = 0;
+                row.setAttribute("role", "button");
                 row.onclick = () => {
                     overlay.remove();
                     window.__voicx.openPM(n.uid, "");
                 };
             } else if (n.channelID) {
                 row.classList.add("clickable");
+                row.tabIndex = 0;
+                row.setAttribute("role", "button");
                 row.onclick = () => {
                     overlay.remove();
                     App().JoinChannel(n.channelID);
                 };
+            }
+            if (row.classList.contains("clickable")) {
+                row.addEventListener("keydown", (event) => {
+                    if (!isActivationKey(event.key)) return;
+                    event.preventDefault();
+                    row.click();
+                });
             }
             list.appendChild(row);
         }
@@ -312,8 +324,8 @@ function openNotifCenter() {
         <div class="dlg notif-center">
             <div class="pm-head">
                 <h3>${"Notifications"}</h3>
-                <button class="icon-btn nc-clear" title="clear all">🗑</button>
-                <button class="icon-btn nc-close" title="Close">✕</button>
+                <button class="icon-btn nc-clear" title="Clear all" aria-label="Clear all notifications">🗑</button>
+                <button class="icon-btn nc-close" title="Close" aria-label="Close notifications">✕</button>
             </div>
             <div class="nc-list"></div>
         </div>`;
@@ -324,7 +336,7 @@ function openNotifCenter() {
         render();
     };
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-    document.body.appendChild(overlay);
+    mountDialog(overlay);
     render();
 }
 
@@ -382,7 +394,9 @@ function injectFakeTree(n) {
     const ms = performance.now() - t0;
     const domRows = document.querySelectorAll("#channel-tree .channel, #channel-tree .client").length;
     const total = state.channels.length + state.clients.length;
-    console.log(`[virtualization] ${total} logical rows, ${domRows} DOM rows, rendered in ${ms.toFixed(1)}ms (windowed=${virtualizeEnabled()})`);
+    if (import.meta.env.DEV) {
+        console.log(`[virtualization] ${total} logical rows, ${domRows} DOM rows, rendered in ${ms.toFixed(1)}ms (windowed=${virtualizeEnabled()})`);
+    }
     return { ms, domRows, total, windowed: virtualizeEnabled() };
 }
 

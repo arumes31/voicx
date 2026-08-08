@@ -9,8 +9,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -171,7 +169,27 @@ func (s *TCPServer) handleGroupDelete(ctx context.Context, client *Client, f *ne
 		tier = store.PermTierChannelGroup
 	}
 	audience := s.permAudience(ctx, tier, store.PermTarget{GroupID: msg.GroupID})
-	if err := s.deps.Groups.DeleteGroup(ctx, msg.Type, msg.GroupID, msg.Force); err != nil {
+	deleted := false
+	if groupType == "server" {
+		deleted, err = s.assets().deleteServerGroupWithAssets(ctx, msg.GroupID, msg.Force, s.deps.Groups)
+	} else {
+		err = s.deps.Groups.DeleteGroup(ctx, groupType, msg.GroupID, msg.Force)
+		deleted = err == nil
+	}
+	if err != nil && !deleted {
+		if errors.Is(err, errGroupDeleteIndeterminate) {
+			// The delete may have committed. Flush cached permissions and notify
+			// the prior audience, but retain all icon recovery state until a
+			// later authoritative lookup can resolve the outcome.
+			if s.deps.Perms != nil {
+				s.deps.Perms.InvalidateAll()
+			}
+			s.notifyPermsInvalid("group_delete", audience)
+			return s.sendError(client, errCodeUnavailable, "group deletion outcome is indeterminate")
+		}
+		if errors.Is(err, errGroupDeleteAssetUnavailable) {
+			return s.sendError(client, errCodeUnavailable, "group icon lifecycle unavailable")
+		}
 		return s.sendError(client, errCodeMalformed, "delete failed: "+err.Error())
 	}
 	s.audit(ctx, client.UniqueID, "group_delete", fmt.Sprintf("%s:%d", msg.Type, msg.GroupID), fmt.Sprintf("force=%t", msg.Force))
@@ -179,6 +197,9 @@ func (s *TCPServer) handleGroupDelete(ctx context.Context, client *Client, f *ne
 		s.deps.Perms.InvalidateAll()
 	}
 	s.notifyPermsInvalid("group_delete", audience)
+	if err != nil {
+		return s.sendError(client, errCodeUnavailable, "group deleted but icon cleanup failed")
+	}
 	return nil
 }
 
@@ -526,11 +547,6 @@ func (s *TCPServer) ReapExpiredGroups(ctx context.Context) {
 
 // --- group icons (177) -------------------------------------------------------
 
-// groupIconDir returns the group-icon storage directory.
-func (s *TCPServer) groupIconDir() string {
-	return filepath.Join(s.cfg.FileRoot, "group_icons")
-}
-
 // handleGroupIconSet stores a server-group icon and marks the group.
 func (s *TCPServer) handleGroupIconSet(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.GroupIconSet
@@ -544,22 +560,22 @@ func (s *TCPServer) handleGroupIconSet(ctx context.Context, client *Client, f *n
 	if !pc.granted(permissions.PermissionKeyServerGroupManage) {
 		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyServerGroupManage))
 	}
+	if msg.GroupID <= 0 {
+		return s.sendError(client, errCodeMalformed, "group_id must be positive")
+	}
+	if s.deps == nil || s.deps.Groups == nil {
+		return s.sendError(client, errCodeUnavailable, "group store unavailable")
+	}
 	raw, ext, err := decodeImage(msg.DataBase64)
 	if err != nil {
 		return s.sendError(client, errCodeMalformed, err.Error())
 	}
-	dir := s.groupIconDir()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return s.sendError(client, errCodeUnavailable, "icon storage unavailable")
-	}
-	fileName := strconv.FormatInt(msg.GroupID, 10) + ext
-	if err := os.WriteFile(filepath.Join(dir, fileName), raw, 0o644); err != nil {
-		return s.sendError(client, errCodeUnavailable, "icon write failed")
-	}
-	if s.deps != nil && s.deps.Groups != nil {
-		if err := s.deps.Groups.SetGroupIcon(ctx, msg.GroupID, fileName); err != nil {
-			s.logger.Warn("marking group icon failed", zap.Int64("group_id", msg.GroupID), zap.Error(err))
+	fileName, err := s.assets().writeGroupIconWithMetadata(ctx, msg.GroupID, ext, raw, s.deps.Groups)
+	if err != nil {
+		if errors.Is(err, errAssetGroupMissing) {
+			return s.sendError(client, errCodeNotFound, "server group not found")
 		}
+		return s.sendError(client, errCodeUnavailable, "group icon update failed")
 	}
 	s.audit(ctx, client.UniqueID, "group_icon_set", fmt.Sprintf("server:%d", msg.GroupID), fileName)
 	return nil
@@ -567,22 +583,24 @@ func (s *TCPServer) handleGroupIconSet(ctx context.Context, client *Client, f *n
 
 // handleGroupIconGet returns a server-group's icon (wave 6b; mirrors
 // handleAvatarGet). Ungated like GroupList: icons are presentation data.
-func (s *TCPServer) handleGroupIconGet(_ context.Context, client *Client, f *netproto.Frame) error {
+func (s *TCPServer) handleGroupIconGet(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.GroupIconGet
 	if err := netproto.Decode(f, &msg); err != nil {
 		return s.sendError(client, errCodeMalformed, "malformed group_icon_get: "+err.Error())
 	}
-	name := strconv.FormatInt(msg.GroupID, 10)
-	for ct, ext := range imageExts {
-		raw, err := os.ReadFile(filepath.Join(s.groupIconDir(), name+ext))
-		if err != nil {
-			continue
-		}
+	if s.deps == nil || s.deps.Groups == nil {
+		return s.sendError(client, errCodeUnavailable, "group store unavailable")
+	}
+	raw, image, err := s.assets().readGroupIcon(ctx, msg.GroupID, s.deps.Groups)
+	if err == nil {
 		return s.writeMessage(client, netproto.MsgGroupIconData, netproto.GroupIconData{
 			GroupID:     msg.GroupID,
 			DataBase64:  base64.StdEncoding.EncodeToString(raw),
-			ContentType: ct,
+			ContentType: image.contentType,
 		})
+	}
+	if errors.Is(err, errGroupIconMetadataRead) {
+		return s.sendError(client, errCodeUnavailable, "group icon lookup failed")
 	}
 	return s.writeMessage(client, netproto.MsgGroupIconData, netproto.GroupIconData{GroupID: msg.GroupID})
 }

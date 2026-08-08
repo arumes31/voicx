@@ -23,6 +23,8 @@ import (
 
 	"go.uber.org/zap"
 	"golang.org/x/crypto/ssh"
+
+	"voicx/internal/safecast"
 )
 
 const handshakeTimeout = 30 * time.Second
@@ -180,7 +182,11 @@ func (s *SSHServer) passwordCallback(ctx context.Context) func(ssh.ConnMetadata,
 // serve runs one SSH connection: handshake, then one command loop per
 // accepted session channel.
 func (s *SSHServer) serve(ctx context.Context, nConn net.Conn, cfg *ssh.ServerConfig) {
-	defer nConn.Close()
+	defer func() {
+		if err := nConn.Close(); err != nil {
+			s.logger.Debug("closing query ssh network connection failed", zap.Error(err))
+		}
+	}()
 
 	if err := nConn.SetDeadline(time.Now().Add(handshakeTimeout)); err != nil {
 		s.logger.Debug("setting query ssh handshake deadline failed", zap.Error(err))
@@ -199,7 +205,11 @@ func (s *SSHServer) serve(ctx context.Context, nConn net.Conn, cfg *ssh.ServerCo
 			zap.String("remote", nConn.RemoteAddr().String()), zap.Error(err))
 		return
 	}
-	defer sshConn.Close()
+	defer func() {
+		if err := sshConn.Close(); err != nil {
+			s.logger.Debug("closing query ssh connection failed", zap.Error(err))
+		}
+	}()
 	go ssh.DiscardRequests(globalReqs)
 
 	s.logger.Info("query ssh client logged in",
@@ -226,7 +236,11 @@ func (s *SSHServer) serve(ctx context.Context, nConn net.Conn, cfg *ssh.ServerCo
 // serveChannel runs the command loop for one SSH session channel. It supports
 // an interactive shell and a one-shot exec ("ssh host clientlist").
 func (s *SSHServer) serveChannel(ctx context.Context, sshConn *ssh.ServerConn, nConn net.Conn, ch ssh.Channel, reqs <-chan *ssh.Request) {
-	defer ch.Close()
+	defer func() {
+		if err := ch.Close(); err != nil {
+			s.logger.Debug("closing query ssh channel failed", zap.Error(err))
+		}
+	}()
 
 	sess := &session{
 		r: bufio.NewReader(ch),
@@ -273,8 +287,9 @@ func execCommand(payload []byte) string {
 	if len(payload) < 4 {
 		return ""
 	}
-	n := binary.BigEndian.Uint32(payload)
-	if n > uint32(len(payload)-4) {
+	declared := binary.BigEndian.Uint32(payload)
+	n, err := safecast.Uint32ToInt(declared)
+	if err != nil || n > len(payload)-4 {
 		return ""
 	}
 	return string(payload[4 : 4+n])
@@ -295,6 +310,8 @@ func loadOrCreateHostKey(path string) (ssh.Signer, error) {
 	if path == "" {
 		return nil, errors.New("no host key path configured")
 	}
+	// #nosec G304 -- path is an administrator-selected SSH host-key location,
+	// intentionally outside a fixed application data root.
 	raw, err := os.ReadFile(path)
 	if err == nil {
 		return ssh.ParsePrivateKey(raw)
@@ -315,7 +332,28 @@ func loadOrCreateHostKey(path string) (ssh.Signer, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+	// Use O_EXCL so concurrent server starts cannot overwrite each other's keys.
+	// #nosec G304 -- path is the same administrator-selected host-key location.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		raw, readErr := os.ReadFile(path) // #nosec G304 -- configured host-key path.
+		if readErr != nil {
+			return nil, readErr
+		}
+		return ssh.ParsePrivateKey(raw)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if _, err := f.Write(encoded); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
 		return nil, err
 	}
 	return ssh.ParsePrivateKey(encoded)

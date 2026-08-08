@@ -71,7 +71,7 @@ func TestTCPServerStartShutdownPingPong(t *testing.T) {
 	if dialErr != nil {
 		t.Fatalf("dial tcp server: %v", dialErr)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Send a Ping frame.
 	pingFrame, err := netproto.Encode(netproto.MsgPing, netproto.Ping{})
@@ -83,7 +83,7 @@ func TestTCPServerStartShutdownPingPong(t *testing.T) {
 	}
 
 	// Expect a Pong frame back.
-	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	resp, err := netproto.ReadFrame(conn)
 	if err != nil {
 		t.Fatalf("read pong: %v", err)

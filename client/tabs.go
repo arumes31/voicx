@@ -40,10 +40,9 @@ type journalEntry struct {
 
 // tabState bundles a tab's manager with its replay journal and badges.
 type tabState struct {
-	cm       *connManager
-	info     TabInfo
-	journal  []journalEntry // events since the last snapshot
-	maxItems int
+	cm      *connManager
+	info    TabInfo
+	journal []journalEntry // events since the last snapshot
 }
 
 // tabsMu guards tabs/activeID. cmMu (app.go) guards the active cm pointer.
@@ -167,16 +166,6 @@ func (a *App) tabsRegistry() map[string]*tabState {
 	return a.tabs
 }
 
-// activeCM returns the active tab's connManager (may be nil).
-func (a *App) activeCM() *connManager {
-	a.tabsMu.Lock()
-	defer a.tabsMu.Unlock()
-	if ts := a.tabs[a.activeID]; ts != nil {
-		return ts.cm
-	}
-	return nil
-}
-
 // newTab creates a tab with a fresh connManager and registers it.
 func (a *App) newTab() (string, *tabState) {
 	a.tabsMu.Lock()
@@ -269,8 +258,7 @@ func (a *App) ConnectBookmarkTab(bookmark, addr, nickname, password, serverPassw
 	if err != "" {
 		a.removeTab(id)
 		if err == errFingerprintMismatch.Error() {
-			_, presented, _ := ts.cm.securitySnapshot()
-			return fmt.Sprintf("%s: the server certificate changed (presented: %s). Possible MITM — only trust it if you expected the change", err, presented)
+			return fingerprintMismatchMessage(ts.cm)
 		}
 		return err
 	}
@@ -295,6 +283,9 @@ func (a *App) ConnectGuestBookmarkTab(bookmark, addr, nickname string) string {
 	id, ts := a.newTab()
 	if err := ts.cm.connect(addr, nickname, "", ""); err != "" {
 		a.removeTab(id)
+		if err == errFingerprintMismatch.Error() {
+			return fingerprintMismatchMessage(ts.cm)
+		}
 		return err
 	}
 	ts.info.Addr = addr
@@ -302,6 +293,12 @@ func (a *App) ConnectGuestBookmarkTab(bookmark, addr, nickname string) string {
 	a.onTabConnected(ts.cm, bookmark, addr, nickname)
 	a.activate(id)
 	return ""
+}
+
+func fingerprintMismatchMessage(cm *connManager) string {
+	_, presented, _ := cm.securitySnapshot()
+	return fmt.Sprintf("%s: the server certificate changed (presented: %s). Possible MITM — only trust it if you expected the change",
+		errFingerprintMismatch, presented)
 }
 
 // lookupBookmark resolves the bookmark a connection belongs to, by explicit

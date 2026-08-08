@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/lib/pq"
+
+	"voicx/internal/safecast"
 )
 
 // ErrChatEditConflict means the message changed after the caller rendered it.
@@ -91,15 +93,17 @@ func (s *Store) ChatHistory(ctx context.Context, channelID, beforeID int64, limi
 	      WHERE channel_id = $1`
 	args := []any{channelID}
 	if beforeID > 0 {
-		q += ` AND id < $2`
-		args = append(args, beforeID)
+		q += ` AND id < $2 ORDER BY id DESC LIMIT $3`
+		args = append(args, beforeID, limit)
+	} else {
+		q += ` ORDER BY id DESC LIMIT $2`
+		args = append(args, limit)
 	}
-	q += fmt.Sprintf(` ORDER BY id DESC LIMIT %d`, limit)
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("querying chat history: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 
 	var out []ChatMessage
 	for rows.Next() {
@@ -112,7 +116,10 @@ func (s *Store) ChatHistory(ctx context.Context, channelID, beforeID int64, limi
 			return nil, fmt.Errorf("scanning chat message: %w", err)
 		}
 		m.ReplyToID = replyToID.Int64
-		m.KeyID = uint32(keyID)
+		m.KeyID, err = safecast.Int64ToUint32(keyID)
+		if err != nil {
+			return nil, fmt.Errorf("scanning chat message %d has invalid key id %d: %w", m.ID, keyID, err)
+		}
 		out = append(out, m)
 	}
 	return out, rows.Err()
@@ -137,7 +144,10 @@ func (s *Store) GetChatMessage(ctx context.Context, id int64) (*ChatMessage, err
 		}
 		return nil, fmt.Errorf("querying chat message: %w", err)
 	}
-	m.KeyID = uint32(keyID)
+	m.KeyID, err = safecast.Int64ToUint32(keyID)
+	if err != nil {
+		return nil, fmt.Errorf("querying chat message %d returned invalid key id %d: %w", id, keyID, err)
+	}
 	m.ReplyToID = replyToID.Int64
 	return &m, nil
 }
@@ -212,7 +222,7 @@ func (s *Store) ChatPins(ctx context.Context, channelID int64) ([]PinnedMessage,
 	if err != nil {
 		return nil, fmt.Errorf("querying pins: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 
 	var out []PinnedMessage
 	for rows.Next() {
@@ -378,7 +388,7 @@ func queryReactions(ctx context.Context, qx reactionQuerier, messageID int64) (m
 	if err != nil {
 		return nil, fmt.Errorf("querying reactions: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	out := map[string]int{}
 	for rows.Next() {
 		var emoji string
@@ -413,7 +423,7 @@ func (s *Store) ReactionsFor(ctx context.Context, ids []int64) (map[int64]map[st
 	if err != nil {
 		return nil, fmt.Errorf("querying reactions page: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	for rows.Next() {
 		var id int64
 		var emoji string
@@ -485,7 +495,11 @@ func (s *Store) GetServerSetting(ctx context.Context, key string) (string, uint3
 		}
 		return "", 0, fmt.Errorf("loading server setting: %w", err)
 	}
-	return v, uint32(keyID), nil
+	convertedKeyID, err := safecast.Int64ToUint32(keyID)
+	if err != nil {
+		return "", 0, fmt.Errorf("loading server setting %q returned invalid key id %d: %w", key, keyID, err)
+	}
+	return v, convertedKeyID, nil
 }
 
 // --- One-shot legacy backfill (migration 012) --------------------------------
@@ -507,7 +521,7 @@ func (s *Store) LegacyPlaintextPage(ctx context.Context, afterID int64, limit in
 	if err != nil {
 		return nil, fmt.Errorf("querying legacy chat rows: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []LegacyChatRow
 	for rows.Next() {
 		var r LegacyChatRow

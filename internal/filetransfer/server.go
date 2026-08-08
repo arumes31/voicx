@@ -8,8 +8,8 @@
 // length + 2-byte type + payload) with a tiny frame vocabulary (see
 // protocol.go): one init frame authenticates the connection, raw chunk
 // frames carry the data, and a digest frame carrying the SHA-256 of the file
-// closes the transfer. Uploads are written to <root>/<channel_id>/<name>.part
-// and atomically renamed on success; a same-name upload replaces the
+// closes the transfer. Uploads are written to a random, exclusive temporary
+// file below <root>/<channel_id> and atomically renamed on success; a same-name upload replaces the
 // previous file (both on disk and in the files table).
 //
 // The port speaks TLS whenever Config.TLSEnabled is set (91-135); when it is
@@ -71,6 +71,11 @@ var ErrTooLarge = errors.New("filetransfer: file too large")
 
 // ErrInvalidName is returned when a file name fails sanitization.
 var ErrInvalidName = errors.New("filetransfer: invalid file name")
+
+// ErrChannelDeleted is returned when work is requested for a channel whose
+// deletion cleanup has started. Channel IDs are never reused, so the
+// tombstone is intentionally permanent for the lifetime of the server.
+var ErrChannelDeleted = errors.New("filetransfer: channel deleted")
 
 // ErrEncryptedAttachment is returned when an expiring download link (267) is
 // requested for a client-encrypted chat attachment.
@@ -181,6 +186,21 @@ type transfer struct {
 	Expires   time.Time
 }
 
+// activeTransfer lets channel deletion revoke transfers that already
+// consumed their single-use token. Closing conn interrupts both upload and
+// download I/O; done closes only after any partial upload has been removed.
+type activeTransfer struct {
+	transferID string
+	channelID  int64
+	conn       net.Conn
+	done       chan struct{}
+}
+
+type channelCleanup struct {
+	done chan struct{}
+	err  error
+}
+
 // Server is the file-transfer listener and token registry.
 type Server struct {
 	cfg    Config
@@ -193,7 +213,10 @@ type Server struct {
 	links *LinkRegistry
 	// moveBlobFn is injectable in tests so metadata rollback can be exercised
 	// without depending on the host's volume layout.
-	moveBlobFn func(string, string) error
+	moveBlobFn func(*os.Root, string, string) error
+	// removeChannelDataFn is injectable in tests so cleanup retry semantics can
+	// be verified without relying on platform-specific filesystem failures.
+	removeChannelDataFn func(int64) error
 
 	// OnTransferComplete, when set, is called with the direction and result
 	// ("ok"/"error") when a transfer finishes (metrics).
@@ -208,8 +231,15 @@ type Server struct {
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
 
-	mu        sync.Mutex
-	transfers map[string]*transfer // keyed by token
+	// fileOpsMu makes filesystem-producing mutations linearizable with a
+	// channel tombstone. Deletion takes the write side only long enough to
+	// drain prior mutations and publish the tombstone; later operations acquire
+	// the read side, observe it, and fail before touching disk or metadata.
+	fileOpsMu       sync.RWMutex
+	mu              sync.Mutex
+	transfers       map[string]*transfer // keyed by token digest
+	activeTransfers map[string]*activeTransfer
+	deletedChannels map[int64]*channelCleanup
 }
 
 // New constructs a Server. The listener is created lazily in Start.
@@ -221,16 +251,20 @@ func New(cfg Config, st FileStore, logger *zap.Logger) *Server {
 	if _, p, err := net.SplitHostPort(cfg.Addr); err == nil {
 		port, _ = strconv.Atoi(p)
 	}
-	return &Server{
-		cfg:        cfg,
-		store:      st,
-		logger:     logger,
-		port:       port,
-		links:      NewLinkRegistry(),
-		moveBlobFn: moveBlob,
-		stopCh:     make(chan struct{}),
-		transfers:  make(map[string]*transfer),
+	s := &Server{
+		cfg:             cfg,
+		store:           st,
+		logger:          logger,
+		port:            port,
+		links:           NewLinkRegistry(cfg.RootDir),
+		moveBlobFn:      moveBlob,
+		stopCh:          make(chan struct{}),
+		transfers:       make(map[string]*transfer),
+		activeTransfers: make(map[string]*activeTransfer),
+		deletedChannels: make(map[int64]*channelCleanup),
 	}
+	s.removeChannelDataFn = s.removeChannelData
+	return s
 }
 
 // Port returns the configured file-transfer port (0 when the address has no
@@ -367,7 +401,17 @@ func (s *Server) DeleteFile(ctx context.Context, channelID int64, folder, name s
 	if err := s.store.DeleteFile(ctx, channelID, folder, name); err != nil {
 		return err
 	}
-	if err := os.Remove(s.filePath(channelID, folder, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	root, err := s.openBlobRoot()
+	if err != nil {
+		s.logger.Warn("opening file root failed while removing blob",
+			zap.Int64("channel_id", channelID),
+			zap.String("name", name),
+			zap.Error(err),
+		)
+		return nil
+	}
+	defer func() { _ = root.Close() }()
+	if err := root.Remove(blobPath(channelID, folder, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		s.logger.Warn("removing file blob failed",
 			zap.Int64("channel_id", channelID),
 			zap.String("name", name),
@@ -405,12 +449,22 @@ func (s *Server) MoveFile(ctx context.Context, channelID int64, folder, name str
 	if newChannelID == 0 {
 		newChannelID = channelID
 	}
+	s.fileOpsMu.RLock()
+	defer s.fileOpsMu.RUnlock()
+	if s.channelDeleted(channelID) || s.channelDeleted(newChannelID) {
+		return ErrChannelDeleted
+	}
 	if channelID == newChannelID && folder == newFolder && name == newName {
 		return errors.New("nothing to rename")
 	}
-	oldPath := s.filePath(channelID, folder, name)
-	newPath := s.filePath(newChannelID, newFolder, newName)
-	if err := os.MkdirAll(filepath.Dir(newPath), 0o750); err != nil {
+	root, err := s.openBlobRoot()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	oldPath := blobPath(channelID, folder, name)
+	newPath := blobPath(newChannelID, newFolder, newName)
+	if err := root.MkdirAll(filepath.Dir(newPath), 0o700); err != nil {
 		return fmt.Errorf("creating target folder: %w", err)
 	}
 	// A move into an occupied name would silently orphan the blob already
@@ -426,7 +480,7 @@ func (s *Server) MoveFile(ctx context.Context, channelID int64, folder, name str
 		}
 		return err
 	}
-	if err := s.moveBlobFn(oldPath, newPath); err != nil {
+	if err := s.moveBlobFn(root, oldPath, newPath); err != nil {
 		rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer rbCancel()
 		rollbackErr := s.store.MoveFile(rbCtx, newChannelID, newFolder, newName, channelID, folder, name)
@@ -442,40 +496,66 @@ func (s *Server) MoveFile(ctx context.Context, channelID int64, folder, name str
 // on different volumes (a cross-channel move can cross a mount point when the
 // storage root spans devices, and Rename fails with EXDEV there). A missing
 // source is not an error: the row is the record of truth.
-func moveBlob(oldPath, newPath string) error {
-	err := os.Rename(oldPath, newPath)
+func moveBlob(root *os.Root, oldPath, newPath string) error {
+	info, err := root.Lstat(oldPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("checking source blob: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("source blob %q is not a regular file", oldPath)
+	}
+
+	err = root.Rename(oldPath, newPath)
 	if err == nil || errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	return copyBlobAndRemove(oldPath, newPath, err)
+	return copyBlobAndRemove(root, oldPath, newPath, err)
 }
 
 // copyBlobAndRemove is the cross-volume fallback after Rename fails.
-func copyBlobAndRemove(oldPath, newPath string, renameErr error) error {
-	src, openErr := os.Open(oldPath)
+func copyBlobAndRemove(root *os.Root, oldPath, newPath string, renameErr error) error {
+	src, openErr := openRegularBlob(root, oldPath)
 	if openErr != nil {
 		if errors.Is(openErr, os.ErrNotExist) {
 			return nil
 		}
-		return renameErr
+		return fmt.Errorf("copy fallback after rename failed (%v): %w", renameErr, openErr)
 	}
-	defer src.Close()
-	dst, createErr := os.Create(newPath)
+	srcClosed := false
+	defer func() {
+		if !srcClosed {
+			_ = src.Close()
+		}
+	}()
+	dst, createErr := root.OpenFile(newPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if createErr != nil {
 		return createErr
 	}
 	if _, copyErr := io.Copy(dst, src); copyErr != nil {
 		_ = dst.Close()
-		_ = os.Remove(newPath)
+		_ = root.Remove(newPath)
 		return copyErr
 	}
+	if syncErr := dst.Sync(); syncErr != nil {
+		_ = dst.Close()
+		_ = root.Remove(newPath)
+		return syncErr
+	}
 	if closeErr := dst.Close(); closeErr != nil {
-		_ = os.Remove(newPath)
+		_ = root.Remove(newPath)
 		return closeErr
 	}
-	_ = src.Close()
+	closeErr := src.Close()
+	srcClosed = true
+	if closeErr != nil {
+		_ = root.Remove(newPath)
+		return closeErr
+	}
 	// Only drop the source once the copy is safely closed.
-	_ = os.Remove(oldPath)
+	_ = root.Remove(oldPath)
 	return nil
 }
 
@@ -531,7 +611,119 @@ func (s *Server) CreateLink(ctx context.Context, channelID int64, folder, name s
 	if _, err := s.store.GetFile(ctx, channelID, folder, name); err != nil {
 		return "", time.Time{}, err
 	}
-	return s.links.Create(s.filePath(channelID, folder, name), name)
+	return s.links.Create(blobPath(channelID, folder, name), name)
+}
+
+// TombstoneChannelData permanently rejects new work for a deleted channel and
+// immediately revokes all of its pending and active capabilities. Physical
+// cleanup continues asynchronously so callers can tombstone an entire subtree
+// before waiting on slower recorder or filesystem teardown.
+func (s *Server) TombstoneChannelData(channelID int64) error {
+	_, err := s.beginChannelCleanup(channelID)
+	return err
+}
+
+// DeleteChannelData tombstones a deleted channel and waits for its confined
+// on-disk directory to be removed. A context deadline only bounds the wait;
+// cleanup continues asynchronously and a later call can observe completion or
+// retry a failed cleanup.
+func (s *Server) DeleteChannelData(ctx context.Context, channelID int64) error {
+	cleanup, err := s.beginChannelCleanup(channelID)
+	if err != nil {
+		return err
+	}
+	select {
+	case <-cleanup.done:
+		return cleanup.err
+	case <-ctx.Done():
+		return fmt.Errorf("waiting for channel %d file cleanup: %w", channelID, ctx.Err())
+	}
+}
+
+func (s *Server) beginChannelCleanup(channelID int64) (*channelCleanup, error) {
+	if channelID <= 0 {
+		return nil, fmt.Errorf("%w: invalid channel id %d", ErrChannelDeleted, channelID)
+	}
+
+	s.mu.Lock()
+	cleanup, exists := s.deletedChannels[channelID]
+	startCleanup := !exists
+	if exists {
+		select {
+		case <-cleanup.done:
+			// A successful cleanup is permanently idempotent. A failed cleanup
+			// remains a tombstone but receives a fresh worker on the next call.
+			if cleanup.err != nil {
+				cleanup = &channelCleanup{done: make(chan struct{})}
+				s.deletedChannels[channelID] = cleanup
+				startCleanup = true
+			}
+		default:
+		}
+	}
+	if !exists {
+		cleanup = &channelCleanup{done: make(chan struct{})}
+		s.deletedChannels[channelID] = cleanup
+	}
+	for digest, tr := range s.transfers {
+		if tr.ChannelID == channelID {
+			delete(s.transfers, digest)
+		}
+	}
+	active := make([]*activeTransfer, 0)
+	for _, tr := range s.activeTransfers {
+		if tr.channelID == channelID {
+			active = append(active, tr)
+		}
+	}
+	s.mu.Unlock()
+
+	// Capability revocation deliberately precedes the potentially blocking
+	// drain. A wedged pre-delete move may delay physical reclamation, but it
+	// cannot keep a bearer link or transfer token valid after this call starts.
+	s.links.RevokeChannel(channelID)
+	for _, tr := range active {
+		_ = tr.conn.Close()
+	}
+	if startCleanup {
+		go s.finishChannelCleanup(channelID, active, cleanup)
+	}
+	return cleanup, nil
+}
+
+func (s *Server) finishChannelCleanup(channelID int64, active []*activeTransfer, cleanup *channelCleanup) {
+	for _, tr := range active {
+		<-tr.done
+	}
+	// A queued writer prevents later readers from starving cleanup. Operations
+	// already holding the read side finish first; they began before the
+	// tombstone and their output is removed below. Later operations observe the
+	// tombstone immediately after acquiring the read side and fail closed.
+	// Short bounded retries absorb transient sharing violations and delayed
+	// network-volume visibility without holding the global writer while asleep.
+	retryDelays := [...]time.Duration{25 * time.Millisecond, 100 * time.Millisecond, 250 * time.Millisecond}
+	for attempt := 0; ; attempt++ {
+		s.fileOpsMu.Lock()
+		cleanup.err = s.removeChannelDataFn(channelID)
+		s.fileOpsMu.Unlock()
+		if cleanup.err == nil || attempt == len(retryDelays) {
+			break
+		}
+		time.Sleep(retryDelays[attempt])
+	}
+	close(cleanup.done)
+}
+
+func (s *Server) removeChannelData(channelID int64) error {
+	root, err := s.openBlobRoot()
+	if err != nil {
+		return fmt.Errorf("opening file root for channel cleanup: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	if err := root.RemoveAll(strconv.FormatInt(channelID, 10)); err != nil {
+		return fmt.Errorf("removing channel %d files: %w", channelID, err)
+	}
+	return nil
 }
 
 // register creates a transfer ID and token and records the pending transfer.
@@ -549,6 +741,10 @@ func (s *Server) register(tr *transfer) (string, string, error) {
 	tr.Expires = time.Now().Add(tokenTTL)
 
 	s.mu.Lock()
+	if _, deleted := s.deletedChannels[tr.ChannelID]; deleted {
+		s.mu.Unlock()
+		return "", "", ErrChannelDeleted
+	}
 	s.transfers[tokenDigest(token)] = tr
 	s.mu.Unlock()
 	return id, token, nil
@@ -563,15 +759,55 @@ func (s *Server) consume(token, transferID string) (*transfer, error) {
 	if ok {
 		delete(s.transfers, digest)
 	}
+	deleted := ok && s.channelDeletedLocked(tr.ChannelID)
 	s.mu.Unlock()
 
 	if !ok || !constantTimeStringEqual(tr.ID, transferID) {
 		return nil, errors.New("invalid transfer token")
 	}
+	if deleted {
+		return nil, ErrChannelDeleted
+	}
 	if time.Now().After(tr.Expires) {
 		return nil, errors.New("transfer token expired")
 	}
 	return tr, nil
+}
+
+func (s *Server) activateTransfer(tr *transfer, conn net.Conn) (*activeTransfer, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.channelDeletedLocked(tr.ChannelID) {
+		return nil, ErrChannelDeleted
+	}
+	active := &activeTransfer{
+		transferID: tr.ID,
+		channelID:  tr.ChannelID,
+		conn:       conn,
+		done:       make(chan struct{}),
+	}
+	s.activeTransfers[tr.ID] = active
+	return active, nil
+}
+
+func (s *Server) deactivateTransfer(active *activeTransfer) {
+	s.mu.Lock()
+	if current := s.activeTransfers[active.transferID]; current == active {
+		delete(s.activeTransfers, active.transferID)
+	}
+	s.mu.Unlock()
+	close(active.done)
+}
+
+func (s *Server) channelDeletedLocked(channelID int64) bool {
+	_, deleted := s.deletedChannels[channelID]
+	return deleted
+}
+
+func (s *Server) channelDeleted(channelID int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.channelDeletedLocked(channelID)
 }
 
 func tokenDigest(token string) string {
@@ -634,23 +870,90 @@ func sanitizeFolder(folder string) (string, error) {
 	return folder, nil
 }
 
-// filePath returns the on-disk path for a channel file.
+// blobPath returns a path relative to the configured storage root. Remote
+// folders and names are validated before this helper is reached; os.Root is
+// the final confinement layer for every filesystem operation.
+func blobPath(channelID int64, folder, name string) string {
+	return filepath.Join(strconv.FormatInt(channelID, 10), filepath.FromSlash(folder), name)
+}
+
+// filePath returns the absolute on-disk path for APIs that require one. Blob
+// reads and writes use blobPath with os.Root instead.
 func (s *Server) filePath(channelID int64, folder, name string) string {
-	return filepath.Join(s.cfg.RootDir, strconv.FormatInt(channelID, 10), filepath.FromSlash(folder), name)
+	return filepath.Join(s.cfg.RootDir, blobPath(channelID, folder, name))
+}
+
+// openBlobRoot creates the trusted configured root when necessary and opens
+// a capability that rejects traversal and symlink escapes for relative blob
+// paths. Callers close the root after their operation; Root itself is safe for
+// concurrent use while open.
+func (s *Server) openBlobRoot() (*os.Root, error) {
+	if err := os.MkdirAll(s.cfg.RootDir, 0o700); err != nil {
+		return nil, fmt.Errorf("creating file root %s: %w", s.cfg.RootDir, err)
+	}
+	root, err := os.OpenRoot(s.cfg.RootDir)
+	if err != nil {
+		return nil, fmt.Errorf("opening file root %s: %w", s.cfg.RootDir, err)
+	}
+	return root, nil
+}
+
+// openRegularBlob opens an existing blob only when the directory entry and
+// the opened target are regular files. The second check rejects a non-regular
+// target swapped in between Lstat and Open; os.Root keeps either lookup
+// confined in all cases.
+func openRegularBlob(root *os.Root, name string) (*os.File, error) {
+	info, err := root.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("blob %q is not a regular file", name)
+	}
+	f, err := root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	openedInfo, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if !openedInfo.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, fmt.Errorf("blob %q is not a regular file", name)
+	}
+	return f, nil
 }
 
 // CheckRoot verifies the storage root exists and is writable, creating it if
 // needed. It is called at startup so a misconfigured volume is logged loudly
 // instead of failing on the first upload.
 func (s *Server) CheckRoot() error {
-	if err := os.MkdirAll(s.cfg.RootDir, 0o750); err != nil {
-		return fmt.Errorf("creating file root %s: %w", s.cfg.RootDir, err)
+	root, err := s.openBlobRoot()
+	if err != nil {
+		return err
 	}
-	probe := filepath.Join(s.cfg.RootDir, ".writetest")
-	if err := os.WriteFile(probe, []byte("ok"), 0o600); err != nil {
+	defer func() { _ = root.Close() }()
+	probeID, err := randomHex(8)
+	if err != nil {
+		return err
+	}
+	probe := ".writetest-" + probeID
+	f, err := root.OpenFile(probe, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
 		return fmt.Errorf("file root %s is not writable: %w", s.cfg.RootDir, err)
 	}
-	_ = os.Remove(probe)
+	if _, err := f.Write([]byte("ok")); err != nil {
+		_ = f.Close()
+		_ = root.Remove(probe)
+		return fmt.Errorf("file root %s is not writable: %w", s.cfg.RootDir, err)
+	}
+	if err := f.Close(); err != nil {
+		_ = root.Remove(probe)
+		return fmt.Errorf("file root %s is not writable: %w", s.cfg.RootDir, err)
+	}
+	_ = root.Remove(probe)
 	return nil
 }
 
@@ -680,7 +983,7 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.cfg.TLSEnabled {
 		ln = tls.NewListener(ln, &tls.Config{
 			Certificates: []tls.Certificate{s.cfg.Cert},
-			MinVersion:   tls.VersionTLS12,
+			MinVersion:   tls.VersionTLS13,
 		})
 	}
 	s.lifecycleMu.Lock()

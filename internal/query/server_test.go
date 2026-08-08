@@ -7,12 +7,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func closeServerQueryTestResource(t *testing.T, closer io.Closer) {
+	t.Helper()
+	if err := closer.Close(); err != nil {
+		t.Logf("closing test resource: %v", err)
+	}
+}
 
 // fakeBackend implements Backend with canned data and call recording.
 type fakeBackend struct {
@@ -551,7 +559,7 @@ func TestGreeting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 
 	r := bufio.NewReader(conn)
 	if line := readLine(t, r); !strings.Contains(line, "VOICX ServerQuery "+Version) {
@@ -565,7 +573,7 @@ func TestGreeting(t *testing.T) {
 func TestUnauthedRejected(t *testing.T) {
 	addr, _ := startQueryServer(t, newFakeBackend())
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 
 	lines := sendCmd(t, conn, r, "clientlist")
 	if got := lastErr(t, lines); got != `error id=2568 msg=not\slogged\sin` {
@@ -576,7 +584,7 @@ func TestUnauthedRejected(t *testing.T) {
 func TestLoginFailures(t *testing.T) {
 	addr, _ := startQueryServer(t, newFakeBackend())
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 
 	// Wrong password.
 	lines := sendCmd(t, conn, r, "login admin-uid wrong")
@@ -600,7 +608,7 @@ func TestLoginFailures(t *testing.T) {
 func TestClientlist(t *testing.T) {
 	addr, _ := startQueryServer(t, newFakeBackend())
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	lines := sendCmd(t, conn, r, "clientlist")
@@ -619,7 +627,7 @@ func TestClientlist(t *testing.T) {
 func TestChannellist(t *testing.T) {
 	addr, _ := startQueryServer(t, newFakeBackend())
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	lines := sendCmd(t, conn, r, "channellist")
@@ -632,7 +640,7 @@ func TestChannellist(t *testing.T) {
 func TestServerinfo(t *testing.T) {
 	addr, _ := startQueryServer(t, newFakeBackend())
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	lines := sendCmd(t, conn, r, "serverinfo")
@@ -648,7 +656,7 @@ func TestClientmove(t *testing.T) {
 	backend := newFakeBackend()
 	addr, _ := startQueryServer(t, backend)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	lines := sendCmd(t, conn, r, "clientmove clid=c-1 cid=7")
@@ -666,7 +674,7 @@ func TestClientkick(t *testing.T) {
 	backend := newFakeBackend()
 	addr, _ := startQueryServer(t, backend)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	// Channel kick (reasonid 4).
@@ -691,7 +699,7 @@ func TestSendtextmessage(t *testing.T) {
 	backend := newFakeBackend()
 	addr, _ := startQueryServer(t, backend)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	sendCmd(t, conn, r, `sendtextmessage targetmode=1 target=c-1 msg=hi\sthere`)
@@ -718,7 +726,7 @@ func TestChannelcreateDelete(t *testing.T) {
 	backend := newFakeBackend()
 	addr, _ := startQueryServer(t, backend)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	lines := sendCmd(t, conn, r, `channelcreate channel_name=New\sChan channel_topic=a\stopic channel_flag_permanent=1`)
@@ -748,7 +756,7 @@ func TestBanclient(t *testing.T) {
 	backend := newFakeBackend()
 	addr, _ := startQueryServer(t, backend)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	lines := sendCmd(t, conn, r, `banclient clid=c-1 time=3600 banreason=rule\s7`)
@@ -766,7 +774,7 @@ func TestBanclient(t *testing.T) {
 func TestUnknownCommand(t *testing.T) {
 	addr, _ := startQueryServer(t, newFakeBackend())
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	lines := sendCmd(t, conn, r, "frobnicate foo=1")
@@ -778,7 +786,7 @@ func TestUnknownCommand(t *testing.T) {
 func TestHelpVersionQuit(t *testing.T) {
 	addr, _ := startQueryServer(t, newFakeBackend())
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 
 	// help works unauthenticated.
 	lines := sendCmd(t, conn, r, "help")
@@ -807,7 +815,7 @@ func TestBruteForceLockout(t *testing.T) {
 	addr, _ := startQueryServerWith(t, backend, func(s *Server) { s.MaxLoginFailures = 3 })
 
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 
 	for i := 0; i < 3; i++ {
 		sendCmd(t, conn, r, "login admin-uid wrong")
@@ -824,16 +832,16 @@ func TestConnectionCap(t *testing.T) {
 	addr, _ := startQueryServerWith(t, newFakeBackend(), func(s *Server) { s.MaxConns = 2 })
 
 	c1, _ := dialQuery(t, addr)
-	defer c1.Close()
+	defer closeServerQueryTestResource(t, c1)
 	c2, _ := dialQuery(t, addr)
-	defer c2.Close()
+	defer closeServerQueryTestResource(t, c2)
 
 	// Third connection is refused with an error line.
 	c3, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer c3.Close()
+	defer closeServerQueryTestResource(t, c3)
 	r3 := bufio.NewReader(c3)
 	line, err := r3.ReadString('\n')
 	if err != nil {
@@ -848,7 +856,7 @@ func TestIdleTimeout(t *testing.T) {
 	addr, _ := startQueryServerWith(t, newFakeBackend(), func(s *Server) { s.IdleTimeout = 100 * time.Millisecond })
 
 	conn, _ := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 
 	// Send nothing: the server should close the connection after the idle
 	// timeout.
@@ -865,7 +873,7 @@ func TestLoginBackendError(t *testing.T) {
 	backend := newFakeBackend()
 	addr, _ := startQueryServer(t, backend)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 
 	// Unknown user is a clean login failure, not an internal error.
 	lines := sendCmd(t, conn, r, "login ghost-uid pw")
@@ -883,7 +891,7 @@ func TestComplaintCommands(t *testing.T) {
 	}
 	addr, _ := startQueryServer(t, backend)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	lines := sendCmd(t, conn, r, "complaintlist")
@@ -917,7 +925,7 @@ func TestTokenCommands(t *testing.T) {
 	backend := newFakeBackend()
 	addr, _ := startQueryServer(t, backend)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	// Create an admin-grant token (no group).
@@ -964,7 +972,7 @@ func TestAuditlogCommand(t *testing.T) {
 	}
 	addr, _ := startQueryServer(t, backend)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	lines := sendCmd(t, conn, r, "auditlog")
@@ -995,7 +1003,7 @@ func TestServeredit(t *testing.T) {
 	backend := newFakeBackend()
 	addr, _ := startQueryServer(t, backend)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	lines := sendCmd(t, conn, r, `serveredit virtualserver_name=My\sServer virtualserver_maxclients=50`)
@@ -1035,7 +1043,7 @@ func TestServerstopConfirm(t *testing.T) {
 	backend := newFakeBackend()
 	addr, _ := startQueryServer(t, backend)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	lines := sendCmd(t, conn, r, "serverstop")
@@ -1075,7 +1083,7 @@ func TestPermoverview(t *testing.T) {
 	backend := newFakeBackend()
 	addr, _ := startQueryServer(t, backend)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	lines := sendCmd(t, conn, r, "permoverview user-uid")
@@ -1097,7 +1105,7 @@ func TestChannelPerms(t *testing.T) {
 	backend := newFakeBackend()
 	addr, _ := startQueryServer(t, backend)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	sendCmd(t, conn, r, "channeladdperm cid=1 permid=i_client_needed_talk_power permvalue=50 permgrant=75 permskip=1")
@@ -1126,7 +1134,7 @@ func TestServerGroups(t *testing.T) {
 	backend := newFakeBackend()
 	addr, _ := startQueryServer(t, backend)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	lines := sendCmd(t, conn, r, `servergroupadd name=Mods\sAlpha sortid=10`)
@@ -1162,7 +1170,7 @@ func TestCustomProps(t *testing.T) {
 	backend := newFakeBackend()
 	addr, _ := startQueryServer(t, backend)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	sendCmd(t, conn, r, `customset cldbid=user-uid ident=role value=senior\sdev`)
@@ -1189,7 +1197,7 @@ func TestLogview(t *testing.T) {
 	backend.logLines = []string{"first line", "second line with marker"}
 	addr, _ := startQueryServer(t, backend)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	lines := sendCmd(t, conn, r, "logview lines=5")
@@ -1208,7 +1216,7 @@ func TestLogviewFollow(t *testing.T) {
 	backend.logLines = []string{"tail line"}
 	addr, _ := startQueryServer(t, backend)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	// Queue the live lines up front: the follow window is short, and the
@@ -1247,7 +1255,7 @@ func TestServerrules(t *testing.T) {
 	backend.rulesAccepted = 7
 	addr, _ := startQueryServer(t, backend)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	lines := sendCmd(t, conn, r, "serverrules")
@@ -1278,7 +1286,7 @@ func TestChanneladdpermUnknownKey(t *testing.T) {
 	backend := newFakeBackend()
 	addr, _ := startQueryServer(t, backend)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	lines := sendCmd(t, conn, r, "channeladdperm cid=1 permid=i_client_needed_talkpower permvalue=50")

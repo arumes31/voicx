@@ -10,6 +10,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
@@ -56,7 +57,7 @@ func serveFrames(conn net.Conn, handle frameHandler) {
 func newPipedApp(t *testing.T, handle frameHandler) (*App, *connManager) {
 	t.Helper()
 	cli, srv := net.Pipe()
-	cm := newConnManager(nil)
+	cm := newConnManager(context.Background())
 	cm.sink = &eventRecorder{}
 	cm.id = mustTempIdentity(t)
 	cm.mu.Lock()
@@ -267,19 +268,19 @@ func TestMOTDDecryptedBeforeConnectReturns(t *testing.T) {
 	}
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
+		MinVersion:   tls.VersionTLS13,
 	})
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		f, err := netproto.ReadFrame(conn)
 		if err != nil {
 			return

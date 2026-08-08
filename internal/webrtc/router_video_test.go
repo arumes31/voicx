@@ -7,7 +7,7 @@ import (
 
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
-	"github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v4"
 )
 
 // fakeVideoTrack is a VideoTrackReader with a fixed RID/SSRC and a scripted
@@ -68,7 +68,7 @@ func TestForwardVideoFanout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 
 	attachFakePeer(t, e, r, "b")
@@ -92,7 +92,7 @@ func TestSimulcastLayerSelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 
 	for _, id := range []string{"hi", "mid", "lo", "def"} {
@@ -136,7 +136,7 @@ func TestSimulcastFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 
 	attachFakePeer(t, e, r, "mid")
@@ -173,7 +173,7 @@ func TestNonSimulcastAcceptsAll(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 
 	attachFakePeer(t, e, r, "lo")

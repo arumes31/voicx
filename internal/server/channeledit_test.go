@@ -20,7 +20,7 @@ func TestChannelEditDenied(t *testing.T) {
 	env.state.AddChannel(&state.Channel{ChannelID: 1, Name: "Lobby", ChannelType: 2})
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	topic := "new topic"
 	send(t, conn, netproto.MsgChannelEdit, netproto.ChannelEdit{ChannelID: 1, Topic: &topic})
@@ -44,7 +44,7 @@ func TestChannelEditOK(t *testing.T) {
 	env.state.AddChannel(&state.Channel{ChannelID: 1, Name: "Lobby", ChannelType: 2})
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	topic := "music room"
 	bitrate := 128000
@@ -88,7 +88,7 @@ func TestChannelEditUnknown(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	topic := "x"
 	send(t, conn, netproto.MsgChannelEdit, netproto.ChannelEdit{ChannelID: 999, Topic: &topic})
@@ -109,7 +109,7 @@ func TestPrioritySpeakerDenied(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgPrioritySpeaker, netproto.PrioritySpeaker{Active: true})
 	f := readOfType(t, conn, netproto.MsgError)
@@ -133,7 +133,7 @@ func TestPrioritySpeakerOK(t *testing.T) {
 	defer env.stop()
 
 	conn, clientID := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgPrioritySpeaker, netproto.PrioritySpeaker{Active: true})
 	data := readEventOfType(t, conn, "priority_speaker_changed")

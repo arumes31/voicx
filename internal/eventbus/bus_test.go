@@ -2,6 +2,8 @@ package eventbus
 
 import (
 	"encoding/json"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -171,5 +173,58 @@ func TestPublishCopiesPayload(t *testing.T) {
 	}
 	if err := json.Unmarshal(evt.Data, &doc); err != nil || doc.N != 1 {
 		t.Fatalf("payload = %s (err %v)", evt.Data, err)
+	}
+}
+
+func TestSubscribersCannotMutateEachOthersPayload(t *testing.T) {
+	bus := New(zap.NewNop())
+	defer bus.Close()
+	first := bus.Subscribe("first", nil, 1)
+	second := bus.Subscribe("second", nil, 1)
+	bus.Publish("x", []byte(`{"safe":true}`))
+
+	firstEvent := recv(t, first)
+	firstEvent.Data[2] = 'X'
+	secondEvent := recv(t, second)
+	if got := string(secondEvent.Data); got != `{"safe":true}` {
+		t.Fatalf("second subscriber payload was aliased: %q", got)
+	}
+}
+
+func TestConcurrentPublishPreservesSequenceOrder(t *testing.T) {
+	bus := New(zap.NewNop())
+	defer bus.Close()
+	const publishers = 256
+	sub := bus.Subscribe("ordered", nil, publishers)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < publishers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			<-start
+			bus.Publish("concurrent", []byte(fmt.Sprintf(`{"id":%d}`, id)))
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for want := uint64(1); want <= publishers; want++ {
+		if got := recv(t, sub).Seq; got != want {
+			t.Fatalf("event sequence = %d, want %d", got, want)
+		}
+	}
+}
+
+func TestEvictDoesNotCountAlreadyUnsubscribedConsumer(t *testing.T) {
+	bus := New(zap.NewNop())
+	defer bus.Close()
+	sub := bus.Subscribe("gone", nil, 1)
+	sub.Unsubscribe()
+
+	bus.evict(sub)
+	if got := bus.Stats().Evicted; got != 0 {
+		t.Fatalf("evicted count = %d, want 0", got)
 	}
 }

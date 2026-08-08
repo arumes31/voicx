@@ -8,14 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"time"
 
 	"go.uber.org/zap"
 
+	"voicx/internal/channels"
 	"voicx/internal/netproto"
 	"voicx/internal/permissions"
 	"voicx/internal/store"
@@ -23,14 +21,6 @@ import (
 
 // maxImageBytes is the maximum decoded size of an avatar or channel icon.
 const maxImageBytes = 256 * 1024
-
-// imageExts maps accepted content types to file extensions.
-var imageExts = map[string]string{
-	"image/png":  ".png",
-	"image/jpeg": ".jpg",
-	"image/gif":  ".gif",
-	"image/webp": ".webp",
-}
 
 // Event types for the Phase 9 features.
 const (
@@ -55,21 +45,11 @@ func decodeImage(dataBase64 string) ([]byte, string, error) {
 	if len(raw) > maxImageBytes {
 		return nil, "", errors.New("image too large (max 256 KiB)")
 	}
-	ext, ok := imageExts[http.DetectContentType(raw)]
-	if !ok {
+	format, err := inspectAssetImage(raw)
+	if err != nil {
 		return nil, "", errors.New("unsupported image type (want png, jpeg, gif, or webp)")
 	}
-	return raw, ext, nil
-}
-
-// avatarDir returns the avatar storage directory under the file root.
-func (s *TCPServer) avatarDir() string {
-	return filepath.Join(s.cfg.FileRoot, "avatars")
-}
-
-// iconDir returns the channel-icon storage directory under the file root.
-func (s *TCPServer) iconDir() string {
-	return filepath.Join(s.cfg.FileRoot, "icons")
+	return raw, format.extension, nil
 }
 
 // handleAvatarSet validates and stores the client's avatar, replacing any
@@ -94,15 +74,7 @@ func (s *TCPServer) handleAvatarSet(ctx context.Context, client *Client, f *netp
 	if err != nil {
 		return s.sendError(client, errCodeMalformed, err.Error())
 	}
-	if err := os.MkdirAll(s.avatarDir(), 0o750); err != nil {
-		return s.sendError(client, errCodeUnavailable, "avatar storage unavailable")
-	}
-	// Remove previous avatars of this user (any extension) so the latest set
-	// wins deterministically.
-	for _, e := range imageExts {
-		_ = os.Remove(filepath.Join(s.avatarDir(), client.UniqueID+e))
-	}
-	if err := os.WriteFile(filepath.Join(s.avatarDir(), client.UniqueID+ext), raw, 0o640); err != nil {
+	if _, err := s.assets().writeAvatar(client.UniqueID, ext, raw); err != nil {
 		return s.sendError(client, errCodeUnavailable, "storing avatar failed")
 	}
 
@@ -117,15 +89,12 @@ func (s *TCPServer) handleAvatarGet(_ context.Context, client *Client, f *netpro
 		return s.sendError(client, errCodeMalformed, "malformed avatar_get: "+err.Error())
 	}
 
-	for ct, ext := range imageExts {
-		raw, err := os.ReadFile(filepath.Join(s.avatarDir(), msg.UniqueID+ext))
-		if err != nil {
-			continue
-		}
+	raw, image, err := s.assets().readAvatar(msg.UniqueID)
+	if err == nil {
 		return s.writeMessage(client, netproto.MsgAvatarData, netproto.AvatarData{
 			UniqueID:    msg.UniqueID,
 			DataBase64:  base64.StdEncoding.EncodeToString(raw),
-			ContentType: ct,
+			ContentType: image.contentType,
 		})
 	}
 	return s.sendError(client, errCodeNotFound, "no avatar for this user")
@@ -138,7 +107,7 @@ func (s *TCPServer) handleChannelIconSet(ctx context.Context, client *Client, f 
 	if err := netproto.Decode(f, &msg); err != nil {
 		return s.sendError(client, errCodeMalformed, "malformed channel_icon_set: "+err.Error())
 	}
-	if s.deps == nil || s.deps.State == nil {
+	if s.deps == nil || s.deps.State == nil || s.deps.Channels == nil {
 		return s.sendError(client, errCodeUnavailable, "state backend unavailable")
 	}
 	if _, ok := s.deps.State.GetChannel(msg.ChannelID); !ok {
@@ -156,35 +125,35 @@ func (s *TCPServer) handleChannelIconSet(ctx context.Context, client *Client, f 
 	raw, ext, err := decodeImage(msg.DataBase64)
 	if msg.CopyFromChannelID != 0 && msg.DataBase64 == "" {
 		// (271) icon library: reuse another channel's stored icon.
-		raw = nil
-		ext = ""
-		for _, e := range imageExts {
-			b, rerr := os.ReadFile(filepath.Join(s.iconDir(), strconv.FormatInt(msg.CopyFromChannelID, 10)+e))
-			if rerr == nil {
-				raw, ext = b, e
-				break
-			}
+		if _, ok := s.deps.State.GetChannel(msg.CopyFromChannelID); !ok {
+			return s.sendError(client, errCodeNotFound, "source channel not found")
 		}
-		if raw == nil {
+		var source assetImage
+		raw, source, err = s.assets().readImage("icons", strconv.FormatInt(msg.CopyFromChannelID, 10))
+		if err != nil {
 			return s.sendError(client, errCodeNotFound, "source channel has no icon")
 		}
+		ext = source.extension
 	} else if err != nil {
 		return s.sendError(client, errCodeMalformed, err.Error())
 	}
-	if err := os.MkdirAll(s.iconDir(), 0o750); err != nil {
-		return s.sendError(client, errCodeUnavailable, "icon storage unavailable")
-	}
 	name := strconv.FormatInt(msg.ChannelID, 10)
-	for _, e := range imageExts {
-		_ = os.Remove(filepath.Join(s.iconDir(), name+e))
+	err = s.deps.Channels.WithChannelLifecycle(msg.ChannelID, func() error {
+		if _, err := s.assets().writeImage("icons", name, ext, raw); err != nil {
+			return err
+		}
+		if !s.deps.State.SetChannelHasIcon(msg.ChannelID, true) {
+			return channels.ErrChannelNotFound
+		}
+		return nil
+	})
+	if errors.Is(err, channels.ErrChannelNotFound) {
+		return s.sendError(client, errCodeNotFound, "channel not found")
 	}
-	if err := os.WriteFile(filepath.Join(s.iconDir(), name+ext), raw, 0o640); err != nil {
+	if err != nil {
 		return s.sendError(client, errCodeUnavailable, "storing icon failed")
 	}
 
-	if ch, ok := s.deps.State.GetChannel(msg.ChannelID); ok {
-		ch.HasIcon = true
-	}
 	s.broadcastEvent(eventChannelIconChanged, channelEvent{ChannelID: msg.ChannelID})
 	return nil
 }
@@ -198,40 +167,33 @@ func (s *TCPServer) handleChannelIconGet(_ context.Context, client *Client, f *n
 	if err := netproto.Decode(f, &msg); err != nil {
 		return s.sendError(client, errCodeMalformed, "malformed channel_icon_get: "+err.Error())
 	}
-	name := strconv.FormatInt(msg.ChannelID, 10)
-	for ct, ext := range imageExts {
-		raw, err := os.ReadFile(filepath.Join(s.iconDir(), name+ext))
-		if err != nil {
-			continue
+	if s.deps == nil || s.deps.State == nil || s.deps.Channels == nil {
+		return s.sendError(client, errCodeUnavailable, "state backend unavailable")
+	}
+	var (
+		raw   []byte
+		image assetImage
+	)
+	err := s.deps.Channels.WithChannelLifecycle(msg.ChannelID, func() error {
+		channel, ok := s.deps.State.GetChannel(msg.ChannelID)
+		if !ok || !channel.HasIcon {
+			return channels.ErrChannelNotFound
 		}
+		var err error
+		raw, image, err = s.assets().readImage("icons", strconv.FormatInt(msg.ChannelID, 10))
+		return err
+	})
+	if err == nil {
 		return s.writeMessage(client, netproto.MsgChannelIconData, netproto.ChannelIconData{
 			ChannelID:   msg.ChannelID,
 			DataBase64:  base64.StdEncoding.EncodeToString(raw),
-			ContentType: ct,
+			ContentType: image.contentType,
 		})
 	}
 	return s.writeMessage(client, netproto.MsgChannelIconData, netproto.ChannelIconData{ChannelID: msg.ChannelID})
 }
 
 // --- server icon + banner (270) -----------------------------------------------
-
-// brandingPath finds a stored server branding image by its base name (any
-// accepted extension). The icon and the banner differ only in that name, so
-// they share the lookup, the admin gate and the 256 KiB cap.
-func (s *TCPServer) brandingPath(base string) (string, string, bool) {
-	for ct, ext := range imageExts {
-		p := filepath.Join(s.cfg.FileRoot, base+ext)
-		if _, err := os.Stat(p); err == nil {
-			return p, ct, true
-		}
-	}
-	return "", "", false
-}
-
-// serverIconPath finds the stored server icon (any accepted extension).
-func (s *TCPServer) serverIconPath() (string, string, bool) {
-	return s.brandingPath("server_icon")
-}
 
 // storeBranding writes one admin-only branding image, replacing whatever
 // extension was there before so a png does not linger behind a new jpg.
@@ -247,13 +209,7 @@ func (s *TCPServer) storeBranding(ctx context.Context, client *Client, base, dat
 	if err != nil {
 		return s.sendError(client, errCodeMalformed, err.Error())
 	}
-	if err := os.MkdirAll(s.cfg.FileRoot, 0o750); err != nil {
-		return s.sendError(client, errCodeUnavailable, "branding storage unavailable")
-	}
-	for _, e := range imageExts {
-		_ = os.Remove(filepath.Join(s.cfg.FileRoot, base+e))
-	}
-	if err := os.WriteFile(filepath.Join(s.cfg.FileRoot, base+ext), raw, 0o640); err != nil {
+	if _, err := s.assets().writeImage("", base, ext, raw); err != nil {
 		return s.sendError(client, errCodeUnavailable, "branding write failed")
 	}
 	s.audit(ctx, client.UniqueID, action, "", ext)
@@ -280,17 +236,13 @@ func (s *TCPServer) handleServerBannerGet(_ context.Context, client *Client, f *
 	if err := netproto.Decode(f, &netproto.ServerBannerGet{}); err != nil {
 		return s.sendError(client, errCodeMalformed, "malformed server_banner_get: "+err.Error())
 	}
-	p, ct, ok := s.brandingPath("server_banner")
-	if !ok {
-		return s.writeMessage(client, netproto.MsgServerBannerDat, netproto.ServerBannerData{})
-	}
-	raw, err := os.ReadFile(p)
+	raw, image, err := s.assets().readImage("", "server_banner")
 	if err != nil {
 		return s.writeMessage(client, netproto.MsgServerBannerDat, netproto.ServerBannerData{})
 	}
 	return s.writeMessage(client, netproto.MsgServerBannerDat, netproto.ServerBannerData{
 		DataBase64:  base64.StdEncoding.EncodeToString(raw),
-		ContentType: ct,
+		ContentType: image.contentType,
 	})
 }
 
@@ -308,17 +260,13 @@ func (s *TCPServer) handleServerIconGet(_ context.Context, client *Client, f *ne
 	if err := netproto.Decode(f, &netproto.ServerIconGet{}); err != nil {
 		return s.sendError(client, errCodeMalformed, "malformed server_icon_get: "+err.Error())
 	}
-	p, ct, ok := s.serverIconPath()
-	if !ok {
-		return s.writeMessage(client, netproto.MsgServerIconData, netproto.ServerIconData{})
-	}
-	raw, err := os.ReadFile(p)
+	raw, image, err := s.assets().readImage("", "server_icon")
 	if err != nil {
 		return s.writeMessage(client, netproto.MsgServerIconData, netproto.ServerIconData{})
 	}
 	return s.writeMessage(client, netproto.MsgServerIconData, netproto.ServerIconData{
 		DataBase64:  base64.StdEncoding.EncodeToString(raw),
-		ContentType: ct,
+		ContentType: image.contentType,
 	})
 }
 

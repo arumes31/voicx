@@ -91,7 +91,7 @@ func (s *Store) ListTokens(ctx context.Context) ([]Token, error) {
 	if err != nil {
 		return nil, fmt.Errorf("querying tokens: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 
 	var out []Token
 	for rows.Next() {

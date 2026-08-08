@@ -42,7 +42,7 @@ func (s *Store) ListGroups(ctx context.Context, groupType string) ([]Group, erro
 	if err != nil {
 		return nil, fmt.Errorf("listing %s groups: %w", groupType, err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []Group
 	for rows.Next() {
 		var g Group
@@ -233,7 +233,7 @@ func (s *Store) ExpiredGroupMembers(ctx context.Context, now time.Time) ([][2]in
 	if err != nil {
 		return nil, fmt.Errorf("reaping expired group members: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out [][2]int64
 	for rows.Next() {
 		var pair [2]int64
@@ -253,7 +253,7 @@ func (s *Store) UserGroupIDs(ctx context.Context, userID int64) ([]int64, error)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []int64
 	for rows.Next() {
 		var id int64
@@ -278,8 +278,20 @@ func (s *Store) UserUniqueID(ctx context.Context, userID int64) (string, error) 
 // SetGroupIcon marks a server group's icon file name (surfaced in GroupList).
 func (s *Store) SetGroupIcon(ctx context.Context, groupID int64, icon string) error {
 	const q = `UPDATE server_groups SET icon = $1 WHERE id = $2`
-	if _, err := s.db.ExecContext(ctx, q, icon, groupID); err != nil {
+	result, err := s.db.ExecContext(ctx, q, icon, groupID)
+	if err != nil {
 		return fmt.Errorf("setting group icon: %w", err)
+	}
+	return checkGroupIconUpdate(result)
+}
+
+func checkGroupIconUpdate(result sql.Result) error {
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("reading group icon update result: %w", err)
+	}
+	if affected == 0 {
+		return errors.New("group not found")
 	}
 	return nil
 }
@@ -306,6 +318,8 @@ func (s *Store) SetGroupCosmetics(ctx context.Context, groupID int64, color *str
 		return errors.New("no cosmetic fields to set")
 	}
 	args = append(args, groupID)
+	// #nosec G201 -- every SET expression is assembled from the three fixed
+	// column names above; all caller-controlled values remain parameters.
 	q := fmt.Sprintf(`UPDATE server_groups SET %s WHERE id = $%d`, strings.Join(sets, ", "), len(args))
 	res, err := s.db.ExecContext(ctx, q, args...)
 	if err != nil {
@@ -357,7 +371,7 @@ func (s *Store) ListChannelGroupMembers(ctx context.Context, groupID, channelID 
 	if err != nil {
 		return nil, fmt.Errorf("listing channel group members: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []GroupMember
 	for rows.Next() {
 		var gm GroupMember
@@ -376,7 +390,7 @@ func (s *Store) scanGroupMembers(ctx context.Context, q string, groupID int64) (
 	if err != nil {
 		return nil, fmt.Errorf("listing group members: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []GroupMember
 	for rows.Next() {
 		var gm GroupMember
@@ -530,7 +544,7 @@ func (s *Store) ListPermissions(ctx context.Context, tier PermTier, target PermT
 	if err != nil {
 		return nil, fmt.Errorf("listing %s permissions: %w", tier, err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []PermEntry
 	for rows.Next() {
 		var e PermEntry
@@ -578,12 +592,16 @@ func unsetPermissionWith(ctx context.Context, db permissionExecutor, tier PermTi
 // CopyPermissions atomically removes destination-only keys and writes the
 // source entries. Callers perform authorization before entering this store
 // operation; the transaction guarantees Replace cannot leave a partial copy.
-func (s *Store) CopyPermissions(ctx context.Context, tier PermTier, target PermTarget, remove []string, entries []PermEntry) error {
+func (s *Store) CopyPermissions(ctx context.Context, tier PermTier, target PermTarget, remove []string, entries []PermEntry) (retErr error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("beginning permission copy: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() {
+		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			retErr = errors.Join(retErr, fmt.Errorf("rolling back permission copy: %w", err))
+		}
+	}()
 	for _, key := range remove {
 		if err := unsetPermissionWith(ctx, tx, tier, target, key); err != nil {
 			return err
@@ -632,15 +650,17 @@ func (s *Store) AuditList(ctx context.Context, beforeID int64, limit int) ([]Aud
 	q := `SELECT id, actor_unique_id, action, target, detail, created_at FROM audit_log`
 	args := []any{}
 	if beforeID > 0 {
-		q += ` WHERE id < $1`
-		args = append(args, beforeID)
+		q += ` WHERE id < $1 ORDER BY id DESC LIMIT $2`
+		args = append(args, beforeID, limit)
+	} else {
+		q += ` ORDER BY id DESC LIMIT $1`
+		args = append(args, limit)
 	}
-	q += fmt.Sprintf(` ORDER BY id DESC LIMIT %d`, limit)
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("listing audit log: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []AuditEntry
 	for rows.Next() {
 		var e AuditEntry

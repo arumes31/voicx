@@ -3,9 +3,16 @@
 // icons are downscaled to max 1024px and recompressed as JPEG q0.85 (274).
 // Animated GIF/WebP always pass through untouched — canvas re-encoding
 // would flatten the animation (269).
+import { closeDialog, mountDialog } from "./modal.js";
+
 const V = () => window.__voicx;
 
 const MAX_UPLOAD = 256 * 1024; // server-side image cap (same as avatars)
+
+function generationCurrent(options) {
+    return !Object.hasOwn(options, "serverGeneration") ||
+        options.serverGeneration === V().state.serverGeneration;
+}
 
 // readFileBase64 reads a File as base64.
 async function readFileBase64(file) {
@@ -29,11 +36,29 @@ function loadImage(file) {
     return new Promise((resolve, reject) => {
         const url = URL.createObjectURL(file);
         const img = new Image();
-        img.onload = () => resolve({ img, url });
-        img.onerror = () => {
+        let settled = false;
+        const fail = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            img.onload = null;
+            img.onerror = null;
             URL.revokeObjectURL(url);
             reject(new Error("cannot read image"));
         };
+        const timeout = setTimeout(() => {
+            img.src = "";
+            fail();
+        }, 15000);
+        img.onload = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timeout);
+            img.onload = null;
+            img.onerror = null;
+            resolve({ img, url });
+        };
+        img.onerror = fail;
         img.src = url;
     });
 }
@@ -51,16 +76,17 @@ async function passthroughAnimated(file) {
 
 // pickAvatar opens the picker + crop dialog (268) and resolves with
 // {dataBase64, contentType} or null when cancelled.
-export async function pickAvatar() {
+export async function pickAvatar(options = {}) {
     const file = await pickFile();
-    if (!file) return null;
+    if (!file || !generationCurrent(options)) return null;
     const anim = await passthroughAnimated(file);
+    if (!generationCurrent(options)) return null;
     if (anim) return anim.dataBase64 ? anim : null;
     if (file.size > 8 * 1024 * 1024) {
         V().toast("image too large (max 8 MiB)", "warn");
         return null;
     }
-    return cropDialog(file);
+    return cropDialog(file, options);
 }
 
 // pickIcon opens the picker and returns a compressed image (274): downscale
@@ -77,8 +103,11 @@ export async function pickIcon(maxDim = 1024, quality = 0.85) {
         V().toast("image too large (max 8 MiB)", "warn");
         return null;
     }
+    let objectURL = "";
     try {
-        const { img, url } = await loadImage(file);
+        const loaded = await loadImage(file);
+        const { img } = loaded;
+        objectURL = loaded.url;
         let dim = maxDim;
         let best = null;
         for (let attempt = 0; attempt < 4; attempt++) {
@@ -94,18 +123,18 @@ export async function pickIcon(maxDim = 1024, quality = 0.85) {
                 best = out.toDataURL("image/jpeg", q).split(",")[1];
                 // base64 inflates by 4/3; compare the decoded length.
                 if (base64Bytes(best) <= MAX_UPLOAD) {
-                    URL.revokeObjectURL(url);
                     return { dataBase64: best, contentType: "image/jpeg" };
                 }
             }
             dim = Math.max(128, Math.round(dim / 2));
         }
-        URL.revokeObjectURL(url);
         V().toast("image could not be compressed under 256 KiB", "warn");
         return null;
     } catch {
         V().toast("cannot read image", "warn");
         return null;
+    } finally {
+        if (objectURL) URL.revokeObjectURL(objectURL);
     }
 }
 
@@ -117,13 +146,17 @@ function base64Bytes(b64) {
 
 // cropDialog shows the 256x256 preview/crop editor (268): zoom slider and
 // drag-to-reposition on a canvas, output PNG.
-function cropDialog(file) {
+function cropDialog(file, options = {}) {
     return new Promise(async (resolve) => {
         let img, url;
         try {
             ({ img, url } = await loadImage(file));
         } catch {
-            V().toast("cannot read image", "warn");
+            if (generationCurrent(options)) V().toast("cannot read image", "warn");
+            return resolve(null);
+        }
+        if (!generationCurrent(options)) {
+            URL.revokeObjectURL(url);
             return resolve(null);
         }
         const overlay = document.createElement("div");
@@ -168,19 +201,28 @@ function cropDialog(file) {
         window.addEventListener("mouseup", onUp);
         draw();
 
-        const close = (result) => {
+        let result = null;
+        let settled = false;
+        const cleanup = () => {
             window.removeEventListener("mousemove", onMove);
             window.removeEventListener("mouseup", onUp);
             URL.revokeObjectURL(url);
-            overlay.remove();
-            resolve(result);
+            if (!settled) {
+                settled = true;
+                resolve(result);
+            }
         };
         overlay.querySelector(".dlg-ok").onclick = () => {
             const dataUrl = canvas.toDataURL("image/png");
-            close({ dataBase64: dataUrl.split(",")[1], contentType: "image/png" });
+            result = { dataBase64: dataUrl.split(",")[1], contentType: "image/png" };
+            closeDialog(overlay);
         };
-        overlay.querySelector(".dlg-cancel").onclick = () => close(null);
-        overlay.onclick = (e) => { if (e.target === overlay) close(null); };
-        document.body.appendChild(overlay);
+        overlay.querySelector(".dlg-cancel").onclick = () => closeDialog(overlay, "cancel");
+        overlay.onclick = (e) => { if (e.target === overlay) closeDialog(overlay, "cancel"); };
+        mountDialog(overlay, {
+            onCancel: () => { result = null; },
+            onClose: cleanup,
+            serverScoped: options.serverScoped,
+        });
     });
 }

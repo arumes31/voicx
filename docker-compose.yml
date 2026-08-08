@@ -65,10 +65,15 @@ services:
     ports:
       # TeamSpeak-style voice transport (UDP)
       - "12334:12334/udp"
-      # ServerQuery / raw TCP control
+      # TLS control channel
       - "12333:12333"
-      # ServerQuery (admin/bot text protocol)
-      - "12335:12335"
+      # Raw ServerQuery is loopback-only inside the container by default.
+      # Prefer SSH for remote administration. If raw remote access is
+      # intentional, publish 12335 and set both VOICX_QUERY_ADDR=:12335 and
+      # VOICX_QUERY_ALLOW_REMOTE=true.
+      # - "12335:12335"
+      # Preferred remote administration: enable Query SSH and publish 12339.
+      # - "12339:12339"
       # File transfer
       - "12336:12336"
       # Health/readiness/metrics HTTP endpoint
@@ -80,10 +85,12 @@ services:
     environment:
       # --- Logging ---
       VOICX_LOG_LEVEL: ${VOICX_LOG_LEVEL:-info}
-      VOICX_DEV_MODE: ${VOICX_DEV_MODE:-false}
+      # Required explicit choice: the sample .env selects local development.
+      # Production validation adds database credential and TLS requirements.
+      VOICX_DEV_MODE: ${VOICX_DEV_MODE:?set VOICX_DEV_MODE to true or false}
 
       # --- Database (points at the postgres service) ---
-      VOICX_DATABASE_URL: "postgres://${POSTGRES_USER:-voicx}:${POSTGRES_PASSWORD:-voicx}@postgres:5432/${POSTGRES_DB:-voicx}?sslmode=disable"
+      VOICX_DATABASE_URL: "${VOICX_COMPOSE_DATABASE_URL:-postgres://${POSTGRES_USER:-voicx}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-voicx}?sslmode=disable}"
       VOICX_PII_KEY_FILE: "/data/keys/pii.key"
 
       # --- Redis (points at the redis service) ---
@@ -96,8 +103,12 @@ services:
       # gRPC carries Basic credentials over plaintext and is loopback-only.
       VOICX_GRPC_ADDR: "127.0.0.1:12338"
       VOICX_HEALTH_ADDR: ":12337"
-      VOICX_QUERY_ADDR: ":12335"
+      VOICX_METRICS_ALLOW_REMOTE: ${VOICX_METRICS_ALLOW_REMOTE:-false}
+      VOICX_QUERY_ADDR: ${VOICX_QUERY_ADDR:-127.0.0.1:12335}
+      VOICX_QUERY_ALLOW_REMOTE: ${VOICX_QUERY_ALLOW_REMOTE:-false}
+      VOICX_QUERY_SSH_ENABLED: ${VOICX_QUERY_SSH_ENABLED:-false}
       VOICX_QUERY_SSH_ADDR: ":12339"
+      VOICX_QUERY_SSH_HOST_KEY: "/data/keys/query_ssh_host.key"
       VOICX_FILE_ADDR: ":12336"
 
       # --- Writable data on the named volume (read_only root fs) ---
@@ -122,7 +133,7 @@ services:
   # postgres — primary relational database
   # ---------------------------------------------------------------------------
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777 # 16.14-alpine3.24
     container_name: voicx-postgres
     restart: unless-stopped
     networks:
@@ -132,7 +143,7 @@ services:
       - "5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-voicx}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-voicx}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-voicx}
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -146,7 +157,7 @@ services:
   # Nightly compressed dumps. Backups use a volume separate from pgdata and
   # are retained for seven days; set BACKUP_REMOTE for optional object upload.
   postgres-backup:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777 # 16.14-alpine3.24
     profiles: ["backup"]
     restart: unless-stopped
     depends_on:
@@ -155,7 +166,7 @@ services:
     networks:
       - voicx-net
     environment:
-      DATABASE_URL: "postgres://${POSTGRES_USER:-voicx}:${POSTGRES_PASSWORD:-voicx}@postgres:5432/${POSTGRES_DB:-voicx}?sslmode=disable"
+      DATABASE_URL: "${VOICX_COMPOSE_DATABASE_URL:-postgres://${POSTGRES_USER:-voicx}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-voicx}?sslmode=disable}"
       POSTGRES_DB: ${POSTGRES_DB:-voicx}
       BACKUP_DIR: /backups/postgres
       BACKUP_RETENTION_DAYS: 7
@@ -171,7 +182,7 @@ services:
   # redis — cache / pub-sub / session store
   # ---------------------------------------------------------------------------
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2 # 7.4.10-alpine
     container_name: voicx-redis
     restart: unless-stopped
     networks:
@@ -218,7 +229,7 @@ services:
   # 101-port relay publish — but it cannot coexist with the voicx-net bridge.)
   # ---------------------------------------------------------------------------
   coturn:
-    image: coturn/coturn:latest
+    image: coturn/coturn:4.17.0-r0@sha256:7df59bcd84800c3978da2dd0d7fb17a8179e77a8bf667f678813120a9f18b094
     container_name: voicx-coturn
     profiles: [ "turn" ]
     restart: unless-stopped
@@ -270,7 +281,7 @@ services:
   # not UDP; this still exercises the SFU media path under latency, jitter and
   # periodic transport outages rather than merely perturbing signaling.
   toxiproxy:
-    image: ghcr.io/shopify/toxiproxy:2.12.0
+    image: ghcr.io/shopify/toxiproxy:2.12.0@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e
     container_name: voicx-toxiproxy
     profiles: [ "chaos-network" ]
     restart: "no"

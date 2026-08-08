@@ -5,6 +5,7 @@ package store
 
 import (
 	"context"
+	"database/sql/driver"
 	"fmt"
 	"sync"
 	"testing"
@@ -20,10 +21,10 @@ func testDBStore(t *testing.T) *Store {
 		t.Skipf("no database available (%v); skipping DB-backed test", err)
 	}
 	if err := s.Migrate(); err != nil {
-		s.Close()
+		_ = s.Close()
 		t.Skipf("migrations failed (%v); skipping DB-backed test", err)
 	}
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
 
@@ -171,6 +172,40 @@ func TestGroupsDB(t *testing.T) {
 	uid, err := s.UserUniqueID(ctx, userID)
 	if err != nil || uid != "w6atest_"+suffix {
 		t.Fatalf("UserUniqueID = %q, err=%v", uid, err)
+	}
+}
+
+func TestSetGroupIconChecksAffectedRows(t *testing.T) {
+	s := testDBStore(t)
+	ctx := context.Background()
+	suffix := fmt.Sprint(time.Now().UnixNano())
+	gid, err := s.CreateGroup(ctx, "server", "icon_rows_"+suffix, 0)
+	if err != nil {
+		t.Fatalf("CreateGroup: %v", err)
+	}
+	t.Cleanup(func() { _ = s.DeleteGroup(ctx, "server", gid, true) })
+
+	if err := s.SetGroupIcon(ctx, gid, fmt.Sprintf("%d.png", gid)); err != nil {
+		t.Fatalf("SetGroupIcon existing group: %v", err)
+	}
+	group, err := s.GetGroup(ctx, "server", gid)
+	if err != nil || group == nil || group.Icon != fmt.Sprintf("%d.png", gid) {
+		t.Fatalf("group after icon update = %+v, err = %v", group, err)
+	}
+	if err := s.SetGroupIcon(ctx, -1, "missing.png"); err == nil {
+		t.Fatal("SetGroupIcon missing group returned nil")
+	}
+}
+
+func TestCheckGroupIconUpdate(t *testing.T) {
+	if err := checkGroupIconUpdate(driver.RowsAffected(1)); err != nil {
+		t.Fatalf("one affected row: %v", err)
+	}
+	if err := checkGroupIconUpdate(driver.RowsAffected(0)); err == nil {
+		t.Fatal("zero affected rows returned nil")
+	}
+	if err := checkGroupIconUpdate(driver.ResultNoRows); err == nil {
+		t.Fatal("RowsAffected failure returned nil")
 	}
 }
 

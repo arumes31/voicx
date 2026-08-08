@@ -5,7 +5,9 @@ package main
 
 import (
 	"archive/zip"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -25,13 +27,20 @@ func logDir() (string, error) {
 	return filepath.Join(dir, "voicx"), nil
 }
 
+func openLogRoot() (*os.Root, error) {
+	dir, err := logDir()
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return nil, err
+	}
+	return os.OpenRoot(dir)
+}
+
 // ExportLogs writes client.log + chat.log into a zip via the save dialog
 // (326). Returns "" on success or cancel, or the error.
 func (a *App) ExportLogs() string {
-	dir, err := logDir()
-	if err != nil {
-		return err.Error()
-	}
 	dest, err := wailsRuntime.SaveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
 		Title:           "Export logs",
 		DefaultFilename: fmt.Sprintf("voicx-logs-%s.zip", time.Now().Format("20060102-150405")),
@@ -40,16 +49,33 @@ func (a *App) ExportLogs() string {
 	if err != nil || dest == "" {
 		return ""
 	}
-	out, err := os.Create(dest)
+	root, err := openLogRoot()
 	if err != nil {
 		return err.Error()
 	}
-	defer out.Close()
+	if err := exportLogsTo(root, dest); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+func exportLogsTo(root *os.Root, dest string) (retErr error) {
+	defer func() { retErr = errors.Join(retErr, root.Close()) }()
+	// #nosec G304 -- dest is explicitly selected by the local user in the
+	// native save dialog; exporting there is the requested operation.
+	out, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() { retErr = errors.Join(retErr, out.Close()) }()
 	zw := zip.NewWriter(out)
-	entries, _ := filepath.Glob(filepath.Join(dir, "*.log"))
-	for _, path := range entries {
-		name := filepath.Base(path)
-		raw, err := os.ReadFile(path)
+	entries, _ := fs.ReadDir(root.FS(), ".")
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || filepath.Ext(name) != ".log" {
+			continue
+		}
+		raw, err := root.ReadFile(name)
 		if err != nil {
 			continue // a missing log is fine
 		}
@@ -60,9 +86,9 @@ func (a *App) ExportLogs() string {
 		_, _ = w.Write(raw)
 	}
 	if err := zw.Close(); err != nil {
-		return err.Error()
+		return err
 	}
-	return ""
+	return nil
 }
 
 // SetDebugFrames toggles the debug console's frame tee (327).
@@ -76,14 +102,7 @@ func (a *App) SetDebugFrames(on bool) {
 
 // --- crash handler (331) -------------------------------------------------------
 
-// crashLogPath returns the crash log location inside the config dir.
-func crashLogPath() (string, error) {
-	dir, err := logDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "crash.log"), nil
-}
+const crashLogName = "crash.log"
 
 // guardCrash recovers from a panic in fn, writes a timestamped crash log,
 // and re-panics so the process still exits (the log is offered at the next
@@ -91,14 +110,15 @@ func crashLogPath() (string, error) {
 func guardCrash(context string, fn func()) {
 	defer func() {
 		if r := recover(); r != nil {
-			path, err := crashLogPath()
+			root, err := openLogRoot()
 			if err == nil {
-				f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+				f, err := root.OpenFile(crashLogName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 				if err == nil {
-					fmt.Fprintf(f, "\n=== %s: panic in %s: %v\n%s\n",
+					_, _ = fmt.Fprintf(f, "\n=== %s: panic in %s: %v\n%s\n",
 						time.Now().Format(time.RFC3339), context, r, debug.Stack())
 					_ = f.Close()
 				}
+				_ = root.Close()
 			}
 			panic(r)
 		}
@@ -109,15 +129,16 @@ func guardCrash(context string, fn func()) {
 // LastCrash returns the crash log's tail when one exists (offered at
 // startup; cleared after reading).
 func (a *App) LastCrash() string {
-	path, err := crashLogPath()
+	root, err := openLogRoot()
 	if err != nil {
 		return ""
 	}
-	raw, err := os.ReadFile(path)
+	defer func() { _ = root.Close() }()
+	raw, err := root.ReadFile(crashLogName)
 	if err != nil || len(raw) == 0 {
 		return ""
 	}
-	_ = os.Remove(path) // report once
+	_ = root.Remove(crashLogName) // report once
 	const max = 4000
 	if len(raw) > max {
 		raw = raw[len(raw)-max:]

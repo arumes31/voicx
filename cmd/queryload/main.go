@@ -27,7 +27,7 @@ type options struct {
 
 func main() {
 	var o options
-	flag.StringVar(&o.addr, "addr", "127.0.0.1"+config.DefaultQueryAddr, "ServerQuery address")
+	flag.StringVar(&o.addr, "addr", config.DefaultQueryAddr, "ServerQuery address")
 	flag.StringVar(&o.user, "user", os.Getenv("VOICX_QUERY_USER"), "admin unique ID (or VOICX_QUERY_USER)")
 	flag.StringVar(&o.password, "password", os.Getenv("VOICX_QUERY_PASSWORD"), "admin password (or VOICX_QUERY_PASSWORD)")
 	flag.StringVar(&o.command, "command", "clientlist", "query command to execute")
@@ -66,7 +66,7 @@ func run(parent context.Context, o options) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			defer conn.Close()
+			defer func() { _ = conn.Close() }()
 			for range jobs {
 				start := time.Now()
 				if _, err := fmt.Fprintln(conn, o.command); err != nil || readResponse(reader) != nil {
@@ -108,19 +108,19 @@ func dialAndLogin(o options) (net.Conn, *bufio.Reader, error) {
 	reader := bufio.NewReaderSize(conn, 64*1024)
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	if _, err := reader.ReadString('\n'); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, nil, err
 	}
 	if _, err := reader.ReadString('\n'); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, nil, err
 	}
 	if _, err := fmt.Fprintf(conn, "login %s %s\n", escape(o.user), escape(o.password)); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, nil, err
 	}
 	if err := readResponse(reader); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, nil, err
 	}
 	_ = conn.SetDeadline(time.Time{})

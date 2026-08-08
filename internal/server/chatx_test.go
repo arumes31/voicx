@@ -16,6 +16,7 @@ import (
 	"voicx/internal/config"
 	"voicx/internal/netproto"
 	"voicx/internal/permissions"
+	"voicx/internal/state"
 )
 
 func TestTypingTrackerCleanupIsRateLimited(t *testing.T) {
@@ -76,8 +77,8 @@ func TestChatHistoryEncryptedRoundTrip(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	alice, bob, key, keyID, bobPriv := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 	bobPub := x25519Pub(bobPriv)
 
 	sendEncChat(t, bob, key, keyID, "1", canary)
@@ -107,7 +108,7 @@ func TestChatHistoryEncryptedRoundTrip(t *testing.T) {
 
 	// A non-member may not read the channel's history.
 	conn3, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn3.Close()
+	defer func() { _ = conn3.Close() }()
 	env.state.AddChannel(testChannel(2))
 	send(t, conn3, netproto.MsgChatHistory, netproto.ChatHistory{ChannelID: 2})
 	// user-uid is in channel 1, asking for channel 2 → denied... but conn3 is
@@ -129,8 +130,8 @@ func TestChatPinsRequiresMembership(t *testing.T) {
 	env := startTestEnv(t, permsWithPin())
 	defer env.stop()
 	alice, bob, key, keyID, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	sendEncChat(t, bob, key, keyID, "1", "pin me")
 	data := readEventOfType(t, alice, eventChat)
@@ -144,7 +145,7 @@ func TestChatPinsRequiresMembership(t *testing.T) {
 	// An outsider joins channel 2 and asks for channel 1's pins.
 	env.state.AddChannel(testChannel(2))
 	outsider, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer outsider.Close()
+	defer func() { _ = outsider.Close() }()
 	opub, _ := testX25519(t)
 	publishKey(t, outsider, opub)
 	send(t, outsider, netproto.MsgJoinChannel, netproto.JoinChannel{ChannelID: 2})
@@ -169,7 +170,7 @@ func TestHistoryRefusedWithoutPublishedKey(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgChatHistory, netproto.ChatHistory{ChannelID: 0})
 	f := readOfType(t, conn, netproto.MsgError)
@@ -188,8 +189,8 @@ func TestHistoryAcrossRotation(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	alice, bob, key1, gen1, bobPriv := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 	bobPub := x25519Pub(bobPriv)
 
 	sendEncChat(t, bob, key1, gen1, "1", "before rotation")
@@ -237,8 +238,8 @@ func TestKeyBundleTruncationIsNotRefusal(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	alice, bob, _, _, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	ctx := t.Context()
 	for i := 0; i < maxKeysPerResponse+6; i++ {
@@ -276,8 +277,8 @@ func TestPlaintextEscapeHatchStillStoresAndRelaysCiphertext(t *testing.T) {
 	env := startTestEnv(t, nil) // the harness sets ChatAllowPlaintext
 	defer env.stop()
 	alice, bob, key, _, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	send(t, bob, netproto.MsgChatSend, netproto.ChatSend{ChannelID: "1", Text: canary})
 	data := readEventOfType(t, alice, eventChat)
@@ -310,8 +311,8 @@ func TestStorageFailureIsNotRelayed(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	alice, bob, key, keyID, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	env.chat.failStores(errors.New("chat_messages_no_plaintext violated"))
 	sendEncChat(t, bob, key, keyID, "1", "never stored")
@@ -336,8 +337,8 @@ func TestEditRejectsStaleKeyID(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	alice, bob, key, keyID, bobPriv := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	sendEncChat(t, bob, key, keyID, "1", "original")
 	data := readEventOfType(t, bob, eventChat)
@@ -370,8 +371,8 @@ func TestEditStoresCiphertextVerbatim(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	alice, bob, key, keyID, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	sendEncChat(t, bob, key, keyID, "1", "original")
 	data := readEventOfType(t, bob, eventChat)
@@ -413,8 +414,8 @@ func TestModerationPipelineOrderUnchanged(t *testing.T) {
 	env := startTestEnvFull(t, nil, func(c *config.Config) { c.ChatWordFilter = "forbidden" })
 	defer env.stop()
 	alice, bob, key, keyID, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	// A body the word filter rejects must never reach the spam tracker (which
 	// runs after it) nor the store (which runs after both).
@@ -455,8 +456,8 @@ func TestChatEditDelete(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	alice, bob, key, keyID, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	sendEncChat(t, bob, key, keyID, "1", "original")
 	data := readEventOfType(t, alice, eventChat)
@@ -546,8 +547,8 @@ func TestChatDeleteAny(t *testing.T) {
 	env := startTestEnv(t, &perms)
 	defer env.stop()
 	alice, bob, key, keyID, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	sendEncChat(t, bob, key, keyID, "1", "delete me")
 	data := readEventOfType(t, alice, eventChat)
@@ -566,12 +567,13 @@ func TestSlowMode(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	alice, bob, key, _, bpriv := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	env.state.AddChannel(testChannel(3))
-	if ch, ok := env.state.GetChannel(3); ok {
-		ch.SlowModeSeconds = 5
+	slowMode := 5
+	if !env.state.UpdateChannel(3, state.ChannelUpdate{SlowModeSeconds: &slowMode}) {
+		t.Fatal("slow-mode channel missing from state")
 	}
 	// Move both to the slow channel; re-key for the new scope.
 	send(t, alice, netproto.MsgJoinChannel, netproto.JoinChannel{ChannelID: 3})
@@ -609,11 +611,12 @@ func TestSlowModeBypassPermission(t *testing.T) {
 	env := startTestEnv(t, &perms)
 	defer env.stop()
 	alice, bob, key, keyID, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
-	if ch, ok := env.state.GetChannel(1); ok {
-		ch.SlowModeSeconds = 60
+	slowMode := 60
+	if !env.state.UpdateChannel(1, state.ChannelUpdate{SlowModeSeconds: &slowMode}) {
+		t.Fatal("slow-mode channel missing from state")
 	}
 	sendEncChat(t, bob, key, keyID, "1", "first")
 	readEventOfType(t, alice, eventChat)
@@ -654,8 +657,8 @@ func TestChatRateLimit(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	alice, bob, key, keyID, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	// Default bucket: 5 messages per 3s — the 6th is rejected.
 	rejected := false
@@ -675,8 +678,8 @@ func TestChatSpam(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	alice, bob, key, keyID, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	rejected := false
 	for i := 0; i < 3; i++ {
@@ -700,8 +703,8 @@ func TestWordAndLinkFilters(t *testing.T) {
 	})
 	defer env.stop()
 	alice, bob, key, keyID, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	sendEncChat(t, bob, key, keyID, "1", "this has BadWord in it")
 	expectChatError(t, bob, "word filter")
@@ -721,8 +724,8 @@ func TestChatMaxLength(t *testing.T) {
 	env := startTestEnvFull(t, nil, func(c *config.Config) { c.ChatMaxLength = limit })
 	defer env.stop()
 	alice, bob, key, keyID, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	// Exactly at the limit, in two-byte runes: accepted.
 	atLimit := strings.Repeat("é", limit/2)
@@ -774,8 +777,8 @@ func TestLinkFilterIsURLAware(t *testing.T) {
 	})
 	defer env.stop()
 	alice, bob, key, keyID, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	for _, tc := range []struct {
 		name string
@@ -831,8 +834,8 @@ func TestChatFiltersRuntimeManaged(t *testing.T) {
 	})
 	defer env.stop()
 	alice, bob, key, keyID, _ := chatPair(t, env) // alice is admin, bob is not
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	// Reading the lists is gated too: they say exactly what to evade.
 	send(t, bob, netproto.MsgChatFilterGet, netproto.ChatFilterGet{})
@@ -884,7 +887,7 @@ func TestChatFilterManageIsDelegable(t *testing.T) {
 	env := startTestEnv(t, &perms)
 	defer env.stop()
 	bob, _ := dialAuthed(t, env.addr, "user-uid")
-	defer bob.Close()
+	defer func() { _ = bob.Close() }()
 
 	words := "delegated"
 	send(t, bob, netproto.MsgChatFilterSet, netproto.ChatFilterSet{WordFilter: &words})
@@ -910,8 +913,8 @@ func TestMentions(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	alice, bob, key, keyID, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	// @nickname (bob's nickname is "user").
 	sendEncChat(t, alice, key, keyID, "1", "hey @user ping")
@@ -973,8 +976,8 @@ func TestChatPins(t *testing.T) {
 	env := startTestEnv(t, &perms)
 	defer env.stop()
 	alice, bob, key, keyID, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	sendEncChat(t, bob, key, keyID, "1", "pin me")
 	data := readEventOfType(t, alice, eventChat)
@@ -1016,8 +1019,8 @@ func TestChatReact(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	alice, bob, key, keyID, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	sendEncChat(t, bob, key, keyID, "1", "react to me")
 	data := readEventOfType(t, alice, eventChat)
@@ -1062,8 +1065,8 @@ func TestTyping(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	alice, bob, _, _, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	send(t, bob, netproto.MsgTyping, netproto.Typing{ChannelID: 1})
 	data := readEventOfType(t, alice, "typing")
@@ -1084,8 +1087,8 @@ func TestDMReceipts(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	alice, bob, _, _, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	send(t, bob, netproto.MsgChatDelivered, netproto.ChatDelivered{ToUniqueID: "admin-uid", ClientMsgID: "ref-1"})
 	data := readEventOfType(t, alice, "dm_delivered")
@@ -1111,14 +1114,14 @@ func TestEmojiUpload(t *testing.T) {
 	env := startTestEnv(t, &perms)
 	defer env.stop()
 	alice, bob, _, _, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	// Without the permission (admin bypasses, so test denial on a fresh env).
 	env2 := startTestEnv(t, nil)
 	defer env2.stop()
 	c2, _ := dialAuthed(t, env2.addr, "user-uid")
-	defer c2.Close()
+	defer func() { _ = c2.Close() }()
 	send(t, c2, netproto.MsgEmojiUpload, netproto.EmojiUpload{Name: "party", DataBase64: b64e(tinyPNG)})
 	expectChatError(t, c2, "insufficient permission")
 
@@ -1153,7 +1156,7 @@ func TestMOTDSealedInAuthResponse(t *testing.T) {
 
 	pub, priv := testX25519(t)
 	conn, resp := dialAuthedX25519(t, env.addr, "user-uid", pub)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if !resp.MOTDEnc || resp.MOTDKeyID == 0 || resp.MOTD == canary {
 		t.Fatalf("motd = %q enc=%v key=%d, want sealed", resp.MOTD, resp.MOTDEnc, resp.MOTDKeyID)
@@ -1169,7 +1172,7 @@ func TestMOTDSealedInAuthResponse(t *testing.T) {
 	// A client that publishes no encryption key could not open it, so it gets
 	// neither the key nor the MOTD.
 	plainConn, _ := dialAuthedPlain(t, env.addr, "admin-uid")
-	defer plainConn.Close()
+	defer func() { _ = plainConn.Close() }()
 }
 
 // dialAuthedPlain authenticates without presenting an encryption key and
@@ -1201,7 +1204,7 @@ func TestAnnouncementSealed(t *testing.T) {
 
 	pub, priv := testX25519(t)
 	conn, resp := dialAuthedX25519(t, env.addr, "user-uid", pub)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if len(resp.ChatKeys) != 1 {
 		t.Fatalf("auth response carried %d chat keys, want 1", len(resp.ChatKeys))
 	}
@@ -1232,7 +1235,7 @@ func TestAnnouncementSealed(t *testing.T) {
 
 	// The replay on login still reaches a client that never published a key.
 	late, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer late.Close()
+	defer func() { _ = late.Close() }()
 	replay := readEventOfType(t, late, eventAnnouncement)
 	var ann2 struct {
 		Text  string `json:"text"`
@@ -1251,7 +1254,7 @@ func TestAnnouncementSealed(t *testing.T) {
 	// response handed over, or the banner renders a placeholder forever.
 	lpub, lpriv := testX25519(t)
 	keyed, keyedResp := dialAuthedX25519(t, env.addr, "user-uid", lpub)
-	defer keyed.Close()
+	defer func() { _ = keyed.Close() }()
 	if len(keyedResp.ChatKeys) != 1 {
 		t.Fatalf("late joiner got %d chat keys, want 1", len(keyedResp.ChatKeys))
 	}
@@ -1281,7 +1284,7 @@ func TestServerTextSealed(t *testing.T) {
 
 	apub, apriv := testX25519(t)
 	alice, resp := dialAuthedX25519(t, env.addr, "admin-uid", apub)
-	defer alice.Close()
+	defer func() { _ = alice.Close() }()
 	global := unsealScopeKey(t, resp.ChatKeys[0], apub, apriv)
 	clientID := resp.ClientID
 
@@ -1338,7 +1341,7 @@ func TestServerInfoMOTDPlaintextIsOptIn(t *testing.T) {
 		t.Fatalf("set motd: %v", err)
 	}
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	send(t, conn, netproto.MsgServerInfoQuery, netproto.ServerInfoQuery{})
 	f := readOfType(t, conn, netproto.MsgServerInfoResponse)
 	var info netproto.ServerInfoResponse
@@ -1355,7 +1358,7 @@ func TestServerInfoMOTDPlaintextIsOptIn(t *testing.T) {
 		t.Fatalf("set motd: %v", err)
 	}
 	conn2, _ := dialAuthed(t, off.addr, "user-uid")
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 	send(t, conn2, netproto.MsgServerInfoQuery, netproto.ServerInfoQuery{})
 	f = readOfType(t, conn2, netproto.MsgServerInfoResponse)
 	var info2 netproto.ServerInfoResponse

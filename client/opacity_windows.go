@@ -14,11 +14,10 @@ const (
 	wsExLayered  = 0x00080000
 	lwaAlpha     = 0x00000002
 	opacityFloor = 20
+	// GWL_EXSTYLE is the signed Win32 index -20 represented in an ABI-sized
+	// argument without a narrowing or sign-changing runtime conversion.
+	gwlExStyleArg = ^uintptr(19)
 )
-
-// gwlExStyle is a var, not a const: the negative GWL index only converts to
-// uintptr at run time (a constant conversion overflows).
-var gwlExStyle = int32(-20)
 
 var (
 	procGetWindowLongPtr           = user32.NewProc("GetWindowLongPtrW")
@@ -48,11 +47,11 @@ func setWindowOpacity(pct int) error {
 	if hwnd == 0 {
 		return fmt.Errorf("no window yet")
 	}
-	style, _, _ := procGetWindowLongPtr.Call(hwnd, uintptr(gwlExStyle))
+	style, _, _ := procGetWindowLongPtr.Call(hwnd, gwlExStyleArg)
 	if style&wsExLayered == 0 {
 		// Call surfaces the thread's last error even on success, so the
 		// SetLayeredWindowAttributes result below is the only real check.
-		_, _, _ = procSetWindowLongPtr.Call(hwnd, uintptr(gwlExStyle), style|wsExLayered)
+		_, _, _ = procSetWindowLongPtr.Call(hwnd, gwlExStyleArg, style|wsExLayered)
 	}
 	alpha := uintptr(pct * 255 / 100)
 	ok, _, err := procSetLayeredWindowAttributes.Call(hwnd, 0, alpha, lwaAlpha)

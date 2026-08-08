@@ -2,6 +2,7 @@
 // TS3-style Client Info dialog (live-refreshing).
 import { getUserVolume, isUserMuted, setUserMuted, setUserVolume } from "./audio.js";
 import { pickIcon } from "./image-tools.js";
+import { closeDialog, isCurrentServerDialog, mountServerDialog } from "./modal.js";
 
 const V = () => window.__voicx;
 
@@ -219,6 +220,7 @@ async function refreshVoiceStats(overlay, client) {
     }
     try {
         const stats = await state.pc.getStats();
+        if (!isCurrentServerDialog(overlay)) return;
         if (client.client_id === state.myClientID) {
             refreshOwnVoiceStats(stats, setVal, blank);
             return;
@@ -323,7 +325,7 @@ function openClientInfo(client) {
     overlay.innerHTML = `
         <div class="dlg client-info">
             <div class="ci-title">
-                <span>Connection Info</span>
+                <span role="heading" aria-level="3">Connection Info</span>
                 <span class="ci-nick"></span>
             </div>
             <div class="ci-grid">
@@ -397,6 +399,7 @@ function openClientInfo(client) {
         } catch {
             return; // transient; try again next tick
         }
+        if (!isCurrentServerDialog(overlay)) return;
         setVal("nick", info.nickname);
         overlay.querySelector('[data-f="uid"]').textContent = info.unique_id;
         setVal("conn", humanDuration(Date.now() / 1000 - info.connected_at));
@@ -415,17 +418,17 @@ function openClientInfo(client) {
     };
 
     let refreshTimer = null;
-    const close = () => {
+    const stopRefresh = () => {
         if (refreshTimer) {
             clearInterval(refreshTimer);
             refreshTimer = null;
         }
-        overlay.remove();
     };
+    const close = () => closeDialog(overlay);
     overlay.querySelector(".dlg-ok").onclick = close;
-    overlay.onclick = (e) => { if (e.target === overlay) close(); };
+    overlay.onclick = (e) => { if (e.target === overlay) closeDialog(overlay, "cancel"); };
 
-    document.body.appendChild(overlay);
+    mountServerDialog(overlay, { onClose: stopRefresh });
     refresh();
     refreshTimer = setInterval(refresh, 2000);
 }
@@ -456,7 +459,7 @@ function reasonDialog(title, client, cb) {
     };
     overlay.querySelector(".dlg-cancel").onclick = () => overlay.remove();
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-    document.body.appendChild(overlay);
+    mountServerDialog(overlay);
     overlay.querySelector(".reason").focus();
 }
 
@@ -496,7 +499,7 @@ function banDialog(client) {
     };
     overlay.querySelector(".dlg-cancel").onclick = () => overlay.remove();
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-    document.body.appendChild(overlay);
+    mountServerDialog(overlay);
     overlay.querySelector(".reason").focus();
 }
 
@@ -623,7 +626,7 @@ function openChannelNotify(channel) {
     };
     q(".dlg-cancel").onclick = () => overlay.remove();
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-    document.body.appendChild(overlay);
+    mountServerDialog(overlay);
 }
 
 // countSubtree returns how many descendants a channel has (167 warning).
@@ -670,7 +673,7 @@ function confirmChannelDelete(channel) {
     };
     overlay.querySelector(".dlg-cancel").onclick = () => overlay.remove();
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-    document.body.appendChild(overlay);
+    mountServerDialog(overlay);
 }
 
 // openChannelCreate is the full create dialog (164): name, parent, type,
@@ -735,7 +738,7 @@ function openChannelCreate(parent) {
     };
     q(".dlg-cancel").onclick = () => overlay.remove();
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-    document.body.appendChild(overlay);
+    mountServerDialog(overlay);
     q(".cc-name").focus();
 }
 
@@ -878,8 +881,9 @@ function openChannelEdit(channel) {
     }
     q(".ce-icon-upload").onclick = async () => {
         const img = await pickIcon();
-        if (!img) return;
+        if (!img || !isCurrentServerDialog(overlay)) return;
         const err = await window.go.main.App.ChannelIconSet(channel.ChannelID, img.dataBase64, 0);
+        if (!isCurrentServerDialog(overlay)) return;
         if (err) V().toast("icon failed: " + err, "warn");
         else V().toast("channel icon updated");
     };
@@ -903,6 +907,7 @@ function openChannelEdit(channel) {
             q(".ce-stereo").checked,
             q(".ce-desc").value,
             parseInt(q(".ce-slowmode").value, 10) || 0);
+        if (!isCurrentServerDialog(overlay)) return;
 
         // Only the tree fields the user actually moved are sent: a parent_id
         // on the wire drops the server's whole permission cache, so an
@@ -920,6 +925,7 @@ function openChannelEdit(channel) {
         if (fields.length) {
             treeErr = await window.go.main.App.ChannelEditTree(
                 channel.ChannelID, fields.join(","), joinPower, orderIndex, parentID, inherit);
+            if (!isCurrentServerDialog(overlay)) return;
         }
         overlay.remove();
         if (err) V().sysMsg("channel edit failed: " + err);
@@ -929,13 +935,14 @@ function openChannelEdit(channel) {
     };
     q(".dlg-cancel").onclick = () => overlay.remove();
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-    document.body.appendChild(overlay);
+    mountServerDialog(overlay);
     q(".ce-topic").focus();
 }
 
 // --- wiring -------------------------------------------------------------------
 
 export function initClientInfo() {
+    window.__voicx.openClientInfo = openClientInfo;
     const tree = document.getElementById("channel-tree");
     // (164) root channel creation via the sidebar + button.
     document.getElementById("channel-create-btn").onclick = (e) => {

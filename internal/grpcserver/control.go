@@ -14,6 +14,7 @@ import (
 
 	"voicx/internal/auth"
 	"voicx/internal/query"
+	"voicx/internal/safecast"
 	voicxv1 "voicx/v1"
 )
 
@@ -61,13 +62,21 @@ func (c *controlService) ListChannels(ctx context.Context, req *voicxv1.ListChan
 		if !keep[ch.ChannelID] {
 			continue
 		}
+		maxClients, err := safecast.IntToInt32(ch.MaxClients)
+		if err != nil || ch.MaxClients < 0 {
+			return nil, status.Errorf(codes.Internal, "channel %d has invalid max clients", ch.ChannelID)
+		}
+		currentClients, err := safecast.IntToInt32(ch.ClientCount)
+		if err != nil || ch.ClientCount < 0 {
+			return nil, status.Errorf(codes.Internal, "channel %d has invalid current clients", ch.ChannelID)
+		}
 		resp.Channels = append(resp.Channels, &voicxv1.Channel{
 			Id:             strconv.FormatInt(ch.ChannelID, 10),
 			Name:           ch.Name,
 			ParentId:       formatInt(ch.ParentID),
-			MaxClients:     int32(ch.MaxClients),
+			MaxClients:     maxClients,
 			Permanent:      ch.Type == 2,
-			CurrentClients: int32(ch.ClientCount),
+			CurrentClients: currentClients,
 		})
 	}
 	return resp, nil

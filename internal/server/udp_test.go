@@ -67,7 +67,7 @@ func TestUDPServerStartShutdownPingPong(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial udp server: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Send a UDPMsgPing packet and expect a UDPMsgPong reply. The ping is
 	// retried because UDP delivery itself is lossy even after the socket binds.

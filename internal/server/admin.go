@@ -77,17 +77,24 @@ func (s *TCPServer) performKick(byClientID, targetID string, fromServer, ban boo
 		return nil
 	}
 
-	// Channel kick: move the target out of its channel.
-	sc, ok := s.deps.State.GetClient(target.ID)
-	if !ok || sc.ChannelID == 0 {
-		return errors.New("target is not in a channel")
-	}
-	channelID := sc.ChannelID
-	if err := s.deps.State.LeaveChannel(target.ID); err != nil {
-		return err
-	}
+	// Channel kick: leave through the lifecycle manager so a concurrent move,
+	// disconnect, or temporary-channel cleanup cannot strand timer ownership.
+	var channelID int64
 	if s.deps.Channels != nil {
-		s.deps.Channels.OnClientLeftChannel(channelID)
+		var err error
+		channelID, err = s.deps.Channels.LeaveClient(target.ID)
+		if err != nil {
+			return err
+		}
+	} else {
+		sc, ok := s.deps.State.GetClient(target.ID)
+		if !ok || sc.ChannelID == 0 {
+			return errors.New("target is not in a channel")
+		}
+		channelID = sc.ChannelID
+		if err := s.deps.State.LeaveChannel(target.ID); err != nil {
+			return err
+		}
 	}
 	if s.deps.Voice != nil {
 		s.deps.Voice.LeaveChannel(target.ID, channelID)

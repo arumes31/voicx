@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -18,8 +19,8 @@ const (
 
 type dailyLogWriter struct {
 	mu         sync.Mutex
-	dir        string
 	baseName   string
+	root       *os.Root
 	file       *os.File
 	day        string
 	maxBytes   int64
@@ -28,26 +29,36 @@ type dailyLogWriter struct {
 }
 
 func newDailyLogWriter(dir, baseName string) (*dailyLogWriter, error) {
-	w := &dailyLogWriter{dir: dir, baseName: baseName, maxBytes: maxLogDirectoryBytes, now: time.Now}
+	if !filepath.IsLocal(baseName) || filepath.Base(baseName) != baseName {
+		return nil, fmt.Errorf("invalid log file name %q", baseName)
+	}
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return nil, err
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, err
+	}
+	w := &dailyLogWriter{
+		baseName: baseName, root: root,
+		maxBytes: maxLogDirectoryBytes, now: time.Now,
+	}
 	if err := w.open(); err != nil {
+		_ = root.Close()
 		return nil, err
 	}
 	return w, nil
 }
 
 func (w *dailyLogWriter) open() error {
-	if err := os.MkdirAll(w.dir, 0o750); err != nil {
-		return err
-	}
 	now := w.now()
 	w.day = now.Format("20060102")
-	path := filepath.Join(w.dir, w.baseName)
-	if info, err := os.Stat(path); err == nil && info.ModTime().Format("20060102") != w.day {
+	if info, err := w.root.Stat(w.baseName); err == nil && info.ModTime().Format("20060102") != w.day {
 		stem := strings.TrimSuffix(w.baseName, filepath.Ext(w.baseName))
-		rotated := filepath.Join(w.dir, fmt.Sprintf("%s-%s%s", stem, info.ModTime().Format("20060102-150405"), filepath.Ext(w.baseName)))
-		_ = os.Rename(path, rotated)
+		rotated := fmt.Sprintf("%s-%s%s", stem, info.ModTime().Format("20060102-150405"), filepath.Ext(w.baseName))
+		_ = w.root.Rename(w.baseName, rotated)
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	f, err := w.root.OpenFile(w.baseName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -61,6 +72,9 @@ func (w *dailyLogWriter) open() error {
 func (w *dailyLogWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.file == nil || w.root == nil {
+		return 0, os.ErrClosed
+	}
 	if w.now().Format("20060102") != w.day {
 		if err := w.rotate(); err != nil {
 			return 0, err
@@ -80,31 +94,30 @@ func (w *dailyLogWriter) Write(p []byte) (int, error) {
 func (w *dailyLogWriter) rotate() error {
 	if w.file != nil {
 		_ = w.file.Close()
+		w.file = nil
 	}
-	path := filepath.Join(w.dir, w.baseName)
 	stem := strings.TrimSuffix(w.baseName, filepath.Ext(w.baseName))
-	rotated := filepath.Join(w.dir, fmt.Sprintf("%s-%s%s", stem, w.day, filepath.Ext(w.baseName)))
-	if _, err := os.Stat(rotated); err == nil {
-		rotated = filepath.Join(w.dir, fmt.Sprintf("%s-%s-%d%s", stem, w.day, w.now().Unix(), filepath.Ext(w.baseName)))
+	rotated := fmt.Sprintf("%s-%s%s", stem, w.day, filepath.Ext(w.baseName))
+	if _, err := w.root.Stat(rotated); err == nil {
+		rotated = fmt.Sprintf("%s-%s-%d%s", stem, w.day, w.now().Unix(), filepath.Ext(w.baseName))
 	}
-	_ = os.Rename(path, rotated)
+	_ = w.root.Rename(w.baseName, rotated)
 	return w.open()
 }
 
 type logFile struct {
-	path string
+	name string
 	size int64
 	mod  time.Time
 }
 
 func (w *dailyLogWriter) prune() error {
-	entries, err := os.ReadDir(w.dir)
+	entries, err := fs.ReadDir(w.root.FS(), ".")
 	if err != nil {
 		return err
 	}
 	var files []logFile
 	var total int64
-	active := filepath.Join(w.dir, w.baseName)
 	ext := filepath.Ext(w.baseName)
 	stem := strings.TrimSuffix(w.baseName, ext)
 	for _, entry := range entries {
@@ -117,10 +130,9 @@ func (w *dailyLogWriter) prune() error {
 		if err != nil {
 			continue
 		}
-		path := filepath.Join(w.dir, entry.Name())
 		total += info.Size()
-		if path != active {
-			files = append(files, logFile{path: path, size: info.Size(), mod: info.ModTime()})
+		if name != w.baseName {
+			files = append(files, logFile{name: name, size: info.Size(), mod: info.ModTime()})
 		}
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
@@ -128,7 +140,7 @@ func (w *dailyLogWriter) prune() error {
 		if total <= w.maxBytes {
 			break
 		}
-		if err := os.Remove(file.path); err == nil {
+		if err := w.root.Remove(file.name); err == nil {
 			total -= file.size
 		}
 	}
@@ -159,10 +171,18 @@ func allDigits(value string) bool {
 func (w *dailyLogWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.file == nil {
-		return nil
+	var closeErr error
+	if w.file != nil {
+		closeErr = w.file.Close()
+		w.file = nil
 	}
-	return w.file.Close()
+	if w.root != nil {
+		if err := w.root.Close(); closeErr == nil {
+			closeErr = err
+		}
+		w.root = nil
+	}
+	return closeErr
 }
 
 var (

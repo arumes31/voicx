@@ -133,8 +133,8 @@ func TestNoPlaintextAnywhereInServerState(t *testing.T) {
 	env := startTestEnv(t, permsWithPin())
 	defer env.stop()
 	alice, bob, key, keyID, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	sendEncChat(t, bob, key, keyID, "1", canary)
 	sent := readEventOfType(t, alice, eventChat)
@@ -151,8 +151,8 @@ func TestNoPlaintextAnywhereInServerState(t *testing.T) {
 	send(t, alice, netproto.MsgChatPin, netproto.ChatPin{ChannelID: 1, MessageID: chat.ID, Pinned: true})
 	pinned := readEventOfType(t, alice, eventChatPinned)
 
-	alice.Close()
-	bob.Close()
+	_ = alice.Close()
+	_ = bob.Close()
 	env.stop()
 
 	for name, v := range map[string]any{
@@ -177,8 +177,8 @@ func TestNoPlaintextInHistoryResponse(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	alice, bob, key, keyID, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	sendEncChat(t, bob, key, keyID, "1", canary)
 	readEventOfType(t, alice, eventChat)
@@ -208,8 +208,8 @@ func TestNoPlaintextInPinsResponse(t *testing.T) {
 	env := startTestEnv(t, permsWithPin())
 	defer env.stop()
 	alice, bob, key, keyID, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	sendEncChat(t, bob, key, keyID, "1", canary)
 	data := readEventOfType(t, alice, eventChat)
@@ -244,8 +244,8 @@ func TestNoPlaintextInEditBroadcast(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	alice, bob, key, keyID, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	sendEncChat(t, bob, key, keyID, "1", "before")
 	data := readEventOfType(t, alice, eventChat)
@@ -322,8 +322,8 @@ func TestChatPipelineLogsNoBodies(t *testing.T) {
 	env := startTestEnvLogger(t, nil, nil, nil, zap.New(core))
 	defer env.stop()
 	alice, bob, key, keyID, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	sendEncChat(t, bob, key, keyID, "1", canary)
 	readEventOfType(t, alice, eventChat)

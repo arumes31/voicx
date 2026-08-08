@@ -77,6 +77,7 @@ func storageName(content []byte) string {
 func pinnedTLSConfig(wantFP string) *tls.Config {
 	return &tls.Config{
 		InsecureSkipVerify: true, // pinned below, same model as the control channel
+		MinVersion:         tls.VersionTLS13,
 		VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
 			if len(raw) == 0 {
 				return errors.New("no certificate presented")
@@ -119,7 +120,7 @@ func TestFileTransferRequiresTLS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	// The write may succeed (it is just bytes into a socket); the server sees
 	// a failed handshake, never an init frame.
 	_ = writeJSON(conn, frameInit, initMsg{Token: token, TransferID: id})
@@ -149,7 +150,7 @@ func TestFileTransferTLSRoundTrip(t *testing.T) {
 		t.Fatalf("InitUpload: %v", err)
 	}
 	up := dialTransferTLS(t, addr, fp, id, token)
-	defer up.Close()
+	defer func() { _ = up.Close() }()
 	if err := netproto.WriteFrame(up, &netproto.Frame{Type: frameChunk, Payload: content}); err != nil {
 		t.Fatalf("write chunk: %v", err)
 	}
@@ -173,7 +174,7 @@ func TestFileTransferTLSRoundTrip(t *testing.T) {
 		t.Fatalf("InitDownload: %v", err)
 	}
 	down := dialTransferTLS(t, addr, fp, id, token)
-	defer down.Close()
+	defer func() { _ = down.Close() }()
 
 	_ = down.SetReadDeadline(time.Now().Add(3 * time.Second))
 	var got []byte
@@ -202,6 +203,22 @@ func TestFileTransferTLSRoundTrip(t *testing.T) {
 	}
 	if st := readStatus(t, down); !st.OK {
 		t.Fatalf("download status = %+v, want ok", st)
+	}
+}
+
+// TestFileTransferRequiresTLS13 pins the data listener's documented minimum.
+func TestFileTransferRequiresTLS13(t *testing.T) {
+	fs := newFakeFileStore()
+	addr, _, _ := startTLSServer(t, fs)
+
+	conn, err := tls.Dial("tcp", addr, &tls.Config{
+		InsecureSkipVerify: true, //nolint:gosec // protocol-version test
+		MinVersion:         tls.VersionTLS12,
+		MaxVersion:         tls.VersionTLS12,
+	})
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("TLS 1.2 handshake succeeded, want rejection")
 	}
 }
 
@@ -313,7 +330,7 @@ func TestEncryptedAttachmentNameMustMatchDigest(t *testing.T) {
 		t.Fatalf("InitUpload %s: %v", forged, err)
 	}
 	conn := dialTransfer(t, addr, id, token)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if err := netproto.WriteFrame(conn, &netproto.Frame{Type: frameChunk, Payload: content}); err != nil {
 		t.Fatalf("write chunk: %v", err)
 	}

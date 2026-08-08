@@ -43,9 +43,6 @@ type App struct {
 	// visible opacity divergent (292).
 	opacityMu sync.Mutex
 
-	// readMu guards settings.LastReadChannels: server pushes from the read
-	// loop race the frontend's own mark-read calls (121).
-	readMu sync.Mutex
 	// dmMu serialises the local DM logs — every append rewrites a whole
 	// file, so two concurrent DMs with one peer would otherwise lose one (122).
 	dmMu sync.Mutex
@@ -226,13 +223,23 @@ func (a *App) ServerFingerprint() string {
 // TrustServerFingerprint pins fp for addr in the TOFU store (explicit user
 // action after a fingerprint-mismatch warning).
 func (a *App) TrustServerFingerprint(addr, fp string) string {
-	if a.cmLoad() == nil || a.cmLoad().knownServers == nil {
+	ks := a.knownServers
+	if ks == nil {
+		if cm := a.cmLoad(); cm != nil {
+			ks = cm.knownServers
+		}
+	}
+	if ks == nil {
 		return "trust store unavailable"
 	}
 	if addr == "" || fp == "" {
 		return "address and fingerprint are required"
 	}
-	if err := a.cmLoad().knownServers.trust(addr, fp); err != nil {
+	normalized, err := normalizeFingerprint(fp)
+	if err != nil {
+		return "invalid fingerprint: " + err.Error()
+	}
+	if err := ks.trust(addr, normalized); err != nil {
 		return err.Error()
 	}
 	return ""

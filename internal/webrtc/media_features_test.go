@@ -24,7 +24,7 @@ func TestEngineDTLSCertificateIsStableForRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	if e.DTLSFingerprint() == "" {
 		t.Fatal("empty DTLS fingerprint")
 	}

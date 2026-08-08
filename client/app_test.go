@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"voicx/internal/netproto"
+	"voicx/internal/tlscert"
 )
 
 func nextFrame(t *testing.T, frames <-chan *netproto.Frame, want netproto.MessageType) *netproto.Frame {
@@ -143,11 +144,15 @@ func TestAppConnectedBindings(t *testing.T) {
 	if got := app.TrustServerFingerprint("", "AA:BB"); got != "address and fingerprint are required" {
 		t.Fatalf("TrustServerFingerprint empty = %q", got)
 	}
-	if got := app.TrustServerFingerprint("server.test:12333", "CC:DD"); got != "" {
+	replacementFingerprint := tlscert.FingerprintDER([]byte("replacement certificate"))
+	if got := app.TrustServerFingerprint("server.test:12333", strings.ToUpper(replacementFingerprint)); got != "" {
 		t.Fatalf("TrustServerFingerprint = %q", got)
 	}
-	if got := cm.knownServers.verify("server.test:12333", "cc:dd"); got != trustOK {
+	if got := cm.knownServers.verify("server.test:12333", replacementFingerprint); got != trustOK {
 		t.Fatalf("trusted fingerprint status = %v", got)
+	}
+	if got := app.TrustServerFingerprint("server.test:12333", "CC:DD"); !strings.HasPrefix(got, "invalid fingerprint:") {
+		t.Fatalf("TrustServerFingerprint invalid = %q", got)
 	}
 
 	if got := app.JoinChannel(7); got != "" {

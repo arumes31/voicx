@@ -11,6 +11,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"voicx/internal/safecast"
 )
 
 var (
@@ -24,10 +26,14 @@ var (
 // findMainWindow returns the first visible top-level window owned by this
 // process, or 0.
 func findMainWindow() uintptr {
-	pid := uint32(os.Getpid())
+	pid, err := safecast.IntToUint32(os.Getpid())
+	if err != nil {
+		return 0
+	}
 	var hwnd uintptr
 	cb := syscall.NewCallback(func(h uintptr, l uintptr) uintptr {
 		var windowPID uint32
+		// #nosec G103 -- GetWindowThreadProcessId requires a writable DWORD pointer.
 		_, _, _ = procGetWindowPID.Call(h, uintptr(unsafe.Pointer(&windowPID)))
 		if windowPID == pid {
 			visible, _, _ := procIsWindowVisible.Call(h)

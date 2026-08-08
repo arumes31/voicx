@@ -39,9 +39,11 @@ func NewPIICipher(key []byte) (*PIICipher, error) {
 // LoadOrCreatePIICipher keeps the master key outside PostgreSQL. Creation is
 // atomic and refuses permissive replacement of an existing key.
 func LoadOrCreatePIICipher(path string) (*PIICipher, error) {
+	// #nosec G304 -- path is an administrator-selected PII key location;
+	// the file type and restrictive permissions are validated immediately.
 	rf, err := os.Open(path)
 	if err == nil {
-		defer rf.Close()
+		defer func() { _ = rf.Close() }()
 		info, statErr := rf.Stat()
 		if statErr != nil {
 			return nil, fmt.Errorf("checking PII key permissions: %w", statErr)
@@ -65,6 +67,8 @@ func LoadOrCreatePIICipher(path string) (*PIICipher, error) {
 	if _, err := io.ReadFull(rand.Reader, newKey); err != nil {
 		return nil, fmt.Errorf("generating PII key: %w", err)
 	}
+	// #nosec G304 -- path is the same administrator-selected key location;
+	// O_EXCL prevents replacing an existing key.
 	wf, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {

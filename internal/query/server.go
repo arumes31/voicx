@@ -168,7 +168,11 @@ func (s *Server) unregisterConn(conn net.Conn) {
 
 // serve handles one query connection for its lifetime.
 func (s *Server) serve(ctx context.Context, conn net.Conn) {
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			s.logger.Debug("closing query connection", zap.Error(err))
+		}
+	}()
 	defer s.unregisterConn(conn)
 
 	s.logger.Debug("query connection accepted", zap.String("remote", conn.RemoteAddr().String()))

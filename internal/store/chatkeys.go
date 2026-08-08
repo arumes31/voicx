@@ -15,6 +15,8 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
+
+	"voicx/internal/safecast"
 )
 
 // ScopeKey is one persisted generation of a scope's chat key. Wrapped is
@@ -51,7 +53,11 @@ func (s *Store) AllocScopeKeyID(ctx context.Context, scope int64) (uint32, error
 	if err := s.db.QueryRowContext(ctx, q, scope).Scan(&id); err != nil {
 		return 0, fmt.Errorf("allocating scope key id for %d: %w", scope, err)
 	}
-	return uint32(id), nil
+	keyID, err := safecast.Int64ToUint32(id)
+	if err != nil {
+		return 0, fmt.Errorf("allocating scope key id for %d returned invalid id %d: %w", scope, id, err)
+	}
+	return keyID, nil
 }
 
 // CurrentScopeKey returns the scope's live generation, or (nil, nil) when the
@@ -73,7 +79,7 @@ func (s *Store) scanScopeKey(row *sql.Row, scope int64) (*ScopeKey, error) {
 	var (
 		k     ScopeKey
 		keyID int64
-		kekID int16
+		kekID int64
 	)
 	err := row.Scan(&keyID, &k.Wrapped, &kekID, &k.CreatedAt, &k.RetiredAt)
 	if err != nil {
@@ -82,8 +88,14 @@ func (s *Store) scanScopeKey(row *sql.Row, scope int64) (*ScopeKey, error) {
 		}
 		return nil, fmt.Errorf("loading scope key for %d: %w", scope, err)
 	}
-	k.KeyID = uint32(keyID)
-	k.KEKID = uint16(kekID)
+	k.KeyID, err = safecast.Int64ToUint32(keyID)
+	if err != nil {
+		return nil, fmt.Errorf("loading scope key for %d has invalid key id %d: %w", scope, keyID, err)
+	}
+	k.KEKID, err = safecast.Int64ToUint16(kekID)
+	if err != nil {
+		return nil, fmt.Errorf("loading scope key for %d has invalid kek id %d: %w", scope, kekID, err)
+	}
 	return &k, nil
 }
 
@@ -92,7 +104,7 @@ func (s *Store) scanScopeKey(row *sql.Row, scope int64) (*ScopeKey, error) {
 // key materials competing for one generation id.
 func (s *Store) InsertScopeKey(ctx context.Context, scope int64, keyID uint32, wrapped []byte, kekID uint16) error {
 	const q = `INSERT INTO chat_scope_keys (scope_id, key_id, wrapped_key, kek_id) VALUES ($1, $2, $3, $4)`
-	if _, err := s.db.ExecContext(ctx, q, scope, int64(keyID), wrapped, int16(kekID)); err != nil {
+	if _, err := s.db.ExecContext(ctx, q, scope, int64(keyID), wrapped, int32(kekID)); err != nil {
 		return fmt.Errorf("inserting scope key %d/%d: %w", scope, keyID, err)
 	}
 	return nil
@@ -113,7 +125,7 @@ func (s *Store) RotateScopeKey(ctx context.Context, scope int64, newKeyID uint32
 		return fmt.Errorf("retiring scope key for %d: %w", scope, err)
 	}
 	const ins = `INSERT INTO chat_scope_keys (scope_id, key_id, wrapped_key, kek_id) VALUES ($1, $2, $3, $4)`
-	if _, err := tx.ExecContext(ctx, ins, scope, int64(newKeyID), wrapped, int16(kekID)); err != nil {
+	if _, err := tx.ExecContext(ctx, ins, scope, int64(newKeyID), wrapped, int32(kekID)); err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("inserting scope key %d/%d: %w", scope, newKeyID, err)
 	}

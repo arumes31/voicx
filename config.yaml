@@ -14,8 +14,10 @@ udp_addr: ":12334"    # UDP keepalive/media support
 udp_rate_limit_pps: 200   # per-source-IP UDP rate limit (pkt/s); 0 = disabled
 udp_rate_burst: 400       # per-source-IP UDP burst allowance
 grpc_addr: "127.0.0.1:12338"   # plaintext gRPC is restricted to loopback
-health_addr: ":12337"  # health/readiness HTTP endpoint (/healthz, /readyz)
-query_addr: ":12335"  # ServerQuery (admin/bot text protocol)
+health_addr: ":12337"  # /healthz and /readyz; /metrics is loopback-only by default
+metrics_allow_remote: false  # explicit opt-in; exposes operational metrics
+query_addr: "127.0.0.1:12335"  # raw ServerQuery is plaintext and loopback-only by default
+query_allow_remote: false       # explicit opt-in; prefer query_ssh_enabled for remote use
 # ServerQuery over SSH (224): same commands and credentials as query_addr.
 query_ssh_enabled: false
 query_ssh_addr: ":12339"
@@ -51,23 +53,31 @@ db_conn_max_lifetime: 30m
 # Echo test channel (15): ensured to exist at startup; publishers in it hear
 # their own audio routed back. Empty disables the echo channel.
 echo_channel_name: "Echo Test"
+channel_temp_lifetime_seconds: 60
 
-# TLS for the TCP control channel (wave 4a). Enabled by default. With empty
+# TLS 1.3 for the TCP control and file-transfer channels. Enabled by default.
+# With empty
 # cert/key files a self-signed ECDSA P-256 certificate (10y, SANs localhost +
 # server name) is generated into tls_dir on first start and reused after —
 # clients pin its SHA-256 fingerprint (TOFU), which is logged at startup and
 # sent in the auth response. tls_enabled: false is a dev/e2e escape hatch.
-# ServerQuery and file-transfer ports stay plaintext (backlog 225).
 tls_enabled: true
 tls_dir: "./data/tls"
 tls_cert_file: ""
 tls_key_file: ""
+file_tls_enabled: true  # false is accepted only with dev_mode: true
 
 # Chat payload encryption (wave 4b). Plaintext chat is rejected by default;
 # allow_plaintext is a dev escape hatch for old clients.
 chat_allow_plaintext: false
+chat_master_key_file: "./data/keys/chat_master.key"
+chat_legacy_history: encrypt       # encrypt | purge
+chat_key_rotate_min_seconds: 60
+chat_search_max_messages: 2000
+server_info_motd: false            # true exposes MOTD plaintext after authentication
+default_groups_enabled: true
 
-# Chat moderation & limits (wave 5a). max_length is in plaintext characters
+# Chat moderation & limits (wave 5a). max_length is in UTF-8 plaintext bytes
 # post-decrypt. rate = per-user token bucket. word/link filters apply to
 # channel/global scopes only (DMs are E2EE, exempt). whitelist non-empty =
 # ONLY those domains may be linked.
@@ -108,3 +118,8 @@ recording:
   format: webm
   video_args: ["-c:v", "copy"]
   audio_args: ["-c:a", "copy"]
+  # Hard process/memory budget: starting and active sessions both count.
+  max_concurrent: 4
+  # Windows only: pre-create recording.dir, apply a restricted inheritable
+  # NTFS DACL, then set true. Recording fails closed without both.
+  windows_acl_ready: false

@@ -17,9 +17,9 @@ func TestSetStatus(t *testing.T) {
 	defer env.stop()
 
 	aliceConn, aliceID := dialAuthed(t, env.addr, "user-uid")
-	defer aliceConn.Close()
+	defer func() { _ = aliceConn.Close() }()
 	bobConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer bobConn.Close()
+	defer func() { _ = bobConn.Close() }()
 
 	send(t, aliceConn, netproto.MsgSetStatus, netproto.SetStatus{Status: "away", Message: "brb"})
 	data := readEventOfType(t, bobConn, "status_changed")
@@ -59,9 +59,9 @@ func TestPoke(t *testing.T) {
 	defer env.stop()
 
 	aliceConn, aliceID := dialAuthed(t, env.addr, "user-uid")
-	defer aliceConn.Close()
+	defer func() { _ = aliceConn.Close() }()
 	bobConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer bobConn.Close()
+	defer func() { _ = bobConn.Close() }()
 	bobID := bobClientID(t, env)
 
 	send(t, aliceConn, netproto.MsgPoke, netproto.Poke{ClientID: bobID, Message: "hey"})
@@ -87,9 +87,9 @@ func TestPokeDenied(t *testing.T) {
 	defer env.stop()
 
 	aliceConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer aliceConn.Close()
+	defer func() { _ = aliceConn.Close() }()
 	bobConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer bobConn.Close()
+	defer func() { _ = bobConn.Close() }()
 
 	send(t, aliceConn, netproto.MsgPoke, netproto.Poke{ClientID: bobClientID(t, env)})
 	if e := readError(t, aliceConn); e.Code != errCodePermissionDenied {
@@ -103,7 +103,7 @@ func TestServerInfoQuery(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgServerInfoQuery, netproto.ServerInfoQuery{})
 	f := readOfType(t, conn, netproto.MsgServerInfoResponse)
@@ -138,7 +138,7 @@ func TestInvisibleGate(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	send(t, conn, netproto.MsgSetStatus, netproto.SetStatus{Status: "invisible"})
 	if e := readError(t, conn); e.Code != errCodePermissionDenied {
 		t.Fatalf("error = %+v, want permission denied", e)
@@ -150,7 +150,7 @@ func TestInvisibleGate(t *testing.T) {
 func snapshotUIDs(t *testing.T, addr, uid string) map[string]bool {
 	t.Helper()
 	conn := dialRetry(t, addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: uid, Password: "pw"})
 	readOfType(t, conn, netproto.MsgAuthResponse)
 	f := readOfType(t, conn, netproto.MsgSnapshot)
@@ -190,9 +190,9 @@ func TestInvisibleSnapshotFiltering(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	// Both users must be in a channel to appear in snapshots.
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Lobby", Type: 2})

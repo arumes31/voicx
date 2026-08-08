@@ -1,38 +1,88 @@
 // menu.js — TS3-style menu bar with dropdown menus.
+import { isActivationKey, wrappedIndex } from "./a11y.js";
+import { mountDialog } from "./modal.js";
+
 const V = () => window.__voicx;
 
 let openMenu = null;
+let documentClickBound = false;
+const focusoutBoundBars = new WeakSet();
 
-function closeMenus() {
+function closeMenus(restoreFocus = false) {
+    const trigger = openMenu;
     document.querySelectorAll(".menu-dropdown.open").forEach((d) => d.classList.remove("open"));
-    document.querySelectorAll(".menu-item.open").forEach((d) => d.classList.remove("open"));
+    document.querySelectorAll(".menu-item.open").forEach((d) => {
+        d.classList.remove("open");
+        d.setAttribute("aria-expanded", "false");
+    });
     openMenu = null;
+    if (restoreFocus) trigger?.focus();
 }
 
 function menuAction(label, fn, opts = {}) {
     const a = document.createElement("a");
     a.textContent = label;
+    a.setAttribute("role", "menuitem");
+    a.tabIndex = -1;
     if (opts.disabled) {
         a.className = "disabled";
         a.title = opts.tooltip || "coming soon";
+        a.setAttribute("aria-disabled", "true");
         return a;
     }
-    a.onclick = () => { closeMenus(); fn(); };
+    a.onclick = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        closeMenus();
+        fn();
+    };
+    a.addEventListener("keydown", (event) => {
+        if (event.key === "Tab") {
+            closeMenus();
+            return;
+        }
+        if (isActivationKey(event.key)) {
+            event.preventDefault();
+            event.stopPropagation();
+            a.click();
+            return;
+        }
+        if (event.key === "Escape") {
+            event.preventDefault();
+            event.stopPropagation();
+            closeMenus(true);
+            return;
+        }
+        if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+        event.preventDefault();
+        event.stopPropagation();
+        const items = [...a.closest(".menu-dropdown").querySelectorAll('[role="menuitem"]')]
+            .filter((item) => item.getAttribute("aria-disabled") !== "true");
+        const next = wrappedIndex(items.indexOf(a), items.length, event.key === "ArrowDown" ? 1 : -1);
+        items[next]?.focus();
+    });
     return a;
 }
 
 function divider() {
     const d = document.createElement("div");
     d.className = "menu-divider";
+    d.setAttribute("role", "separator");
     return d;
 }
 
 function buildMenu(label, items) {
     const item = document.createElement("div");
     item.className = "menu-item";
+    item.tabIndex = 0;
+    item.setAttribute("role", "menuitem");
+    item.setAttribute("aria-haspopup", "menu");
+    item.setAttribute("aria-expanded", "false");
     item.innerHTML = `<span>${label}</span>`;
     const drop = document.createElement("div");
     drop.className = "menu-dropdown";
+    drop.setAttribute("role", "menu");
+    drop.setAttribute("aria-label", label);
     for (const it of items) drop.appendChild(it);
     item.appendChild(drop);
     item.onclick = (e) => {
@@ -42,9 +92,34 @@ function buildMenu(label, items) {
         if (!wasOpen) {
             item.classList.add("open");
             drop.classList.add("open");
+            item.setAttribute("aria-expanded", "true");
             openMenu = item;
         }
     };
+    item.addEventListener("keydown", (event) => {
+        if (event.key === "Tab") {
+            closeMenus();
+            return;
+        }
+        if (event.key === "Escape") {
+            closeMenus(true);
+            return;
+        }
+        if (isActivationKey(event.key) || event.key === "ArrowDown") {
+            event.preventDefault();
+            if (openMenu !== item) item.click();
+            const first = [...drop.querySelectorAll('[role="menuitem"]')]
+                .find((entry) => entry.getAttribute("aria-disabled") !== "true");
+            first?.focus();
+            return;
+        }
+        if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+        event.preventDefault();
+        const menus = [...document.querySelectorAll('#menubar > [role="menuitem"]')];
+        const next = wrappedIndex(menus.indexOf(item), menus.length, event.key === "ArrowRight" ? 1 : -1);
+        closeMenus();
+        menus[next]?.focus();
+    });
     return item;
 }
 
@@ -70,7 +145,7 @@ function dlgPrompt(title, label, initial, cb) {
     overlay.querySelector(".dlg-ok").onclick = () => { cb(input.value.trim()); overlay.remove(); };
     overlay.querySelector(".dlg-cancel").onclick = () => overlay.remove();
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-    document.body.appendChild(overlay);
+    mountDialog(overlay);
     input.focus();
 }
 
@@ -99,7 +174,7 @@ function dlgAbout() {
     uidEl.textContent = state.myUniqueID || "(not connected)";
     overlay.querySelector(".dlg-ok").onclick = () => overlay.remove();
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-    document.body.appendChild(overlay);
+    mountDialog(overlay);
 }
 
 // --- bookmarks ---------------------------------------------------------------
@@ -239,7 +314,7 @@ function manageBookmarks() {
         </div>`;
     overlay.querySelector(".dlg-ok").onclick = () => overlay.remove();
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-    document.body.appendChild(overlay);
+    mountDialog(overlay);
     render();
 }
 
@@ -294,7 +369,7 @@ function editBookmark(b, persist, render) {
     };
     q(".dlg-cancel").onclick = () => overlay.remove();
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-    document.body.appendChild(overlay);
+    mountDialog(overlay);
 }
 
 // --- Self actions --------------------------------------------------------------
@@ -308,18 +383,22 @@ import { pickAvatar, pickIcon } from "./image-tools.js";
 // setAvatarFile opens the avatar crop dialog (268): preview, zoom/reposition,
 // 256x256 canvas resize; animated GIF/WebP pass through untouched (269).
 async function setAvatarFile() {
-    const img = await pickAvatar();
-    if (!img) return;
+    const generation = V().state.serverGeneration;
+    const img = await pickAvatar({ serverScoped: true, serverGeneration: generation });
+    if (!img || generation !== V().state.serverGeneration) return;
     const err = await window.go.main.App.SetAvatar(img.dataBase64);
+    if (generation !== V().state.serverGeneration) return;
     if (err) V().toast("avatar failed: " + err, "warn");
     else V().toast("avatar updated");
 }
 
 // setServerIcon uploads a compressed server icon (admin, 270/274).
 async function setServerIcon() {
+    const generation = V().state.serverGeneration;
     const img = await pickIcon();
-    if (!img) return;
+    if (!img || generation !== V().state.serverGeneration) return;
     const err = await window.go.main.App.ServerIconSet(img.dataBase64);
+    if (generation !== V().state.serverGeneration) return;
     if (err) {
         V().toast("server icon failed: " + err, "warn");
         return;
@@ -504,8 +583,23 @@ export function initMenu() {
     ]);
 
     const bar = $("menubar");
+    bar.setAttribute("role", "menubar");
     for (const m of [connections, bookmarks, self, view, permissions, tools, help]) bar.appendChild(m);
-    document.addEventListener("click", closeMenus);
+    if (!focusoutBoundBars.has(bar)) {
+        focusoutBoundBars.add(bar);
+        bar.addEventListener("focusout", () => {
+            setTimeout(() => {
+                if (openMenu && !openMenu.contains(document.activeElement)) closeMenus();
+            }, 0);
+        });
+    }
+    if (!documentClickBound) {
+        document.addEventListener("click", () => closeMenus());
+        document.addEventListener("focusin", (event) => {
+            if (openMenu && !openMenu.contains(event.target)) closeMenus();
+        });
+        documentClickBound = true;
+    }
 }
 
 // setTheme switches the UI theme (294/295) and persists it.

@@ -31,9 +31,9 @@ type ringBuf struct {
 // to the ring. Everything else (level filtering, output) stays with the
 // primary core via zapcore.NewTee.
 type ringCore struct {
-	zapcore.Core
-	buf *ringBuf
-	enc zapcore.Encoder
+	level zapcore.LevelEnabler
+	buf   *ringBuf
+	enc   zapcore.Encoder
 }
 
 var globalRing = &ringBuf{}
@@ -55,21 +55,37 @@ func Tee() zap.Option {
 		EncodeCaller:   zapcore.ShortCallerEncoder,
 	}
 	return zap.WrapCore(func(core zapcore.Core) zapcore.Core {
-		return &ringCore{Core: core, buf: globalRing, enc: zapcore.NewConsoleEncoder(encCfg)}
+		ring := &ringCore{level: core, buf: globalRing, enc: zapcore.NewConsoleEncoder(encCfg)}
+		return zapcore.NewTee(core, ring)
 	})
 }
 
-// Check implements zapcore.Core.
+// Enabled implements zapcore.LevelEnabler.
+func (c *ringCore) Enabled(level zapcore.Level) bool {
+	return c.level.Enabled(level)
+}
+
+// With implements zapcore.Core and preserves contextual fields in ring lines.
+func (c *ringCore) With(fields []zapcore.Field) zapcore.Core {
+	clone := c.enc.Clone()
+	for _, field := range fields {
+		field.AddTo(clone)
+	}
+	return &ringCore{level: c.level, buf: c.buf, enc: clone}
+}
+
+// Check implements zapcore.Core without re-registering the primary core.
 func (c *ringCore) Check(ent zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
 	if c.Enabled(ent.Level) {
-		ce = ce.AddCore(ent, c)
+		return ce.AddCore(ent, c)
 	}
-	return c.Core.Check(ent, ce)
+	return ce
 }
 
 // Write implements zapcore.Core.
 func (c *ringCore) Write(ent zapcore.Entry, fields []zapcore.Field) error {
 	if buf, err := c.enc.EncodeEntry(ent, fields); err == nil {
+		defer buf.Free()
 		line := strings.TrimRight(buf.String(), "\n")
 		c.buf.mu.Lock()
 		c.buf.lines = append(c.buf.lines, line)
@@ -85,8 +101,11 @@ func (c *ringCore) Write(ent zapcore.Entry, fields []zapcore.Field) error {
 		}
 		c.buf.mu.Unlock()
 	}
-	return c.Core.Write(ent, fields)
+	return nil
 }
+
+// Sync implements zapcore.Core. The in-memory ring has nothing to flush.
+func (c *ringCore) Sync() error { return nil }
 
 // Follow returns a channel of log lines emitted from now on, and a cancel
 // function that unregisters it (223). The channel is never closed by the

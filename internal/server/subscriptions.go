@@ -257,20 +257,6 @@ func (s *TCPServer) broadcastChannelScoped(ctx context.Context, channelID int64,
 	}
 }
 
-// subscriberIDsOf snapshots the client IDs subscribed to a channel. A delete
-// has to take this BEFORE the channel leaves the state manager, which is what
-// drops the entries, or there would be nobody left to notify.
-func (s *TCPServer) subscriberIDsOf(channelID int64) []string {
-	if s.deps == nil || s.deps.State == nil {
-		return nil
-	}
-	out := make([]string, 0)
-	for _, sc := range s.deps.State.ChannelSubscribers(channelID) {
-		out = append(out, sc.ClientID)
-	}
-	return out
-}
-
 // pushSubscriptionStateTo re-pushes the authoritative set to the named
 // clients, so a drop they did not ask for still reaches them.
 func (s *TCPServer) pushSubscriptionStateTo(clientIDs []string) {

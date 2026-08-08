@@ -1,6 +1,8 @@
 // meta-ui.js — wave-8b meta features: debug console (327), connection stats
 // page (328), onboarding wizard (329), what's-new dialog (330), crash report
 // toast (331).
+import { closeDialog, isCurrentServerDialog, mountDialog, mountServerDialog } from "./modal.js";
+
 const V = () => window.__voicx;
 const App = () => window.go.main.App;
 
@@ -29,10 +31,13 @@ function openDebugConsole() {
             <div class="dbg-list mono"></div>
         </div>`;
     dbg.overlay = overlay;
-    const close = () => {
+    const close = () => closeDialog(overlay);
+    const cleanup = (reason) => {
         dbg.open = false;
-        App().SetDebugFrames(false);
-        overlay.remove();
+        if (dbg.overlay === overlay) dbg.overlay = null;
+        // A tab reset has already activated another backend; never send the
+        // old dialog's teardown command to that newly active connection.
+        if (reason !== "server-change") App().SetDebugFrames(false);
     };
     overlay.querySelector(".dbg-close").onclick = close;
     overlay.onclick = (e) => { if (e.target === overlay) close(); };
@@ -48,7 +53,7 @@ function openDebugConsole() {
         dbg.rows = [];
         renderDbg();
     };
-    document.body.appendChild(overlay);
+    mountServerDialog(overlay, { onClose: cleanup });
     App().SetDebugFrames(true);
     renderDbg();
 }
@@ -71,8 +76,13 @@ function escapeHtml(s) {
 // ---------------------------------------------------------------------------
 
 let statsTimer = null;
+let statsOverlay = null;
 
 function openStatsPage() {
+    if (statsOverlay?.isConnected) {
+        statsOverlay.focus();
+        return;
+    }
     const overlay = document.createElement("div");
     overlay.className = "dlg-overlay";
     overlay.innerHTML = `
@@ -89,17 +99,19 @@ function openStatsPage() {
             <div class="stats-jitter mono"></div>
             <div class="dlg-buttons"><button class="dlg-ok">Close</button></div>
         </div>`;
-    const close = () => {
+    statsOverlay = overlay;
+    const cleanup = () => {
         if (statsTimer) {
             clearInterval(statsTimer);
             statsTimer = null;
         }
-        overlay.remove();
+        if (statsOverlay === overlay) statsOverlay = null;
     };
+    const close = () => closeDialog(overlay);
     overlay.querySelector(".stats-close").onclick = close;
     overlay.querySelector(".dlg-ok").onclick = close;
     overlay.onclick = (e) => { if (e.target === overlay) close(); };
-    document.body.appendChild(overlay);
+    mountServerDialog(overlay, { onClose: cleanup });
 
     const rttHist = [];
     const lossHist = [];
@@ -108,6 +120,7 @@ function openStatsPage() {
         if (!state.myClientID) return;
         try {
             const info = await App().GetClientInfo(state.myClientID);
+            if (!isCurrentServerDialog(overlay)) return;
             overlay.querySelector(".stats-server").textContent =
                 `${info.unique_id?.slice(0, 12) || ""}… · ping ${info.ping_ms} ms · connected ${Math.floor((Date.now() / 1000 - info.connected_at) / 60)} min`;
             rttHist.push(info.ping_ms >= 0 ? info.ping_ms : 0);
@@ -175,6 +188,13 @@ function maybeOnboard() {
         { title: "Microphone check", body: `<p>Open Settings → Capture and use the <b>mic test</b> to verify your input level.</p><button class="dlg-ok ob-mic">Open capture settings</button>` },
         { title: "Connect", body: `<p>Enter a server address and connect — bookmarks and recents make the next time one click.</p>` },
     ];
+    let completed = false;
+    const done = async () => {
+        if (completed) return;
+        completed = true;
+        s.onboarding_done = true;
+        await App().SaveSettings(s);
+    };
     const render = () => {
         const st = steps[step];
         overlay.innerHTML = `
@@ -189,32 +209,28 @@ function maybeOnboard() {
             </div>`;
         const mic = overlay.querySelector(".ob-mic");
         if (mic) mic.onclick = () => {
-            overlay.remove();
-            done();
+            closeDialog(overlay);
+            void done();
             window.__voicx.openSettings("capture");
         };
         overlay.querySelector(".ob-skip").onclick = () => {
-            overlay.remove();
-            done();
+            closeDialog(overlay);
+            void done();
         };
         overlay.querySelector(".ob-next").onclick = () => {
             const nick = overlay.querySelector(".ob-nick");
             if (nick && nick.value.trim()) document.getElementById("login-nick").value = nick.value.trim();
             step++;
             if (step >= steps.length) {
-                overlay.remove();
-                done();
+                closeDialog(overlay);
+                void done();
             } else {
                 render();
             }
         };
     };
-    const done = async () => {
-        s.onboarding_done = true;
-        await App().SaveSettings(s);
-    };
     render();
-    document.body.appendChild(overlay);
+    mountDialog(overlay, { onClose: () => { void done(); } });
 }
 
 // maybeWhatsNew shows release notes after an update (330).
@@ -233,7 +249,7 @@ async function maybeWhatsNew() {
         overlay.querySelector(".whatsnew-body").textContent = notes;
         overlay.querySelector(".dlg-ok").onclick = () => overlay.remove();
         overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-        document.body.appendChild(overlay);
+        mountDialog(overlay);
     } catch { /* best-effort */ }
 }
 
@@ -256,7 +272,7 @@ export function initMetaUI() {
         if (dbg.rows.length > 500) dbg.rows.shift();
         renderDbg();
     });
-    window.__voicxMeta = { openDebugConsole, openStatsPage };
+    window.__voicxMeta = { openDebugConsole, openStatsPage, maybeOnboard };
     // Startup flows: crash report, what's new, onboarding (in that order).
     setTimeout(() => {
         maybeCrashToast();

@@ -16,8 +16,12 @@ func TestSnapshotCarriesBotFlag(t *testing.T) {
 	sm.AddChannel(&state.Channel{ChannelID: 1, Name: "Lobby"})
 	sm.AddClient(&state.Client{ClientID: "c-bot", UniqueID: "bot-uid", Nickname: "bot", IsBot: true, ConnectedAt: time.Now()})
 	sm.AddClient(&state.Client{ClientID: "c-human", UniqueID: "human-uid", Nickname: "human", ConnectedAt: time.Now()})
-	sm.MoveClient("c-bot", 1)
-	sm.MoveClient("c-human", 1)
+	if err := sm.MoveClient("c-bot", 1); err != nil {
+		t.Fatalf("move bot client: %v", err)
+	}
+	if err := sm.MoveClient("c-human", 1); err != nil {
+		t.Fatalf("move human client: %v", err)
+	}
 
 	raw, err := json.Marshal(BuildSnapshot(sm, true, ""))
 	if err != nil {

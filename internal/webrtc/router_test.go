@@ -8,7 +8,8 @@ import (
 
 	"github.com/pion/interceptor"
 	"github.com/pion/rtp"
-	"github.com/pion/webrtc/v3"
+	"github.com/pion/sdp/v3"
+	"github.com/pion/webrtc/v4"
 )
 
 // --- fakes ------------------------------------------------------------------
@@ -154,7 +155,7 @@ func TestForwardRTPChannelFanout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 
 	for _, id := range []string{"a", "b", "c"} {
@@ -201,7 +202,7 @@ func TestForwardRTPTap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 
 	attachFakePeer(t, e, r, "a")
@@ -229,7 +230,7 @@ func TestWhisperRouting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 
 	for _, id := range []string{"a", "b", "c", "d"} {
@@ -261,7 +262,7 @@ func TestWhisperDedup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 
 	attachFakePeer(t, e, r, "a")
@@ -371,6 +372,31 @@ func TestReadLoopTalkGateMuted(t *testing.T) {
 	}
 }
 
+func TestAudioLevelExtIDFromExtensions(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		extensions []webrtc.RTPHeaderExtensionParameter
+		expected   uint8
+	}{
+		{name: "negotiated", extensions: []webrtc.RTPHeaderExtensionParameter{{URI: sdp.AudioLevelURI, ID: 14}}, expected: 14},
+		{name: "missing", extensions: []webrtc.RTPHeaderExtensionParameter{{URI: "urn:example", ID: 1}}},
+		{name: "zero is reserved", extensions: []webrtc.RTPHeaderExtensionParameter{{URI: sdp.AudioLevelURI, ID: 0}}},
+		{name: "negative", extensions: []webrtc.RTPHeaderExtensionParameter{{URI: sdp.AudioLevelURI, ID: -1}}},
+		{name: "above wire range", extensions: []webrtc.RTPHeaderExtensionParameter{{URI: sdp.AudioLevelURI, ID: 256}}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := audioLevelExtIDFromExtensions(test.extensions); got != test.expected {
+				t.Fatalf("audioLevelExtIDFromExtensions() = %d, want %d", got, test.expected)
+			}
+		})
+	}
+}
+
 // TestAudioLevel verifies header-extension extraction.
 func TestAudioLevel(t *testing.T) {
 	pkt := makeAudioPacket(t, 1, 33)
@@ -393,7 +419,7 @@ func TestAttachPeer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 
 	r := NewRouter(nil)
 	attachFakePeer(t, e, r, "c1")
@@ -436,7 +462,7 @@ func TestPublisherTrackMSID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 
 	for _, id := range []string{"a", "b", "c"} {
@@ -475,7 +501,7 @@ func TestTrackSlotMSID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 
 	for _, id := range []string{"a", "b"} {
@@ -519,7 +545,7 @@ func TestForwardRTPUnknownSlotDropped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 
 	for _, id := range []string{"a", "b"} {
@@ -543,7 +569,7 @@ func TestReadLoopSlotClaimedOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 
 	attachFakePeer(t, e, r, "b")
@@ -577,7 +603,7 @@ func TestEnsurePublishersEchoSelfPair(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 	r.SetEchoChannel(15)
 
@@ -614,7 +640,7 @@ func TestVoiceHandleOffer(t *testing.T) {
 	}
 	r := NewRouter(nil)
 	v := NewVoice(e, r, testLogger())
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 
 	// Build a genuine offer with a client-side peer connection (using the
 	// same codec set as the engine so negotiation can succeed).
@@ -626,7 +652,7 @@ func TestVoiceHandleOffer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client NewPeerConnection: %v", err)
 	}
-	defer clientPC.Close()
+	defer func() { _ = clientPC.Close() }()
 	if _, err := clientPC.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio); err != nil {
 		t.Fatalf("AddTransceiverFromKind: %v", err)
 	}
@@ -681,7 +707,7 @@ func TestVoiceHandleOfferKeepsChannel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 	v := NewVoice(e, r, testLogger())
 
@@ -698,7 +724,7 @@ func TestVoiceHandleOfferKeepsChannel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client NewPeerConnection: %v", err)
 	}
-	defer clientPC.Close()
+	defer func() { _ = clientPC.Close() }()
 	if _, err := clientPC.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio); err != nil {
 		t.Fatalf("AddTransceiverFromKind: %v", err)
 	}
@@ -749,7 +775,7 @@ func TestVoiceHandleOfferConcurrentMove(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 	v := NewVoice(e, r, testLogger())
 
@@ -798,7 +824,7 @@ func TestVoiceNoPeer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	v := NewVoice(e, NewRouter(nil), testLogger())
 
 	if err := v.HandleAnswer("ghost", "sdp"); err != ErrNoPeer {

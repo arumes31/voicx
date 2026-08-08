@@ -36,7 +36,7 @@ func editForInvalidation(t *testing.T, edit netproto.ChannelEdit) bool {
 	env.state.AddChannel(&state.Channel{ChannelID: 2, Name: "Parent", ChannelType: 2})
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	send(t, conn, netproto.MsgChannelEdit, edit)
 	readEventOfType(t, conn, "channel_updated")
 	return invalidatedAll(env)

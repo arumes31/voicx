@@ -4,6 +4,9 @@
 // the shared namespace (window.__voicx) populated by main.js.
 import { GridCompositor } from "./grid-compositor.js";
 
+import { isCurrentServerDialog, mountServerDialog } from "./modal.js";
+import { setSafeImage } from "./safe-media.js";
+
 const V = () => window.__voicx;
 
 // (70/73) Track-identity contract with the router: a publisher's media arrives
@@ -207,7 +210,7 @@ function applyTileIdentity(t) {
     av.dataset.uid = uid;
     const url = uid && state.avatars.get(uid);
     if (url) {
-        av.innerHTML = `<img src="${url}" alt="">`;
+        setSafeImage(av, url);
     } else {
         av.textContent = initials(name || "?");
         if (uid) fetchAvatar(uid);
@@ -524,6 +527,7 @@ export async function setLowBandwidth(on, persist) {
     lowBandwidth = on;
     const { $ } = V();
     $("voice-lowbw").classList.toggle("active", on);
+    $("voice-lowbw").setAttribute("aria-pressed", String(on));
     gridEl().classList.toggle("lowbw", on);
     lastSentQuality = ""; // force re-push with the new effective quality
     pushQuality();
@@ -548,13 +552,16 @@ export async function setLowBandwidth(on, persist) {
 // on, or null. Matches by transceiver so it never confuses the share-audio
 // sender, and skips recvonly ones: with no camera there is no send transceiver
 // at all and replaceTrack on a server-side recvonly would publish nothing.
-function videoSender() {
-    const { state } = V();
-    if (!state.pc) return null;
-    const t = state.pc.getTransceivers().find((t) =>
+function videoSenderFor(pc) {
+    if (!pc) return null;
+    const t = pc.getTransceivers().find((t) =>
         (t.receiver.track?.kind === "video" || t.sender.track?.kind === "video") &&
         (t.direction === "sendrecv" || t.direction === "sendonly"));
     return t ? t.sender : null;
+}
+
+function videoSender() {
+    return videoSenderFor(V().state.pc);
 }
 
 // applySendCaps caps (or restores) the outgoing video bitrate: 150 kbps on a
@@ -647,13 +654,14 @@ function openShareDialog() {
     overlay.querySelector(".dlg-cancel").onclick = () => overlay.remove();
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
     overlay.querySelector(".dlg-ok").onclick = async () => {
+        if (!isCurrentServerDialog(overlay)) return;
         const surface = overlay.querySelector('input[name="shsrc"]:checked').value;
         const preset = overlay.querySelector(".sh-preset").value;
         const withAudio = overlay.querySelector(".sh-audio").checked;
         overlay.remove();
         await startShare({ surface, preset, withAudio });
     };
-    document.body.appendChild(overlay);
+    mountServerDialog(overlay);
     if (!regionSupported) {
         // (71) the radio is disabled, so the dialog has to say why and what to
         // do instead — a disabled control with no explanation reads as a bug.
@@ -671,6 +679,10 @@ function openShareDialog() {
 // audio (70), and applies the quality preset (72).
 async function startShare({ surface, preset, withAudio }) {
     const { state } = V();
+    const generation = state.serverGeneration;
+    const peerConnection = state.pc;
+    const current = () => state.serverGeneration === generation && state.pc === peerConnection;
+    const discardDisplay = (stream) => stream?.getTracks().forEach((track) => track.stop());
     const p = SHARE_PRESETS[preset] || SHARE_PRESETS.balanced;
     const video = {
         width: { ideal: p.width },
@@ -690,6 +702,7 @@ async function startShare({ surface, preset, withAudio }) {
     try {
         display = await navigator.mediaDevices.getDisplayMedia(gdm);
     } catch (e) {
+        if (!current()) return;
         if (withAudio) {
             // (70) WebView2 may refuse display audio (works on Windows for
             // screen/tab shares) — retry video-only and say so.
@@ -698,6 +711,7 @@ async function startShare({ surface, preset, withAudio }) {
                 display = await navigator.mediaDevices.getDisplayMedia(Object.assign({}, gdm, { audio: false }));
                 withAudio = false;
             } catch (e2) {
+                if (!current()) return;
                 V().sysMsg("screen capture failed: " + (e2.message || e2.name));
                 return;
             }
@@ -706,34 +720,47 @@ async function startShare({ surface, preset, withAudio }) {
             return;
         }
     }
+    if (!current()) {
+        discardDisplay(display);
+        return;
+    }
     const screenTrack = display.getVideoTracks()[0];
     if (!screenTrack) {
+        discardDisplay(display);
         V().sysMsg("screen capture produced no video track");
         return;
     }
     screenTrack.contentHint = preset === "text" ? "detail" : "motion";
 
     if (surface === "region") {
-        const ok = await pickRegionAndCrop(screenTrack);
-        if (!ok) {
-            display.getTracks().forEach((t) => t.stop());
+        const ok = await pickRegionAndCrop(screenTrack, current);
+        if (!ok || !current()) {
+            discardDisplay(display);
             return; // cancelled
         }
     }
 
     state.shareStream = display;
-    let vs = videoSender();
-    if (!vs && state.pc) {
+    let vs = videoSenderFor(peerConnection);
+    if (!vs && peerConnection) {
         // Cameraless machine: startVoice never added a send transceiver, so
         // the share needs its own one plus a renegotiation. addTrack would
         // recycle one of the server's recvonly m-lines and publish on a
         // subscriber slot, so take a dedicated sendonly transceiver.
         let tr = null;
         try {
-            tr = state.pc.addTransceiver(screenTrack, { direction: "sendonly", streams: [display] });
+            tr = peerConnection.addTransceiver(screenTrack, { direction: "sendonly", streams: [display] });
             vs = tr.sender;
-            await renegotiate();
+            await renegotiate(peerConnection, generation);
+            if (!current()) {
+                discardDisplay(display);
+                return;
+            }
         } catch (e) {
+            if (!current()) {
+                discardDisplay(display);
+                return;
+            }
             V().sysMsg("publishing screen share failed: " + (e.message || e.name));
             // a rollback only drops transceivers created by applying a remote
             // description, so this one survives with its direction flip and
@@ -748,7 +775,15 @@ async function startShare({ surface, preset, withAudio }) {
     } else if (vs) {
         try {
             await vs.replaceTrack(screenTrack);
+            if (!current()) {
+                discardDisplay(display);
+                return;
+            }
         } catch (e) {
+            if (!current()) {
+                discardDisplay(display);
+                return;
+            }
             V().sysMsg("publishing screen share failed: " + (e.message || e.name));
             display.getTracks().forEach((t) => t.stop());
             state.shareStream = null;
@@ -777,18 +812,26 @@ async function startShare({ surface, preset, withAudio }) {
     // (70) merge display audio as a second published audio track (the server
     // fans out every publisher audio track) + renegotiate.
     const displayAudio = withAudio ? display.getAudioTracks()[0] : null;
-    if (displayAudio && state.pc) {
+    if (displayAudio && peerConnection) {
         if (!state.shareAudioTransceiver) {
             let tr = null;
             try {
                 // addTrack would recycle one of the server's recvonly audio
                 // m-lines and publish the share on a subscriber slot, so take a
                 // dedicated sendonly transceiver.
-                tr = state.pc.addTransceiver(displayAudio, { direction: "sendonly", streams: [display] });
+                tr = peerConnection.addTransceiver(displayAudio, { direction: "sendonly", streams: [display] });
                 state.shareAudioTransceiver = tr;
                 state.shareAudioSender = tr.sender;
-                await renegotiate();
+                await renegotiate(peerConnection, generation);
+                if (!current()) {
+                    discardDisplay(display);
+                    return;
+                }
             } catch (e) {
+                if (!current()) {
+                    discardDisplay(display);
+                    return;
+                }
                 V().sysMsg("publishing share audio failed: " + (e.message || e.name));
                 // a rollback keeps this transceiver, so without the stop() the
                 // dead track is re-offered on the next renegotiation.
@@ -801,21 +844,38 @@ async function startShare({ surface, preset, withAudio }) {
             try {
                 state.shareAudioSender = state.shareAudioTransceiver.sender;
                 await state.shareAudioSender.replaceTrack(displayAudio);
+                if (!current()) {
+                    discardDisplay(display);
+                    return;
+                }
             } catch (e) {
+                if (!current()) {
+                    discardDisplay(display);
+                    return;
+                }
                 V().sysMsg("publishing share audio failed: " + (e.message || e.name));
                 displayAudio.stop();
             }
         }
     }
 
+    if (!current()) {
+        discardDisplay(display);
+        return;
+    }
     state.screenSharing = true;
     const shareErr = await window.go.main.App.SetScreenShareQuality(true, p.height);
+    if (!current()) {
+        discardDisplay(display);
+        return;
+    }
     if (shareErr) {
         V().sysMsg("screen share permission failed: " + shareErr);
         await doStopShare();
         return;
     }
     document.getElementById("voice-screen").classList.add("active");
+    document.getElementById("voice-screen").setAttribute("aria-pressed", "true");
 }
 
 // pickRegionAndCrop shows a draggable/resizable box over the app; on confirm
@@ -824,8 +884,11 @@ async function startShare({ surface, preset, withAudio }) {
 // so removing it would blank the share. It is torn down in doStopShare.
 // The crop itself lives on the MediaStreamTrack, so it survives the
 // renegotiation that publishes the share (and any later one).
-function pickRegionAndCrop(track) {
+let cancelPendingRegion = null;
+
+function pickRegionAndCrop(track, isCurrent = () => true) {
     return new Promise((resolve) => {
+        cancelPendingRegion?.();
         const box = document.createElement("div");
         box.className = "region-box";
         box.innerHTML = `
@@ -833,6 +896,18 @@ function pickRegionAndCrop(track) {
             <button class="region-ok">Crop &amp; share</button>
             <button class="region-cancel">Cancel</button>`;
         document.body.appendChild(box);
+        let settled = false;
+        const finish = (value) => {
+            if (settled) return;
+            settled = true;
+            if (cancelPendingRegion === cancel) cancelPendingRegion = null;
+            resolve(value);
+        };
+        const cancel = () => {
+            box.remove();
+            finish(false);
+        };
+        cancelPendingRegion = cancel;
 
         // Drag by the title bar; resize via CSS resize handle.
         const title = box.querySelector(".region-title");
@@ -851,14 +926,19 @@ function pickRegionAndCrop(track) {
             document.addEventListener("pointerup", up);
         };
 
-        box.querySelector(".region-cancel").onclick = () => {
-            box.remove();
-            resolve(false);
-        };
+        box.querySelector(".region-cancel").onclick = cancel;
         box.querySelector(".region-ok").onclick = async () => {
+            if (settled || !isCurrent()) {
+                cancel();
+                return;
+            }
             try {
                 const target = await CropTarget.fromElement(box);
                 await track.cropTo(target);
+                if (settled || !isCurrent()) {
+                    cancel();
+                    return;
+                }
                 // the box is inside its own crop rect from now on, so it has to
                 // stop painting anything: .cropping leaves a transparent hole
                 // and marks the region with an outline, which is drawn outside
@@ -866,11 +946,10 @@ function pickRegionAndCrop(track) {
                 box.innerHTML = "";
                 box.classList.add("cropping");
                 V().state.regionBox = box;
-                resolve(true);
+                finish(true);
             } catch (e) {
-                V().sysMsg("region capture failed: " + (e.message || e.name));
-                box.remove();
-                resolve(false);
+                if (!settled && isCurrent()) V().sysMsg("region capture failed: " + (e.message || e.name));
+                cancel();
             }
         };
     });
@@ -878,6 +957,9 @@ function pickRegionAndCrop(track) {
 
 // clearRegionBox drops the persistent crop target (71).
 export function clearRegionBox() {
+    const cancel = cancelPendingRegion;
+    cancelPendingRegion = null;
+    cancel?.();
     const { state } = V();
     if (state.regionBox) {
         state.regionBox.remove();
@@ -918,12 +1000,16 @@ async function videoIsBeingDecoded() {
 // confirmStopPublish (85) asks before cutting a stream others receive; it
 // stops straight away when nobody in the channel can be receiving it.
 async function confirmStopPublish({ heading, what, stopLabel, keepLabel, onStop }) {
+    const { state } = V();
+    const generation = state.serverGeneration;
+    const peerConnection = state.pc;
     const n = receiverCount();
     if (n === 0) {
         onStop();
         return;
     }
     const decoded = await videoIsBeingDecoded();
+    if (state.serverGeneration !== generation || state.pc !== peerConnection) return;
     const users = n + " user" + (n === 1 ? "" : "s");
     const text = decoded
         ? `${users} in your channel — at least one is decoding your ${what} right now.`
@@ -945,7 +1031,7 @@ async function confirmStopPublish({ heading, what, stopLabel, keepLabel, onStop 
     };
     overlay.querySelector(".dlg-cancel").onclick = () => overlay.remove();
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-    document.body.appendChild(overlay);
+    mountServerDialog(overlay);
 }
 
 function confirmStopShare() {
@@ -964,6 +1050,7 @@ async function doStopShare() {
     if (!state.screenSharing) return;
     state.screenSharing = false;
     document.getElementById("voice-screen").classList.remove("active");
+    document.getElementById("voice-screen").setAttribute("aria-pressed", "false");
     await window.go.main.App.SetScreenShare(false);
 
     if (state.shareAudioSender && state.pc) {
@@ -1007,6 +1094,7 @@ function syncCameraButton() {
     if (!btn) return;
     btn.disabled = !cam;
     btn.classList.toggle("active", !!cam && !cameraOff);
+    btn.setAttribute("aria-pressed", String(!!cam && !cameraOff));
     btn.title = !cam ? "No camera in this session"
         : cameraOff ? "Camera off — click to turn on" : "Camera on — click to turn off";
     $("local-video").classList.toggle("hidden", !cam || cameraOff);
@@ -1015,6 +1103,7 @@ function syncCameraButton() {
 // resetCameraState clears the toggle for a fresh (or ended) voice session.
 export function resetCameraState() {
     cameraOff = false;
+    sharePresetBitrate = 0;
     syncCameraButton();
 }
 
@@ -1087,15 +1176,23 @@ export function trackSlots() {
 // share track); the server treats re-offers idempotently. A failed round is
 // rolled back to "stable": without that the pc stays in have-local-offer and
 // every later renegotiation dies with InvalidStateError.
-async function renegotiate() {
-    const { state } = V();
-    const offer = await state.pc.createOffer();
-    await state.pc.setLocalDescription(offer);
+async function renegotiate(peerConnection = V().state.pc, generation = V().state.serverGeneration) {
+    const current = () => V().state.pc === peerConnection && V().state.serverGeneration === generation;
+    const ensureCurrent = () => {
+        if (!current()) throw new DOMException("server session changed", "AbortError");
+    };
     try {
+        ensureCurrent();
+        const offer = await peerConnection.createOffer();
+        ensureCurrent();
+        await peerConnection.setLocalDescription(offer);
+        ensureCurrent();
         const answerSDP = await window.go.main.App.WebRTCOffer(offer.sdp, trackSlots());
-        await state.pc.setRemoteDescription({ type: "answer", sdp: answerSDP });
+        ensureCurrent();
+        await peerConnection.setRemoteDescription({ type: "answer", sdp: answerSDP });
+        ensureCurrent();
     } catch (e) {
-        await state.pc.setLocalDescription({ type: "rollback" }).catch(() => {});
+        await peerConnection?.setLocalDescription({ type: "rollback" }).catch(() => {});
         throw e;
     }
 }

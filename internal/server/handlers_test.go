@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -145,12 +146,13 @@ func (f *fakeAuth) LookupActiveBan(_ context.Context, uniqueID, ip string) (*aut
 type fakeChannels struct {
 	state *state.Manager
 
-	mu      sync.Mutex
-	nextID  int64
-	created []channels.ChannelSpec
-	deleted []int64
-	joinLog []int64
-	leftLog []int64
+	mu            sync.Mutex
+	nextID        int64
+	created       []channels.ChannelSpec
+	deleted       []int64
+	joinLog       []int64
+	leftLog       []int64
+	deleteAttempt chan struct{}
 }
 
 func (f *fakeChannels) CreateChannel(_ context.Context, spec channels.ChannelSpec) (int64, error) {
@@ -183,48 +185,129 @@ func (f *fakeChannels) CreateChannel(_ context.Context, spec channels.ChannelSpe
 	return f.nextID, nil
 }
 
-func (f *fakeChannels) DeleteChannel(_ context.Context, channelID int64) error {
+func deleteFakeChannelSubtree(sm *state.Manager, channelID int64) (channels.DeleteResult, error) {
+	if _, ok := sm.GetChannel(channelID); !ok {
+		return channels.DeleteResult{}, channels.ErrChannelNotFound
+	}
+	children := make(map[int64][]int64)
+	for _, channel := range sm.ListChannels() {
+		children[channel.ParentID] = append(children[channel.ParentID], channel.ChannelID)
+	}
+	queue := []int64{channelID}
+	seen := make(map[int64]struct{})
+	var ids []int64
+	for len(queue) > 0 {
+		id := queue[0]
+		queue = queue[1:]
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+		queue = append(queue, children[id]...)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	removed := sm.RemoveChannels(ids)
+	members := make([]channels.DeletedMember, 0, len(removed.Members))
+	for _, member := range removed.Members {
+		members = append(members, channels.DeletedMember{
+			ClientID:  member.ClientID,
+			ChannelID: member.ChannelID,
+		})
+	}
+	return channels.DeleteResult{
+		RootID:        channelID,
+		ChannelIDs:    ids,
+		SubscriberIDs: removed.SubscriberIDs,
+		Members:       members,
+	}, nil
+}
+
+func (f *fakeChannels) DeleteChannelSubtree(_ context.Context, channelID int64) (channels.DeleteResult, error) {
+	if f.deleteAttempt != nil {
+		f.deleteAttempt <- struct{}{}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	result, err := deleteFakeChannelSubtree(f.state, channelID)
+	if err != nil {
+		return channels.DeleteResult{}, err
+	}
+	f.deleted = append(f.deleted, channelID)
+	return result, nil
+}
+
+func (f *fakeChannels) MoveClientWithLifecycle(clientID string, channelID int64, afterMove func(int64)) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	oldChannelID, _, ok := f.state.ClientChannelState(clientID)
+	if !ok {
+		return 0, state.ErrClientNotFound
+	}
+	if err := f.state.MoveClient(clientID, channelID); err != nil {
+		return oldChannelID, err
+	}
+	if oldChannelID != 0 && oldChannelID != channelID {
+		f.leftLog = append(f.leftLog, oldChannelID)
+	}
+	f.joinLog = append(f.joinLog, channelID)
+	if afterMove != nil {
+		afterMove(oldChannelID)
+	}
+	return oldChannelID, nil
+}
+
+func (f *fakeChannels) LeaveClient(clientID string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	oldChannelID, _, ok := f.state.ClientChannelState(clientID)
+	if !ok {
+		return 0, state.ErrClientNotFound
+	}
+	if err := f.state.LeaveChannel(clientID); err != nil {
+		return oldChannelID, err
+	}
+	if oldChannelID != 0 {
+		f.leftLog = append(f.leftLog, oldChannelID)
+	}
+	return oldChannelID, nil
+}
+
+func (f *fakeChannels) RemoveClient(clientID string) (*state.Client, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	removed, ok := f.state.RemoveClient(clientID)
+	if !ok {
+		return nil, state.ErrClientNotFound
+	}
+	if removed.ChannelID != 0 {
+		f.leftLog = append(f.leftLog, removed.ChannelID)
+	}
+	return removed, nil
+}
+
+func (f *fakeChannels) WithChannelLifecycle(channelID int64, operation func() error) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.state.GetChannel(channelID); !ok {
 		return channels.ErrChannelNotFound
 	}
-	f.state.RemoveChannel(channelID)
-	f.deleted = append(f.deleted, channelID)
-	return nil
-}
-
-func (f *fakeChannels) OnClientJoinedChannel(channelID int64) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.joinLog = append(f.joinLog, channelID)
+	return operation()
 }
 
 // UpdateChannel applies the non-nil fields of upd to the in-memory channel.
 func (f *fakeChannels) UpdateChannel(_ context.Context, channelID int64, upd channels.ChannelUpdate) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	ch, ok := f.state.GetChannel(channelID)
-	if !ok {
+	if !f.state.UpdateChannel(channelID, state.ChannelUpdate{
+		Topic:       upd.Topic,
+		MaxClients:  upd.MaxClients,
+		OpusBitrate: upd.OpusBitrate,
+		OpusFEC:     upd.OpusFEC,
+		OpusDTX:     upd.OpusDTX,
+		OpusStereo:  upd.OpusStereo,
+	}) {
 		return channels.ErrChannelNotFound
-	}
-	if upd.Topic != nil {
-		ch.Topic = *upd.Topic
-	}
-	if upd.MaxClients != nil {
-		ch.MaxClients = *upd.MaxClients
-	}
-	if upd.OpusBitrate != nil {
-		ch.OpusBitrate = *upd.OpusBitrate
-	}
-	if upd.OpusFEC != nil {
-		ch.OpusFEC = *upd.OpusFEC
-	}
-	if upd.OpusDTX != nil {
-		ch.OpusDTX = *upd.OpusDTX
-	}
-	if upd.OpusStereo != nil {
-		ch.OpusStereo = *upd.OpusStereo
 	}
 	return nil
 }
@@ -1064,7 +1147,7 @@ func TestRequiresAuthentication(t *testing.T) {
 	defer env.stop()
 
 	conn := dialRetry(t, env.addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgChatSend, netproto.ChatSend{Text: "hello"})
 	f := readOfType(t, conn, netproto.MsgError)
@@ -1087,7 +1170,7 @@ func TestAuthenticateBadCredentials(t *testing.T) {
 	defer env.stop()
 
 	conn := dialRetry(t, env.addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: "user-uid", Password: "wrong"})
 	f := readOfType(t, conn, netproto.MsgAuthResponse)
@@ -1119,7 +1202,7 @@ func TestAuthenticateBannedUniqueID(t *testing.T) {
 	env.auth.bans["user-uid"] = &auth.Ban{ID: 1, Type: 1, Value: "user-uid", Reason: "spam"}
 
 	conn := dialRetry(t, env.addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: "user-uid", Password: "pw"})
 	f := readOfType(t, conn, netproto.MsgAuthResponse)
@@ -1145,7 +1228,7 @@ func TestAuthenticateBannedIP(t *testing.T) {
 	env.auth.bans["127.0.0.1"] = &auth.Ban{ID: 2, Type: 0, Value: "127.0.0.1"}
 
 	conn := dialRetry(t, env.addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: "user-uid", Password: "pw"})
 	f := readOfType(t, conn, netproto.MsgAuthResponse)
@@ -1191,7 +1274,7 @@ func TestCreateChannelPermissionDenied(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "nope", Type: 0})
 	f := readOfType(t, conn, netproto.MsgError)
@@ -1215,7 +1298,7 @@ func TestCreateChannelGranted(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Temp", Type: 0})
 	f := readOfType(t, conn, netproto.MsgChannelList)
@@ -1238,9 +1321,9 @@ func TestCreateChannelAsAdminBroadcasts(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Lobby", Type: 2})
 	readOfType(t, adminConn, netproto.MsgChannelList)
@@ -1262,9 +1345,9 @@ func TestJoinChannelAndChat(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	// Admin creates a permanent channel.
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Lobby", Type: 2})
@@ -1300,9 +1383,9 @@ func TestDirectMessage(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, userID := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	send(t, adminConn, netproto.MsgChatSend, netproto.ChatSend{ToClientID: userID, Text: "psst"})
 
@@ -1323,9 +1406,9 @@ func TestMoveOtherClientDenied(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, userID := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Lobby", Type: 2})
 	readOfType(t, adminConn, netproto.MsgChannelList)
@@ -1348,9 +1431,9 @@ func TestKickFromChannel(t *testing.T) {
 	defer env.stop()
 
 	adminConn, adminID := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, userID := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Lobby", Type: 2})
 	readOfType(t, adminConn, netproto.MsgChannelList)
@@ -1387,18 +1470,25 @@ func TestKickFromChannel(t *testing.T) {
 	})
 }
 
-// TestDeleteChannel verifies the admin delete flow broadcasts channel_deleted.
+// TestDeleteChannel verifies the admin delete flow broadcasts and tears down
+// the complete cascaded subtree, including voice membership.
 func TestDeleteChannel(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
-	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = adminConn.Close() }()
+	userConn, userID := dialAuthed(t, env.addr, "user-uid")
+	defer func() { _ = userConn.Close() }()
 
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Lobby", Type: 2})
 	readOfType(t, adminConn, netproto.MsgChannelList)
+	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Child", ParentID: 1, Type: 2})
+	readOfType(t, adminConn, netproto.MsgChannelList)
+	send(t, userConn, netproto.MsgJoinChannel, netproto.JoinChannel{ChannelID: 2})
+	waitFor(t, "user in child channel", func() bool {
+		return len(env.state.ChannelMembers(2)) == 1
+	})
 
 	send(t, adminConn, netproto.MsgDeleteChannel, netproto.DeleteChannel{ChannelID: 1})
 	data := readEventOfType(t, userConn, eventChannelDeleted)
@@ -1406,11 +1496,155 @@ func TestDeleteChannel(t *testing.T) {
 	if err := json.Unmarshal(data, &ce); err != nil {
 		t.Fatalf("unmarshal channel event: %v", err)
 	}
-	if ce.ChannelID != 1 {
-		t.Fatalf("deleted channel id = %d, want 1", ce.ChannelID)
+	if ce.ChannelID != 1 || len(ce.ChannelIDs) != 2 || ce.ChannelIDs[0] != 1 || ce.ChannelIDs[1] != 2 {
+		t.Fatalf("deleted channel event = %+v, want root 1 and IDs [1 2]", ce)
 	}
 	if _, ok := env.state.GetChannel(1); ok {
 		t.Fatal("channel 1 still in state after delete")
+	}
+	if _, ok := env.state.GetChannel(2); ok {
+		t.Fatal("channel 2 still in state after cascaded delete")
+	}
+	channelID, _, ok := env.state.ClientChannelState(userID)
+	if !ok || channelID != 0 {
+		t.Fatalf("displaced user state = (%d, %v), want channel 0", channelID, ok)
+	}
+	env.voice.mu.Lock()
+	leaves := append([][2]any(nil), env.voice.leaves...)
+	env.voice.mu.Unlock()
+	if len(leaves) == 0 || leaves[len(leaves)-1] != [2]any{userID, int64(2)} {
+		t.Fatalf("voice leaves = %v, want displaced user from child 2", leaves)
+	}
+	var stopped []int64
+	var channelsMarked []int64
+	var channelsRemoved []int64
+	waitFor(t, "subtree resource cleanup", func() bool {
+		env.recorder.mu.Lock()
+		stopped = append([]int64(nil), env.recorder.stopped...)
+		env.recorder.mu.Unlock()
+		env.ft.mu.Lock()
+		channelsMarked = append([]int64(nil), env.ft.channelsMarked...)
+		channelsRemoved = append([]int64(nil), env.ft.channelsRemoved...)
+		env.ft.mu.Unlock()
+		return len(stopped) == 2 && len(channelsMarked) == 2 && len(channelsRemoved) == 2
+	})
+	if stopped[0] != 1 || stopped[1] != 2 {
+		t.Fatalf("stopped recordings = %v, want [1 2]", stopped)
+	}
+	if len(channelsMarked) != 2 || channelsMarked[0] != 1 || channelsMarked[1] != 2 {
+		t.Fatalf("tombstoned file channels = %v, want [1 2]", channelsMarked)
+	}
+	if len(channelsRemoved) != 2 || channelsRemoved[0] != 1 || channelsRemoved[1] != 2 {
+		t.Fatalf("removed file channels = %v, want [1 2]", channelsRemoved)
+	}
+}
+
+func TestApplyChannelDeletionTombstonesSubtreeBeforeRecorderDrain(t *testing.T) {
+	stopEntered := make(chan struct{}, 2)
+	stopRelease := make(chan struct{})
+	rec := &fakeRecorder{stopEntered: stopEntered, stopRelease: stopRelease}
+	ft := &fakeFileTransfer{}
+	srv := New(
+		&config.Config{FileRoot: t.TempDir()},
+		testLogger(),
+		&Deps{Recorder: rec, FileTransfer: ft},
+	)
+
+	done := make(chan struct{})
+	go func() {
+		srv.ApplyChannelDeletion(channels.DeleteResult{RootID: 7, ChannelIDs: []int64{7, 8}})
+		close(done)
+	}()
+
+	for range 2 {
+		select {
+		case <-stopEntered:
+		case <-time.After(waitDeadline):
+			t.Fatal("concurrent recorder stop was not reached")
+		}
+	}
+	rec.mu.Lock()
+	maxStops := rec.stopMax
+	rec.mu.Unlock()
+	if maxStops != 2 {
+		t.Fatalf("concurrent recorder stops = %d, want 2", maxStops)
+	}
+	ft.mu.Lock()
+	marked := append([]int64(nil), ft.channelsMarked...)
+	removed := append([]int64(nil), ft.channelsRemoved...)
+	ft.mu.Unlock()
+	if len(marked) != 2 || marked[0] != 7 || marked[1] != 8 {
+		t.Fatalf("tombstones before recorder drain = %v, want [7 8]", marked)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("physical cleanup ran before recorder drain: %v", removed)
+	}
+
+	close(stopRelease)
+	select {
+	case <-done:
+	case <-time.After(waitDeadline):
+		t.Fatal("channel cleanup did not finish after recorder release")
+	}
+}
+
+func TestApplyChannelDeletionTombstonesEntireSubtreeBeforeBroadcast(t *testing.T) {
+	sm := state.New(testLogger())
+	bc := broadcast.New(testLogger(), sm)
+	defer bc.Close()
+	events, err := bc.Register("observer")
+	if err != nil {
+		t.Fatalf("register observer: %v", err)
+	}
+
+	entered := make(chan int64, 2)
+	releaseLast := make(chan struct{})
+	ft := &fakeFileTransfer{}
+	ft.tombstoneHook = func(channelID int64) {
+		entered <- channelID
+		if channelID == 8 {
+			<-releaseLast
+		}
+	}
+	srv := New(
+		&config.Config{FileRoot: t.TempDir()},
+		testLogger(),
+		&Deps{State: sm, Broadcast: bc, FileTransfer: ft},
+	)
+
+	done := make(chan struct{})
+	go func() {
+		srv.ApplyChannelDeletion(channels.DeleteResult{RootID: 7, ChannelIDs: []int64{7, 8}})
+		close(done)
+	}()
+	for _, want := range []int64{7, 8} {
+		select {
+		case got := <-entered:
+			if got != want {
+				t.Fatalf("tombstone order = %d, want %d", got, want)
+			}
+		case <-events:
+			t.Fatal("channel deletion was broadcast before the full subtree was tombstoned")
+		case <-time.After(waitDeadline):
+			t.Fatalf("tombstone %d was not reached", want)
+		}
+	}
+	select {
+	case <-events:
+		t.Fatal("channel deletion was broadcast while the last tombstone was blocked")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseLast)
+	select {
+	case <-events:
+	case <-time.After(waitDeadline):
+		t.Fatal("channel deletion was not broadcast after tombstoning completed")
+	}
+	select {
+	case <-done:
+	case <-time.After(waitDeadline):
+		t.Fatal("channel deletion lifecycle did not finish")
 	}
 }
 
@@ -1420,7 +1654,7 @@ func TestJoinUnknownChannel(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgJoinChannel, netproto.JoinChannel{ChannelID: 999})
 	f := readOfType(t, conn, netproto.MsgError)
@@ -1439,7 +1673,7 @@ func TestSendErrorOnMalformed(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if err := netproto.WriteFrame(conn, &netproto.Frame{
 		Type:    uint16(netproto.MsgCreateChannel),
@@ -1482,7 +1716,7 @@ func TestChallengeAuthHandshake(t *testing.T) {
 	env.auth.users[uid] = &auth.User{ID: 3, UniqueID: uid, Nickname: "keyuser"}
 
 	conn := dialRetry(t, env.addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Round 1: authenticate without a password -> challenge.
 	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: uid})
@@ -1530,7 +1764,7 @@ func TestChallengeAuthBadSignature(t *testing.T) {
 	env.auth.users[uid] = &auth.User{ID: 3, UniqueID: uid, Nickname: "keyuser"}
 
 	conn := dialRetry(t, env.addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: uid})
 	readOfType(t, conn, netproto.MsgAuthChallenge)
@@ -1566,9 +1800,9 @@ func TestJoinChannelPassword(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, userID := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Vault", Type: 2, Password: "chanpw"})
 	readOfType(t, adminConn, netproto.MsgChannelList)
@@ -1608,9 +1842,9 @@ func TestJoinChannelIgnorePassword(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, userID := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "Vault", Type: 2, Password: "chanpw"})
 	readOfType(t, adminConn, netproto.MsgChannelList)
@@ -1634,9 +1868,9 @@ func TestJoinChannelNeededPower(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "HQ", Type: 2, NeededJoinPower: 50})
 	readOfType(t, adminConn, netproto.MsgChannelList)
@@ -1660,9 +1894,9 @@ func TestJoinChannelNeededPowerGranted(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, userID := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	send(t, adminConn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "HQ", Type: 2, NeededJoinPower: 50})
 	readOfType(t, adminConn, netproto.MsgChannelList)
@@ -1689,7 +1923,7 @@ func TestCreateChannelNeededPowerCap(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgCreateChannel, netproto.CreateChannel{Name: "TooHigh", Type: 0, NeededJoinPower: 50})
 	f := readOfType(t, conn, netproto.MsgError)
@@ -1723,7 +1957,7 @@ func TestDirectMessageSpooledOffline(t *testing.T) {
 	defer env.stop()
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 
 	send(t, adminConn, netproto.MsgChatSend, netproto.ChatSend{
 		ToUniqueID: "user-uid", Text: "see you later", Enc: true,
@@ -1758,7 +1992,7 @@ func TestSpooledMessagesDeliveredOnLogin(t *testing.T) {
 	}
 
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	data := readEventOfType(t, userConn, eventChat)
 	var chat netproto.ChatBroadcast

@@ -40,7 +40,8 @@ func startWS(t *testing.T, bus *Bus) string {
 // dialWS opens an authenticated event-stream connection.
 func dialWS(t *testing.T, url, user, password string) *websocket.Conn {
 	t.Helper()
-	cfg, err := websocket.NewConfig(url, "http://localhost")
+	origin := "http" + strings.TrimPrefix(url, "ws")
+	cfg, err := websocket.NewConfig(url, origin)
 	if err != nil {
 		t.Fatalf("ws config: %v", err)
 	}

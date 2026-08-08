@@ -16,7 +16,7 @@ var updateGolden = flag.Bool("update-golden", false, "rewrite ServerQuery golden
 func TestResponseGolden(t *testing.T) {
 	addr, _ := startQueryServer(t, newFakeBackend())
 	conn, reader := dialQuery(t, addr)
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	loginOK(t, conn, reader)
 
 	var got strings.Builder

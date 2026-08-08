@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -122,6 +123,24 @@ func pollCondition(t *testing.T, timeout time.Duration, fn func() bool, msg stri
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal(msg)
+}
+
+func activeCleanupToken(t *testing.T, mgr *ChannelManager, channelID int64) *cleanupTimer {
+	t.Helper()
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	token := mgr.timers[channelID]
+	if token == nil {
+		t.Fatalf("channel %d has no active cleanup token", channelID)
+	}
+	return token
+}
+
+func hasCleanupTimer(mgr *ChannelManager, channelID int64) bool {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	_, ok := mgr.timers[channelID]
+	return ok
 }
 
 // TestCreateChannel_AllTypes verifies that CreateChannel inserts each channel
@@ -263,6 +282,146 @@ func TestDeleteChannel(t *testing.T) {
 	}
 }
 
+func TestDeleteChannel_RemovesEntireSubtreeFromStateAndTimers(t *testing.T) {
+	mgr, s, sm := testEnv(t)
+	mgr.SetCleanupDelay(time.Hour)
+	userID := createTestUser(t, s)
+
+	create := func(name string, parentID int64, channelType ChannelType) int64 {
+		t.Helper()
+		id, err := mgr.CreateChannel(context.Background(), ChannelSpec{
+			Name:      name,
+			ParentID:  parentID,
+			Type:      channelType,
+			CreatedBy: userID,
+		})
+		if err != nil {
+			t.Fatalf("CreateChannel(%q): %v", name, err)
+		}
+		return id
+	}
+
+	rootID := create("subtree-root", 0, ChannelTypePermanent)
+	childID := create("subtree-child", rootID, ChannelTypePermanent)
+	grandchildID := create("subtree-grandchild", childID, ChannelTypePermanent)
+	temporaryID := create("subtree-temporary", childID, ChannelTypeTemporary)
+
+	sm.AddClient(&state.Client{ClientID: "subtree-client-a"})
+	sm.AddClient(&state.Client{ClientID: "subtree-client-b"})
+	if _, err := mgr.MoveClient("subtree-client-a", childID); err != nil {
+		t.Fatalf("move client a: %v", err)
+	}
+	if _, err := mgr.MoveClient("subtree-client-b", grandchildID); err != nil {
+		t.Fatalf("move client b: %v", err)
+	}
+	sm.SetSpeaking("subtree-client-a", true)
+	sm.Subscribe("subtree-client-a", []int64{temporaryID})
+	if got := mgr.CleanupTimersCount(); got != 1 {
+		t.Fatalf("cleanup timers before delete = %d, want 1", got)
+	}
+
+	if err := mgr.DeleteChannel(context.Background(), rootID); err != nil {
+		t.Fatalf("DeleteChannel: %v", err)
+	}
+	for _, id := range []int64{rootID, childID, grandchildID, temporaryID} {
+		if channelExistsInDB(t, s, id) {
+			t.Errorf("channel %d remains in database", id)
+		}
+		if _, ok := sm.GetChannel(id); ok {
+			t.Errorf("channel %d remains in state", id)
+		}
+	}
+	for _, clientID := range []string{"subtree-client-a", "subtree-client-b"} {
+		channelID, _, ok := sm.ClientChannelState(clientID)
+		if !ok || channelID != 0 {
+			t.Errorf("client %q state = (%d, %v), want channel 0 and present", clientID, channelID, ok)
+		}
+	}
+	if sm.IsSpeaking("subtree-client-a") {
+		t.Error("descendant speaking state remains after subtree delete")
+	}
+	if sm.IsSubscribed("subtree-client-a", temporaryID) {
+		t.Error("descendant subscription remains after subtree delete")
+	}
+	if got := mgr.CleanupTimersCount(); got != 0 {
+		t.Fatalf("cleanup timers after subtree delete = %d, want 0", got)
+	}
+}
+
+func TestDeleteChannelSubtree_RepairsStateAfterExternalDatabaseDelete(t *testing.T) {
+	mgr, s, sm := testEnv(t)
+	userID := createTestUser(t, s)
+	rootID, err := mgr.CreateChannel(context.Background(), ChannelSpec{
+		Name: "externally-deleted-root", Type: ChannelTypePermanent, CreatedBy: userID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	childID, err := mgr.CreateChannel(context.Background(), ChannelSpec{
+		Name: "externally-deleted-child", ParentID: rootID, Type: ChannelTypePermanent, CreatedBy: userID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientID := "external-delete-client"
+	sm.AddClient(&state.Client{ClientID: clientID})
+	if _, err := mgr.MoveClient(clientID, childID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(context.Background(), `DELETE FROM channels WHERE id = $1`, rootID); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := mgr.DeleteChannelSubtree(context.Background(), rootID)
+	if err != nil {
+		t.Fatalf("repairing stale subtree: %v", err)
+	}
+	if result.RootID != rootID || len(result.ChannelIDs) != 2 || len(result.Members) != 1 {
+		t.Fatalf("repair result = %+v", result)
+	}
+	if result.Members[0].ClientID != clientID || result.Members[0].ChannelID != childID {
+		t.Fatalf("displaced members = %+v", result.Members)
+	}
+	if _, ok := sm.GetChannel(rootID); ok {
+		t.Fatal("stale root remains in state")
+	}
+	if _, ok := sm.GetChannel(childID); ok {
+		t.Fatal("stale child remains in state")
+	}
+	channelID, _, ok := sm.ClientChannelState(clientID)
+	if !ok || channelID != 0 {
+		t.Fatalf("displaced client state = (%d, %v), want channel 0", channelID, ok)
+	}
+}
+
+func TestDeleteChannelSubtree_ReconcilesAppliedExecError(t *testing.T) {
+	mgr, s, sm := testEnv(t)
+	userID := createTestUser(t, s)
+	channelID := createParentChannel(t, mgr, sm, userID)
+	execErr := errors.New("delete result lost")
+	mgr.testHooks.deleteChannel = func(ctx context.Context, id int64) (sql.Result, error) {
+		result, err := s.DB().ExecContext(ctx, `DELETE FROM channels WHERE id = $1`, id)
+		if err != nil {
+			return result, err
+		}
+		return result, execErr
+	}
+
+	result, err := mgr.DeleteChannelSubtree(context.Background(), channelID)
+	if err != nil {
+		t.Fatalf("DeleteChannelSubtree after applied Exec error: %v", err)
+	}
+	if result.RootID != channelID || len(result.ChannelIDs) != 1 || result.ChannelIDs[0] != channelID {
+		t.Fatalf("delete result = %+v", result)
+	}
+	if channelExistsInDB(t, s, channelID) {
+		t.Fatal("ambiguously committed delete remains in database")
+	}
+	if _, ok := sm.GetChannel(channelID); ok {
+		t.Fatal("ambiguously committed delete remains in state")
+	}
+}
+
 // TestSetChannelType_Transitions verifies type transitions adjust the cleanup
 // timer appropriately.
 func TestSetChannelType_Transitions(t *testing.T) {
@@ -324,11 +483,343 @@ func TestSetChannelType_Transitions(t *testing.T) {
 	}
 }
 
+func TestSetChannelType_SerializesCommitStateAndTimer(t *testing.T) {
+	mgr, s, sm := testEnv(t)
+	mgr.SetCleanupDelay(time.Hour)
+	userID := createTestUser(t, s)
+	channelID := createParentChannel(t, mgr, sm, userID)
+
+	firstCommitted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var first atomic.Bool
+	mgr.testHooks.afterSetTypeCommit = func(id int64) {
+		if id != channelID || !first.CompareAndSwap(false, true) {
+			return
+		}
+		// Exercise post-commit reconciliation while the first operation still
+		// owns the lifecycle lock.
+		sm.RemoveChannel(channelID)
+		close(firstCommitted)
+		<-releaseFirst
+	}
+
+	firstResult := make(chan error, 1)
+	go func() {
+		firstResult <- mgr.SetChannelType(context.Background(), channelID, ChannelTypeTemporary)
+	}()
+	select {
+	case <-firstCommitted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first type update did not reach its post-commit barrier")
+	}
+
+	secondStarted := make(chan struct{})
+	secondResult := make(chan error, 1)
+	go func() {
+		close(secondStarted)
+		secondResult <- mgr.SetChannelType(context.Background(), channelID, ChannelTypePermanent)
+	}()
+	<-secondStarted
+	select {
+	case err := <-secondResult:
+		t.Fatalf("second type update crossed the first operation's state/timer boundary: %v", err)
+	default:
+	}
+
+	close(releaseFirst)
+	if err := <-firstResult; err != nil {
+		t.Fatalf("temporary update: %v", err)
+	}
+	if err := <-secondResult; err != nil {
+		t.Fatalf("permanent update: %v", err)
+	}
+
+	if got := channelTypeInDB(t, s, channelID); got != int16(ChannelTypePermanent) {
+		t.Fatalf("database type = %d, want permanent", got)
+	}
+	channel, ok := sm.GetChannel(channelID)
+	if !ok || channel.ChannelType != int(ChannelTypePermanent) {
+		t.Fatalf("state channel = %+v, present=%v; want permanent", channel, ok)
+	}
+	if got := mgr.CleanupTimersCount(); got != 0 {
+		t.Fatalf("cleanup timers = %d, want 0 for final permanent type", got)
+	}
+}
+
+func TestSetChannelType_ReconcilesAppliedCommitError(t *testing.T) {
+	mgr, s, sm := testEnv(t)
+	mgr.SetCleanupDelay(time.Hour)
+	userID := createTestUser(t, s)
+	channelID := createParentChannel(t, mgr, sm, userID)
+	commitErr := errors.New("commit result lost")
+	mgr.testHooks.commitSetType = func(tx *sql.Tx) error {
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		return commitErr
+	}
+
+	if err := mgr.SetChannelType(context.Background(), channelID, ChannelTypeTemporary); err != nil {
+		t.Fatalf("SetChannelType after applied commit error: %v", err)
+	}
+	if got := channelTypeInDB(t, s, channelID); got != int16(ChannelTypeTemporary) {
+		t.Fatalf("database type = %d, want temporary", got)
+	}
+	channel, ok := sm.GetChannel(channelID)
+	if !ok || channel.ChannelType != int(ChannelTypeTemporary) {
+		t.Fatalf("state channel = %+v, present=%v", channel, ok)
+	}
+	if !hasCleanupTimer(mgr, channelID) {
+		t.Fatal("confirmed temporary commit did not reconcile cleanup timer")
+	}
+}
+
+func TestCleanupCallback_ClaimsExactTimerToken(t *testing.T) {
+	mgr, s, sm := testEnv(t)
+	mgr.SetCleanupDelay(time.Hour)
+	userID := createTestUser(t, s)
+	channelID, err := mgr.CreateChannel(context.Background(), ChannelSpec{
+		Name:      "timer-token",
+		Type:      ChannelTypeTemporary,
+		CreatedBy: userID,
+	})
+	if err != nil {
+		t.Fatalf("CreateChannel: %v", err)
+	}
+
+	oldToken := activeCleanupToken(t, mgr, channelID)
+	mgr.StartCleanupWatcher(channelID)
+	replacement := activeCleanupToken(t, mgr, channelID)
+	if replacement == oldToken || replacement.generation <= oldToken.generation {
+		t.Fatalf("replacement token = %+v, old = %+v", replacement, oldToken)
+	}
+
+	// Model a stopped timer whose callback had already begun running.
+	mgr.cleanupCallback(channelID, oldToken)
+	if got := activeCleanupToken(t, mgr, channelID); got != replacement {
+		t.Fatalf("stale callback claimed replacement token: got %p, want %p", got, replacement)
+	}
+	if !channelExistsInDB(t, s, channelID) {
+		t.Fatal("stale callback deleted the channel")
+	}
+	if _, ok := sm.GetChannel(channelID); !ok {
+		t.Fatal("stale callback removed the state channel")
+	}
+}
+
+func TestMoveClient_LinearizableWithTemporaryCleanup(t *testing.T) {
+	t.Run("cleanup wins", func(t *testing.T) {
+		mgr, s, sm := testEnv(t)
+		mgr.SetCleanupDelay(time.Hour)
+		userID := createTestUser(t, s)
+		channelID, err := mgr.CreateChannel(context.Background(), ChannelSpec{
+			Name:      "cleanup-wins",
+			Type:      ChannelTypeTemporary,
+			CreatedBy: userID,
+		})
+		if err != nil {
+			t.Fatalf("CreateChannel: %v", err)
+		}
+		clientID := "cleanup-wins-client"
+		sm.AddClient(&state.Client{ClientID: clientID})
+		token := activeCleanupToken(t, mgr, channelID)
+
+		deleteReady := make(chan struct{})
+		releaseDelete := make(chan struct{})
+		mgr.testHooks.beforeCleanupDelete = func(id int64) {
+			if id == channelID {
+				close(deleteReady)
+				<-releaseDelete
+			}
+		}
+		cleanupDone := make(chan struct{})
+		go func() {
+			mgr.cleanupCallback(channelID, token)
+			close(cleanupDone)
+		}()
+		select {
+		case <-deleteReady:
+		case <-time.After(5 * time.Second):
+			t.Fatal("cleanup did not reach its pre-delete barrier")
+		}
+
+		moveStarted := make(chan struct{})
+		moveResult := make(chan error, 1)
+		go func() {
+			close(moveStarted)
+			_, err := mgr.MoveClient(clientID, channelID)
+			moveResult <- err
+		}()
+		<-moveStarted
+		select {
+		case err := <-moveResult:
+			t.Fatalf("move completed while cleanup owned the channel lock: %v", err)
+		default:
+		}
+
+		close(releaseDelete)
+		<-cleanupDone
+		if err := <-moveResult; !errors.Is(err, state.ErrChannelNotFound) {
+			t.Fatalf("move after cleanup error = %v, want state.ErrChannelNotFound", err)
+		}
+		if channelExistsInDB(t, s, channelID) {
+			t.Fatal("cleanup-winning channel remains in database")
+		}
+		if _, ok := sm.GetChannel(channelID); ok {
+			t.Fatal("cleanup-winning channel remains in state")
+		}
+	})
+
+	t.Run("join wins", func(t *testing.T) {
+		mgr, s, sm := testEnv(t)
+		mgr.SetCleanupDelay(time.Hour)
+		userID := createTestUser(t, s)
+		channelID, err := mgr.CreateChannel(context.Background(), ChannelSpec{
+			Name:      "join-wins",
+			Type:      ChannelTypeTemporary,
+			CreatedBy: userID,
+		})
+		if err != nil {
+			t.Fatalf("CreateChannel: %v", err)
+		}
+		clientID := "join-wins-client"
+		sm.AddClient(&state.Client{ClientID: clientID})
+		token := activeCleanupToken(t, mgr, channelID)
+
+		if oldChannelID, err := mgr.MoveClient(clientID, channelID); err != nil || oldChannelID != 0 {
+			t.Fatalf("MoveClient = (%d, %v), want (0, nil)", oldChannelID, err)
+		}
+		mgr.cleanupCallback(channelID, token)
+
+		if !channelExistsInDB(t, s, channelID) {
+			t.Fatal("join-winning channel was deleted")
+		}
+		if _, ok := sm.GetChannel(channelID); !ok {
+			t.Fatal("join-winning channel missing from state")
+		}
+		members := sm.ChannelMembers(channelID)
+		if len(members) != 1 || members[0].ClientID != clientID {
+			t.Fatalf("members after winning join = %+v", members)
+		}
+		if got := mgr.CleanupTimersCount(); got != 0 {
+			t.Fatalf("cleanup timers after winning join = %d, want 0", got)
+		}
+	})
+}
+
+func TestClientLeaveAndRemovalSerializeWithMove(t *testing.T) {
+	setup := func(t *testing.T) (*ChannelManager, *state.Manager, int64, int64, string) {
+		t.Helper()
+		mgr, store, sm := testEnv(t)
+		mgr.SetCleanupDelay(time.Hour)
+		userID := createTestUser(t, store)
+		sourceID := createParentChannel(t, mgr, sm, userID)
+		targetID, err := mgr.CreateChannel(context.Background(), ChannelSpec{
+			Name:      "serialized-move-target",
+			Type:      ChannelTypeTemporary,
+			CreatedBy: userID,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		clientID := "serialized-client"
+		sm.AddClient(&state.Client{ClientID: clientID})
+		if _, err := mgr.MoveClient(clientID, sourceID); err != nil {
+			t.Fatal(err)
+		}
+		return mgr, sm, sourceID, targetID, clientID
+	}
+
+	t.Run("leave then move", func(t *testing.T) {
+		mgr, sm, sourceID, targetID, clientID := setup(t)
+		leaveReady := make(chan struct{})
+		releaseLeave := make(chan struct{})
+		mgr.testHooks.beforeLeaveClient = func(string) {
+			close(leaveReady)
+			<-releaseLeave
+		}
+		leaveResult := make(chan error, 1)
+		go func() {
+			oldChannelID, err := mgr.LeaveClient(clientID)
+			if err == nil && oldChannelID != sourceID {
+				err = fmt.Errorf("old channel = %d, want %d", oldChannelID, sourceID)
+			}
+			leaveResult <- err
+		}()
+		<-leaveReady
+		moveResult := make(chan error, 1)
+		go func() {
+			_, err := mgr.MoveClient(clientID, targetID)
+			moveResult <- err
+		}()
+		select {
+		case err := <-moveResult:
+			t.Fatalf("move crossed leave lifecycle lock: %v", err)
+		default:
+		}
+		close(releaseLeave)
+		if err := <-leaveResult; err != nil {
+			t.Fatal(err)
+		}
+		if err := <-moveResult; err != nil {
+			t.Fatal(err)
+		}
+		channelID, _, ok := sm.ClientChannelState(clientID)
+		if !ok || channelID != targetID {
+			t.Fatalf("final client state = (%d, %v), want target %d", channelID, ok, targetID)
+		}
+		if got := mgr.CleanupTimersCount(); got != 0 {
+			t.Fatalf("target cleanup timer survived successful move: %d", got)
+		}
+	})
+
+	t.Run("remove then move", func(t *testing.T) {
+		mgr, _, sourceID, targetID, clientID := setup(t)
+		removeReady := make(chan struct{})
+		releaseRemove := make(chan struct{})
+		mgr.testHooks.beforeRemoveClient = func(string) {
+			close(removeReady)
+			<-releaseRemove
+		}
+		removeResult := make(chan error, 1)
+		go func() {
+			removed, err := mgr.RemoveClient(clientID)
+			if err == nil && (removed == nil || removed.ChannelID != sourceID) {
+				err = fmt.Errorf("removed client = %+v, want source %d", removed, sourceID)
+			}
+			removeResult <- err
+		}()
+		<-removeReady
+		moveResult := make(chan error, 1)
+		go func() {
+			_, err := mgr.MoveClient(clientID, targetID)
+			moveResult <- err
+		}()
+		select {
+		case err := <-moveResult:
+			t.Fatalf("move crossed remove lifecycle lock: %v", err)
+		default:
+		}
+		close(releaseRemove)
+		if err := <-removeResult; err != nil {
+			t.Fatal(err)
+		}
+		if err := <-moveResult; !errors.Is(err, state.ErrClientNotFound) {
+			t.Fatalf("move after removal error = %v, want client not found", err)
+		}
+		if got := mgr.CleanupTimersCount(); got != 1 {
+			t.Fatalf("empty target cleanup timer count = %d, want 1", got)
+		}
+	})
+}
+
 // TestCleanupTimer_DeletesEmptyTemporary verifies that the cleanup goroutine
 // deletes an empty temporary channel after the cleanup delay.
 func TestCleanupTimer_DeletesEmptyTemporary(t *testing.T) {
 	mgr, s, sm := testEnv(t)
 	userID := createTestUser(t, s)
+	deleted := make(chan DeleteResult, 1)
+	mgr.SetCleanupDeleteHandler(func(result DeleteResult) { deleted <- result })
 
 	id, err := mgr.CreateChannel(context.Background(), ChannelSpec{
 		Name:      "auto-cleanup",
@@ -341,19 +832,17 @@ func TestCleanupTimer_DeletesEmptyTemporary(t *testing.T) {
 
 	// Simulate a client joining then leaving.
 	clientID := "test-client-cleanup"
-	sm.AddClient(&state.Client{ClientID: clientID, ChannelID: id})
-	if err := sm.JoinChannel(clientID, id); err != nil {
-		t.Fatalf("JoinChannel: %v", err)
+	sm.AddClient(&state.Client{ClientID: clientID})
+	if _, err := mgr.MoveClient(clientID, id); err != nil {
+		t.Fatalf("MoveClient: %v", err)
 	}
-	mgr.OnClientJoinedChannel(id)
 	if mgr.CleanupTimersCount() != 0 {
 		t.Fatalf("expected 0 timers after join, got %d", mgr.CleanupTimersCount())
 	}
 
-	if err := sm.LeaveChannel(clientID); err != nil {
-		t.Fatalf("LeaveChannel: %v", err)
+	if oldChannelID, err := mgr.LeaveClient(clientID); err != nil || oldChannelID != id {
+		t.Fatalf("LeaveClient = (%d, %v), want (%d, nil)", oldChannelID, err, id)
 	}
-	mgr.OnClientLeftChannel(id)
 	if mgr.CleanupTimersCount() != 1 {
 		t.Fatalf("expected 1 timer after leave, got %d", mgr.CleanupTimersCount())
 	}
@@ -368,11 +857,59 @@ func TestCleanupTimer_DeletesEmptyTemporary(t *testing.T) {
 	if mgr.CleanupTimersCount() != 0 {
 		t.Fatalf("expected 0 timers after cleanup, got %d", mgr.CleanupTimersCount())
 	}
+	select {
+	case result := <-deleted:
+		if result.RootID != id || len(result.ChannelIDs) != 1 || result.ChannelIDs[0] != id {
+			t.Fatalf("cleanup deletion result = %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cleanup deletion was not published to the side-effect sink")
+	}
 }
 
-// TestOnClientJoinedChannel_CancelsCleanup verifies that joining a channel
-// cancels a pending cleanup so the channel survives past the delay.
-func TestOnClientJoinedChannel_CancelsCleanup(t *testing.T) {
+func TestTemporaryParentSurvivesUntilItsLastChildIsDeleted(t *testing.T) {
+	mgr, s, _ := testEnv(t)
+	mgr.SetCleanupDelay(40 * time.Millisecond)
+	userID := createTestUser(t, s)
+	parentID, err := mgr.CreateChannel(context.Background(), ChannelSpec{
+		Name:      "temporary-parent",
+		Type:      ChannelTypeTemporary,
+		CreatedBy: userID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	childID, err := mgr.CreateChannel(context.Background(), ChannelSpec{
+		Name:      "permanent-child",
+		ParentID:  parentID,
+		Type:      ChannelTypePermanent,
+		CreatedBy: userID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := mgr.CleanupTimersCount(); got != 0 {
+		t.Fatalf("cleanup timers with child present = %d, want 0", got)
+	}
+	time.Sleep(120 * time.Millisecond)
+	if !channelExistsInDB(t, s, parentID) || !channelExistsInDB(t, s, childID) {
+		t.Fatal("temporary parent cleanup cascaded through an existing child")
+	}
+
+	if err := mgr.DeleteChannel(context.Background(), childID); err != nil {
+		t.Fatal(err)
+	}
+	if got := mgr.CleanupTimersCount(); got != 1 {
+		t.Fatalf("cleanup timers after last child deletion = %d, want 1", got)
+	}
+	pollCondition(t, time.Second, func() bool {
+		return !channelExistsInDB(t, s, parentID)
+	}, "temporary parent was not cleaned after becoming an empty leaf")
+}
+
+// TestMoveClient_CancelsCleanup verifies that joining through the lifecycle
+// manager cancels pending cleanup so the channel survives past the delay.
+func TestMoveClient_CancelsCleanup(t *testing.T) {
 	mgr, s, sm := testEnv(t)
 	userID := createTestUser(t, s)
 
@@ -388,24 +925,21 @@ func TestOnClientJoinedChannel_CancelsCleanup(t *testing.T) {
 	// Leave -> timer starts (channel is empty already, but simulate the leave
 	// path by adding/leaving a client).
 	clientID := "test-client-join-cancel"
-	sm.AddClient(&state.Client{ClientID: clientID, ChannelID: id})
-	if err := sm.JoinChannel(clientID, id); err != nil {
-		t.Fatalf("JoinChannel: %v", err)
+	sm.AddClient(&state.Client{ClientID: clientID})
+	if _, err := mgr.MoveClient(clientID, id); err != nil {
+		t.Fatalf("MoveClient: %v", err)
 	}
-	mgr.OnClientJoinedChannel(id)
-	if err := sm.LeaveChannel(clientID); err != nil {
-		t.Fatalf("LeaveChannel: %v", err)
+	if _, err := mgr.LeaveClient(clientID); err != nil {
+		t.Fatalf("LeaveClient: %v", err)
 	}
-	mgr.OnClientLeftChannel(id)
 	if mgr.CleanupTimersCount() != 1 {
 		t.Fatalf("expected 1 timer after leave, got %d", mgr.CleanupTimersCount())
 	}
 
 	// Re-join before the delay elapses -> timer cancels.
-	if err := sm.JoinChannel(clientID, id); err != nil {
-		t.Fatalf("JoinChannel rejoin: %v", err)
+	if _, err := mgr.MoveClient(clientID, id); err != nil {
+		t.Fatalf("MoveClient rejoin: %v", err)
 	}
-	mgr.OnClientJoinedChannel(id)
 	if mgr.CleanupTimersCount() != 0 {
 		t.Fatalf("expected 0 timers after rejoin, got %d", mgr.CleanupTimersCount())
 	}
@@ -420,10 +954,9 @@ func TestOnClientJoinedChannel_CancelsCleanup(t *testing.T) {
 	}
 
 	// Clean up: leave and let the timer fire, then ensure deletion.
-	if err := sm.LeaveChannel(clientID); err != nil {
-		t.Fatalf("LeaveChannel final: %v", err)
+	if _, err := mgr.LeaveClient(clientID); err != nil {
+		t.Fatalf("LeaveClient final: %v", err)
 	}
-	mgr.OnClientLeftChannel(id)
 	pollCondition(t, 2*time.Second, func() bool {
 		return !channelExistsInDB(t, s, id)
 	}, "channel not deleted after final leave")
@@ -682,6 +1215,197 @@ func TestUpdateChannel_Persistence(t *testing.T) {
 	}
 }
 
+func TestUpdateChannel_SerializesCommitAndStateMirror(t *testing.T) {
+	mgr, s, sm := testEnv(t)
+	userID := createTestUser(t, s)
+	channelID := createParentChannel(t, mgr, sm, userID)
+
+	firstCommitted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var first atomic.Bool
+	mgr.testHooks.afterUpdateCommit = func(id int64) {
+		if id == channelID && first.CompareAndSwap(false, true) {
+			close(firstCommitted)
+			<-releaseFirst
+		}
+	}
+
+	firstTopic := "first committed topic"
+	secondTopic := "second committed topic"
+	firstResult := make(chan error, 1)
+	go func() {
+		firstResult <- mgr.UpdateChannel(context.Background(), channelID, ChannelUpdate{Topic: &firstTopic})
+	}()
+	select {
+	case <-firstCommitted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first update did not reach its post-commit barrier")
+	}
+
+	secondStarted := make(chan struct{})
+	secondResult := make(chan error, 1)
+	go func() {
+		close(secondStarted)
+		secondResult <- mgr.UpdateChannel(context.Background(), channelID, ChannelUpdate{Topic: &secondTopic})
+	}()
+	<-secondStarted
+	select {
+	case err := <-secondResult:
+		t.Fatalf("second update crossed the first operation's state boundary: %v", err)
+	default:
+	}
+
+	close(releaseFirst)
+	if err := <-firstResult; err != nil {
+		t.Fatalf("first UpdateChannel: %v", err)
+	}
+	if err := <-secondResult; err != nil {
+		t.Fatalf("second UpdateChannel: %v", err)
+	}
+
+	var dbTopic string
+	if err := s.DB().QueryRowContext(context.Background(),
+		`SELECT COALESCE(topic, '') FROM channels WHERE id = $1`, channelID,
+	).Scan(&dbTopic); err != nil {
+		t.Fatalf("query final topic: %v", err)
+	}
+	if dbTopic != secondTopic {
+		t.Fatalf("database topic = %q, want %q", dbTopic, secondTopic)
+	}
+	channel, ok := sm.GetChannel(channelID)
+	if !ok || channel.Topic != secondTopic {
+		t.Fatalf("state channel = %+v, present=%v; want topic %q", channel, ok, secondTopic)
+	}
+}
+
+func TestUpdateChannel_ConcurrentReparentsReconcileActualParents(t *testing.T) {
+	mgr, s, sm := testEnv(t)
+	mgr.SetCleanupDelay(time.Hour)
+	userID := createTestUser(t, s)
+	create := func(name string, parentID int64, channelType ChannelType) int64 {
+		t.Helper()
+		id, err := mgr.CreateChannel(context.Background(), ChannelSpec{
+			Name: name, ParentID: parentID, Type: channelType, CreatedBy: userID,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	parentA := create("reparent-a", 0, ChannelTypeTemporary)
+	parentB := create("reparent-b", 0, ChannelTypeTemporary)
+	parentC := create("reparent-c", 0, ChannelTypeTemporary)
+	childID := create("reparent-child", parentA, ChannelTypePermanent)
+
+	firstCommitted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var first atomic.Bool
+	mgr.testHooks.afterUpdateCommit = func(id int64) {
+		if id == childID && first.CompareAndSwap(false, true) {
+			close(firstCommitted)
+			<-releaseFirst
+		}
+	}
+	firstResult := make(chan error, 1)
+	go func() {
+		firstResult <- mgr.UpdateChannel(context.Background(), childID, ChannelUpdate{ParentID: &parentB})
+	}()
+	<-firstCommitted
+	secondResult := make(chan error, 1)
+	go func() {
+		secondResult <- mgr.UpdateChannel(context.Background(), childID, ChannelUpdate{ParentID: &parentC})
+	}()
+	select {
+	case err := <-secondResult:
+		t.Fatalf("second reparent crossed first tree mutation: %v", err)
+	default:
+	}
+	close(releaseFirst)
+	if err := <-firstResult; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondResult; err != nil {
+		t.Fatal(err)
+	}
+
+	channel, ok := sm.GetChannel(childID)
+	if !ok || channel.ParentID != parentC {
+		t.Fatalf("final state channel = %+v, present=%v; want parent %d", channel, ok, parentC)
+	}
+	var databaseParent int64
+	if err := s.DB().QueryRowContext(context.Background(),
+		`SELECT parent_id FROM channels WHERE id = $1`, childID,
+	).Scan(&databaseParent); err != nil {
+		t.Fatal(err)
+	}
+	if databaseParent != parentC {
+		t.Fatalf("database parent = %d, want %d", databaseParent, parentC)
+	}
+	for _, parentID := range []int64{parentA, parentB} {
+		if !hasCleanupTimer(mgr, parentID) {
+			t.Errorf("empty former parent %d has no cleanup timer", parentID)
+		}
+	}
+	if hasCleanupTimer(mgr, parentC) {
+		t.Errorf("occupied final parent %d retained cleanup timer", parentC)
+	}
+	if got := mgr.CleanupTimersCount(); got != 2 {
+		t.Fatalf("cleanup timer count = %d, want 2 former parents", got)
+	}
+}
+
+func TestUpdateChannel_ReconcilesAppliedCommitError(t *testing.T) {
+	mgr, s, sm := testEnv(t)
+	userID := createTestUser(t, s)
+	channelID := createParentChannel(t, mgr, sm, userID)
+	topic := "committed despite lost result"
+	commitErr := errors.New("update commit result lost")
+	mgr.testHooks.commitUpdate = func(tx *sql.Tx) error {
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		return commitErr
+	}
+
+	if err := mgr.UpdateChannel(context.Background(), channelID, ChannelUpdate{Topic: &topic}); err != nil {
+		t.Fatalf("UpdateChannel after applied commit error: %v", err)
+	}
+	var databaseTopic string
+	if err := s.DB().QueryRowContext(context.Background(),
+		`SELECT topic FROM channels WHERE id = $1`, channelID,
+	).Scan(&databaseTopic); err != nil {
+		t.Fatal(err)
+	}
+	channel, ok := sm.GetChannel(channelID)
+	if databaseTopic != topic || !ok || channel.Topic != topic {
+		t.Fatalf("database topic=%q state=%+v present=%v, want %q", databaseTopic, channel, ok, topic)
+	}
+}
+
+func TestUpdateChannel_ReconcilesMissingStateAfterCommit(t *testing.T) {
+	mgr, s, sm := testEnv(t)
+	userID := createTestUser(t, s)
+	channelID := createParentChannel(t, mgr, sm, userID)
+	description := "durable description"
+
+	var removed atomic.Bool
+	mgr.testHooks.afterUpdateCommit = func(id int64) {
+		if id == channelID && removed.CompareAndSwap(false, true) {
+			sm.RemoveChannel(channelID)
+		}
+	}
+	if err := mgr.UpdateChannel(context.Background(), channelID, ChannelUpdate{Description: &description}); err != nil {
+		t.Fatalf("UpdateChannel: %v", err)
+	}
+	channel, ok := sm.GetChannel(channelID)
+	if !ok {
+		t.Fatal("committed channel was not reloaded into state")
+	}
+	if channel.Description != description || channel.Name == "" || channel.ChannelType != int(ChannelTypePermanent) {
+		t.Fatalf("reconciled state channel = %+v", channel)
+	}
+}
+
 // TestUpdateChannel_Description verifies the description column (migration
 // 008) persists and loads back into state (112/113).
 func TestUpdateChannel_Description(t *testing.T) {
@@ -712,5 +1436,224 @@ func TestUpdateChannel_Description(t *testing.T) {
 	}
 	if ch, _ := sm.GetChannel(channelID); ch.Description != desc {
 		t.Fatalf("description after reload = %q, want %q", ch.Description, desc)
+	}
+}
+
+func TestMoveClientWithLifecycleOrdersConsequencesBeforeDeletion(t *testing.T) {
+	mgr, s, sm := testEnv(t)
+	userID := createTestUser(t, s)
+	channelID := createParentChannel(t, mgr, sm, userID)
+	const clientID = "lifecycle-move-client"
+	sm.AddClient(&state.Client{ClientID: clientID})
+
+	callbackEntered := make(chan struct{})
+	allowCallback := make(chan struct{})
+	moveDone := make(chan error, 1)
+	var consequenceErr error
+	go func() {
+		_, err := mgr.MoveClientWithLifecycle(clientID, channelID, func(oldChannelID int64) {
+			if oldChannelID != 0 {
+				consequenceErr = fmt.Errorf("old channel = %d, want 0", oldChannelID)
+			}
+			current, _, ok := sm.ClientChannelState(clientID)
+			if !ok || current != channelID {
+				consequenceErr = fmt.Errorf("callback state = (%d, %v), want (%d, true)", current, ok, channelID)
+			}
+			close(callbackEntered)
+			<-allowCallback
+		})
+		moveDone <- err
+	}()
+	<-callbackEntered
+
+	deleteStarted := make(chan struct{})
+	deleteDone := make(chan error, 1)
+	go func() {
+		close(deleteStarted)
+		deleteDone <- mgr.DeleteChannel(context.Background(), channelID)
+	}()
+	<-deleteStarted
+	select {
+	case err := <-deleteDone:
+		t.Fatalf("deletion crossed lifecycle callback: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(allowCallback)
+	if err := <-moveDone; err != nil {
+		t.Fatalf("MoveClientWithLifecycle: %v", err)
+	}
+	if consequenceErr != nil {
+		t.Fatal(consequenceErr)
+	}
+	if err := <-deleteDone; err != nil {
+		t.Fatalf("DeleteChannel: %v", err)
+	}
+	current, _, ok := sm.ClientChannelState(clientID)
+	if !ok || current != 0 {
+		t.Fatalf("client state after deletion = (%d, %v), want (0, true)", current, ok)
+	}
+}
+
+func TestDeleteChannelSubtreeUsesAuthoritativeDatabaseParent(t *testing.T) {
+	mgr, s, sm := testEnv(t)
+	mgr.SetCleanupDelay(time.Hour)
+	userID := createTestUser(t, s)
+	parentID, err := mgr.CreateChannel(context.Background(), ChannelSpec{
+		Name:      fmt.Sprintf("authoritative-parent-%d", time.Now().UnixNano()),
+		Type:      ChannelTypeTemporary,
+		CreatedBy: userID,
+	})
+	if err != nil {
+		t.Fatalf("create temporary parent: %v", err)
+	}
+	childID, err := mgr.CreateChannel(context.Background(), ChannelSpec{
+		Name:      fmt.Sprintf("state-missing-child-%d", time.Now().UnixNano()),
+		ParentID:  parentID,
+		Type:      ChannelTypePermanent,
+		CreatedBy: userID,
+	})
+	if err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+	if hasCleanupTimer(mgr, parentID) {
+		t.Fatal("temporary parent retained a cleanup timer while it had a child")
+	}
+
+	// Simulate state loss after the child was committed. The database remains
+	// authoritative for both the deletion target and its parent edge.
+	sm.RemoveChannel(childID)
+	result, err := mgr.DeleteChannelSubtree(context.Background(), childID)
+	if err != nil {
+		t.Fatalf("DeleteChannelSubtree: %v", err)
+	}
+	if len(result.ChannelIDs) != 1 || result.ChannelIDs[0] != childID {
+		t.Fatalf("deleted IDs = %v, want [%d]", result.ChannelIDs, childID)
+	}
+	if !hasCleanupTimer(mgr, parentID) {
+		t.Fatal("database parent was not reconciled after deleting its final child")
+	}
+}
+
+func TestDeleteChannelSubtreeReloadsLiveStateOnlyDescendant(t *testing.T) {
+	mgr, s, sm := testEnv(t)
+	mgr.SetCleanupDelay(time.Hour)
+	userID := createTestUser(t, s)
+	deletedParentID := createParentChannel(t, mgr, sm, userID)
+	liveParentID, err := mgr.CreateChannel(context.Background(), ChannelSpec{
+		Name:      fmt.Sprintf("live-parent-%d", time.Now().UnixNano()),
+		Type:      ChannelTypeTemporary,
+		CreatedBy: userID,
+	})
+	if err != nil {
+		t.Fatalf("create live parent: %v", err)
+	}
+	childID, err := mgr.CreateChannel(context.Background(), ChannelSpec{
+		Name:      fmt.Sprintf("ambiguously-moved-child-%d", time.Now().UnixNano()),
+		ParentID:  deletedParentID,
+		Type:      ChannelTypePermanent,
+		CreatedBy: userID,
+	})
+	if err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+	if !hasCleanupTimer(mgr, liveParentID) {
+		t.Fatal("temporary destination parent should begin with a cleanup timer")
+	}
+
+	// Model a reparent whose commit succeeded but whose state reconciliation
+	// failed: the row is live beneath liveParentID while state still points at
+	// the channel that is about to be deleted.
+	if _, err := s.DB().ExecContext(context.Background(),
+		`UPDATE channels SET parent_id = $1 WHERE id = $2`, liveParentID, childID,
+	); err != nil {
+		t.Fatalf("move child directly in database: %v", err)
+	}
+
+	result, err := mgr.DeleteChannelSubtree(context.Background(), deletedParentID)
+	if err != nil {
+		t.Fatalf("DeleteChannelSubtree: %v", err)
+	}
+	if len(result.ChannelIDs) != 1 || result.ChannelIDs[0] != deletedParentID {
+		t.Fatalf("deleted IDs = %v, want only [%d]", result.ChannelIDs, deletedParentID)
+	}
+	if !channelExistsInDB(t, s, childID) {
+		t.Fatal("live reparented child was deleted from the database")
+	}
+	child, ok := sm.GetChannel(childID)
+	if !ok || child.ParentID != liveParentID {
+		t.Fatalf("reloaded child = %+v, found=%v, want parent %d", child, ok, liveParentID)
+	}
+	if hasCleanupTimer(mgr, liveParentID) {
+		t.Fatal("live temporary parent retained a cleanup timer after its child was reloaded")
+	}
+}
+
+func TestChannelUpdatesPropagateRowsAffectedErrors(t *testing.T) {
+	t.Run("set type", func(t *testing.T) {
+		mgr, s, sm := testEnv(t)
+		userID := createTestUser(t, s)
+		channelID := createParentChannel(t, mgr, sm, userID)
+		injected := errors.New("injected rows affected failure")
+		mgr.testHooks.rowsAffected = func(sql.Result) (int64, error) {
+			return 0, injected
+		}
+
+		err := mgr.SetChannelType(context.Background(), channelID, ChannelTypeTemporary)
+		if !errors.Is(err, injected) {
+			t.Fatalf("SetChannelType error = %v, want injected row-count error", err)
+		}
+		if got := channelTypeInDB(t, s, channelID); got != int16(ChannelTypePermanent) {
+			t.Fatalf("database type = %d, want rolled-back permanent type", got)
+		}
+		channel, ok := sm.GetChannel(channelID)
+		if !ok || channel.ChannelType != int(ChannelTypePermanent) {
+			t.Fatalf("state channel = %+v, found=%v, want permanent", channel, ok)
+		}
+	})
+
+	t.Run("general update", func(t *testing.T) {
+		mgr, s, sm := testEnv(t)
+		userID := createTestUser(t, s)
+		channelID := createParentChannel(t, mgr, sm, userID)
+		injected := errors.New("injected rows affected failure")
+		mgr.testHooks.rowsAffected = func(sql.Result) (int64, error) {
+			return 0, injected
+		}
+		updatedTopic := "must roll back"
+
+		err := mgr.UpdateChannel(context.Background(), channelID, ChannelUpdate{Topic: &updatedTopic})
+		if !errors.Is(err, injected) {
+			t.Fatalf("UpdateChannel error = %v, want injected row-count error", err)
+		}
+		var databaseTopic string
+		if err := s.DB().QueryRowContext(context.Background(),
+			`SELECT COALESCE(topic, '') FROM channels WHERE id = $1`, channelID,
+		).Scan(&databaseTopic); err != nil {
+			t.Fatalf("query topic: %v", err)
+		}
+		if databaseTopic != "" {
+			t.Fatalf("database topic = %q, want rollback", databaseTopic)
+		}
+		channel, ok := sm.GetChannel(channelID)
+		if !ok || channel.Topic != "" {
+			t.Fatalf("state channel = %+v, found=%v, want original topic", channel, ok)
+		}
+	})
+}
+
+func TestDeleteChannelSubtreeMissingPreimageSkipsDelete(t *testing.T) {
+	mgr, _, _ := testEnv(t)
+	deleteCalled := false
+	mgr.testHooks.deleteChannel = func(context.Context, int64) (sql.Result, error) {
+		deleteCalled = true
+		return nil, errors.New("delete hook must not run")
+	}
+
+	_, err := mgr.DeleteChannelSubtree(context.Background(), 9_000_000_000)
+	if !errors.Is(err, ErrChannelNotFound) {
+		t.Fatalf("missing delete error = %v, want ErrChannelNotFound", err)
+	}
+	if deleteCalled {
+		t.Fatal("database delete ran without a database or state preimage")
 	}
 }

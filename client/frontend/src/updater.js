@@ -1,12 +1,14 @@
 // updater.js — Check for updates modal + startup auto-check.
+import { closeDialog, mountDialog } from "./modal.js";
+
 const V = () => window.__voicx;
 
 let modal = null;
+const progressCleanup = new WeakMap();
 
 function closeModal() {
     if (modal) {
-        modal.remove();
-        modal = null;
+        closeDialog(modal);
     }
 }
 
@@ -30,7 +32,14 @@ function showUpdateModal() {
         </div>`;
     modal.querySelector(".upd-close").onclick = closeModal;
     modal.onclick = (e) => { if (e.target === modal) closeModal(); };
-    document.body.appendChild(modal);
+    const mounted = modal;
+    mountDialog(modal, {
+        onClose: () => {
+            progressCleanup.get(mounted)?.();
+            progressCleanup.delete(mounted);
+            if (modal === mounted) modal = null;
+        },
+    });
     return modal;
 }
 
@@ -57,7 +66,11 @@ async function runCheck(m) {
         return;
     }
 
-    status.innerHTML = `update available: <b>${info.version}</b> (${(info.size / 1024 / 1024).toFixed(1)} MiB)`;
+    const version = document.createElement("b");
+    version.textContent = String(info.version || "unknown");
+    const size = Number(info.size);
+    const sizeMiB = Number.isFinite(size) && size >= 0 ? (size / 1024 / 1024).toFixed(1) : "0.0";
+    status.replaceChildren("update available: ", version, ` (${sizeMiB} MiB)`);
     const btn = m.querySelector(".upd-update");
     btn.classList.remove("hidden");
     btn.onclick = () => startDownload(m, info);
@@ -79,11 +92,18 @@ async function startDownload(m, info) {
             pct.textContent = p + "%";
         }
     };
-    const unsub = window.runtime.EventsOn("update_progress", onProgress);
+    let progressUnsub = window.runtime.EventsOn("update_progress", onProgress);
+    const unsubscribe = () => {
+        if (!progressUnsub) return;
+        progressUnsub();
+        progressUnsub = null;
+        if (progressCleanup.get(m) === unsubscribe) progressCleanup.delete(m);
+    };
+    progressCleanup.set(m, unsubscribe);
 
     try {
         const err = await window.go.main.App.DownloadAndApply(info);
-        unsub();
+        unsubscribe();
         if (err) {
             status.textContent = err;
             status.classList.add("warn");
@@ -96,7 +116,7 @@ async function startDownload(m, info) {
         btn.disabled = false;
         btn.onclick = () => window.go.main.App.ApplyAndRestart();
     } catch (e) {
-        unsub();
+        unsubscribe();
         status.textContent = "update failed: " + e;
         status.classList.add("warn");
         prog.classList.add("hidden");

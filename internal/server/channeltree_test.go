@@ -39,13 +39,48 @@ func (f *treeChannels) CreateChannel(_ context.Context, spec channels.ChannelSpe
 	return 1, nil
 }
 
-func (f *treeChannels) DeleteChannel(_ context.Context, channelID int64) error {
-	f.state.RemoveChannel(channelID)
-	return nil
+func (f *treeChannels) DeleteChannelSubtree(_ context.Context, channelID int64) (channels.DeleteResult, error) {
+	return deleteFakeChannelSubtree(f.state, channelID)
 }
 
-func (f *treeChannels) OnClientJoinedChannel(int64) {}
-func (f *treeChannels) OnClientLeftChannel(int64)   {}
+func (f *treeChannels) MoveClientWithLifecycle(clientID string, channelID int64, afterMove func(int64)) (int64, error) {
+	oldChannelID, _, ok := f.state.ClientChannelState(clientID)
+	if !ok {
+		return 0, state.ErrClientNotFound
+	}
+	if err := f.state.MoveClient(clientID, channelID); err != nil {
+		return oldChannelID, err
+	}
+	if afterMove != nil {
+		afterMove(oldChannelID)
+	}
+	return oldChannelID, nil
+}
+
+func (f *treeChannels) LeaveClient(clientID string) (int64, error) {
+	oldChannelID, _, ok := f.state.ClientChannelState(clientID)
+	if !ok {
+		return 0, state.ErrClientNotFound
+	}
+	return oldChannelID, f.state.LeaveChannel(clientID)
+}
+
+func (f *treeChannels) RemoveClient(clientID string) (*state.Client, error) {
+	removed, ok := f.state.RemoveClient(clientID)
+	if !ok {
+		return nil, state.ErrClientNotFound
+	}
+	return removed, nil
+}
+
+func (f *treeChannels) WithChannelLifecycle(channelID int64, operation func() error) error {
+	if _, ok := f.state.GetChannel(channelID); !ok {
+		return channels.ErrChannelNotFound
+	}
+	return operation()
+}
+
+func (f *treeChannels) OnClientLeftChannel(int64) {}
 
 func (f *treeChannels) UpdateChannel(_ context.Context, channelID int64, upd channels.ChannelUpdate) error {
 	f.mu.Lock()
@@ -53,21 +88,13 @@ func (f *treeChannels) UpdateChannel(_ context.Context, channelID int64, upd cha
 	if f.updErr != nil {
 		return f.updErr
 	}
-	ch, ok := f.state.GetChannel(channelID)
-	if !ok {
+	if !f.state.UpdateChannel(channelID, state.ChannelUpdate{
+		NeededJoinPower:    upd.NeededJoinPower,
+		OrderIndex:         upd.OrderIndex,
+		ParentID:           upd.ParentID,
+		InheritPermissions: upd.InheritPermissions,
+	}) {
 		return channels.ErrChannelNotFound
-	}
-	if upd.NeededJoinPower != nil {
-		ch.NeededJoinPower = *upd.NeededJoinPower
-	}
-	if upd.OrderIndex != nil {
-		ch.OrderIndex = *upd.OrderIndex
-	}
-	if upd.ParentID != nil {
-		ch.ParentID = *upd.ParentID
-	}
-	if upd.InheritPermissions != nil {
-		ch.InheritPermissions = *upd.InheritPermissions
 	}
 	return nil
 }
@@ -106,7 +133,7 @@ func TestChannelEditJoinPower(t *testing.T) {
 	env.state.AddChannel(&state.Channel{ChannelID: 1, Name: "Lobby", ChannelType: 2})
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	power := 50
 	send(t, conn, netproto.MsgChannelEdit, netproto.ChannelEdit{ChannelID: 1, NeededJoinPower: &power})
@@ -136,7 +163,7 @@ func TestChannelEditJoinPowerAboveOwnDenied(t *testing.T) {
 	env.state.AddChannel(&state.Channel{ChannelID: 1, Name: "Lobby", ChannelType: 2})
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	power := 99
 	send(t, conn, netproto.MsgChannelEdit, netproto.ChannelEdit{ChannelID: 1, NeededJoinPower: &power})
@@ -163,7 +190,7 @@ func TestChannelEditJoinPowerReductionDenied(t *testing.T) {
 	env.state.AddChannel(&state.Channel{ChannelID: 1, Name: "Lobby", ChannelType: 2, NeededJoinPower: 20})
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	power := 0
 	send(t, conn, netproto.MsgChannelEdit, netproto.ChannelEdit{ChannelID: 1, NeededJoinPower: &power})
 	f := readOfType(t, conn, netproto.MsgError)
@@ -190,7 +217,7 @@ func TestChannelEditReorderAndReparent(t *testing.T) {
 	env.state.AddChannel(&state.Channel{ChannelID: 2, Name: "Child", ChannelType: 2})
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	order := 7
 	parent := int64(1)
@@ -226,7 +253,7 @@ func TestChannelEditInvalidMoveRefused(t *testing.T) {
 	env.state.AddChannel(&state.Channel{ChannelID: 2, Name: "Parent", ChannelType: 2})
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	parent := int64(3)
 	send(t, conn, netproto.MsgChannelEdit, netproto.ChannelEdit{ChannelID: 2, ParentID: &parent})
@@ -255,7 +282,7 @@ func TestJoinChannelInheritedPowerDenied(t *testing.T) {
 	env.state.AddChannel(&state.Channel{ChannelID: 2, Name: "Staff sub", ChannelType: 2, ParentID: 1, InheritPermissions: true})
 
 	conn, clientID := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgJoinChannel, netproto.JoinChannel{ChannelID: 2})
 	f := readOfType(t, conn, netproto.MsgError)
@@ -283,7 +310,7 @@ func TestJoinChannelWithoutInheritanceAllowed(t *testing.T) {
 	env.state.AddChannel(&state.Channel{ChannelID: 2, Name: "Staff sub", ChannelType: 2, ParentID: 1})
 
 	conn, clientID := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgJoinChannel, netproto.JoinChannel{ChannelID: 2})
 

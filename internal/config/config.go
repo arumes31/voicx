@@ -1,7 +1,12 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"net"
+	"net/url"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,6 +28,9 @@ type Config struct {
 	GRPCAddr       string `mapstructure:"grpc_addr"`
 	HealthAddr     string `mapstructure:"health_addr"`
 	QueryAddr      string `mapstructure:"query_addr"`
+	// QueryAllowRemote is an explicit acknowledgement that the plaintext
+	// ServerQuery listener may bind beyond loopback. Prefer QuerySSH instead.
+	QueryAllowRemote bool `mapstructure:"query_allow_remote"`
 	// ServerQuery over SSH (224): the same command set and the same
 	// credentials as QueryAddr, wrapped in an SSH transport. Off by default.
 	// QuerySSHHostKey is generated on first start and must persist, or every
@@ -39,19 +47,22 @@ type Config struct {
 	// backups and big uploads run at full speed when nobody is listening.
 	// Both are 0-23; equal values disable the window. A start after the end
 	// wraps past midnight (22 -> 6).
-	FileQuietHoursStart  int    `mapstructure:"file_quiet_hours_start"`
-	FileQuietHoursEnd    int    `mapstructure:"file_quiet_hours_end"`
-	DatabaseURL          string `mapstructure:"database_url"`
-	PIIKeyFile           string `mapstructure:"pii_key_file"`
-	RedisAddr            string `mapstructure:"redis_addr"`
-	RedisPassword        string `mapstructure:"redis_password"`
-	RedisEnabled         bool   `mapstructure:"redis_enabled"`
-	MaxClients           int    `mapstructure:"max_clients"`
-	ClientTimeoutSeconds int    `mapstructure:"client_timeout_seconds"`
-	DefaultOpusBitrate   int    `mapstructure:"default_opus_bitrate"`
-	DefaultOpusFEC       bool   `mapstructure:"default_opus_fec"`
-	DefaultOpusDTX       bool   `mapstructure:"default_opus_dtx"`
-	DefaultOpusStereo    bool   `mapstructure:"default_opus_stereo"`
+	FileQuietHoursStart int    `mapstructure:"file_quiet_hours_start"`
+	FileQuietHoursEnd   int    `mapstructure:"file_quiet_hours_end"`
+	DatabaseURL         string `mapstructure:"database_url"`
+	PIIKeyFile          string `mapstructure:"pii_key_file"`
+	RedisAddr           string `mapstructure:"redis_addr"`
+	RedisPassword       string `mapstructure:"redis_password"`
+	RedisEnabled        bool   `mapstructure:"redis_enabled"`
+	// MetricsAllowRemote exposes /metrics beyond loopback on HealthAddr.
+	// Liveness and readiness remain reachable wherever HealthAddr is bound.
+	MetricsAllowRemote   bool `mapstructure:"metrics_allow_remote"`
+	MaxClients           int  `mapstructure:"max_clients"`
+	ClientTimeoutSeconds int  `mapstructure:"client_timeout_seconds"`
+	DefaultOpusBitrate   int  `mapstructure:"default_opus_bitrate"`
+	DefaultOpusFEC       bool `mapstructure:"default_opus_fec"`
+	DefaultOpusDTX       bool `mapstructure:"default_opus_dtx"`
+	DefaultOpusStereo    bool `mapstructure:"default_opus_stereo"`
 	// EchoChannelName is the name of the loopback test channel: the server
 	// ensures it exists at startup, and publishers in it hear their own audio
 	// routed back (the echo channel is the only channel with self-fan-out).
@@ -62,7 +73,7 @@ type Config struct {
 	// back to channels.DefaultCleanupDelay.
 	ChannelTempLifetimeSeconds int `mapstructure:"channel_temp_lifetime_seconds"`
 
-	// TLS protects the TCP control channel (wave 4a). Enabled by default;
+	// TLS protects the TCP control channel with TLS 1.3. Enabled by default;
 	// when CertFile/KeyFile are empty a self-signed ECDSA P-256 certificate
 	// is generated into TLSDir on first start and reused afterwards (TOFU
 	// pinning on clients needs a stable fingerprint).
@@ -90,7 +101,7 @@ type Config struct {
 	ChatKeyRotateMinSecs  int    `mapstructure:"chat_key_rotate_min_seconds"`
 	ChatSearchMaxMessages int    `mapstructure:"chat_search_max_messages"`
 
-	// FileTLSEnabled wraps the file-transfer data port in TLS with the SAME
+	// FileTLSEnabled wraps the file-transfer data port in TLS 1.3 with the SAME
 	// certificate as the control channel. false is a dev-only escape hatch.
 	FileTLSEnabled bool `mapstructure:"file_tls_enabled"`
 
@@ -162,6 +173,11 @@ type RecordingConfig struct {
 	VideoArgs []string `mapstructure:"video_args"`
 	// AudioArgs are the ffmpeg audio output options.
 	AudioArgs []string `mapstructure:"audio_args"`
+	// MaxConcurrent bounds starting plus active ffmpeg subprocesses.
+	MaxConcurrent int `mapstructure:"max_concurrent"`
+	// WindowsACLReady acknowledges that Dir was provisioned with a restricted,
+	// inheritable NTFS DACL; chmod alone cannot enforce it on Windows.
+	WindowsACLReady bool `mapstructure:"windows_acl_ready"`
 }
 
 // TURNConfig holds TURN server settings (coturn REST API auth, 445/446).
@@ -208,6 +224,7 @@ func Load() (*Config, error) {
 	v.SetDefault("grpc_addr", DefaultGRPCAddr)
 	v.SetDefault("health_addr", DefaultHealthAddr)
 	v.SetDefault("query_addr", DefaultQueryAddr)
+	v.SetDefault("query_allow_remote", false)
 	v.SetDefault("query_ssh_enabled", false)
 	v.SetDefault("query_ssh_addr", DefaultQuerySSHAddr)
 	v.SetDefault("query_ssh_host_key", "./data/keys/query_ssh_host.key")
@@ -222,6 +239,7 @@ func Load() (*Config, error) {
 	v.SetDefault("redis_addr", "localhost:6379")
 	v.SetDefault("redis_password", "")
 	v.SetDefault("redis_enabled", true)
+	v.SetDefault("metrics_allow_remote", false)
 	v.SetDefault("max_clients", 1024)
 	v.SetDefault("echo_channel_name", "Echo Test")
 	// 60s matches channels.DefaultCleanupDelay (165).
@@ -280,6 +298,8 @@ func Load() (*Config, error) {
 	v.SetDefault("recording.format", "webm")
 	v.SetDefault("recording.video_args", []string{"-c:v", "copy"})
 	v.SetDefault("recording.audio_args", []string{"-c:a", "copy"})
+	v.SetDefault("recording.max_concurrent", 4)
+	v.SetDefault("recording.windows_acl_ready", false)
 
 	// config.yaml: the working directory wins; /etc/voicx is the system
 	// location used by the Docker image. The first file found is used.
@@ -304,29 +324,423 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("unmarshalling config: %w", err)
 	}
 
-	switch strings.ToLower(cfg.ChatLegacyHistory) {
+	cfg.LogLevel = strings.ToLower(strings.TrimSpace(cfg.LogLevel))
+	cfg.ChatLegacyHistory = strings.ToLower(strings.TrimSpace(cfg.ChatLegacyHistory))
+	cfg.Recording.Format = strings.ToLower(strings.TrimSpace(cfg.Recording.Format))
+
+	switch cfg.ChatLegacyHistory {
 	case "encrypt", "purge":
-		cfg.ChatLegacyHistory = strings.ToLower(cfg.ChatLegacyHistory)
 	default:
 		return nil, fmt.Errorf("invalid chat_legacy_history %q: must be \"encrypt\" or \"purge\"", cfg.ChatLegacyHistory)
 	}
-	if cfg.FileQuietHoursStart < 0 || cfg.FileQuietHoursStart > 23 {
-		return nil, fmt.Errorf("invalid file_quiet_hours_start %d: must be 0..23", cfg.FileQuietHoursStart)
-	}
-	if cfg.FileQuietHoursEnd < 0 || cfg.FileQuietHoursEnd > 23 {
-		return nil, fmt.Errorf("invalid file_quiet_hours_end %d: must be 0..23", cfg.FileQuietHoursEnd)
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("validating config: %w", err)
 	}
 
 	return cfg, nil
 }
 
+const maxTURNCredentialsTTL = 30 * 24 * time.Hour
+
+// Validate checks configuration values before any listener or resource is
+// created. It returns every independent problem so operators can fix a bad
+// deployment in one pass.
+func (c *Config) Validate() error {
+	if c == nil {
+		return errors.New("config is nil")
+	}
+
+	errs := []error{}
+	if strings.TrimSpace(c.ServerName) == "" {
+		errs = append(errs, errors.New("server_name must not be empty"))
+	}
+	switch strings.ToLower(strings.TrimSpace(c.LogLevel)) {
+	case "debug", "info", "warn", "error":
+	default:
+		errs = append(errs, fmt.Errorf("log_level %q must be debug, info, warn, or error", c.LogLevel))
+	}
+
+	addresses := []struct {
+		name  string
+		value string
+	}{
+		{name: "tcp_addr", value: c.TCPAddr},
+		{name: "udp_addr", value: c.UDPAddr},
+		{name: "grpc_addr", value: c.GRPCAddr},
+		{name: "health_addr", value: c.HealthAddr},
+		{name: "query_addr", value: c.QueryAddr},
+		{name: "query_ssh_addr", value: c.QuerySSHAddr},
+		{name: "file_addr", value: c.FileAddr},
+	}
+	for _, address := range addresses {
+		if err := validateAddress(address.name, address.value); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := validateLoopbackAddress("grpc_addr", c.GRPCAddr); err != nil {
+		errs = append(errs, fmt.Errorf("%w because the gRPC listener is plaintext", err))
+	}
+	if !isLoopbackAddress(c.QueryAddr) && !c.QueryAllowRemote {
+		errs = append(errs, errors.New(
+			"query_addr must be loopback-only unless query_allow_remote=true; "+
+				"prefer query_ssh_enabled for remote administration",
+		))
+	}
+
+	if err := validateDatabaseURL(c.DatabaseURL); err != nil {
+		errs = append(errs, err)
+	} else if !c.DevMode {
+		if err := validateProductionDatabaseURL(c.DatabaseURL); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if c.RedisEnabled {
+		if err := validateAddress("redis_addr", c.RedisAddr); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	if c.MaxClients <= 0 || c.MaxClients > 100_000 {
+		errs = append(errs, fmt.Errorf("max_clients %d must be between 1 and 100000", c.MaxClients))
+	}
+	if c.ClientTimeoutSeconds <= 0 {
+		errs = append(errs, fmt.Errorf("client_timeout_seconds %d must be positive", c.ClientTimeoutSeconds))
+	}
+	if c.DefaultOpusBitrate < 6_000 || c.DefaultOpusBitrate > 512_000 {
+		errs = append(errs, fmt.Errorf("default_opus_bitrate %d must be between 6000 and 512000", c.DefaultOpusBitrate))
+	}
+
+	if c.FileMaxKBps < 0 {
+		errs = append(errs, fmt.Errorf("file_max_kbps %d must not be negative", c.FileMaxKBps))
+	}
+	if c.FileChannelQuotaMB < 0 {
+		errs = append(errs, fmt.Errorf("file_channel_quota_mb %d must not be negative", c.FileChannelQuotaMB))
+	}
+	if c.FileMaxSizeMB < 0 {
+		errs = append(errs, fmt.Errorf("file_max_size_mb %d must not be negative", c.FileMaxSizeMB))
+	}
+	if c.FileQuietHoursStart < 0 || c.FileQuietHoursStart > 23 {
+		errs = append(errs, fmt.Errorf("file_quiet_hours_start %d must be between 0 and 23", c.FileQuietHoursStart))
+	}
+	if c.FileQuietHoursEnd < 0 || c.FileQuietHoursEnd > 23 {
+		errs = append(errs, fmt.Errorf("file_quiet_hours_end %d must be between 0 and 23", c.FileQuietHoursEnd))
+	}
+	if strings.TrimSpace(c.FileRoot) == "" {
+		errs = append(errs, errors.New("file_root must not be empty"))
+	}
+
+	certConfigured := strings.TrimSpace(c.TLSCertFile) != ""
+	keyConfigured := strings.TrimSpace(c.TLSKeyFile) != ""
+	if certConfigured != keyConfigured {
+		errs = append(errs, errors.New("tls_cert_file and tls_key_file must be set together"))
+	}
+	if c.TLSEnabled && !certConfigured && strings.TrimSpace(c.TLSDir) == "" {
+		errs = append(errs, errors.New("tls_dir must not be empty when TLS certificate files are not configured"))
+	}
+	if c.QuerySSHEnabled && strings.TrimSpace(c.QuerySSHHostKey) == "" {
+		errs = append(errs, errors.New("query_ssh_host_key must not be empty when query_ssh_enabled=true"))
+	}
+	if !c.DevMode {
+		if !c.TLSEnabled {
+			errs = append(errs, errors.New("tls_enabled must be true when dev_mode=false"))
+		}
+		if !c.FileTLSEnabled {
+			errs = append(errs, errors.New("file_tls_enabled must be true when dev_mode=false"))
+		}
+		if c.ChatAllowPlaintext {
+			errs = append(errs, errors.New("chat_allow_plaintext must be false when dev_mode=false"))
+		}
+	}
+
+	if strings.TrimSpace(c.ChatMasterKeyFile) == "" {
+		errs = append(errs, errors.New("chat_master_key_file must not be empty"))
+	}
+	if strings.TrimSpace(c.PIIKeyFile) == "" {
+		errs = append(errs, errors.New("pii_key_file must not be empty"))
+	}
+	switch strings.ToLower(strings.TrimSpace(c.ChatLegacyHistory)) {
+	case "encrypt", "purge":
+	default:
+		errs = append(errs, fmt.Errorf("chat_legacy_history %q must be encrypt or purge", c.ChatLegacyHistory))
+	}
+	if c.ChatKeyRotateMinSecs < 0 {
+		errs = append(errs, fmt.Errorf("chat_key_rotate_min_seconds %d must not be negative", c.ChatKeyRotateMinSecs))
+	}
+	if c.ChatSearchMaxMessages <= 0 {
+		errs = append(errs, fmt.Errorf("chat_search_max_messages %d must be positive", c.ChatSearchMaxMessages))
+	}
+	if c.ChatMaxLength <= 0 {
+		errs = append(errs, fmt.Errorf("chat_max_length %d must be positive", c.ChatMaxLength))
+	}
+	if c.ChatRateMsgs <= 0 {
+		errs = append(errs, fmt.Errorf("chat_rate_msgs %d must be positive", c.ChatRateMsgs))
+	}
+	if c.ChatRateWindowSeconds <= 0 {
+		errs = append(errs, fmt.Errorf("chat_rate_window_seconds %d must be positive", c.ChatRateWindowSeconds))
+	}
+
+	if c.DBMaxOpenConns <= 0 {
+		errs = append(errs, fmt.Errorf("db_max_open_conns %d must be positive", c.DBMaxOpenConns))
+	}
+	if c.DBMaxIdleConns <= 0 {
+		errs = append(errs, fmt.Errorf("db_max_idle_conns %d must be positive", c.DBMaxIdleConns))
+	}
+	if c.DBMaxIdleConns > c.DBMaxOpenConns {
+		errs = append(errs, fmt.Errorf(
+			"db_max_idle_conns %d must not exceed db_max_open_conns %d",
+			c.DBMaxIdleConns,
+			c.DBMaxOpenConns,
+		))
+	}
+	if c.DBConnMaxLifetime < 0 {
+		errs = append(errs, fmt.Errorf("db_conn_max_lifetime %s must not be negative", c.DBConnMaxLifetime))
+	}
+
+	if c.TURN.CredentialsTTL <= 0 || c.TURN.CredentialsTTL > maxTURNCredentialsTTL {
+		errs = append(errs, fmt.Errorf(
+			"turn.credentials_ttl %s must be positive and no greater than %s",
+			c.TURN.CredentialsTTL,
+			maxTURNCredentialsTTL,
+		))
+	}
+	if c.TURN.Secret != "" && strings.TrimSpace(c.TURN.Realm) == "" {
+		errs = append(errs, errors.New("turn.realm must not be empty when turn.secret is configured"))
+	}
+	for i, rawURL := range c.TURN.URIs {
+		if err := validateICEURL(fmt.Sprintf("turn.uris[%d]", i), rawURL, true); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	for i, rawURL := range c.WebRTC.ICEServers {
+		if err := validateICEURL(fmt.Sprintf("webrtc.ice_servers[%d]", i), rawURL, false); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	switch strings.ToLower(strings.TrimSpace(c.Recording.Format)) {
+	case "webm", "mp4":
+	default:
+		errs = append(errs, fmt.Errorf("recording.format %q must be webm or mp4", c.Recording.Format))
+	}
+	if c.Recording.Enabled {
+		if strings.TrimSpace(c.Recording.Dir) == "" {
+			errs = append(errs, errors.New("recording.dir must not be empty when recording is enabled"))
+		}
+		if strings.TrimSpace(c.Recording.FFmpegPath) == "" {
+			errs = append(errs, errors.New("recording.ffmpeg_path must not be empty when recording is enabled"))
+		}
+		if c.Recording.MaxConcurrent < 1 || c.Recording.MaxConcurrent > 64 {
+			errs = append(errs, fmt.Errorf("recording.max_concurrent %d must be between 1 and 64", c.Recording.MaxConcurrent))
+		}
+		if runtime.GOOS == "windows" && !c.Recording.WindowsACLReady {
+			errs = append(errs, errors.New(
+				"recording.windows_acl_ready must be true after provisioning a restricted inheritable NTFS DACL",
+			))
+		}
+	}
+
+	if c.UDPRateLimitPPS < 0 {
+		errs = append(errs, fmt.Errorf("udp_rate_limit_pps %d must not be negative", c.UDPRateLimitPPS))
+	}
+	if c.UDPRateBurst < 0 {
+		errs = append(errs, fmt.Errorf("udp_rate_burst %d must not be negative", c.UDPRateBurst))
+	}
+	if c.UDPRateLimitPPS > 0 && c.UDPRateBurst <= 0 {
+		errs = append(errs, errors.New("udp_rate_burst must be positive when udp_rate_limit_pps is enabled"))
+	}
+
+	return errors.Join(errs...)
+}
+
+// Warnings returns security-relevant choices that are valid only because the
+// operator explicitly opted in or selected development mode.
+func (c *Config) Warnings() []string {
+	if c == nil {
+		return []string{"configuration is nil"}
+	}
+	warnings := []string{}
+	if !isLoopbackAddress(c.QueryAddr) && c.QueryAllowRemote {
+		warnings = append(warnings, "query_allow_remote exposes plaintext ServerQuery; prefer ServerQuery over SSH")
+	}
+	if c.MetricsAllowRemote {
+		warnings = append(warnings, "metrics_allow_remote exposes operational metrics beyond loopback")
+	}
+	if !c.TLSEnabled {
+		warnings = append(warnings, "tls_enabled=false exposes the control protocol in plaintext")
+	}
+	if !c.FileTLSEnabled || !c.TLSEnabled {
+		warnings = append(warnings, "file transfers are plaintext because file TLS is not fully enabled")
+	}
+	if c.ChatAllowPlaintext {
+		warnings = append(warnings, "chat_allow_plaintext accepts legacy plaintext chat payloads")
+	}
+	if c.TURN.Secret != "" && len(c.TURN.URIs) == 0 {
+		warnings = append(warnings, "turn.secret is configured but turn.uris is empty; TURN is disabled")
+	}
+	if c.TURN.Secret == "" && len(c.TURN.URIs) > 0 {
+		warnings = append(warnings, "turn.uris is configured but turn.secret is empty; TURN is disabled")
+	}
+	return warnings
+}
+
+func validateAddress(name, address string) error {
+	if strings.TrimSpace(address) != address || address == "" {
+		return fmt.Errorf("%s %q must be a non-empty host:port address without surrounding whitespace", name, address)
+	}
+	_, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("%s %q must be a valid host:port address: %w", name, address, err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("%s %q must use a port between 1 and 65535", name, address)
+	}
+	return nil
+}
+
+func validateLoopbackAddress(name, address string) error {
+	if isLoopbackAddress(address) {
+		return nil
+	}
+	return fmt.Errorf("%s %q must be loopback-only", name, address)
+}
+
+func isLoopbackAddress(address string) bool {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func validateDatabaseURL(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("database_url is invalid: %w", err)
+	}
+	if parsed.Scheme != "postgres" && parsed.Scheme != "postgresql" {
+		return fmt.Errorf("database_url scheme %q must be postgres or postgresql", parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return errors.New("database_url must include a host")
+	}
+	return nil
+}
+
+func validateProductionDatabaseURL(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("database_url is invalid: %w", err)
+	}
+	if parsed.User != nil {
+		password, hasPassword := parsed.User.Password()
+		if hasPassword && strings.EqualFold(parsed.User.Username(), "voicx") && password == "voicx" {
+			return errors.New("database_url must not use the default voicx:voicx credentials when dev_mode=false")
+		}
+	}
+
+	sslMode := strings.ToLower(strings.TrimSpace(parsed.Query().Get("sslmode")))
+	switch sslMode {
+	case "require", "verify-ca", "verify-full":
+		return nil
+	default:
+		return fmt.Errorf(
+			"database_url sslmode %q must be require, verify-ca, or verify-full when dev_mode=false",
+			sslMode,
+		)
+	}
+}
+
+func validateICEURL(name, raw string, turnOnly bool) error {
+	if strings.TrimSpace(raw) != raw || raw == "" {
+		return fmt.Errorf("%s must be a non-empty URL without surrounding whitespace", name)
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%s %q is invalid: %w", name, raw, err)
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	validScheme := scheme == "turn" || scheme == "turns"
+	if !turnOnly {
+		validScheme = validScheme || scheme == "stun" || scheme == "stuns"
+	}
+	if !validScheme {
+		allowed := "turn or turns"
+		if !turnOnly {
+			allowed = "stun, stuns, turn, or turns"
+		}
+		return fmt.Errorf("%s scheme %q must be %s", name, parsed.Scheme, allowed)
+	}
+	if parsed.Host == "" && parsed.Opaque == "" {
+		return fmt.Errorf("%s %q must include a server address", name, raw)
+	}
+	return nil
+}
+
+// RedactedDatabaseURL returns a log-safe database endpoint. User information
+// and sensitive query values are removed; malformed values are not echoed.
+func (c *Config) RedactedDatabaseURL() string {
+	if c == nil {
+		return ""
+	}
+	return redactURL(c.DatabaseURL)
+}
+
+// RedactedRedisAddr returns a log-safe Redis endpoint. Plain host:port values
+// are unchanged, while URI credentials and sensitive query values are removed.
+func (c *Config) RedactedRedisAddr() string {
+	if c == nil {
+		return ""
+	}
+	if !strings.Contains(c.RedisAddr, "://") {
+		if strings.Contains(c.RedisAddr, "@") {
+			return "<redacted>"
+		}
+		return c.RedisAddr
+	}
+	return redactURL(c.RedisAddr)
+}
+
+func redactURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "<redacted>"
+	}
+	parsed.User = nil
+	parsed.Fragment = ""
+	query := parsed.Query()
+	for key := range query {
+		if sensitiveQueryKey(key) {
+			query.Del(key)
+		}
+	}
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
+}
+
+func sensitiveQueryKey(key string) bool {
+	key = strings.ToLower(key)
+	for _, marker := range []string{"credential", "key", "pass", "secret", "token"} {
+		if strings.Contains(key, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // Summary returns a human-readable one-line summary of the configuration,
 // suitable for logging at startup.
 func (c *Config) Summary() string {
+	const format = "name=%q dev=%t level=%s tcp=%q udp=%q grpc=%q health=%q " +
+		"query=%q db=%q redis=%q redis_enabled=%t max_clients=%d av1=%t ice_servers=%d"
 	return fmt.Sprintf(
-		"name=%s dev=%t level=%s tcp=%s udp=%s grpc=%s health=%s db=%s redis=%s redis_enabled=%t max_clients=%d av1=%t ice=%v",
+		format,
 		c.ServerName, c.DevMode, c.LogLevel, c.TCPAddr, c.UDPAddr, c.GRPCAddr,
-		c.HealthAddr, c.DatabaseURL, c.RedisAddr, c.RedisEnabled, c.MaxClients,
-		c.WebRTC.EnableAV1, c.WebRTC.ICEServers,
+		c.HealthAddr, c.QueryAddr, c.RedactedDatabaseURL(), c.RedactedRedisAddr(),
+		c.RedisEnabled, c.MaxClients, c.WebRTC.EnableAV1, len(c.WebRTC.ICEServers),
 	)
 }

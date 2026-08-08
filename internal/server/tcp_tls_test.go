@@ -72,7 +72,7 @@ func TestTLSHandshakeAndFingerprint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tls dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	state := conn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
@@ -103,7 +103,7 @@ func TestTLSRejectsPlaintext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tcp dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// A plaintext frame write hits the TLS record layer: the server either
 	// errors the read or closes the connection; we must not get a Pong.
@@ -112,6 +112,34 @@ func TestTLSRejectsPlaintext(t *testing.T) {
 	_ = netproto.WriteFrame(conn, pingFrame)
 	if _, err := netproto.ReadFrame(conn); err == nil {
 		t.Fatal("plaintext client received a protocol reply from a TLS listener")
+	}
+}
+
+// TestTLSRequiresVersion13 pins the control listener's documented minimum.
+func TestTLSRequiresVersion13(t *testing.T) {
+	addr, _, stop := startTLSTestServer(t, true)
+	defer stop()
+
+	legacy, err := tls.Dial("tcp", addr, &tls.Config{
+		InsecureSkipVerify: true, //nolint:gosec // protocol-version test
+		MinVersion:         tls.VersionTLS12,
+		MaxVersion:         tls.VersionTLS12,
+	})
+	if err == nil {
+		_ = legacy.Close()
+		t.Fatal("TLS 1.2 handshake succeeded, want rejection")
+	}
+
+	current, err := tls.Dial("tcp", addr, &tls.Config{
+		InsecureSkipVerify: true, //nolint:gosec // test client
+		MinVersion:         tls.VersionTLS13,
+	})
+	if err != nil {
+		t.Fatalf("TLS 1.3 dial: %v", err)
+	}
+	defer func() { _ = current.Close() }()
+	if version := current.ConnectionState().Version; version != tls.VersionTLS13 {
+		t.Fatalf("negotiated TLS version = %#x, want TLS 1.3", version)
 	}
 }
 
@@ -128,7 +156,7 @@ func TestPlaintextStillAllowed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tcp dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	send(t, conn, netproto.MsgPing, netproto.Ping{})
 	f := readFrame(t, conn)
 	if netproto.MessageType(f.Type) != netproto.MsgPong {

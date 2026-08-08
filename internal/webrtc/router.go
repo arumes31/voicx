@@ -33,8 +33,10 @@ import (
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/sdp/v3"
-	"github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v4"
 	"go.uber.org/zap"
+
+	"voicx/internal/safecast"
 )
 
 // TrackReader is the subset of *webrtc.TrackRemote the router reads from.
@@ -1287,9 +1289,16 @@ func (r *Router) speak(clientID string, speaking bool) {
 // ID from the receiver parameters, or 0 when the extension was not
 // negotiated.
 func audioLevelExtID(receiver *webrtc.RTPReceiver) uint8 {
-	for _, ext := range receiver.GetParameters().HeaderExtensions {
+	return audioLevelExtIDFromExtensions(receiver.GetParameters().HeaderExtensions)
+}
+
+func audioLevelExtIDFromExtensions(extensions []webrtc.RTPHeaderExtensionParameter) uint8 {
+	for _, ext := range extensions {
 		if ext.URI == sdp.AudioLevelURI {
-			return uint8(ext.ID)
+			id, err := safecast.IntToUint8(ext.ID)
+			if err == nil && id != 0 {
+				return id
+			}
 		}
 	}
 	return 0
@@ -1386,13 +1395,6 @@ func (r *Router) addVideoOutput(clientID string, w TrackWriter) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.videoOutputs[clientID] = w
-}
-
-// removeVideoOutput removes the video output track for clientID, if any.
-func (r *Router) removeVideoOutput(clientID string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.videoOutputs, clientID)
 }
 
 // senderVideoTapID returns the tap clientID recording a given channel, or ""

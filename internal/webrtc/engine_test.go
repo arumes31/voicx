@@ -21,7 +21,7 @@ func TestNewEngine(t *testing.T) {
 	if e == nil {
 		t.Fatal("New returned nil Engine")
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 }
 
 // TestNewEngineNilLogger verifies that New returns an error when the logger
@@ -44,7 +44,7 @@ func TestNewPeerConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 
 	w, err := e.NewPeerConnection("client-1")
 	if err != nil {
@@ -72,7 +72,7 @@ func TestNewPeerConnectionDuplicate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 
 	if _, err := e.NewPeerConnection("client-dup"); err != nil {
 		t.Fatalf("first NewPeerConnection: %v", err)
@@ -88,7 +88,7 @@ func TestNewPeerConnectionEmptyID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 
 	if _, err := e.NewPeerConnection(""); err == nil {
 		t.Fatal("NewPeerConnection(\"\") expected error, got nil")
@@ -137,7 +137,7 @@ func TestClosePeerConnectionMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 
 	if err := e.ClosePeerConnection("does-not-exist"); err != nil {
 		t.Errorf("ClosePeerConnection(missing) = %v, want nil", err)
@@ -151,7 +151,7 @@ func TestPeerConnectionLookup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 
 	if w := e.PeerConnection("missing"); w != nil {
 		t.Errorf("PeerConnection(missing) = %v, want nil", w)

@@ -3,10 +3,13 @@
 package logging
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // isolateRing empties the global ring for one test and puts the previous
@@ -23,6 +26,53 @@ func isolateRing(t *testing.T) {
 		globalRing.lines = saved
 		globalRing.mu.Unlock()
 	})
+}
+
+func TestTeeWritesPrimaryCoreExactlyOnce(t *testing.T) {
+	isolateRing(t)
+	core, observed := observer.New(zapcore.DebugLevel)
+	logger := zap.New(core).WithOptions(Tee())
+	logger.Info("single-primary-write")
+
+	if got := observed.Len(); got != 1 {
+		t.Fatalf("primary log count = %d, want 1", got)
+	}
+	lines := Recent(10, "single-primary-write")
+	if len(lines) != 1 {
+		t.Fatalf("ring log count = %d, want 1: %v", len(lines), lines)
+	}
+}
+
+func TestTeePreservesContextualFields(t *testing.T) {
+	isolateRing(t)
+	core, _ := observer.New(zapcore.DebugLevel)
+	logger := zap.New(core).WithOptions(Tee()).With(zap.String("component", "asset-store"))
+	logger.Info("contextual-ring-line", zap.Int("attempt", 2))
+
+	lines := Recent(10, "contextual-ring-line")
+	if len(lines) != 1 {
+		t.Fatalf("ring lines = %v", lines)
+	}
+	for _, want := range []string{"component", "asset-store", "attempt", "2"} {
+		if !strings.Contains(lines[0], want) {
+			t.Errorf("ring line %q does not contain %q", lines[0], want)
+		}
+	}
+}
+
+func TestTeeUsesPrimaryLevel(t *testing.T) {
+	isolateRing(t)
+	core, _ := observer.New(zapcore.InfoLevel)
+	logger := zap.New(core).WithOptions(Tee())
+	logger.Debug("filtered-debug-line")
+	logger.Info("retained-info-line")
+
+	if lines := Recent(10, "filtered-debug-line"); len(lines) != 0 {
+		t.Fatalf("ring retained disabled debug entry: %v", lines)
+	}
+	if lines := Recent(10, "retained-info-line"); len(lines) != 1 {
+		t.Fatalf("ring info lines = %v", lines)
+	}
 }
 
 // TestFollowStreamsNewLines verifies a follower receives lines emitted after

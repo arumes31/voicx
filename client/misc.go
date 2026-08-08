@@ -43,7 +43,9 @@ func (a *App) OpenLogFolder() string {
 	if err != nil {
 		return err.Error()
 	}
-	if err := exec.Command("explorer", dir).Start(); err != nil {
+	// #nosec G204 -- explorer.exe is fixed and the application-owned config
+	// directory is passed as one argument; no command shell parses it.
+	if err := exec.Command("explorer.exe", dir).Start(); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -152,6 +154,8 @@ func (a *App) ImportIdentity() string {
 	if err != nil || src == "" {
 		return "" // cancelled
 	}
+	// #nosec G304 -- src is explicitly selected by the local user in the
+	// native identity-import dialog and must be read to perform the import.
 	data, err := os.ReadFile(src)
 	if err != nil {
 		return err.Error()

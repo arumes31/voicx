@@ -39,7 +39,7 @@ func (s *Store) CustomInfo(ctx context.Context, uniqueID string) ([]CustomEntry,
 	if err != nil {
 		return nil, fmt.Errorf("querying custom properties: %w", err)
 	}
-	defer rows.Close()
+	defer closeRows(rows)
 	var out []CustomEntry
 	for rows.Next() {
 		var e CustomEntry

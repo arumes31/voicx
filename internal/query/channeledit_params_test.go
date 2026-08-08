@@ -25,7 +25,7 @@ func TestChanneleditTreeParams(t *testing.T) {
 	be := &recordingBackend{fakeBackend: newFakeBackend()}
 	addr, _ := startQueryServer(t, be)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	lines := sendCmd(t, conn, r,
@@ -54,7 +54,7 @@ func TestChanneleditTreeParamsOmitted(t *testing.T) {
 	be := &recordingBackend{fakeBackend: newFakeBackend()}
 	addr, _ := startQueryServer(t, be)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	lines := sendCmd(t, conn, r, "channeledit cid=1 channel_topic=hi")
@@ -73,7 +73,7 @@ func TestChanneleditTreeParamsInvalid(t *testing.T) {
 	be := &recordingBackend{fakeBackend: newFakeBackend()}
 	addr, _ := startQueryServer(t, be)
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 	loginOK(t, conn, r)
 
 	for _, arg := range []string{
@@ -94,7 +94,7 @@ func TestChanneleditTreeParamsInvalid(t *testing.T) {
 func TestHelpListsChanneleditTreeParams(t *testing.T) {
 	addr, _ := startQueryServer(t, newFakeBackend())
 	conn, r := dialQuery(t, addr)
-	defer conn.Close()
+	defer closeServerQueryTestResource(t, conn)
 
 	lines := sendCmd(t, conn, r, "help")
 	joined := strings.Join(lines, "\n")

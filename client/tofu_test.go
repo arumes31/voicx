@@ -1,8 +1,12 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"voicx/internal/tlscert"
 )
 
 // TestTOFUFirstSeenThenMatch verifies the trust-on-first-use lifecycle:
@@ -74,5 +78,37 @@ func TestTOFUMissingFile(t *testing.T) {
 	ks := loadKnownServersAt(filepath.Join(t.TempDir(), "nope.json"))
 	if got := ks.verify("x:1", "fp"); got != trustUnknown {
 		t.Fatalf("verify = %v, want trustUnknown", got)
+	}
+}
+
+func TestTOFUCorruptStoreFailsClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "known_servers.json")
+	if err := os.WriteFile(path, []byte("{not-json"), 0o600); err != nil {
+		t.Fatalf("seed corrupt store: %v", err)
+	}
+	ks := loadKnownServersAt(path)
+	if err := ks.trust("server.test:12333", "fingerprint"); err == nil ||
+		!strings.Contains(err.Error(), "parsing TLS trust store") {
+		t.Fatalf("trust with corrupt store error = %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read corrupt store: %v", err)
+	}
+	if string(got) != "{not-json" {
+		t.Fatalf("corrupt trust store was overwritten: %q", got)
+	}
+}
+
+func TestNormalizeFingerprint(t *testing.T) {
+	fingerprint := tlscert.FingerprintDER([]byte("certificate"))
+	got, err := normalizeFingerprint(strings.ToUpper(fingerprint))
+	if err != nil || got != fingerprint {
+		t.Fatalf("normalizeFingerprint() = (%q, %v), want (%q, nil)", got, err, fingerprint)
+	}
+	for _, invalid := range []string{"", "aa:bb", strings.Repeat("gg:", 31) + "gg"} {
+		if _, err := normalizeFingerprint(invalid); err == nil {
+			t.Fatalf("normalizeFingerprint(%q) succeeded", invalid)
+		}
 	}
 }

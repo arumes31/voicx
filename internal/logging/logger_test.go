@@ -2,6 +2,8 @@ package logging
 
 import (
 	"testing"
+
+	"go.uber.org/zap"
 )
 
 // TestNewDev verifies that New(true, "debug") returns a non-nil development
@@ -17,6 +19,20 @@ func TestNewDev(t *testing.T) {
 	// Should not panic.
 	logger.Info("dev logger info message")
 	_ = logger.Sync()
+}
+
+func TestNewDevHonorsConfiguredLevel(t *testing.T) {
+	logger, err := New(true, "error")
+	if err != nil {
+		t.Fatalf("New(true, error): %v", err)
+	}
+	defer func() { _ = logger.Sync() }()
+	if logger.Core().Enabled(zap.DebugLevel) || logger.Core().Enabled(zap.InfoLevel) {
+		t.Fatal("development logger enabled messages below configured error level")
+	}
+	if !logger.Core().Enabled(zap.ErrorLevel) {
+		t.Fatal("development logger did not enable configured error level")
+	}
 }
 
 // TestNewProd verifies that New(false, "info") returns a non-nil production
@@ -42,6 +58,16 @@ func TestNewProdInvalidLevel(t *testing.T) {
 	}
 	if logger != nil {
 		t.Errorf("New(false, invalid-level) expected nil logger, got %v", logger)
+	}
+}
+
+func TestNewDevInvalidLevel(t *testing.T) {
+	logger, err := New(true, "invalid-level")
+	if err == nil {
+		t.Fatal("New(true, invalid-level) expected error, got nil")
+	}
+	if logger != nil {
+		t.Errorf("New(true, invalid-level) expected nil logger, got %v", logger)
 	}
 }
 

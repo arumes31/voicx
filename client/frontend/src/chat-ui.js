@@ -13,6 +13,8 @@
 import { renderMarkdown, escapeHTML, EMOJI } from "./markdown.js";
 import { playEvent } from "./sounds.js";
 import { pickIcon } from "./image-tools.js";
+import { closeDialog, isCurrentServerDialog, mountServerDialog } from "./modal.js";
+import { imageDataURL } from "./safe-media.js";
 
 const V = () => window.__voicx;
 const $ = (id) => document.getElementById(id);
@@ -72,9 +74,17 @@ let sentHistoryDraft = "";
 let customEmoji = [];
 let customDirty = true;
 const emojiURLs = new Map(); // name -> dataURL | "" (failed)
+const builtInEmoji = [...new Set(Object.values(EMOJI))];
+const EMOJI_CATS = [
+    ["Faces", builtInEmoji.slice(0, 30)],
+    ["Reactions", builtInEmoji.slice(30, 49)],
+    ["Objects & symbols", builtInEmoji.slice(49)],
+];
 
 // Offline-DM toast batching (123).
 const offlineBatch = new Map(); // uid -> {n, nick, timer}
+const reconnectAnnouncementBatches = new Map(); // scope key -> {n, names, event, ctx, timer}
+let reconnectAnnouncementUntil = 0;
 
 // Local DM history (122). The sealed on-disk log is a DM's ONLY history — the
 // server is E2EE-blind and stores nothing — so a peer's log is replayed into
@@ -117,6 +127,61 @@ function activeChannelID() {
     if (view.kind === "chan") return view.id;
     if (view.kind === "channel") return V().state.myChannelID || null;
     return null;
+}
+
+function chatSurfaceVisible(key) {
+    const workspace = document.getElementById("app");
+    const chatTab = document.getElementById("tab-chat");
+    return key === activeKey() && document.visibilityState === "visible" && document.hasFocus() &&
+        workspace && !workspace.classList.contains("hidden") && workspace.getAttribute("aria-hidden") !== "true" &&
+        chatTab?.getAttribute("aria-pressed") === "true";
+}
+
+function chatAnnouncementAllowed(event, ctx, key) {
+    if (!chatSurfaceVisible(key)) return false;
+    return window.__voicxNotify?.notificationOutputAllowed?.(event, ctx, "toast") ?? true;
+}
+
+function chatAnnouncementText(message) {
+    return `${message.from || "Someone"}: ${String(message.text || "message").slice(0, 160)}`;
+}
+
+export function beginReconnectAnnouncementBatch(durationMs = 12000) {
+    reconnectAnnouncementUntil = Math.max(reconnectAnnouncementUntil, Date.now() + Math.max(0, durationMs));
+}
+
+export function cancelReconnectAnnouncementBatch() {
+    reconnectAnnouncementUntil = 0;
+    for (const batch of reconnectAnnouncementBatches.values()) {
+        if (batch.timer) clearTimeout(batch.timer);
+    }
+    reconnectAnnouncementBatches.clear();
+}
+
+function queueReconnectAnnouncement(key, message, event, ctx) {
+    if (Date.now() >= reconnectAnnouncementUntil) return false;
+    const batch = reconnectAnnouncementBatches.get(key) || {
+        n: 0, names: new Set(), event, ctx, timer: null,
+    };
+    batch.n++;
+    if (message.from) batch.names.add(message.from);
+    batch.event = event;
+    batch.ctx = ctx;
+    if (batch.timer) clearTimeout(batch.timer);
+    batch.timer = setTimeout(() => {
+        reconnectAnnouncementBatches.delete(key);
+        if (!chatAnnouncementAllowed(batch.event, batch.ctx, key)) return;
+        const from = batch.names.size === 1 ? ` from ${[...batch.names][0]}` : "";
+        V().announceLive(`${batch.n} message${batch.n === 1 ? "" : "s"}${from} received after reconnect`);
+    }, 700);
+    reconnectAnnouncementBatches.set(key, batch);
+    return true;
+}
+
+function eligibleChatAnnouncement(message, key, event, ctx, allowed) {
+    if (message.self || message.offline || !allowed) return "";
+    if (queueReconnectAnnouncement(key, message, event, ctx)) return "";
+    return chatAnnouncementText(message);
 }
 
 // channelName resolves a channel id to its tree name, falling back to the id
@@ -294,26 +359,27 @@ function markMentions(container) {
 
 async function ensureCustomEmoji() {
     if (!customDirty) return;
+    const generation = V().state.serverGeneration;
     customDirty = false;
     try {
         const r = await app().EmojiList();
+        if (generation !== V().state.serverGeneration) return;
         customEmoji = r.emojis || [];
     } catch {
+        if (generation !== V().state.serverGeneration) return;
         customEmoji = [];
     }
 }
 
-const ALLOWED_EMOJI_MIME = /^image\/(png|jpeg|jpg|gif|webp|svg\+xml)$/i;
-
 async function emojiURL(name) {
     if (emojiURLs.has(name)) return emojiURLs.get(name);
+    const generation = V().state.serverGeneration;
     emojiURLs.set(name, ""); // marks "loading/failed until proven otherwise"
     try {
         const d = await app().EmojiGet(name);
-        if (!d || !d.content_type || !ALLOWED_EMOJI_MIME.test(d.content_type)) {
-            return "";
-        }
-        const u = `data:${d.content_type};base64,${d.data_base64}`;
+        if (generation !== V().state.serverGeneration) return "";
+        const u = imageDataURL(d);
+        if (!u) return "";
         emojiURLs.set(name, u);
         return u;
     } catch {
@@ -599,18 +665,11 @@ function openLightbox(node) {
         big.autoplay = true;
     }
     ov.appendChild(big);
-    const onKey = (e) => {
-        if (e.key === "Escape") close();
-    };
-    const close = () => {
-        document.removeEventListener("keydown", onKey);
-        ov.remove();
-    };
+    const close = () => closeDialog(ov);
     ov.onclick = (e) => {
         if (e.target === ov) close(); // clicking the video's controls must not close it
     };
-    document.addEventListener("keydown", onKey);
-    document.body.appendChild(ov);
+    mountServerDialog(ov);
 }
 
 // --- reactions (97) -----------------------------------------------------------
@@ -1037,10 +1096,15 @@ function activatePM(uid) {
 }
 
 async function openE2EEDiagnostics() {
+    const generation = V().state.serverGeneration;
     const peer = view.kind === "dm" ? view.uid : "";
     let d;
     try { d = await app().E2EEDiagnostics(peer); }
-    catch (err) { V().toast("encryption diagnostics failed: " + err, "warn"); return; }
+    catch (err) {
+        if (generation === V().state.serverGeneration) V().toast("encryption diagnostics failed: " + err, "warn");
+        return;
+    }
+    if (generation !== V().state.serverGeneration) return;
     const overlay = document.createElement("div");
     overlay.className = "dlg-overlay";
     const verified = peer && d.safety_number && V().state.settings?.e2ee_verified?.[peer] === d.safety_number;
@@ -1069,13 +1133,15 @@ async function openE2EEDiagnostics() {
             if (err) throw new Error(err);
         } catch (err) {
             settings.e2ee_verified = previous;
+            if (!isCurrentServerDialog(overlay)) return;
             V().toast("saving safety verification failed: " + err, "warn");
             return;
         }
+        if (!isCurrentServerDialog(overlay)) return;
         overlay.remove();
         V().toast("safety number verified");
     });
-    document.body.appendChild(overlay);
+    mountServerDialog(overlay);
 }
 
 function activateChannel(channelID) {
@@ -1546,34 +1612,53 @@ export function addChat(d) {
     clearTyping(m.fromUID); // (120) their message landed; they are done typing
 
     if (m.e2e) {
-        routeDM(d, m);
-        return;
+        return routeDM(d, m);
     }
 
     const chID = m.channelID ?? 0;
     const key = "ch:" + chID;
     const position = pushMsg(key, m);
-    if (position === "duplicate") return;
+    if (position === "duplicate") return false;
     const directMention = m.mentions.includes(st.myUniqueID) && !m.self;
     const roleMention = !m.self && /@(admin|moderator|member|guest)\b/i.test(m.text || "");
+    const level = st.settings?.chat_notification_level || "all";
+    let announcementAllowed = false;
+    let announcementEvent = "channel_message";
+    let announcementContext = { channelID: m.channelID, className: "messages" };
     if (directMention) {
         m.mentioned = true; // (106) accent highlight
     } else if (!m.self) {
         // (388) keyword highlights: whole-word match gets mention treatment.
         const kw = window.__voicxNotify?.matchKeyword(m.text || "");
+        const keywordLevelAllowed = level === "all" || level === "channel_mentions";
         if (kw) {
             m.mentioned = true;
-            window.__voicxNotify?.notify("keyword", `[${kw}] ` + (m.from || "someone") + ": " + (m.text || "").slice(0, 80),
-                { channelID: m.channelID, className: "mentions", kind: "warn" });
+            if (keywordLevelAllowed) {
+                const keywordContext = { channelID: m.channelID, className: "mentions" };
+                const keywordAnnouncement = chatAnnouncementAllowed("keyword", keywordContext, key);
+                if (keywordAnnouncement) {
+                    announcementAllowed = true;
+                    announcementEvent = "keyword";
+                    announcementContext = keywordContext;
+                }
+                window.__voicxNotify?.notify("keyword", `[${kw}] ` + (m.from || "someone") + ": " + (m.text || "").slice(0, 80),
+                    { ...keywordContext, kind: "warn", announce: false });
+            }
         }
     }
     if (!m.self) {
-        const level = st.settings?.chat_notification_level || "all";
         const allowed = level === "all" || (level === "channel_mentions" && directMention) || (level === "role_mentions" && roleMention);
         if (allowed) {
             const event = directMention || roleMention ? "mention" : "channel_message";
+            const context = { channelID: m.channelID, className: directMention || roleMention ? "mentions" : "messages" };
+            const eventAnnouncement = chatAnnouncementAllowed(event, context, key);
+            if (eventAnnouncement) {
+                announcementAllowed = true;
+                announcementEvent = event;
+                announcementContext = context;
+            }
             window.__voicxNotify?.notify(event, (m.from || "someone") + ": " + (m.text || "").slice(0, 80),
-                { channelID: m.channelID, className: directMention || roleMention ? "mentions" : "messages", kind: directMention || roleMention ? "warn" : "info" });
+                { ...context, kind: directMention || roleMention ? "warn" : "info", announce: false });
         }
     }
     if (key === activeKey()) {
@@ -1590,6 +1675,11 @@ export function addChat(d) {
         V().renderTree();
         renderTabs();
     }
+    return {
+        added: true,
+        announcement: eligibleChatAnnouncement(
+            m, key, announcementEvent, announcementContext, announcementAllowed),
+    };
 }
 
 function pushMsg(key, m) {
@@ -1627,16 +1717,16 @@ function routeDM(d, m) {
     // Peer: incoming → sender; own echo → the user we last DMed (the
     // broadcast carries no to_unique_id client-side).
     const peer = m.self ? (lastDMTarget || (view.kind === "dm" ? view.uid : "")) : (m.fromUID || "");
-    if (!peer) return;
+    if (!peer) return false;
     const tab = pmTabs.get(peer) || { uid: peer, nick: m.self ? peer : m.from, unread: 0, offline: false, pendingRead: "" };
     if (!pmTabs.has(peer)) pmTabs.set(peer, tab);
     if (!m.self) tab.nick = m.from;
 
     const key = "dm:" + peer;
-    if (pushMsg(key, m) === "duplicate") return;
-    if (!m.self) {
+    if (pushMsg(key, m) === "duplicate") return false;
+    if (!m.self && !m.offline) {
         window.__voicxNotify?.notify("dm", (m.from || "someone") + ": " + (m.text || "").slice(0, 80),
-            { uid: peer, className: "messages", kind: "info" });
+            { uid: peer, className: "messages", kind: "info", announce: false });
     }
     dmRecord(peer, tab.nick, m); // (122) both directions, so a restart replays the thread
 
@@ -1648,7 +1738,12 @@ function routeDM(d, m) {
         if (b.timer) clearTimeout(b.timer);
         b.timer = setTimeout(() => {
             offlineBatch.delete(peer);
-            V().toast(`${b.n} offline message${b.n === 1 ? "" : "s"} from ${b.nick}`, "info", "alert");
+            const summary = `${b.n} offline message${b.n === 1 ? "" : "s"} from ${b.nick}`;
+            window.__voicxNotify?.notify("dm", summary,
+                { uid: peer, className: "messages", kind: "info", announce: false });
+            if (chatAnnouncementAllowed("dm", { uid: peer, className: "messages" }, key)) {
+                V().announceLive(summary);
+            }
         }, 700);
         offlineBatch.set(peer, b);
     }
@@ -1670,6 +1765,17 @@ function routeDM(d, m) {
         tab.unread++;
     }
     renderTabs();
+    return {
+        added: true,
+        incomingDM: !m.self && !m.offline,
+        announcement: eligibleChatAnnouncement(
+            m,
+            key,
+            "dm",
+            { uid: peer, className: "messages" },
+            chatAnnouncementAllowed("dm", { uid: peer, className: "messages" }, key),
+        ),
+    };
 }
 
 function sendPendingReads() {
@@ -2084,11 +2190,13 @@ function toggleEmojiPanel() {
     up.title = "upload a custom server emoji (needs permission)";
     up.onclick = async (ev) => {
         ev.stopPropagation();
+        const generation = V().state.serverGeneration;
         const img = await pickIcon(128, 0.9);
-        if (!img?.dataBase64) return;
+        if (!img?.dataBase64 || generation !== V().state.serverGeneration) return;
         const name = (prompt("Emoji shortcode (letters, digits, _ and -):") || "").trim();
-        if (!name) return;
+        if (!name || generation !== V().state.serverGeneration) return;
         const err = await app().EmojiUpload(name, img.dataBase64);
+        if (generation !== V().state.serverGeneration) return;
         if (err) {
             V().toast("emoji upload failed: " + err, "warn");
             return;
@@ -2403,6 +2511,7 @@ const SEARCH_LABEL = "search all history";
 // pages the scope in Go and matches over bodies it decrypted itself, because
 // the server stores only ciphertext and cannot match on content (110).
 async function searchAll() {
+    const generation = V().state.serverGeneration;
     const q = $("chat-search").value.trim();
     if (!q) return;
     const btn = $("chat-search-server");
@@ -2420,8 +2529,9 @@ async function searchAll() {
         try {
             dm = await app().DMSearch(view.uid, q, SEARCH_MAX);
         } catch (e) {
-            V().toast("search failed: " + e, "warn");
+            if (generation === V().state.serverGeneration) V().toast("search failed: " + e, "warn");
         }
+        if (generation !== V().state.serverGeneration) return;
         btn.disabled = false;
         btn.textContent = SEARCH_LABEL;
         showSearchResults(q.toLowerCase(), dm.messages || [], dm.scanned || 0, dm.undecryptable || 0);
@@ -2438,9 +2548,10 @@ async function searchAll() {
     try {
         res = await app().ChatSearch(chID, q, SEARCH_MAX);
     } catch (e) {
-        V().toast("search failed: " + e, "warn");
+        if (generation === V().state.serverGeneration) V().toast("search failed: " + e, "warn");
     }
     if (unsub) unsub();
+    if (generation !== V().state.serverGeneration) return;
     btn.disabled = false;
     btn.textContent = SEARCH_LABEL;
     showSearchResults(q.toLowerCase(), res.messages || [], res.scanned || 0, res.undecryptable || 0);
@@ -2506,7 +2617,7 @@ function showSearchResults(q, results, scanned, undecryptable) {
     overlay.onclick = (e) => {
         if (e.target === overlay) overlay.remove();
     };
-    document.body.appendChild(overlay);
+    mountServerDialog(overlay);
 }
 
 // ---------------------------------------------------------------------------
@@ -2599,7 +2710,7 @@ function openDescription() {
     overlay.onclick = (e) => {
         if (e.target === overlay) overlay.remove();
     };
-    document.body.appendChild(overlay);
+    mountServerDialog(overlay);
 }
 
 // exportProgressDialog reports how far a running export got. Paging a whole
@@ -2618,10 +2729,12 @@ function exportProgressDialog() {
     dlg.appendChild(h);
     dlg.appendChild(p);
     overlay.appendChild(dlg);
-    document.body.appendChild(overlay);
+    let cleanup = null;
+    mountServerDialog(overlay, { onClose: () => cleanup?.() });
     return {
         update: (n) => { p.textContent = `decrypted ${n} messages…`; },
-        close: () => overlay.remove(),
+        close: () => closeDialog(overlay),
+        setCleanup: (fn) => { cleanup = fn; },
     };
 }
 
@@ -2633,6 +2746,8 @@ function exportProgressDialog() {
 // export is the one place this client can undo the storage guarantee: it takes
 // an explicit confirm, and the encrypted container is offered first.
 async function exportChat() {
+    const generation = V().state.serverGeneration;
+    const exportView = { ...view };
     // Without a joined channel the channel view has no scope of its own, and
     // channel id 0 is GLOBAL: exporting it here would hand over a different
     // conversation than the one on screen.
@@ -2640,26 +2755,30 @@ async function exportChat() {
         V().toast("join a channel to export its history — or switch to global", "info", "alert");
         return;
     }
-    const name = view.kind === "dm" ? "dm-" + view.uid.slice(0, 8)
-        : view.kind === "global" ? "global"
+    const name = exportView.kind === "dm" ? "dm-" + exportView.uid.slice(0, 8)
+        : exportView.kind === "global" ? "global"
         : (V().state.channels.find((c) => c.ChannelID === activeChannelID())?.Name || "channel");
 
     const pass = await askExportPassphrase();
-    if (pass === null) return; // cancelled
+    if (pass === null || generation !== V().state.serverGeneration) return; // cancelled or switched
 
     const prog = exportProgressDialog();
-    const unsub = window.runtime.EventsOn("chatexport:progress", (n) => prog.update(n));
+    let unsub = window.runtime.EventsOn("chatexport:progress", (n) => prog.update(n));
+    prog.setCleanup(() => {
+        if (!unsub) return;
+        unsub();
+        unsub = null;
+    });
     let res = null;
     try {
-        res = view.kind === "dm"
-            ? await app().DMExportHistory(view.uid)
-            : await app().ChatExportHistory(view.kind === "global" ? 0 : (activeChannelID() || 0), 0);
+        res = exportView.kind === "dm"
+            ? await app().DMExportHistory(exportView.uid)
+            : await app().ChatExportHistory(exportView.kind === "global" ? 0 : (activeChannelID() || 0), 0);
     } catch (e) {
-        V().toast("export failed: " + e, "warn");
+        if (generation === V().state.serverGeneration) V().toast("export failed: " + e, "warn");
     }
-    if (unsub) unsub();
     prog.close();
-    if (!res) return;
+    if (!res || generation !== V().state.serverGeneration) return;
 
     const contents = res.text || "";
     if (pass !== "") {
@@ -2689,6 +2808,8 @@ async function exportChat() {
 // export, explicitly confirmed) or null (cancelled).
 function askExportPassphrase() {
     return new Promise((resolve) => {
+        let result = null;
+        let settled = false;
         const overlay = document.createElement("div");
         overlay.className = "dlg-overlay";
         const dlg = document.createElement("div");
@@ -2707,7 +2828,10 @@ function askExportPassphrase() {
         dlg.appendChild(inp);
         const btns = document.createElement("div");
         btns.className = "dlg-buttons";
-        const done = (v) => { overlay.remove(); resolve(v); };
+        const done = (value) => {
+            result = value;
+            closeDialog(overlay, value === null ? "cancel" : "close");
+        };
         const cancel = document.createElement("button");
         cancel.textContent = "Cancel";
         cancel.onclick = () => done(null);
@@ -2724,8 +2848,15 @@ function askExportPassphrase() {
         dlg.appendChild(btns);
         overlay.appendChild(dlg);
         overlay.onclick = (e) => { if (e.target === overlay) done(null); };
-        document.body.appendChild(overlay);
-        inp.focus();
+        mountServerDialog(overlay, {
+            initialFocus: inp,
+            onCancel: () => { result = null; },
+            onClose: () => {
+                if (settled) return;
+                settled = true;
+                resolve(result);
+            },
+        });
     });
 }
 
@@ -2791,10 +2922,33 @@ export function onMyChannelChanged() {
     renderTabs();
 }
 
+// Channel deletion can remove a whole subtree in one event. Purge every
+// channel-owned cache immediately instead of waiting for a later subscription
+// snapshot, and leave a deleted subscribed-channel view for the joined scope.
+export function onChannelsDeleted(channelIDs) {
+    const removed = new Set((channelIDs || []).map(Number).filter((id) => id > 0));
+    if (removed.size === 0) return;
+    subscriptions = subscriptions.filter((id) => !removed.has(id));
+    for (const id of removed) {
+        chanTabs.delete(id);
+        unread.delete(id);
+        store.delete("ch:" + id);
+    }
+    if (removed.has(pendingChannelTab)) pendingChannelTab = 0;
+    if (view.kind === "chan" && removed.has(view.id)) {
+        $("chat-scope").value = "channel";
+        V().setDirectTargetVisible(false);
+        setView({ kind: "channel" });
+        return;
+    }
+    renderTabs();
+    updateHeader();
+}
+
 // resetView clears all per-server chat state (281 tab switch): message
 // stores, unread badges, PM tabs, and the rendered panes. The tab journal
 // replay rebuilds the view from server frames afterwards.
-export function resetView() {
+export function resetView(options = {}) {
     view = { kind: "channel" };
     store.clear();
     unread.clear();
@@ -2816,6 +2970,7 @@ export function resetView() {
         if (b.timer) clearTimeout(b.timer);
     }
     offlineBatch.clear();
+    if (!options.preserveReconnectAnnouncements) cancelReconnectAnnouncementBatch();
     linkCards.clear();
     receipts.clear();
     myReactions.clear();
@@ -2907,8 +3062,7 @@ function qsScore(q, s) {
 
 function closeQS() {
     if (qsOverlay) {
-        qsOverlay.remove();
-        qsOverlay = null;
+        closeDialog(qsOverlay);
     }
 }
 
@@ -2945,7 +3099,13 @@ function openQS() {
     qsOverlay.onclick = (e) => {
         if (e.target === qsOverlay) closeQS();
     };
-    document.body.appendChild(qsOverlay);
+    const mountedOverlay = qsOverlay;
+    mountServerDialog(qsOverlay, {
+        initialFocus: input,
+        onClose: () => {
+            if (qsOverlay === mountedOverlay) qsOverlay = null;
+        },
+    });
 
     let sel = 0;
     let matches = [];

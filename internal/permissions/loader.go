@@ -238,7 +238,7 @@ func (l *Loader) LoadServerGroupsForUser(ctx context.Context, userID int64) ([]i
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var ids []int64
 	for rows.Next() {
@@ -279,7 +279,7 @@ func (l *Loader) LoadChannelGroupsForUser(ctx context.Context, userID int64, cha
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var ids []int64
 	for rows.Next() {
@@ -415,7 +415,7 @@ func (l *Loader) channelPermissionChain(ctx context.Context, channelID int64) ([
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var ids []int64
 	for rows.Next() {
@@ -437,7 +437,7 @@ func (l *Loader) loadPermissionRows(ctx context.Context, query string, args ...i
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	set := NewPermissionSet()
 	for rows.Next() {

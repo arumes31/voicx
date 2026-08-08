@@ -40,7 +40,7 @@ func TestResumeState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resumeState (resume): %v", err)
 	}
-	defer f2.Close()
+	defer func() { _ = f2.Close() }()
 	if have2 != 14 {
 		t.Fatalf("resume offset = %d, want 14", have2)
 	}

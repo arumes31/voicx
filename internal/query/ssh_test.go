@@ -3,6 +3,7 @@ package query
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"net"
 	"path/filepath"
 	"strings"
@@ -80,12 +81,12 @@ func TestSSHCloseWithActiveSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ssh dial: %v", err)
 	}
-	defer client.Close()
+	defer closeServerQueryTestResource(t, client)
 	sess, err := client.NewSession()
 	if err != nil {
 		t.Fatalf("new session: %v", err)
 	}
-	defer sess.Close()
+	defer closeServerQueryTestResource(t, sess)
 	if err := sess.Shell(); err != nil {
 		t.Fatalf("shell: %v", err)
 	}
@@ -130,7 +131,7 @@ func TestSSHExec(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new session: %v", err)
 	}
-	defer sess.Close()
+	defer closeServerQueryTestResource(t, sess)
 
 	out, err := sess.Output("clientlist")
 	if err != nil {
@@ -156,7 +157,7 @@ func TestSSHShell(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new session: %v", err)
 	}
-	defer sess.Close()
+	defer closeServerQueryTestResource(t, sess)
 
 	stdin, err := sess.StdinPipe()
 	if err != nil {
@@ -234,5 +235,35 @@ func TestSSHHostKeyIsStable(t *testing.T) {
 	}
 	if ssh.FingerprintSHA256(first.PublicKey()) != ssh.FingerprintSHA256(second.PublicKey()) {
 		t.Fatal("host key changed between starts")
+	}
+}
+
+func TestExecCommand(t *testing.T) {
+	t.Parallel()
+
+	payload := func(declared uint32, body string) []byte {
+		out := make([]byte, 4+len(body))
+		binary.BigEndian.PutUint32(out, declared)
+		copy(out[4:], body)
+		return out
+	}
+	tests := []struct {
+		name     string
+		payload  []byte
+		expected string
+	}{
+		{name: "valid", payload: payload(10, "clientlist"), expected: "clientlist"},
+		{name: "truncated prefix", payload: []byte{0, 0, 0}},
+		{name: "declared length exceeds payload", payload: payload(11, "clientlist")},
+		{name: "maximum declared length", payload: payload(^uint32(0), "clientlist")},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := execCommand(test.payload); got != test.expected {
+				t.Fatalf("execCommand() = %q, want %q", got, test.expected)
+			}
+		})
 	}
 }

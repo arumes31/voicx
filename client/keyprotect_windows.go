@@ -11,6 +11,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"voicx/internal/safecast"
 )
 
 var (
@@ -38,22 +40,30 @@ func callCrypt(proc *windows.LazyProc, in []byte) ([]byte, error) {
 	if len(in) == 0 {
 		return nil, fmt.Errorf("empty input")
 	}
-	inBlob := windows.DataBlob{Size: uint32(len(in)), Data: &in[0]}
+	inputSize, err := safecast.IntToUint32(len(in))
+	if err != nil {
+		return nil, fmt.Errorf("input is too large: %w", err)
+	}
+	inBlob := windows.DataBlob{Size: inputSize, Data: &in[0]}
 	var outBlob windows.DataBlob
-	r, _, err := proc.Call(
-		uintptr(unsafe.Pointer(&inBlob)),
-		0, // szDataDescr / ppszDataDescr
-		0, // pOptionalEntropy
-		0, // pvReserved
-		0, // pPromptStruct
+	r, _, callErr := proc.Call(
+		uintptr(unsafe.Pointer(&inBlob)), // #nosec G103 -- CryptProtectData requires a DATA_BLOB pointer.
+		0,                                // szDataDescr / ppszDataDescr
+		0,                                // pOptionalEntropy
+		0,                                // pvReserved
+		0,                                // pPromptStruct
 		uintptr(cryptProtectUIForbidden),
-		uintptr(unsafe.Pointer(&outBlob)),
+		uintptr(unsafe.Pointer(&outBlob)), // #nosec G103 -- CryptProtectData writes a DATA_BLOB through this pointer.
 	)
 	if r == 0 {
-		return nil, fmt.Errorf("%s: %w", proc.Name, err)
+		return nil, fmt.Errorf("%s: %w", proc.Name, callErr)
 	}
-	defer windows.LocalFree(windows.Handle(unsafe.Pointer(outBlob.Data)))
+	defer func() {
+		// #nosec G103 -- DPAPI allocates outBlob.Data with LocalAlloc; LocalFree is the matching release API.
+		_, _ = windows.LocalFree(windows.Handle(unsafe.Pointer(outBlob.Data)))
+	}()
 	// The blob lives in LocalAlloc memory freed above, so it has to be copied.
+	// #nosec G103 -- DPAPI returned outBlob.Size bytes at outBlob.Data; the copy completes before LocalFree.
 	return append([]byte(nil), unsafe.Slice(outBlob.Data, outBlob.Size)...), nil
 }
 

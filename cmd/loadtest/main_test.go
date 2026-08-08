@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +18,7 @@ import (
 	"voicx/internal/permissions"
 	"voicx/internal/server"
 	"voicx/internal/state"
+	"voicx/internal/tlscert"
 )
 
 // fakeAuth implements server.AuthBackend for the smoke test.
@@ -140,4 +145,61 @@ func TestLoadtestSmoke(t *testing.T) {
 		t.Fatalf("server start error: %v", err)
 	}
 	_ = srv.Shutdown()
+}
+
+func TestReadRTPIdentifiers(t *testing.T) {
+	sequence, timestamp, ssrc, err := readRTPIdentifiers(bytes.NewReader([]byte{
+		0x01, 0x02,
+		0x03, 0x04, 0x05, 0x06,
+		0x07, 0x08, 0x09, 0x0a,
+	}))
+	if err != nil {
+		t.Fatalf("readRTPIdentifiers: %v", err)
+	}
+	if sequence != 0x0102 || timestamp != 0x03040506 || ssrc != 0x0708090a {
+		t.Fatalf("identifiers = (%#x, %#x, %#x)", sequence, timestamp, ssrc)
+	}
+}
+
+func TestControlTLSConfigRestrictsInsecureMode(t *testing.T) {
+	if _, _, err := controlTLSConfig(options{addr: "192.0.2.1:12333", tlsInsecure: true}); err == nil {
+		t.Fatal("remote -tls-insecure address accepted")
+	}
+
+	cfg, enabled, err := controlTLSConfig(options{addr: "127.0.0.1:12333", tlsInsecure: true})
+	if err != nil {
+		t.Fatalf("loopback -tls-insecure: %v", err)
+	}
+	if !enabled || !cfg.InsecureSkipVerify || cfg.MinVersion != tls.VersionTLS13 {
+		t.Fatalf("unexpected loopback TLS config: %+v", cfg)
+	}
+}
+
+func TestPinnedTLSConfigVerifiesExactCertificate(t *testing.T) {
+	cert, fingerprint, err := tlscert.Ensure(t.TempDir(), "", "", []string{"localhost"})
+	if err != nil {
+		t.Fatalf("generate certificate: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+
+	cfg, err := pinnedTLSConfig(fingerprint)
+	if err != nil {
+		t.Fatalf("pinnedTLSConfig: %v", err)
+	}
+	state := tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}
+	if err := cfg.VerifyConnection(state); err != nil {
+		t.Fatalf("matching certificate rejected: %v", err)
+	}
+
+	wrong := strings.Repeat("00:", 31) + "00"
+	cfg, err = pinnedTLSConfig(wrong)
+	if err != nil {
+		t.Fatalf("wrong pin syntax: %v", err)
+	}
+	if err := cfg.VerifyConnection(state); err == nil {
+		t.Fatal("mismatched certificate accepted")
+	}
 }

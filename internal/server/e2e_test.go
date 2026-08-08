@@ -83,7 +83,7 @@ func TestKeyPublishAndRequest(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	pub, _ := testX25519(t)
 	send(t, conn, netproto.MsgKeyPublish, netproto.KeyPublish{PublicKey: b64e(pub[:])})
 	// The publish triggers delivery of the global key; drain it.
@@ -96,7 +96,7 @@ func TestKeyPublishAndRequest(t *testing.T) {
 
 	// Resolvable via KeyRequest from another client.
 	conn2, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 	send(t, conn2, netproto.MsgKeyRequest, netproto.KeyRequest{UniqueID: "user-uid"})
 	f := readOfType(t, conn2, netproto.MsgKeyResponse)
 	var resp netproto.KeyResponse
@@ -127,7 +127,7 @@ func TestPlaintextChatRejected(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgChatSend, netproto.ChatSend{Text: "hello"})
 	f := readOfType(t, conn, netproto.MsgError)
@@ -151,9 +151,9 @@ func TestChannelKeyRotationOnLeave(t *testing.T) {
 	defer env.stop()
 
 	alice, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer alice.Close()
+	defer func() { _ = alice.Close() }()
 	bob, _ := dialAuthed(t, env.addr, "user-uid")
-	defer bob.Close()
+	defer func() { _ = bob.Close() }()
 
 	apub, _ := testX25519(t)
 	bpub, _ := testX25519(t)
@@ -174,7 +174,7 @@ func TestChannelKeyRotationOnLeave(t *testing.T) {
 	}
 
 	// Bob leaves; alice must receive a bumped generation.
-	bob.Close()
+	_ = bob.Close()
 	ckAlice2 := readChannelKeyFor(t, alice, 1)
 	if ckAlice2.KeyID != ckAlice1.KeyID+1 {
 		t.Fatalf("rotated key id = %d, want %d", ckAlice2.KeyID, ckAlice1.KeyID+1)
@@ -236,9 +236,9 @@ func TestEncryptedChannelChatRoundTrip(t *testing.T) {
 	defer env.stop()
 
 	alice, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer alice.Close()
+	defer func() { _ = alice.Close() }()
 	bob, _ := dialAuthed(t, env.addr, "user-uid")
-	defer bob.Close()
+	defer func() { _ = bob.Close() }()
 
 	apub, _ := testX25519(t)
 	bpub, bpriv := testX25519(t)
@@ -315,12 +315,12 @@ func TestE2EDMSpoolCiphertext(t *testing.T) {
 	if entry.Message != ciphertext || entry.FromUniqueID != "admin-uid" {
 		t.Fatalf("spooled = %+v, want ciphertext + admin-uid", entry)
 	}
-	alice.Close()
+	_ = alice.Close()
 
 	// Bob logs in: the offline delivery is marked Enc + E2E with the sender's
 	// unique ID so the client can fetch the public key.
 	bob, _ := dialAuthed(t, env.addr, "user-uid")
-	defer bob.Close()
+	defer func() { _ = bob.Close() }()
 	data := readEventOfType(t, bob, eventChat)
 	var chat netproto.ChatBroadcast
 	if err := json.Unmarshal(data, &chat); err != nil {
@@ -353,7 +353,7 @@ func TestScopeKeyNotMintedByChatSend(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	pub, _ := testX25519(t)
 	publishKey(t, conn, pub)
 
@@ -494,12 +494,12 @@ func TestChatKeyRequestRequiresMembership(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	alice, bob, _, keyID, _ := chatPair(t, env)
-	defer alice.Close()
-	defer bob.Close()
+	defer func() { _ = alice.Close() }()
+	defer func() { _ = bob.Close() }()
 
 	env.state.AddChannel(testChannel(2))
 	outsider, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer outsider.Close()
+	defer func() { _ = outsider.Close() }()
 	opub, _ := testX25519(t)
 	publishKey(t, outsider, opub)
 	send(t, outsider, netproto.MsgJoinChannel, netproto.JoinChannel{ChannelID: 2})
@@ -523,7 +523,7 @@ func TestChatKeyRequestRejectsEmptyIDs(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	pub, _ := testX25519(t)
 	publishKey(t, conn, pub)
 
@@ -558,7 +558,7 @@ func TestChatKeyRequestRateLimited(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	pub, _ := testX25519(t)
 	publishKey(t, conn, pub)
 

@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/pion/rtp"
-	"github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v4"
 )
 
 // --- ChannelAudio ------------------------------------------------------------
@@ -145,7 +145,7 @@ func TestEchoChannelSelfHearing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 	r.SetEchoChannel(99)
 
@@ -188,11 +188,11 @@ func TestEchoChannelSelfPairThroughSignaling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 	r.SetEchoChannel(99)
 	v := NewVoice(e, r, testLogger())
-	defer v.ClosePeer("a")
+	defer func() { _ = v.ClosePeer("a") }()
 
 	// Joined the echo channel with no peer connection yet: nothing to pair to.
 	r.JoinChannel(99, "a")

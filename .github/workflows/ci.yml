@@ -4,15 +4,25 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   frontend-e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     defaults:
       run:
         working-directory: client/frontend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
@@ -25,9 +35,10 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777 # 16.14-alpine3.24
         env:
           POSTGRES_USER: voicx
           POSTGRES_PASSWORD: voicx
@@ -40,17 +51,19 @@ jobs:
           --health-timeout 5s
           --health-retries 5
       redis:
-        image: redis:7-alpine
+        image: redis:7-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2 # 7.4.10-alpine
         ports:
           - 6379:6379
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
@@ -59,7 +72,7 @@ jobs:
       - name: install linux client dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libx11-dev libxtst-dev libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev xvfb
+          sudo apt-get install -y libx11-dev libxtst-dev libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev postgresql-client xvfb
 
       - name: build frontend assets
         working-directory: client/frontend
@@ -88,7 +101,7 @@ jobs:
         run: |
           root_coverage="$RUNNER_TEMP/root-unit.out"
           go test -race -count=1 -covermode=atomic -coverprofile="$root_coverage" ./internal/...
-          go test -race -count=1 . ./cmd/... ./v1
+          go test -race -count=1 ./cmd/... ./v1
           root_pct="$(go tool cover -func="$root_coverage" | awk '/^total:/ {gsub("%", "", $3); print $3}')"
           awk -v got="$root_pct" 'BEGIN {
             minimum = 70
@@ -116,32 +129,127 @@ jobs:
 
       - name: upload coverage profiles
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: go-coverage
           path: |
             ${{ runner.temp }}/root-unit.out
             ${{ runner.temp }}/client-unit.out
 
+      - name: verify database backup and restore
+        shell: bash
+        env:
+          PGHOST: localhost
+          PGUSER: voicx
+          PGPASSWORD: voicx
+          VOICX_DEV_MODE: "true"
+        run: |
+          set -euo pipefail
+          source_db="voicx_backup_source"
+          restore_db="voicx_backup_restore"
+          backup="$RUNNER_TEMP/voicx-backup.pgdump"
+          cleanup() {
+            dropdb --if-exists --force "$source_db"
+            dropdb --if-exists --force "$restore_db"
+          }
+          trap cleanup EXIT
+          cleanup
+          createdb "$source_db"
+          VOICX_DATABASE_URL="postgres://voicx:voicx@localhost:5432/$source_db?sslmode=disable" \
+            go run ./cmd/migrate -timeout 2m
+          pg_dump --format=custom --no-owner --file="$backup" "$source_db"
+          test -s "$backup"
+          createdb "$restore_db"
+          pg_restore --exit-on-error --no-owner --dbname="$restore_db" "$backup"
+          VOICX_DATABASE_URL="postgres://voicx:voicx@localhost:5432/$restore_db?sslmode=disable" \
+            go run ./cmd/migrate -timeout 2m
+          source_ledger="$(psql --dbname="$source_db" --tuples-only --no-align \
+            --command="SELECT filename || ':' || checksum FROM public.schema_migrations ORDER BY filename")"
+          restore_ledger="$(psql --dbname="$restore_db" --tuples-only --no-align \
+            --command="SELECT filename || ':' || checksum FROM public.schema_migrations ORDER BY filename")"
+          test -n "$source_ledger"
+          test "$source_ledger" = "$restore_ledger"
+
+  security-gate:
+    name: Release security gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            client/go.sum
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.19.0
+          cache: npm
+          cache-dependency-path: client/frontend/package-lock.json
+
+      - name: install pinned Go security analyzers
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
+      - name: scan reachable Go vulnerabilities
+        run: |
+          govulncheck ./...
+          (cd client && govulncheck ./...)
+
+      - name: scan Go source security
+        run: |
+          gosec -quiet -exclude-generated ./cmd/...
+          gosec -quiet -exclude-generated ./internal/auth/... ./internal/channels/... ./internal/chatcrypto/... ./internal/config/... ./internal/filetransfer/... ./internal/netproto/... ./internal/permissions/...
+          gosec -quiet -exclude-generated ./internal/query/... ./internal/recorder/... ./internal/safecast/... ./internal/server/... ./internal/store/...
+          gosec -quiet -exclude-generated . ./internal/tlscert/... ./internal/turn/... ./internal/version/... ./internal/webrtc/... ./v1/...
+          (cd client && gosec -quiet -exclude-generated ./...)
+
+      - name: audit frontend dependencies
+        working-directory: client/frontend
+        run: |
+          npm ci
+          npm audit --audit-level=high
+
+      - name: lint GitHub Actions workflows
+        run: actionlint
+
+      - name: scan repository secrets
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   docker:
-    needs: test
+    needs: [test, frontend-e2e, security-gate]
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -149,7 +257,7 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
@@ -163,7 +271,7 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -172,21 +280,28 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
 
   release:
-    needs: test
+    needs: [test, frontend-e2e, security-gate]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      VOICX_UPDATE_PUBLIC_KEYS: ${{ vars.VOICX_UPDATE_PUBLIC_KEYS }}
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
 
@@ -198,8 +313,22 @@ jobs:
           echo "VOICX_BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
           echo "VOICX_DIRTY=false" >> "$GITHUB_ENV"
 
+      - name: validate update signing configuration
+        shell: bash
+        env:
+          VOICX_UPDATE_SIGNING_KEY: ${{ secrets.VOICX_UPDATE_SIGNING_KEY }}
+        run: |
+          test -n "$VOICX_UPDATE_PUBLIC_KEYS" || {
+            echo "repository variable VOICX_UPDATE_PUBLIC_KEYS is required" >&2
+            exit 1
+          }
+          test -n "$VOICX_UPDATE_SIGNING_KEY" || {
+            echo "repository secret VOICX_UPDATE_SIGNING_KEY is required" >&2
+            exit 1
+          }
+
       - name: install wails CLI
-        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0
 
       - name: build client (windows/amd64)
         shell: bash
@@ -211,9 +340,11 @@ jobs:
             -X voicx/internal/version.Commit=${{ env.VOICX_COMMIT }} \
             -X voicx/internal/version.BuildDate=${{ env.VOICX_BUILD_DATE }} \
             -X voicx/internal/version.Dirty=${{ env.VOICX_DIRTY }} \
-            -X voicx/internal/version.UpdateRepo=${{ github.repository }}"
+            -X voicx/internal/version.UpdateRepo=${{ github.repository }} \
+            -X voicx/internal/version.UpdatePublicKeys=${{ env.VOICX_UPDATE_PUBLIC_KEYS }}"
 
       - name: build server (linux/amd64)
+        shell: bash
         run: |
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build \
             -ldflags "-s -w \
@@ -229,13 +360,21 @@ jobs:
         shell: bash
         run: |
           cp client/build/bin/voicx-client.exe voicx-client-windows-amd64.exe
-          sha256sum voicx-client-windows-amd64.exe voicx-server-linux-amd64 > checksums.txt
+          printf '# voicx-version: %s\n' "$GITHUB_REF_NAME" > checksums.txt
+          sha256sum voicx-client-windows-amd64.exe voicx-server-linux-amd64 >> checksums.txt
           cat checksums.txt
 
+      - name: sign update manifest
+        shell: bash
+        env:
+          VOICX_UPDATE_SIGNING_KEY: ${{ secrets.VOICX_UPDATE_SIGNING_KEY }}
+        run: go run ./cmd/signrelease -in checksums.txt -out checksums.txt.sig
+
       - name: upload to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: |
             voicx-client-windows-amd64.exe
             voicx-server-linux-amd64
             checksums.txt
+            checksums.txt.sig

@@ -6,10 +6,15 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -48,6 +53,10 @@ type fakeGroups struct {
 
 	audit     []store.AuditEntry
 	uniqueIDs map[int64]string
+
+	getGroupErr      error
+	deleteGroupHook  func(groupType string, groupID int64, force bool) error
+	setGroupIconHook func(groupID int64, icon string) error
 }
 
 func newFakeGroups() *fakeGroups {
@@ -95,6 +104,9 @@ func (f *fakeGroups) ListGroups(_ context.Context, groupType string) ([]store.Gr
 func (f *fakeGroups) GetGroup(_ context.Context, groupType string, id int64) (*store.Group, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.getGroupErr != nil {
+		return nil, f.getGroupErr
+	}
 	if g, ok := f.groups[groupType][id]; ok {
 		cp := *g
 		return &cp, nil
@@ -141,6 +153,14 @@ func (f *fakeGroups) SetGroupCosmetics(_ context.Context, groupID int64, color *
 }
 
 func (f *fakeGroups) DeleteGroup(_ context.Context, groupType string, id int64, force bool) error {
+	f.mu.Lock()
+	hook := f.deleteGroupHook
+	f.mu.Unlock()
+	if hook != nil {
+		if err := hook(groupType, id, force); err != nil {
+			return err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.groups[groupType][id]; !ok {
@@ -256,6 +276,14 @@ func (f *fakeGroups) UserUniqueID(_ context.Context, userID int64) (string, erro
 
 // SetGroupIcon marks the icon on the fake group.
 func (f *fakeGroups) SetGroupIcon(_ context.Context, groupID int64, icon string) error {
+	f.mu.Lock()
+	hook := f.setGroupIconHook
+	f.mu.Unlock()
+	if hook != nil {
+		if err := hook(groupID, icon); err != nil {
+			return err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	g, ok := f.groups["server"][groupID]
@@ -435,7 +463,7 @@ func TestGroupCreateListRenameDelete(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Empty list first.
 	send(t, conn, netproto.MsgGroupList, netproto.GroupList{Type: "server"})
@@ -468,9 +496,13 @@ func TestGroupCreateListRenameDelete(t *testing.T) {
 
 	// Delete.
 	send(t, conn, netproto.MsgGroupDelete, netproto.GroupDelete{Type: "server", GroupID: groupID})
-	waitFor(t, "group deleted", func() bool {
+	waitFor(t, "group deletion lifecycle", func() bool {
 		g, _ := env.groups.GetGroup(context.Background(), "server", groupID)
-		return g == nil
+		if g != nil {
+			return false
+		}
+		got := env.groups.auditActions()
+		return len(got) == 3 && got[2] == "group_delete"
 	})
 
 	// All three writes were audited in order.
@@ -488,7 +520,7 @@ func TestGroupManageGate(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgGroupCreate, netproto.GroupCreate{Type: "server", Name: "Nope"})
 	if e := readError(t, conn); e.Code != errCodePermissionDenied {
@@ -501,7 +533,7 @@ func TestGroupManageGate(t *testing.T) {
 	env2 := startTestEnv(t, &tp)
 	defer env2.stop()
 	conn2, _ := dialAuthed(t, env2.addr, "user-uid")
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 
 	send(t, conn2, netproto.MsgGroupCreate, netproto.GroupCreate{Type: "server", Name: "OK"})
 	readOfType(t, conn2, netproto.MsgGroupListResponse)
@@ -518,7 +550,7 @@ func TestGroupDeleteRequiresForce(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	gid, err := env.groups.CreateGroup(context.Background(), "server", "Busy", 0)
 	if err != nil {
@@ -535,11 +567,17 @@ func TestGroupDeleteRequiresForce(t *testing.T) {
 	if !env.groups.hasServerMember(gid, 2) {
 		t.Fatal("member lost after refused delete")
 	}
+	if _, err := os.Stat(filepath.Join(
+		env.srv.cfg.FileRoot,
+		groupIconDeleteTombstonePath(strconv.FormatInt(gid, 10)),
+	)); !os.IsNotExist(err) {
+		t.Fatalf("refused delete left recovery tombstone: %v", err)
+	}
 
 	send(t, conn, netproto.MsgGroupDelete, netproto.GroupDelete{Type: "server", GroupID: gid, Force: true})
-	waitFor(t, "group force-deleted", func() bool {
+	waitFor(t, "group force-deletion lifecycle", func() bool {
 		g, _ := env.groups.GetGroup(context.Background(), "server", gid)
-		return g == nil
+		return g == nil && env.perms.invalidateAllRecorded()
 	})
 	if !env.perms.invalidateAllRecorded() {
 		t.Fatal("no cache invalidation after force delete")
@@ -554,9 +592,9 @@ func TestGroupAssign(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	gid, _ := env.groups.CreateGroup(context.Background(), "server", "VIPs", 0)
 
@@ -601,7 +639,7 @@ func TestGroupAssignChannelRequiresChannelID(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	gid, _ := env.groups.CreateGroup(context.Background(), "channel", "ChanOps", 0)
 
@@ -628,7 +666,7 @@ func TestPermSetUnset(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgPermSet, netproto.PermSet{
 		Tier: "server_group", GroupID: 3, Key: "i_client_talk_power", Value: 10, Grant: 50,
@@ -679,7 +717,7 @@ func TestPermSetGate(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgPermSet, netproto.PermSet{
 		Tier: "server_group", GroupID: 3, Key: "i_client_talk_power", Value: 1,
@@ -703,7 +741,7 @@ func TestPermSetGrantCap(t *testing.T) {
 	env := startTestEnv(t, &tp)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Within the cap: allowed.
 	send(t, conn, netproto.MsgPermSet, netproto.PermSet{
@@ -751,7 +789,7 @@ func TestPermUnsetGrantCap(t *testing.T) {
 	env := startTestEnv(t, &tp)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	for _, key := range []string{"i_channel_modify_power", "i_client_ban_power"} {
 		if err := env.groups.SetPermission(ctx, store.PermTierServerGroup, target, key, 100, 100, false, false); err != nil {
@@ -791,7 +829,7 @@ func TestPermUnsetGrantCap(t *testing.T) {
 	env2 := startTestEnv(t, &strong)
 	defer env2.stop()
 	conn2, _ := dialAuthed(t, env2.addr, "user-uid")
-	defer conn2.Close()
+	defer func() { _ = conn2.Close() }()
 
 	if err := env2.groups.SetPermission(ctx, store.PermTierServerGroup, target, "i_channel_modify_power", 100, 100, false, false); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -813,7 +851,7 @@ func TestPermTemplateApply(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgPermTemplateApply, netproto.PermTemplateApply{
 		Template: "moderator", Tier: "server_group", GroupID: 4,
@@ -852,7 +890,7 @@ func TestPermTemplateApplyGrantCap(t *testing.T) {
 	env := startTestEnv(t, &tp)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgPermTemplateApply, netproto.PermTemplateApply{
 		Template: "admin", Tier: "server_group", GroupID: 4,
@@ -882,7 +920,7 @@ func TestPermTemplateApplyOverwriteGrantCap(t *testing.T) {
 	env := startTestEnv(t, &tp)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Untouched target: every key is within the caller's grant, so it lands.
 	send(t, conn, netproto.MsgPermTemplateApply, netproto.PermTemplateApply{
@@ -937,7 +975,7 @@ func TestPermTrace(t *testing.T) {
 	env := startTestEnv(t, &tp)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgPermTrace, netproto.PermTrace{UniqueID: "user-uid", Key: "i_client_talk_power", ChannelID: 1})
 	f := readOfType(t, conn, netproto.MsgPermTraceResponse)
@@ -970,7 +1008,7 @@ func TestPermTraceGate(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	send(t, conn, netproto.MsgPermTrace, netproto.PermTrace{UniqueID: "user-uid", Key: "i_client_talk_power"})
 	if e := readError(t, conn); e.Code != errCodePermissionDenied {
@@ -987,7 +1025,7 @@ func TestAuditLog(t *testing.T) {
 
 	// Non-admin without b_audit_view: denied.
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 	send(t, userConn, netproto.MsgAuditLog, netproto.AuditLog{})
 	if e := readError(t, userConn); e.Code != errCodePermissionDenied {
 		t.Fatalf("error = %+v, want permission denied", e)
@@ -995,7 +1033,7 @@ func TestAuditLog(t *testing.T) {
 
 	// Seed three entries via real writes (group creates as admin).
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	for _, name := range []string{"g1", "g2", "g3"} {
 		send(t, adminConn, netproto.MsgGroupCreate, netproto.GroupCreate{Type: "server", Name: name})
 		readOfType(t, adminConn, netproto.MsgGroupListResponse)
@@ -1040,12 +1078,12 @@ func TestAssignDefaultGroup(t *testing.T) {
 	defer env.stop()
 
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	conn.Close()
+	_ = conn.Close()
 	waitFor(t, "default group assigned", func() bool { return env.groups.hasServerMember(7, 2) })
 
 	// Second login: the user already has a membership, no duplicate work.
 	conn2, _ := dialAuthed(t, env.addr, "user-uid")
-	conn2.Close()
+	_ = conn2.Close()
 	ids, err := env.groups.UserGroupIDs(context.Background(), 2)
 	if err != nil || len(ids) != 1 || ids[0] != 7 {
 		t.Fatalf("groups after relogin = %v, err=%v", ids, err)
@@ -1058,7 +1096,7 @@ func TestNoDefaultGroupWhenDisabled(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	conn.Close()
+	_ = conn.Close()
 	ids, err := env.groups.UserGroupIDs(context.Background(), 2)
 	if err != nil || len(ids) != 0 {
 		t.Fatalf("groups = %v, want none", ids)
@@ -1111,7 +1149,7 @@ func TestReapExpiredGroups(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	gid, _ := env.groups.CreateGroup(context.Background(), "server", "TempTrial", 0)
 	env.groups.seedExpiredMember(gid, 2)
@@ -1197,7 +1235,7 @@ func TestBanListRemove(t *testing.T) {
 
 	// Non-admin without ban permission: denied.
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 	send(t, userConn, netproto.MsgBanList, netproto.BanList{})
 	if e := readError(t, userConn); e.Code != errCodePermissionDenied {
 		t.Fatalf("error = %+v, want permission denied", e)
@@ -1205,7 +1243,7 @@ func TestBanListRemove(t *testing.T) {
 
 	// Admin lists.
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	send(t, adminConn, netproto.MsgBanList, netproto.BanList{})
 	f := readOfType(t, adminConn, netproto.MsgBanListResponse)
 	var list netproto.BanListResponse
@@ -1232,7 +1270,7 @@ func TestGroupIconSetGet(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Unknown group: empty payload (not an error).
 	send(t, conn, netproto.MsgGroupIconGet, netproto.GroupIconGet{GroupID: 42})
@@ -1266,12 +1304,308 @@ func TestGroupIconSetGet(t *testing.T) {
 	}
 }
 
+func TestGroupIconGetRequiresAuthoritativeMetadata(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	conn, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer func() { _ = conn.Close() }()
+
+	tests := []struct {
+		name  string
+		setup func(*testing.T, int64)
+	}{
+		{
+			name: "empty metadata ignores orphan",
+			setup: func(t *testing.T, groupID int64) {
+				t.Helper()
+				if _, err := env.srv.assets().writeImage(
+					"group_icons", strconv.FormatInt(groupID, 10), ".png", tinyPNG,
+				); err != nil {
+					t.Fatalf("write orphan: %v", err)
+				}
+			},
+		},
+		{
+			name: "deleted group ignores orphan",
+			setup: func(t *testing.T, groupID int64) {
+				t.Helper()
+				base := strconv.FormatInt(groupID, 10)
+				if _, err := env.srv.assets().writeImage("group_icons", base, ".png", tinyPNG); err != nil {
+					t.Fatalf("write icon: %v", err)
+				}
+				if err := env.groups.SetGroupIcon(context.Background(), groupID, base+".png"); err != nil {
+					t.Fatalf("set icon metadata: %v", err)
+				}
+				if err := env.groups.DeleteGroup(context.Background(), "server", groupID, true); err != nil {
+					t.Fatalf("delete group: %v", err)
+				}
+			},
+		},
+		{
+			name: "metadata file missing",
+			setup: func(t *testing.T, groupID int64) {
+				t.Helper()
+				base := strconv.FormatInt(groupID, 10)
+				if err := env.groups.SetGroupIcon(context.Background(), groupID, base+".png"); err != nil {
+					t.Fatalf("set missing metadata: %v", err)
+				}
+			},
+		},
+		{
+			name: "metadata file corrupt",
+			setup: func(t *testing.T, groupID int64) {
+				t.Helper()
+				base := strconv.FormatInt(groupID, 10)
+				if _, err := env.srv.assets().writeImage("group_icons", base, ".png", []byte("not an image")); err != nil {
+					t.Fatalf("write corrupt icon: %v", err)
+				}
+				if err := env.groups.SetGroupIcon(context.Background(), groupID, base+".png"); err != nil {
+					t.Fatalf("set corrupt metadata: %v", err)
+				}
+			},
+		},
+		{
+			name: "alternate variant is not fallback",
+			setup: func(t *testing.T, groupID int64) {
+				t.Helper()
+				base := strconv.FormatInt(groupID, 10)
+				if _, err := env.srv.assets().writeImage("group_icons", base, ".gif", tinyGIF); err != nil {
+					t.Fatalf("write alternate icon: %v", err)
+				}
+				if err := env.groups.SetGroupIcon(context.Background(), groupID, base+".png"); err != nil {
+					t.Fatalf("set alternate metadata: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			groupID, err := env.groups.CreateGroup(context.Background(), "server", test.name, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.setup(t, groupID)
+
+			send(t, conn, netproto.MsgGroupIconGet, netproto.GroupIconGet{GroupID: groupID})
+			frame := readOfType(t, conn, netproto.MsgGroupIconData)
+			var data netproto.GroupIconData
+			if err := netproto.Decode(frame, &data); err != nil {
+				t.Fatalf("decode icon data: %v", err)
+			}
+			if data.GroupID != groupID || data.DataBase64 != "" || data.ContentType != "" {
+				t.Fatalf("group icon response = %+v, want empty authoritative result", data)
+			}
+		})
+	}
+}
+
+func TestServerGroupDeleteCleansIconOrphan(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	conn, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer func() { _ = conn.Close() }()
+
+	groupID, err := env.groups.CreateGroup(context.Background(), "server", "orphan cleanup", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := strconv.FormatInt(groupID, 10)
+	if _, err := env.srv.assets().writeImage("group_icons", base, ".png", tinyPNG); err != nil {
+		t.Fatalf("write orphan: %v", err)
+	}
+	iconPath := filepath.Join(env.srv.cfg.FileRoot, "group_icons", base+".png")
+
+	send(t, conn, netproto.MsgGroupDelete, netproto.GroupDelete{Type: "server", GroupID: groupID})
+	waitFor(t, "server group and icon orphan deleted", func() bool {
+		group, getErr := env.groups.GetGroup(context.Background(), "server", groupID)
+		_, statErr := os.Stat(iconPath)
+		return getErr == nil && group == nil && os.IsNotExist(statErr)
+	})
+
+	send(t, conn, netproto.MsgGroupIconGet, netproto.GroupIconGet{GroupID: groupID})
+	frame := readOfType(t, conn, netproto.MsgGroupIconData)
+	var data netproto.GroupIconData
+	if err := netproto.Decode(frame, &data); err != nil {
+		t.Fatalf("decode icon data: %v", err)
+	}
+	if data.DataBase64 != "" || data.ContentType != "" {
+		t.Fatalf("deleted group icon response = %+v, want empty", data)
+	}
+}
+
+var tinyGIF = func() []byte {
+	raw, err := base64.StdEncoding.DecodeString("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==")
+	if err != nil {
+		panic(err)
+	}
+	return raw
+}()
+
+func TestGroupIconSetValidatesStoreAndGroup(t *testing.T) {
+	t.Run("nil store", func(t *testing.T) {
+		env := startTestEnvDeps(t, nil, nil, func(deps *Deps) { deps.Groups = nil })
+		defer env.stop()
+		conn, _ := dialAuthed(t, env.addr, "admin-uid")
+		defer func() { _ = conn.Close() }()
+		send(t, conn, netproto.MsgGroupIconSet, netproto.GroupIconSet{GroupID: 1, DataBase64: b64(tinyPNG)})
+		if got := readError(t, conn).Code; got != errCodeUnavailable {
+			t.Fatalf("error code = %d, want unavailable", got)
+		}
+	})
+
+	t.Run("nonpositive ID", func(t *testing.T) {
+		env := startTestEnv(t, nil)
+		defer env.stop()
+		conn, _ := dialAuthed(t, env.addr, "admin-uid")
+		defer func() { _ = conn.Close() }()
+		send(t, conn, netproto.MsgGroupIconSet, netproto.GroupIconSet{GroupID: 0, DataBase64: b64(tinyPNG)})
+		if got := readError(t, conn).Code; got != errCodeMalformed {
+			t.Fatalf("error code = %d, want malformed", got)
+		}
+	})
+
+	t.Run("missing group", func(t *testing.T) {
+		env := startTestEnv(t, nil)
+		defer env.stop()
+		conn, _ := dialAuthed(t, env.addr, "admin-uid")
+		defer func() { _ = conn.Close() }()
+		send(t, conn, netproto.MsgGroupIconSet, netproto.GroupIconSet{GroupID: 999, DataBase64: b64(tinyPNG)})
+		if got := readError(t, conn).Code; got != errCodeNotFound {
+			t.Fatalf("error code = %d, want not found", got)
+		}
+		if _, err := os.Stat(filepath.Join(env.srv.cfg.FileRoot, "group_icons", "999.png")); !os.IsNotExist(err) {
+			t.Fatalf("missing group left an icon: %v", err)
+		}
+	})
+
+	t.Run("lookup failure", func(t *testing.T) {
+		env := startTestEnv(t, nil)
+		defer env.stop()
+		env.groups.mu.Lock()
+		env.groups.getGroupErr = errors.New("injected lookup failure")
+		env.groups.mu.Unlock()
+		conn, _ := dialAuthed(t, env.addr, "admin-uid")
+		defer func() { _ = conn.Close() }()
+		send(t, conn, netproto.MsgGroupIconSet, netproto.GroupIconSet{GroupID: 1, DataBase64: b64(tinyPNG)})
+		if got := readError(t, conn).Code; got != errCodeUnavailable {
+			t.Fatalf("error code = %d, want unavailable", got)
+		}
+	})
+}
+
+func TestGroupIconSetRollsBackMetadataFailures(t *testing.T) {
+	t.Run("restores prior image", func(t *testing.T) {
+		env := startTestEnv(t, nil)
+		defer env.stop()
+		conn, _ := dialAuthed(t, env.addr, "admin-uid")
+		defer func() { _ = conn.Close() }()
+		gid, _ := env.groups.CreateGroup(context.Background(), "server", "Rollback", 0)
+		send(t, conn, netproto.MsgGroupIconSet, netproto.GroupIconSet{GroupID: gid, DataBase64: b64(tinyPNG)})
+		waitFor(t, "initial group icon metadata", func() bool {
+			group, _ := env.groups.GetGroup(context.Background(), "server", gid)
+			return group != nil && group.Icon == fmt.Sprintf("%d.png", gid)
+		})
+
+		env.groups.mu.Lock()
+		env.groups.setGroupIconHook = func(int64, string) error { return errors.New("injected metadata failure") }
+		env.groups.mu.Unlock()
+		send(t, conn, netproto.MsgGroupIconSet, netproto.GroupIconSet{GroupID: gid, DataBase64: b64(tinyGIF)})
+		if got := readError(t, conn).Code; got != errCodeUnavailable {
+			t.Fatalf("error code = %d, want unavailable", got)
+		}
+		group, err := env.groups.GetGroup(context.Background(), "server", gid)
+		if err != nil || group.Icon != fmt.Sprintf("%d.png", gid) {
+			t.Fatalf("metadata after rollback = %+v, err = %v", group, err)
+		}
+		raw, image, err := env.srv.assets().readImage("group_icons", fmt.Sprint(gid))
+		if err != nil {
+			t.Fatalf("read rolled-back icon: %v", err)
+		}
+		if image.fileName != group.Icon || string(raw) != string(tinyPNG) {
+			t.Fatalf("rolled-back file = %q %q, metadata = %q", image.fileName, raw, group.Icon)
+		}
+		images, err := env.srv.assets().listImages("group_icons")
+		if err != nil || len(images) != 1 {
+			t.Fatalf("group icon files = %+v, err = %v", images, err)
+		}
+	})
+
+	t.Run("removes new orphan", func(t *testing.T) {
+		env := startTestEnv(t, nil)
+		defer env.stop()
+		conn, _ := dialAuthed(t, env.addr, "admin-uid")
+		defer func() { _ = conn.Close() }()
+		gid, _ := env.groups.CreateGroup(context.Background(), "server", "Orphan", 0)
+		env.groups.mu.Lock()
+		env.groups.setGroupIconHook = func(int64, string) error { return errors.New("injected metadata failure") }
+		env.groups.mu.Unlock()
+		send(t, conn, netproto.MsgGroupIconSet, netproto.GroupIconSet{GroupID: gid, DataBase64: b64(tinyPNG)})
+		if got := readError(t, conn).Code; got != errCodeUnavailable {
+			t.Fatalf("error code = %d, want unavailable", got)
+		}
+		if _, _, err := env.srv.assets().readImage("group_icons", fmt.Sprint(gid)); !os.IsNotExist(err) {
+			t.Fatalf("new orphan remains: %v", err)
+		}
+	})
+}
+
+func TestGroupIconConcurrentUpdatesKeepMetadataAligned(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	first, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer func() { _ = first.Close() }()
+	second, _ := dialAuthed(t, env.addr, "admin-uid")
+	defer func() { _ = second.Close() }()
+
+	gid, _ := env.groups.CreateGroup(context.Background(), "server", "Concurrent", 0)
+	firstMetadata := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var once sync.Once
+	env.groups.mu.Lock()
+	env.groups.setGroupIconHook = func(_ int64, icon string) error {
+		if strings.HasSuffix(icon, ".png") {
+			once.Do(func() {
+				close(firstMetadata)
+				<-releaseFirst
+			})
+		}
+		return nil
+	}
+	env.groups.mu.Unlock()
+	send(t, first, netproto.MsgGroupIconSet, netproto.GroupIconSet{GroupID: gid, DataBase64: b64(tinyPNG)})
+	select {
+	case <-firstMetadata:
+	case <-time.After(3 * time.Second):
+		t.Fatal("first metadata update did not reach barrier")
+	}
+	send(t, second, netproto.MsgGroupIconSet, netproto.GroupIconSet{GroupID: gid, DataBase64: b64(tinyGIF)})
+	close(releaseFirst)
+	wantName := fmt.Sprintf("%d.gif", gid)
+	waitFor(t, "second group icon metadata", func() bool {
+		group, _ := env.groups.GetGroup(context.Background(), "server", gid)
+		return group != nil && group.Icon == wantName
+	})
+	group, _ := env.groups.GetGroup(context.Background(), "server", gid)
+	raw, image, err := env.srv.assets().readImage("group_icons", fmt.Sprint(gid))
+	if err != nil {
+		t.Fatalf("read final icon: %v", err)
+	}
+	if image.fileName != group.Icon || image.fileName != wantName || string(raw) != string(tinyGIF) {
+		t.Fatalf("final file = %q %q, metadata = %q", image.fileName, raw, group.Icon)
+	}
+	images, err := env.srv.assets().listImages("group_icons")
+	if err != nil || len(images) != 1 {
+		t.Fatalf("group icon files = %+v, err = %v", images, err)
+	}
+}
+
 // TestGroupMembers verifies member listings for both group types.
 func TestGroupMembers(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	gid, _ := env.groups.CreateGroup(context.Background(), "server", "Membered", 0)
 	if err := env.groups.AssignServerGroup(context.Background(), gid, 2, time.Hour); err != nil {
@@ -1315,14 +1649,14 @@ func TestPermList(t *testing.T) {
 
 	// Gate: non-admin without b_permission_manage is denied.
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 	send(t, userConn, netproto.MsgPermList, netproto.PermList{Tier: "server_group", GroupID: 3})
 	if e := readError(t, userConn); e.Code != errCodePermissionDenied {
 		t.Fatalf("error = %+v, want permission denied", e)
 	}
 
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	send(t, adminConn, netproto.MsgPermSet, netproto.PermSet{
 		Tier: "server_group", GroupID: 3, Key: "i_client_talk_power", Value: 10, Grant: 50, Skip: true,
 	})
@@ -1413,7 +1747,7 @@ func TestGroupEditCosmetics(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	env.groups.seedGroup("server", 10, "Mods")
 
 	color, hoist, sortID := "#Ff8800", true, 3
@@ -1452,7 +1786,7 @@ func TestGroupEditRejectsBadColor(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	env.groups.seedGroup("server", 10, "Mods")
 
 	for _, bad := range []string{"red", "#fff", "#12345g", "#1234567", "javascript:x"} {
@@ -1484,7 +1818,7 @@ func TestGroupEditGate(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	env.groups.seedGroup("server", 10, "Mods")
 
 	color := "#123456"
@@ -1532,7 +1866,7 @@ func TestPermCopyMergeAndReplace(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	ctx := context.Background()
 
 	src := store.PermTarget{GroupID: 10}
@@ -1570,7 +1904,7 @@ func TestPermCopyGate(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	mustSet(t, env, store.PermTarget{GroupID: 10}, "b_channel_modify", 1, 0)
 
 	callHandler(t, env, "user-uid", netproto.MsgPermCopy,
@@ -1591,7 +1925,7 @@ func TestPermCopyGrantCap(t *testing.T) {
 	env := startTestEnv(t, &tp)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	mustSet(t, env, store.PermTarget{GroupID: 10}, "b_channel_modify", 1, 0)
 
 	// The caller holds no grant for b_channel_modify, so it may not deposit it.
@@ -1616,7 +1950,7 @@ func TestPermCopyReplaceCapsRemovals(t *testing.T) {
 	env := startTestEnv(t, &tp)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	mustSet(t, env, store.PermTarget{GroupID: 10}, "b_channel_modify", 1, 1)
 	// The destination holds an entry far above the caller's level.
@@ -1646,7 +1980,7 @@ func TestPermCopyBadTargets(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	for _, msg := range []netproto.PermCopy{
 		{FromKind: "nonsense", FromID: "10", ToKind: "servergroup", ToID: "11"},
@@ -1667,7 +2001,7 @@ func TestPermCopyClientTiers(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	conn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	ctx := context.Background()
 	mustSet(t, env, store.PermTarget{GroupID: 10}, "b_channel_modify", 1, 0)
 
@@ -1726,9 +2060,9 @@ func TestPermsInvalidReachesGroupMembersOnly(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	env.groups.seedGroup("server", 10, "Mods")
 	if err := env.groups.AssignServerGroup(context.Background(), 10, 2, 0); err != nil {
@@ -1751,9 +2085,9 @@ func TestPermsInvalidOnGroupAssign(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 	env.groups.seedGroup("server", 10, "Mods")
 
 	send(t, adminConn, netproto.MsgGroupAssign, netproto.GroupAssign{
@@ -1777,9 +2111,9 @@ func TestPermsInvalidOnGroupDelete(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	env.groups.seedGroup("server", 10, "Mods")
 	if err := env.groups.AssignServerGroup(context.Background(), 10, 2, 0); err != nil {
@@ -1797,9 +2131,9 @@ func TestPermsInvalidOnGroupEdit(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, _ := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	env.groups.seedGroup("server", 10, "Mods")
 	if err := env.groups.AssignServerGroup(context.Background(), 10, 2, 0); err != nil {
@@ -1819,9 +2153,9 @@ func TestPermsInvalidOnChannelTier(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 	adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	userConn, userID := dialAuthed(t, env.addr, "user-uid")
-	defer userConn.Close()
+	defer func() { _ = userConn.Close() }()
 
 	env.state.AddChannel(&state.Channel{ChannelID: 7, Name: "room"})
 	if err := env.state.JoinChannel(userID, 7); err != nil {
@@ -1882,7 +2216,7 @@ func TestClientIsBot(t *testing.T) {
 	plain := startTestEnv(t, nil)
 	defer plain.stop()
 	adminConn, _ := dialAuthed(t, plain.addr, "admin-uid")
-	defer adminConn.Close()
+	defer func() { _ = adminConn.Close() }()
 	if plain.srv.ClientIsBot(context.Background(), srvClient(t, plain, "admin-uid")) {
 		t.Fatalf("server admin resolved as a bot")
 	}
@@ -1891,7 +2225,7 @@ func TestClientIsBot(t *testing.T) {
 	botEnv := startTestEnv(t, &tp)
 	defer botEnv.stop()
 	conn, _ := dialAuthed(t, botEnv.addr, "user-uid")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if !botEnv.srv.ClientIsBot(context.Background(), srvClient(t, botEnv, "user-uid")) {
 		t.Fatalf("account holding b_client_is_bot did not resolve as a bot")
 	}

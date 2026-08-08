@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS chat_scope_keys (
     scope_id    BIGINT      NOT NULL,               -- 0 = global, else channels.id
     key_id      BIGINT      NOT NULL,               -- generation; never reused
     wrapped_key BYTEA       NOT NULL,
-    kek_id      SMALLINT    NOT NULL DEFAULT 1,
+    kek_id      INTEGER     NOT NULL DEFAULT 1,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     retired_at  TIMESTAMPTZ,                        -- NULL = current generation
     PRIMARY KEY (scope_id, key_id)

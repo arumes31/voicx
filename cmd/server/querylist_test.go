@@ -39,6 +39,15 @@ func TestListChannelsTotalOrder(t *testing.T) {
 	}
 }
 
+func TestQueryBackendCreateChannelRejectsNarrowingWraparound(t *testing.T) {
+	t.Parallel()
+
+	q := &queryBackend{}
+	if _, err := q.CreateChannel(context.Background(), "invalid", "", 256); err == nil {
+		t.Fatal("CreateChannel accepted type 256 as temporary channel type 0")
+	}
+}
+
 func ids(rows []query.ChannelInfo) []int64 {
 	out := make([]int64, 0, len(rows))
 	for _, r := range rows {

@@ -47,6 +47,13 @@ body {
     font-size: 1rem;
     overflow: hidden;
 }
+.skip-link {
+    position: fixed; z-index: 10001; top: 8px; left: 8px;
+    padding: 9px 12px; border: 2px solid var(--accent); border-radius: 4px;
+    background: var(--bg-raised); color: var(--text); font-weight: 700;
+    transform: translateY(-160%);
+}
+.skip-link:focus { transform: translateY(0); }
 .hidden { display: none !important; }
 .mono { font-family: var(--font-mono); }
 .wordmark { font-family: var(--font-display); font-weight: 700; letter-spacing: -0.02em; }
@@ -152,6 +159,7 @@ body:not(.details-collapsed) #details-toggle { display: none; }
     color: var(--text-faint); margin: 14px 0 8px;
 }
 .pane-head:first-child, .brand + .pane-head { margin-top: 0; }
+.sidebar-head h2 { margin: 0; color: inherit; font: inherit; letter-spacing: inherit; }
 
 .brand { display: flex; align-items: center; gap: 6px; min-width: 0; margin-bottom: 14px; }
 .brand .wordmark { flex: 0 0 auto; margin-right: auto; font-size: 1.5714rem; }
@@ -411,6 +419,7 @@ body:not(.details-collapsed) #details-toggle { display: none; }
     font-size: 0.9286rem; color: var(--text-dim); cursor: pointer; text-decoration: none;
 }
 .menu-dropdown a:hover { background: var(--bg-hover); color: var(--text); }
+.menu-dropdown a:focus-visible { background: var(--bg-hover); color: var(--text); }
 .menu-dropdown a.disabled { opacity: .4; cursor: not-allowed; }
 .menu-dropdown a.disabled:hover { background: none; color: var(--text-dim); }
 .menu-divider { height: 1px; margin: 5px 8px; background: var(--border); }
@@ -433,10 +442,6 @@ body:not(.details-collapsed) #details-toggle { display: none; }
         width: min(var(--details-width), calc(100% - 48px));
         box-shadow: -16px 0 40px rgba(0, 0, 0, .35);
     }
-}
-
-.server-rules-gate {
-    z-index: 10000;
 }
 
 .server-rules-text {
@@ -494,6 +499,7 @@ body:not(.details-collapsed) #details-toggle { display: none; }
     display: flex; align-items: center; gap: 8px;
     padding: 7px 10px; border-radius: 6px;
     font-size: 0.9286rem; color: var(--text-dim); cursor: pointer;
+    width: 100%; border: 0; background: transparent; font-family: inherit; text-align: left;
 }
 .settings-nav-item:hover { background: var(--bg-hover); color: var(--text); }
 .settings-nav-item.active { background: var(--bg-hover); color: var(--text); font-weight: 600; }
@@ -1427,7 +1433,11 @@ mark { background: var(--warn); color: #3a2a05; border-radius: 2px; padding: 0 1
 /* (282) login recents */
 #login-recents { margin-top: 8px; max-height: 180px; overflow-y: auto; width: 100%; }
 .recent-row { display: flex; align-items: center; gap: 6px; padding: 3px 0; font-size: 0.9286rem; }
-.recent-label { flex: 1; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recent-label {
+    flex: 1; min-width: 0; border: 0; background: transparent; color: var(--text);
+    font: inherit; text-align: left; cursor: pointer; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+}
 .recent-label:hover { color: var(--accent); }
 .recent-star { background: none; border: none; color: var(--warn); cursor: pointer; font-size: 1rem; }
 
@@ -1447,8 +1457,9 @@ body.compact #app-body { display: block; }
 body.compact #center { width: 100%; }
 body.compact #voice-bar { justify-content: center; padding: 12px; }
 
-/* (298) keyboard navigation: visible focus everywhere. */
-:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-radius: 4px; }
+/* (298) keyboard navigation: visible focus everywhere. !important wins over
+   legacy input rules that intentionally remove the browser's default ring. */
+:focus-visible { outline: 2px solid var(--accent) !important; outline-offset: 2px; border-radius: 4px; }
 .channel:focus-visible, .client:focus-visible { background: var(--bg-hover); }
 
 /* (299/300) hotkey map */
@@ -1628,6 +1639,7 @@ body.compact #voice-bar { justify-content: center; padding: 12px; }
 }
 .pane-handle.right { right: auto; left: -3px; }
 .pane-handle:hover { background: var(--accent-dim); }
+.pane-handle:focus-visible { width: 8px; background: var(--accent-dim); }
 
 /* (339) detachable chat: floating draggable panel. */
 .chat-popout {
@@ -1668,7 +1680,7 @@ body.zen #files-pane { display: none !important; }
 }
 .dlg.notif-center { width: 420px; max-height: 70vh; display: flex; flex-direction: column; }
 .nc-list { overflow-y: auto; display: flex; flex-direction: column; gap: 2px; margin-top: 8px; }
-.nc-row { display: flex; gap: 8px; align-items: center; padding: 4px 6px; border-radius: 6px; font-size: 0.8571rem; }
+.nc-row { display: flex; gap: 8px; align-items: center; padding: 6px 8px; border-radius: 6px; font-size: 0.8571rem; }
 .nc-row.clickable { cursor: pointer; }
 .nc-row.clickable:hover { background: var(--bg-hover); }
 .nc-kind { color: var(--accent); flex: none; }
@@ -1677,10 +1689,29 @@ body.zen #files-pane { display: none !important; }
 
 /* (350) settings search */
 #settings-search { margin-bottom: 8px; }
-.set-search-hit { display: flex; gap: 8px; padding: 4px 6px; border-radius: 6px; cursor: pointer; font-size: 0.8571rem; }
+.set-search-hit {
+    display: flex; gap: 8px; width: 100%; padding: 6px 8px; border: 0;
+    border-radius: 6px; background: transparent; color: var(--text);
+    cursor: pointer; font: 0.8571rem var(--font-body); text-align: left;
+}
 .set-search-hit:hover { background: var(--bg-hover); }
 .set-search-page { color: var(--accent); flex: none; }
 .set-hit { outline: 2px solid var(--accent); border-radius: 6px; }
+
+input::placeholder, textarea::placeholder { color: var(--text-faint); opacity: 1; }
+
+@media (pointer: coarse) {
+    button, [role="button"], .menu-item, .menu-dropdown [role="menuitem"] {
+        min-width: 44px; min-height: 44px;
+    }
+    .channel, .client, .target-option { min-height: 44px; }
+}
+
+@media (forced-colors: active) {
+    :focus-visible { outline-color: Highlight !important; }
+    .active, [aria-selected="true"], [aria-pressed="true"] { border: 2px solid Highlight; }
+    .dlg, .settings-dialog { border: 1px solid CanvasText; }
+}
 
 /* (347) DND quiet-hours row */
 .dnd-hours { display: flex; align-items: center; gap: 4px; }
@@ -1814,6 +1845,12 @@ body {
     border-radius: 8px;
     background: var(--bg-panel);
     color: var(--text-dim);
+}
+.srv-tab-select {
+    display: flex; flex: 1; flex-direction: column; align-items: center;
+    justify-content: center; gap: 3px; width: 100%; min-width: 0; padding: 0;
+    border: 0; background: transparent; color: inherit; font: inherit;
+    cursor: pointer;
 }
 .srv-tab:hover { background: var(--bg-hover); border-color: var(--text-faint); }
 .srv-tab.active {

@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"os"
 	"path/filepath"
@@ -318,7 +319,12 @@ func settingsPath() (string, error) {
 // missing or unreadable file.
 func loadSettingsAt(path string) Settings {
 	s := DefaultSettings()
-	data, err := os.ReadFile(path)
+	root, name, err := openParentRoot(path)
+	if err != nil {
+		return s
+	}
+	defer func() { _ = root.Close() }()
+	data, err := root.ReadFile(name)
 	if err != nil {
 		return s
 	}
@@ -371,7 +377,32 @@ func saveSettingsAt(path string, s Settings) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, raw, 0o600)
+	root, name, err := openParentRoot(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	return root.WriteFile(name, raw, 0o600)
+}
+
+// openParentRoot confines a single-file operation to the file's selected
+// parent directory. Production callers supply application-owned paths and
+// tests supply temporary paths; os.Root additionally prevents a replaced
+// leaf symlink from escaping that directory.
+func openParentRoot(path string) (*os.Root, string, error) {
+	if path == "" {
+		return nil, "", errors.New("file path is empty")
+	}
+	clean := filepath.Clean(path)
+	name := filepath.Base(clean)
+	if name == "." || name == string(filepath.Separator) || !filepath.IsLocal(name) {
+		return nil, "", errors.New("file path must name a local file")
+	}
+	root, err := os.OpenRoot(filepath.Dir(clean))
+	if err != nil {
+		return nil, "", err
+	}
+	return root, name, nil
 }
 
 // loadSettings loads from the default path.
