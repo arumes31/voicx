@@ -10,6 +10,18 @@ const V = () => window.__voicx;
 const App = () => window.go.main.App;
 let activeTabID = "";
 
+async function connectGuestBookmarkWithID(bookmark, addr, nick) {
+    const method = App().ConnectGuestBookmarkTabWithID;
+    const result = typeof method === "function"
+        ? await method(bookmark, addr, nick)
+        : await App().ConnectGuestBookmarkTab(bookmark, addr, nick);
+    if (typeof result === "string") return { tabID: "", error: result };
+    return {
+        tabID: String(result?.tab_id || ""),
+        error: String(result?.error || ""),
+    };
+}
+
 // bookmarkFor resolves the bookmark a tab was opened from (284), so the tab
 // can carry its colour. The nickname actually sent is either the bookmark's
 // own or its per-server override (334), and neither key is unique, so a tie
@@ -220,6 +232,8 @@ function onTabReset(tabID) {
             connectionPill.classList.add("up");
             connectionPill.title = "";
             V().startQualitySampler?.();
+            await V().checkCertificateClock?.(state.lastConnect?.addr || "", tabID);
+            if (activeTabID !== tabID) return;
         } else {
             connectionPill.textContent = state.lastConnect?.addr
                 ? `${state.lastConnect.addr} (offline)`
@@ -241,7 +255,7 @@ async function autoConnectBookmarks() {
         // (334) the per-server nickname override is what gets sent, so the
         // bookmark must be named explicitly for the backend to find it.
         const nick = b.nickname_override || b.nickname;
-        const err = await App().ConnectGuestBookmarkTab(b.name, b.addr, nick);
+        const { error: err, tabID } = await connectGuestBookmarkWithID(b.name, b.addr, nick);
         if (err !== "") {
             // Account login needed: prefill for the user.
             const { $ } = V();
@@ -250,7 +264,7 @@ async function autoConnectBookmarks() {
             V().state.pendingBookmark = { name: b.name, addr: b.addr };
             V().sysMsg?.("auto-connect needs your password for " + b.addr);
         } else {
-            await V().checkCertificateClock?.(b.addr);
+            await V().checkCertificateClock?.(b.addr, tabID);
         }
     }
 }
@@ -269,7 +283,8 @@ async function quickConnectLast() {
     // bookmarks prefill the login dialog. (334) the override is the nickname
     // actually sent, so the bookmark name goes along; recents have neither.
     const nick = target.nickname_override || target.nickname;
-    const err = await App().ConnectGuestBookmarkTab(target.name || "", target.addr, nick);
+    const { error: err, tabID } = await connectGuestBookmarkWithID(
+        target.name || "", target.addr, nick);
     if (err !== "") {
         const { $ } = V();
         $("login-addr").value = target.addr;
@@ -279,7 +294,7 @@ async function quickConnectLast() {
         // recent has no bookmark name and must leave none behind (334).
         if (target.name) V().state.pendingBookmark = { name: target.name, addr: target.addr };
     } else {
-        await V().checkCertificateClock?.(target.addr);
+        await V().checkCertificateClock?.(target.addr, tabID);
     }
 }
 
