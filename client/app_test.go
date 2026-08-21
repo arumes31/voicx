@@ -80,8 +80,13 @@ func TestAppOfflineContracts(t *testing.T) {
 	if got := a.Greet("Ada"); got != "Hello Ada, welcome to voicx!" {
 		t.Fatalf("Greet = %q", got)
 	}
-	if a.ClientVersion() == "" || a.ClientVersionShort() == "" {
-		t.Fatal("client version is empty")
+	for name, value := range map[string]string{
+		"full":  a.ClientVersion(),
+		"short": a.ClientVersionShort(),
+	} {
+		if value == "" || strings.Contains(value, "0.0.0") {
+			t.Fatalf("%s client version = %q", name, value)
+		}
 	}
 
 	a.SetAlwaysOnTop(true)

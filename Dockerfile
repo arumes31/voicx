@@ -20,13 +20,13 @@ FROM --platform=$BUILDPLATFORM golang:1.26-alpine@sha256:0178a641fbb4858c5f1b48e
 ARG TARGETOS
 ARG TARGETARCH
 
-# Version metadata: .git is excluded from the build context (see
-# .dockerignore), so it is injected via --build-arg (from Makefile/compose).
-ARG VOICX_VERSION=0.0.0-dev
-ARG VOICX_BUILD=0
-ARG VOICX_COMMIT=none
+# Version metadata is normally injected via --build-arg by Make/CI. A direct
+# Docker build has no .git directory, so the build falls back to a deterministic
+# hash of the copied source tree.
+ARG VOICX_VERSION
+ARG VOICX_COMMIT
 ARG VOICX_DIRTY=false
-ARG VOICX_BUILD_DATE=unknown
+ARG VOICX_BUILD_DATE
 ARG VOICX_UPDATE_REPO=voicx/voicx
 
 # git is required by `go mod download` for modules that reference VCS sources.
@@ -49,15 +49,18 @@ COPY . .
 # CGO_ENABLED=0 ensures a static binary with no libc dependency.
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
+    if [ -n "${VOICX_VERSION}" ]; then \
+      VOICX_LDFLAGS="-X=voicx/internal/version.Version=${VOICX_VERSION} \
+        -X=voicx/internal/version.Commit=${VOICX_COMMIT} \
+        -X=voicx/internal/version.BuildDate=${VOICX_BUILD_DATE} \
+        -X=voicx/internal/version.Dirty=${VOICX_DIRTY}"; \
+    else \
+      VOICX_LDFLAGS="$(go run ./cmd/version -format ldflags)"; \
+    fi; \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build \
     -mod=readonly -trimpath \
-    -ldflags="-s -w -buildid= \
-      -X voicx/internal/version.Version=${VOICX_VERSION} \
-      -X voicx/internal/version.Build=${VOICX_BUILD} \
-      -X voicx/internal/version.Commit=${VOICX_COMMIT} \
-      -X voicx/internal/version.BuildDate=${VOICX_BUILD_DATE} \
-      -X voicx/internal/version.Dirty=${VOICX_DIRTY} \
-      -X voicx/internal/version.UpdateRepo=${VOICX_UPDATE_REPO}" \
+    -ldflags="-s -w -buildid= ${VOICX_LDFLAGS} \
+      -X=voicx/internal/version.UpdateRepo=${VOICX_UPDATE_REPO}" \
     -o /out/voicx ./cmd/server
 
 # -----------------------------------------------------------------------------

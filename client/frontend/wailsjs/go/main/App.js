@@ -30,6 +30,10 @@ export function CancelTransfer(arg1) {
   return window['go']['main']['App']['CancelTransfer'](arg1);
 }
 
+export function CertificateClockWarning() {
+  return window['go']['main']['App']['CertificateClockWarning']();
+}
+
 export function ChannelEdit(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9) {
   return window['go']['main']['App']['ChannelEdit'](arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9);
 }
@@ -90,10 +94,6 @@ export function CheckForUpdate() {
   return window['go']['main']['App']['CheckForUpdate']();
 }
 
-export function CertificateClockWarning() {
-  return window['go']['main']['App']['CertificateClockWarning']();
-}
-
 export function ClientID() {
   return window['go']['main']['App']['ClientID']();
 }
@@ -126,12 +126,20 @@ export function ConnectBookmarkTab(arg1, arg2, arg3, arg4, arg5) {
   return window['go']['main']['App']['ConnectBookmarkTab'](arg1, arg2, arg3, arg4, arg5);
 }
 
+export function ConnectBookmarkTabWithID(arg1, arg2, arg3, arg4, arg5) {
+  return window['go']['main']['App']['ConnectBookmarkTabWithID'](arg1, arg2, arg3, arg4, arg5);
+}
+
 export function ConnectGuest(arg1, arg2) {
   return window['go']['main']['App']['ConnectGuest'](arg1, arg2);
 }
 
 export function ConnectGuestBookmarkTab(arg1, arg2, arg3) {
   return window['go']['main']['App']['ConnectGuestBookmarkTab'](arg1, arg2, arg3);
+}
+
+export function ConnectGuestBookmarkTabWithID(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ConnectGuestBookmarkTabWithID'](arg1, arg2, arg3);
 }
 
 export function ConnectGuestTab(arg1, arg2) {

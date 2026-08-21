@@ -435,7 +435,7 @@ The files UI (`frontend/src/files-ui.js`, bindings in `files.go`) adds a
 
 - **Go backend** (`app.go`, `conn.go`, `hotkeys.go`) owns all protocol
   state. It speaks the voicx control protocol (`voicx/internal/netproto` —
-  this module imports it via `require voicx v0.0.0` + `replace voicx => ../`)
+  this module imports it via `require voicx v0.4.0` + `replace voicx => ../`)
   and exposes a bound API to the frontend. Server traffic (snapshot, events,
   chat, ICE) is pushed to the UI as Wails runtime events.
 - **Frontend** (`frontend/`) is deliberately vanilla JS + CSS (no React —
@@ -506,9 +506,17 @@ github.com/wailsapp/wails/v2/cmd/wails@latest`).
 # Dev mode with live frontend reload
 wails dev
 
-# Production build (frontend + binary)
-wails build        # output: build/bin/voicx-client.exe
+# Production build with the canonical commit/source version (repo root)
+make client-build  # output: client/build/bin/voicx-client.exe
+
+# Windows PowerShell equivalent (repo root)
+./scripts/build.ps1 client
 ```
+
+Direct `wails dev`/`wails build` builds still derive a commit and dirty binary
+fingerprint through Go's embedded VCS metadata. The root Make target is the
+release-equivalent path and uses the shared `cmd/version` calculator also used
+by CI and Docker.
 
 Connect from the login dialog: server address (`127.0.0.1:12333`), your
 unique ID, account password, and the server password if the server has one
@@ -562,7 +570,7 @@ are logged there for every observed event.
 
 The client can update itself from GitHub Releases (Help → **Check for
 updates…**): it queries the latest release of the configured repo, compares
-base semver + build number against the embedded version, downloads the
+canonical semantic versions against the embedded version, downloads the
 Windows asset with a progress bar, verifies its SHA-256 against the
 release's `checksums.txt`, and self-applies via `minio/selfupdate` (which
 handles the running-exe rename dance on Windows). Nothing applies without
@@ -578,9 +586,10 @@ The update source is the `UpdateRepo` ldflags variable
 repo automatically). With the placeholder default the check reports "no
 update source" and stays silent.
 
-**Security note**: SHA-256 verification guards download corruption/tampering
-on the mirror path, **not authenticity** — whoever can publish to the repo
-controls the binary. Signed releases (sigstore/minisign) are future work.
+**Security note**: SHA-256 verifies artifact integrity and the detached
+Ed25519 signature authenticates the signed manifest against keys embedded in
+the client. Key setup and rotation are documented in
+[`docs/update-signing.md`](../docs/update-signing.md).
 
 ## Headless backend test
 

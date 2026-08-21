@@ -3,10 +3,14 @@
 package main
 
 import (
+	"crypto/tls"
+	"net"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"voicx/internal/netproto"
+	"voicx/internal/tlscert"
 )
 
 // newTabApp returns an App with a fresh tab registry (no Wails context).
@@ -129,6 +133,150 @@ func TestTabReplayUsesCachedFrames(t *testing.T) {
 	ts.cm.dispatch(&netproto.Frame{Type: uint16(netproto.MsgChannelList), Payload: []byte(`{"channels":[]}`)})
 	if ts.cm.lastSnapshot == "" || ts.cm.lastChannelList == "" {
 		t.Fatal("frames not cached on the connManager")
+	}
+}
+
+// TestConnectBookmarkTabWithID verifies successful connections return the
+// exact tab they created and the compatibility wrappers connect only once.
+func TestConnectBookmarkTabWithID(t *testing.T) {
+	oldRoot, oldProtection := identityRootOverride, keyProtectionSetting
+	identityRootOverride = t.TempDir()
+	keyProtectionSetting = func() string { return "off" }
+	t.Cleanup(func() {
+		identityRootOverride = oldRoot
+		keyProtectionSetting = oldProtection
+	})
+
+	addr := startTabAuthServer(t, 3)
+	a := newTabApp(t)
+	t.Cleanup(func() {
+		for _, tab := range a.ListTabs() {
+			a.CloseTab(tab.ID)
+		}
+	})
+
+	account := a.ConnectBookmarkTabWithID("work", addr, "alice", "password", "")
+	if account.Error != "" || account.TabID == "" {
+		t.Fatalf("account result = %+v, want a tab ID without an error", account)
+	}
+	if tabs := a.ListTabs(); len(tabs) != 1 || tabs[0].ID != account.TabID || !tabs[0].Active {
+		t.Fatalf("tabs after account connect = %+v, want active tab %q", tabs, account.TabID)
+	}
+
+	guest := a.ConnectGuestBookmarkTabWithID("guest", addr, "visitor")
+	if guest.Error != "" || guest.TabID == "" {
+		t.Fatalf("guest result = %+v, want a tab ID without an error", guest)
+	}
+	if guest.TabID == account.TabID {
+		t.Fatalf("guest tab ID = account tab ID = %q", guest.TabID)
+	}
+	if a.activeID != guest.TabID {
+		t.Fatalf("active tab = %q, want guest tab %q", a.activeID, guest.TabID)
+	}
+
+	if err := a.ConnectBookmarkTab("legacy", addr, "bob", "password", ""); err != "" {
+		t.Fatalf("compatibility wrapper connect: %s", err)
+	}
+	if tabs := a.ListTabs(); len(tabs) != 3 {
+		t.Fatalf("tabs after three connect calls = %d, want 3", len(tabs))
+	}
+}
+
+func TestConnectTabResultValidation(t *testing.T) {
+	const expected = "server address and nickname are required"
+	a := newTabApp(t)
+
+	account := a.ConnectBookmarkTabWithID("", "", "alice", "password", "")
+	if account.TabID != "" || account.Error != expected {
+		t.Fatalf("account validation result = %+v", account)
+	}
+	guest := a.ConnectGuestBookmarkTabWithID("", "server", "")
+	if guest.TabID != "" || guest.Error != expected {
+		t.Fatalf("guest validation result = %+v", guest)
+	}
+	if got := a.ConnectBookmarkTab("", "", "alice", "password", ""); got != expected {
+		t.Fatalf("account compatibility error = %q, want %q", got, expected)
+	}
+	if got := a.ConnectGuestBookmarkTab("", "server", ""); got != expected {
+		t.Fatalf("guest compatibility error = %q, want %q", got, expected)
+	}
+	if tabs := a.ListTabs(); len(tabs) != 0 {
+		t.Fatalf("validation failures created tabs: %+v", tabs)
+	}
+}
+
+func startTabAuthServer(t *testing.T, connectionCount int) string {
+	t.Helper()
+	cert, _, err := tlscert.Ensure(t.TempDir(), "", "", nil)
+	if err != nil {
+		t.Fatalf("create TLS certificate: %v", err)
+	}
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS13,
+	})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	var (
+		connections  []net.Conn
+		acceptDone   = make(chan struct{})
+		connectionWG sync.WaitGroup
+	)
+	go func() {
+		defer close(acceptDone)
+		for range connectionCount {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			connections = append(connections, conn)
+			connectionWG.Add(1)
+			go func() {
+				defer connectionWG.Done()
+				serveTabAuthConnection(conn)
+			}()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		<-acceptDone
+		for _, conn := range connections {
+			_ = conn.Close()
+		}
+		connectionWG.Wait()
+	})
+	return listener.Addr().String()
+}
+
+func serveTabAuthConnection(conn net.Conn) {
+	defer func() { _ = conn.Close() }()
+	frame, err := netproto.ReadFrame(conn)
+	if err != nil {
+		return
+	}
+	var authenticate netproto.Authenticate
+	if err := netproto.Decode(frame, &authenticate); err != nil {
+		return
+	}
+	nickname := authenticate.Nickname
+	if nickname == "" {
+		nickname = authenticate.Username
+	}
+	response, err := netproto.Encode(netproto.MsgAuthResponse, netproto.AuthResponse{
+		OK:       true,
+		ClientID: "client",
+		UniqueID: "user",
+		Nickname: nickname,
+	})
+	if err != nil || netproto.WriteFrame(conn, response) != nil {
+		return
+	}
+	for {
+		if _, err := netproto.ReadFrame(conn); err != nil {
+			return
+		}
 	}
 }
 

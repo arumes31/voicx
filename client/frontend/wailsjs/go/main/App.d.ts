@@ -17,6 +17,8 @@ export function BanRemove(arg1:number):Promise<string>;
 
 export function CancelTransfer(arg1:string):Promise<void>;
 
+export function CertificateClockWarning():Promise<string>;
+
 export function ChannelEdit(arg1:number,arg2:string,arg3:number,arg4:number,arg5:boolean,arg6:boolean,arg7:boolean,arg8:string,arg9:number):Promise<string>;
 
 export function ChannelEditTree(arg1:number,arg2:string,arg3:number,arg4:number,arg5:number,arg6:boolean):Promise<string>;
@@ -47,8 +49,6 @@ export function ChatSearch(arg1:number,arg2:string,arg3:number):Promise<main.Cha
 
 export function CheckForUpdate():Promise<main.UpdateInfo>;
 
-export function CertificateClockWarning():Promise<string>;
-
 export function ClientID():Promise<string>;
 
 export function ClientVersion():Promise<string>;
@@ -65,9 +65,13 @@ export function Connect(arg1:string,arg2:string,arg3:string,arg4:string):Promise
 
 export function ConnectBookmarkTab(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string):Promise<string>;
 
+export function ConnectBookmarkTabWithID(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string):Promise<main.ConnectTabResult>;
+
 export function ConnectGuest(arg1:string,arg2:string):Promise<string>;
 
 export function ConnectGuestBookmarkTab(arg1:string,arg2:string,arg3:string):Promise<string>;
+
+export function ConnectGuestBookmarkTabWithID(arg1:string,arg2:string,arg3:string):Promise<main.ConnectTabResult>;
 
 export function ConnectGuestTab(arg1:string,arg2:string):Promise<string>;
 

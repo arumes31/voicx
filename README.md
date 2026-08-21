@@ -153,18 +153,38 @@ flowchart TD
 
 #### Build Backend Server
 ```bash
-# Build the standalone server binary
-go build -o bin/voicx-server ./cmd/server
+# Build the standalone server with automatic Git version metadata
+make build
+
+# Inspect the exact version embedded by this source state
+make version
 
 # Run migrations and start server
 VOICX_DATABASE_URL="postgres://voicx:voicx@localhost:5432/voicx?sslmode=disable" ./bin/voicx-server
 ```
 
+On Windows PowerShell, use the equivalent native wrapper:
+
+```powershell
+./scripts/build.ps1 version
+./scripts/build.ps1 server
+```
+
 #### Build Desktop Client
 ```bash
-cd client
-wails build
+# From the repository root
+make client-build
 ```
+
+```powershell
+./scripts/build.ps1 client
+```
+
+Stable versions come from `vMAJOR.MINOR.PATCH` tags. Untagged commits and
+dirty trees receive deterministic commit/content metadata automatically; see
+[`docs/versioning.md`](docs/versioning.md). Plain `go build` and `wails build`
+also use Go's embedded VCS information, while the Make targets additionally
+stamp the exact dirty-tree fingerprint into the binary.
 
 ---
 

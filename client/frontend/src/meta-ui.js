@@ -179,7 +179,7 @@ function drawChart(canvas, data, color) {
 // maybeOnboard shows the first-run wizard (skipped when done before).
 function maybeOnboard() {
     const s = V().state.settings;
-    if (!s || s.onboarding_done) return;
+    if (!s || s.onboarding_done || document.querySelector(".dlg.onboarding")) return;
     const overlay = document.createElement("div");
     overlay.className = "dlg-overlay";
     let step = 0;

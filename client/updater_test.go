@@ -95,11 +95,11 @@ func TestCheckForUpdateRequiresSignature(t *testing.T) {
 
 func TestCheckForUpdateUpToDate(t *testing.T) {
 	withUpdateRepo(t, "o/r")
-	oldV, oldB := version.Version, version.Build
-	version.Version, version.Build = "0.4.0", "100"
-	defer func() { version.Version, version.Build = oldV, oldB }()
+	oldVersion := version.Version
+	version.Version = "0.4.0"
+	defer func() { version.Version = oldVersion }()
 
-	srv := fakeGitHub(t, `{"tag_name": "v0.4.0+99", "assets": []}`)
+	srv := fakeGitHub(t, `{"tag_name": "v0.4.0+different-build", "assets": []}`)
 	defer srv.Close()
 
 	old := updateAPIBase

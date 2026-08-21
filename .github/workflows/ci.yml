@@ -80,6 +80,9 @@ jobs:
           npm ci
           npm run build
 
+      - name: verify version metadata
+        run: go run ./cmd/version -check
+
       - name: gofmt check
         run: |
           fmt=$(gofmt -l .)
@@ -239,7 +242,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: compute version metadata
+        shell: bash
+        run: go run ./cmd/version -check -format github >> "$GITHUB_ENV"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
@@ -268,7 +280,7 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=sha,format=short
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || (startsWith(github.ref, 'refs/tags/') && env.VOICX_PRERELEASE == 'false') }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -278,6 +290,12 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VOICX_VERSION=${{ env.VOICX_VERSION }}
+            VOICX_COMMIT=${{ env.VOICX_COMMIT }}
+            VOICX_DIRTY=${{ env.VOICX_DIRTY }}
+            VOICX_BUILD_DATE=${{ env.VOICX_BUILD_DATE }}
+            VOICX_UPDATE_REPO=${{ github.repository }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: mode=max
@@ -290,11 +308,13 @@ jobs:
     timeout-minutes: 45
     env:
       VOICX_UPDATE_PUBLIC_KEYS: ${{ vars.VOICX_UPDATE_PUBLIC_KEYS }}
+      VOICX_UPDATE_REPO: ${{ github.repository }}
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -307,11 +327,7 @@ jobs:
 
       - name: compute version metadata
         shell: bash
-        run: |
-          echo "VOICX_BUILD=$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
-          echo "VOICX_COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
-          echo "VOICX_BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
-          echo "VOICX_DIRTY=false" >> "$GITHUB_ENV"
+        run: go run ./cmd/version -check -format github >> "$GITHUB_ENV"
 
       - name: validate update signing configuration
         shell: bash
@@ -334,26 +350,16 @@ jobs:
         shell: bash
         working-directory: client
         run: |
-          wails build -ldflags "-s -w \
-            -X voicx/internal/version.Version=${{ github.ref_name }} \
-            -X voicx/internal/version.Build=${{ env.VOICX_BUILD }} \
-            -X voicx/internal/version.Commit=${{ env.VOICX_COMMIT }} \
-            -X voicx/internal/version.BuildDate=${{ env.VOICX_BUILD_DATE }} \
-            -X voicx/internal/version.Dirty=${{ env.VOICX_DIRTY }} \
-            -X voicx/internal/version.UpdateRepo=${{ github.repository }} \
-            -X voicx/internal/version.UpdatePublicKeys=${{ env.VOICX_UPDATE_PUBLIC_KEYS }}"
+          wails build -trimpath -ldflags "-s -w $VOICX_LDFLAGS \
+            -X=voicx/internal/version.UpdateRepo=$VOICX_UPDATE_REPO \
+            -X=voicx/internal/version.UpdatePublicKeys=$VOICX_UPDATE_PUBLIC_KEYS"
 
       - name: build server (linux/amd64)
         shell: bash
         run: |
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build \
-            -ldflags "-s -w \
-              -X voicx/internal/version.Version=${{ github.ref_name }} \
-              -X voicx/internal/version.Build=${{ env.VOICX_BUILD }} \
-              -X voicx/internal/version.Commit=${{ env.VOICX_COMMIT }} \
-              -X voicx/internal/version.BuildDate=${{ env.VOICX_BUILD_DATE }} \
-              -X voicx/internal/version.Dirty=${{ env.VOICX_DIRTY }} \
-              -X voicx/internal/version.UpdateRepo=${{ github.repository }}" \
+            -trimpath -ldflags "-s -w $VOICX_LDFLAGS \
+              -X=voicx/internal/version.UpdateRepo=$VOICX_UPDATE_REPO" \
             -o voicx-server-linux-amd64 ./cmd/server
 
       - name: checksums
@@ -373,6 +379,8 @@ jobs:
       - name: upload to GitHub Release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
+          prerelease: ${{ env.VOICX_PRERELEASE == 'true' }}
+          make_latest: ${{ env.VOICX_PRERELEASE == 'false' }}
           files: |
             voicx-client-windows-amd64.exe
             voicx-server-linux-amd64

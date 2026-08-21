@@ -21,6 +21,12 @@ import (
 	"voicx/internal/netproto"
 )
 
+// ConnectTabResult identifies the tab created by a successful connection.
+type ConnectTabResult struct {
+	TabID string `json:"tab_id"`
+	Error string `json:"error"`
+}
+
 // TabInfo describes one server tab for the tab bar.
 type TabInfo struct {
 	ID        string `json:"id"`
@@ -256,23 +262,28 @@ func (a *App) ConnectTab(addr, nickname, password, serverPassword string) string
 // replaces the login nickname before connecting, so addr+nickname no longer
 // identifies the bookmark that per-server settings (300/335) belong to.
 func (a *App) ConnectBookmarkTab(bookmark, addr, nickname, password, serverPassword string) string {
+	return a.ConnectBookmarkTabWithID(bookmark, addr, nickname, password, serverPassword).Error
+}
+
+// ConnectBookmarkTabWithID connects in a new tab and returns that tab's ID.
+func (a *App) ConnectBookmarkTabWithID(bookmark, addr, nickname, password, serverPassword string) ConnectTabResult {
 	if addr == "" || nickname == "" {
-		return "server address and nickname are required"
+		return ConnectTabResult{Error: "server address and nickname are required"}
 	}
 	id, ts := a.newTab()
 	err := ts.cm.connect(addr, nickname, password, serverPassword)
 	if err != "" {
 		a.removeTab(id)
 		if err == errFingerprintMismatch.Error() {
-			return fingerprintMismatchMessage(ts.cm)
+			return ConnectTabResult{Error: fingerprintMismatchMessage(ts.cm)}
 		}
-		return err
+		return ConnectTabResult{Error: err}
 	}
 	ts.info.Addr = addr
 	ts.info.Nickname = nickname
 	a.onTabConnected(ts.cm, bookmark, addr, nickname)
 	a.activate(id)
-	return ""
+	return ConnectTabResult{TabID: id}
 }
 
 // ConnectGuestTab connects as a guest in a NEW tab (mirroring ConnectGuest).
@@ -283,22 +294,27 @@ func (a *App) ConnectGuestTab(addr, nickname string) string {
 // ConnectGuestBookmarkTab is ConnectGuestTab with the originating bookmark's
 // Name (see ConnectBookmarkTab).
 func (a *App) ConnectGuestBookmarkTab(bookmark, addr, nickname string) string {
+	return a.ConnectGuestBookmarkTabWithID(bookmark, addr, nickname).Error
+}
+
+// ConnectGuestBookmarkTabWithID connects as a guest and returns the new tab's ID.
+func (a *App) ConnectGuestBookmarkTabWithID(bookmark, addr, nickname string) ConnectTabResult {
 	if addr == "" || nickname == "" {
-		return "server address and nickname are required"
+		return ConnectTabResult{Error: "server address and nickname are required"}
 	}
 	id, ts := a.newTab()
 	if err := ts.cm.connect(addr, nickname, "", ""); err != "" {
 		a.removeTab(id)
 		if err == errFingerprintMismatch.Error() {
-			return fingerprintMismatchMessage(ts.cm)
+			return ConnectTabResult{Error: fingerprintMismatchMessage(ts.cm)}
 		}
-		return err
+		return ConnectTabResult{Error: err}
 	}
 	ts.info.Addr = addr
 	ts.info.Nickname = nickname
 	a.onTabConnected(ts.cm, bookmark, addr, nickname)
 	a.activate(id)
-	return ""
+	return ConnectTabResult{TabID: id}
 }
 
 func fingerprintMismatchMessage(cm *connManager) string {

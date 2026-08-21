@@ -81,6 +81,7 @@ const state = {
     avatarPending: new Set(),
     serverGeneration: 0, // invalidates async responses when the active server tab changes
     settings: null,
+    activeTabID: "", // frontend-observed active tab; guards async finalizers against tab switches
     lastConnect: null,   // {addr, nick, pw, spw, bookmark} for reconnect-on-loss
     lastSuccessfulConnect: null, // in-memory only; keeps manual tray reconnect available after Disconnect
     tabConnects: new Map(), // (281) tab ID -> its own lastConnect record
@@ -289,6 +290,7 @@ async function connectFromLogin() {
         const connection = { addr, nick, pw, spw, bookmark };
         const ownsActiveTab = await rememberTabConnect(connection, null, tabID);
         if (!ownsActiveTab) return;
+        const finalizationGeneration = state.serverGeneration;
         // A legacy binding has no tab ID, so retain the direct warning path.
         // Current bindings check the exact tab from tabs.js after activation.
         const clockWarning = tabID ? "" : await certificateClockWarning(addr);
@@ -309,7 +311,9 @@ async function connectFromLogin() {
         try {
             security = await window.go.main.App.ConnectionSecurity();
         } catch { /* best-effort status line */ }
+        if (state.serverGeneration !== finalizationGeneration) return;
         if (!await tabIsActive(tabID)) return;
+        if (state.serverGeneration !== finalizationGeneration) return;
         state.myNickname = nick;
         state.myClientID = myClientID;
         state.isAdmin = isAdmin;
@@ -406,7 +410,10 @@ async function activeTabInfo() {
 
 async function tabIsActive(tabID) {
     if (!tabID) return true; // compatibility with pre-tab-ID bindings
-    return (await activeTabInfo())?.id === tabID;
+    if (state.activeTabID && state.activeTabID !== tabID) return false;
+    const active = await activeTabInfo();
+    if (state.activeTabID && state.activeTabID !== tabID) return false;
+    return active?.id === tabID;
 }
 
 async function certificateClockWarning(expectedAddr = "", expectedTabID = "") {
@@ -454,7 +461,7 @@ async function rememberTabConnect(c, expectedGeneration = null, tabID = "") {
     state.lastSuccessfulConnect = { ...c };
     if (tabID) state.tabConnects.set(tabID, c);
     else if (active) state.tabConnects.set(active.id, c);
-    if (tabID && active?.id !== tabID) return false;
+    if (tabID && (active?.id !== tabID || (state.activeTabID && state.activeTabID !== tabID))) return false;
     state.lastConnect = c;
     return true;
 }
@@ -486,6 +493,7 @@ async function completeReconnect(c, generation, tabID) {
     const clockWarning = tabID ? "" : await certificateClockWarning(c.addr);
     const ownsActiveTab = await rememberTabConnect(c, generation, tabID);
     if (generation !== reconnectGeneration) return false;
+    const finalizationGeneration = state.serverGeneration;
     state.reconnectAttempts = 0;
     // A user-selected tab now owns the global UI. The reconnect still
     // succeeded in the background, so stop retrying without painting over it.
@@ -503,7 +511,9 @@ async function completeReconnect(c, generation, tabID) {
         isGuest = await window.go.main.App.IsGuest();
     } catch { /* the credential-derived fallback remains valid */ }
     if (generation !== reconnectGeneration) return false;
+    if (state.serverGeneration !== finalizationGeneration) return true;
     if (!await tabIsActive(tabID)) return true;
+    if (state.serverGeneration !== finalizationGeneration) return true;
     state.myNickname = c.nick;
     state.myClientID = myClientID;
     state.isAdmin = isAdmin;
@@ -3014,7 +3024,7 @@ window.__voicx = {
     applyAppearance, toggleCompact, recentChannels, syncOwnChannel,
     startQualitySampler, stopQualitySampler,
     checkCertificateClock,
-    ensureVoiceForChannel, resetVoiceSession,
+    ensureVoiceForChannel, resetVoiceSession, retryMicrophoneAccess,
     // (70) shared system audio controls for the screen tile's context menu.
     shareAudioCtl: {
         get: (clientID) => {

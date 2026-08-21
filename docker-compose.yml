@@ -20,13 +20,12 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        # .git is excluded from the docker context; inject version metadata
-        # via build args (override in .env or use make docker-build).
-        VOICX_VERSION: ${VOICX_VERSION:-0.0.0-dev}
-        VOICX_BUILD: ${VOICX_BUILD:-0}
-        VOICX_COMMIT: ${VOICX_COMMIT:-none}
+        # Make/CI inject Git metadata. Empty values make a direct Compose build
+        # derive a deterministic version from the copied source tree.
+        VOICX_VERSION: ${VOICX_VERSION:-}
+        VOICX_COMMIT: ${VOICX_COMMIT:-}
         VOICX_DIRTY: ${VOICX_DIRTY:-false}
-        VOICX_BUILD_DATE: ${VOICX_BUILD_DATE:-unknown}
+        VOICX_BUILD_DATE: ${VOICX_BUILD_DATE:-}
         VOICX_UPDATE_REPO: ${VOICX_UPDATE_REPO:-voicx/voicx}
     image: voicx:latest
     container_name: voicx

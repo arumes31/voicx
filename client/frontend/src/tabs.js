@@ -175,6 +175,7 @@ async function refreshTabIdentity(tabID) {
 function onTabReset(tabID) {
     const { state, $ } = V();
     activeTabID = tabID || "";
+    state.activeTabID = activeTabID;
     const preserveReconnectAnnouncements = !!state.reconnectInFlight;
     state.serverGeneration = (state.serverGeneration || 0) + 1;
     // RTT belongs to one server identity. Clear the old sample before replay

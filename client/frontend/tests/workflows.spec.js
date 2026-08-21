@@ -45,9 +45,15 @@ test.beforeEach(async ({ page }) => {
                     if (method === "GetSettings") return structuredClone(initialSettings);
                     if (method === "SaveSettings") { window.__savedSettings = structuredClone(args[0]); return ""; }
                     if (method === "CertificateClockWarning") return window.__certificateClockWarning || "";
-                    if (method === "ConnectBookmarkTab" && window.__connectBookmarkGate) {
-                        await window.__connectBookmarkGate;
-                        return window.__connectBookmarkResult || "";
+                    if (method === "ConnectBookmarkTabWithID") {
+                        if (window.__connectBookmarkGate) await window.__connectBookmarkGate;
+                        return {
+                            tab_id: window.__connectTabID || "",
+                            error: window.__connectBookmarkResult || "",
+                        };
+                    }
+                    if (method === "ConnectGuestBookmarkTabWithID") {
+                        return { tab_id: window.__guestConnectTabID || "", error: "" };
                     }
                     if (method === "ListTabs") return structuredClone(window.__tabs);
                     if (method === "ClientID") {
@@ -332,6 +338,34 @@ test("retries a missing microphone without interrupting video or screen sharing"
     });
 });
 
+test("ignores a delayed microphone failure after the voice session changes", async ({ page }) => {
+    await page.evaluate(() => {
+        window.__voicx.showWorkspace(false);
+        const stream = document.createElement("canvas").captureStream(1);
+        window.__voicx.state.myChannelID = 42;
+        window.__voicx.state.localStream = stream;
+        window.__voicx.state.pc = {
+            close() {},
+            getSenders: () => [],
+            getTransceivers: () => [],
+        };
+        navigator.mediaDevices.getUserMedia = () => new Promise((_resolve, reject) => {
+            window.__rejectStaleMicRetry = reject;
+        });
+        window.__staleMicRetry = window.__voicx.retryMicrophoneAccess();
+    });
+    await expect.poll(() => page.evaluate(() => typeof window.__rejectStaleMicRetry)).toBe("function");
+
+    await page.evaluate(async () => {
+        window.__voicx.resetVoiceSession();
+        window.__rejectStaleMicRetry(new DOMException("late denial", "NotAllowedError"));
+        await window.__staleMicRetry;
+    });
+
+    await expect(page.locator("#mic-status")).toBeEmpty();
+    expect(await page.evaluate(() => window.__voicx.state.micState)).toBe("unknown");
+});
+
 test("edits a recent server in the login form and focuses its address", async ({ page }) => {
     await page.evaluate(() => {
         window.__voicx.state.settings.recents = [{
@@ -432,6 +466,73 @@ test("warns after connect when the local clock is outside certificate validity",
     await expect.poll(() => page.evaluate(() => window.__calls.CertificateClockWarning || 0)).toBe(1);
 });
 
+test("does not paint a completed login over a tab selected during finalization", async ({ page }) => {
+    await page.evaluate(() => {
+        window.__connectTabID = "new-tab";
+        window.__tabs = [
+            { id: "new-tab", addr: "new.example:12333", nickname: "Alice", active: true, connected: true },
+            { id: "other-tab", addr: "other.example:12333", nickname: "Bob", active: false, connected: true },
+        ];
+        window.__voicx.state.tabConnects.set("other-tab", {
+            addr: "other.example:12333", nick: "Bob", pw: "", spw: "", bookmark: "",
+        });
+        window.__clientIDGate = new Promise((resolve) => {
+            window.__releaseConnectIdentity = resolve;
+        });
+    });
+    await page.locator("#login-addr").fill("new.example:12333");
+    await page.locator("#login-nick").fill("Alice");
+    await page.locator("#login-password").fill("secret");
+    await page.getByRole("button", { name: "Connect" }).click();
+    await expect.poll(() => page.evaluate(() => window.__calls.ClientID || 0)).toBeGreaterThan(0);
+
+    await page.evaluate(() => {
+        window.__tabs = window.__tabs.map((tab) => ({
+            ...tab,
+            active: tab.id === "other-tab",
+        }));
+        window.__activeClient = "client-b";
+        for (const callback of window.__events.tab_reset || []) callback("other-tab");
+        window.__releaseConnectIdentity();
+    });
+
+    await expect.poll(() => page.evaluate(() => window.__voicx.state.lastConnect?.addr))
+        .toBe("other.example:12333");
+    await expect(page.locator("#conn-pill")).not.toHaveText("new.example:12333");
+    expect(await page.evaluate(() => window.__voicx.state.tabConnects.get("new-tab")?.pw)).toBe("secret");
+});
+
+test("rejects A-to-B-to-A identity results during login finalization", async ({ page }) => {
+    await page.evaluate(() => {
+        window.__connectTabID = "tab-a";
+        window.__tabs = [{
+            id: "tab-a", addr: "a.example:12333", nickname: "Alice",
+            active: true, connected: true,
+        }];
+        window.__voicx.state.activeTabID = "tab-a";
+        window.__voicx.state.serverGeneration = 10;
+        window.__clientIDGate = new Promise((resolve) => {
+            window.__releaseABAIdentity = resolve;
+        });
+    });
+    await page.locator("#login-addr").fill("a.example:12333");
+    await page.locator("#login-nick").fill("Alice");
+    await page.getByRole("button", { name: "Connect" }).click();
+    await expect.poll(() => page.evaluate(() => window.__calls.ClientID || 0)).toBeGreaterThan(0);
+
+    await page.evaluate(() => {
+        // Model A → B → A: the final active tab matches, but the identity
+        // response came from the intervening tab and the generation changed.
+        window.__activeClient = "client-from-tab-b";
+        window.__voicx.state.serverGeneration += 2;
+        window.__releaseABAIdentity();
+    });
+
+    await expect(page.locator("#login-connect")).toBeEnabled();
+    expect(await page.evaluate(() => window.__voicx.state.myClientID)).not.toBe("client-from-tab-b");
+    await expect(page.locator("#conn-pill")).not.toHaveClass(/\bup\b/);
+});
+
 test("warns about certificate timing after a guest quick-connect", async ({ page }) => {
     await page.evaluate(async () => {
         window.__certificateClockWarning = "Local clock may be inaccurate; check date, time, and time zone.";
@@ -444,7 +545,7 @@ test("warns about certificate timing after a guest quick-connect", async ({ page
     await expect(page.locator("#alert-announcer")).toContainText(
         "Certificate timing warning for quick.example:12333",
     );
-    expect(await page.evaluate(() => window.__calls.ConnectGuestBookmarkTab)).toBe(1);
+    expect(await page.evaluate(() => window.__calls.ConnectGuestBookmarkTabWithID)).toBe(1);
     expect(await page.evaluate(() => window.__calls.CertificateClockWarning)).toBe(1);
 });
 
@@ -462,9 +563,9 @@ test("reconnects the last server from the tray only while disconnected", async (
         for (const callback of window.__events.tray_reconnect || []) callback();
     });
 
-    await expect.poll(() => page.evaluate(() => window.__calls.ConnectBookmarkTab || 0)).toBe(1);
+    await expect.poll(() => page.evaluate(() => window.__calls.ConnectBookmarkTabWithID || 0)).toBe(1);
     await expect(page.locator("#conn-pill")).toHaveClass(/\bup\b/);
-    expect(await page.evaluate(() => window.__callArgs.ConnectBookmarkTab[0])).toEqual([
+    expect(await page.evaluate(() => window.__callArgs.ConnectBookmarkTabWithID[0])).toEqual([
         "Work", "voice.example:12333", "Alice", "secret", "",
     ]);
 
@@ -472,7 +573,7 @@ test("reconnects the last server from the tray only while disconnected", async (
         for (const callback of window.__events.tray_reconnect || []) callback();
     });
     await page.waitForTimeout(50);
-    expect(await page.evaluate(() => window.__calls.ConnectBookmarkTab)).toBe(1);
+    expect(await page.evaluate(() => window.__calls.ConnectBookmarkTabWithID)).toBe(1);
 });
 
 test("keeps an automatic reconnect pinned to the server that dropped", async ({ page }) => {
@@ -489,10 +590,10 @@ test("keeps an automatic reconnect pinned to the server that dropped", async ({ 
     });
 
     await expect.poll(
-        () => page.evaluate(() => window.__calls.ConnectBookmarkTab || 0),
+        () => page.evaluate(() => window.__calls.ConnectBookmarkTabWithID || 0),
         { timeout: 7000 },
     ).toBe(1);
-    expect(await page.evaluate(() => window.__callArgs.ConnectBookmarkTab[0])).toEqual([
+    expect(await page.evaluate(() => window.__callArgs.ConnectBookmarkTabWithID[0])).toEqual([
         "Dropped", "dropped.example:12333", "Alice", "secret", "",
     ]);
 });
@@ -504,19 +605,22 @@ test("does not finish an in-flight reconnect after an intentional disconnect", a
         state.lastSuccessfulConnect = {
             addr: "voice.example:12333", nick: "Alice", pw: "secret", spw: "", bookmark: "Work",
         };
+        window.__connectTabID = "stale-reconnect-tab";
         window.__connectBookmarkGate = new Promise((resolve) => {
             window.__releaseConnectBookmark = resolve;
         });
         for (const callback of window.__events.tray_reconnect || []) callback();
     });
-    await expect.poll(() => page.evaluate(() => window.__calls.ConnectBookmarkTab || 0)).toBe(1);
+    await expect.poll(() => page.evaluate(() => window.__calls.ConnectBookmarkTabWithID || 0)).toBe(1);
 
     await page.evaluate(() => {
         for (const callback of window.__events.tray_disconnect || []) callback();
         window.__releaseConnectBookmark();
     });
 
-    await expect.poll(() => page.evaluate(() => window.__calls.Disconnect || 0)).toBe(2);
+    await expect.poll(() => page.evaluate(() => window.__calls.Disconnect || 0)).toBe(1);
+    await expect.poll(() => page.evaluate(() => window.__calls.CloseTab || 0)).toBe(1);
+    expect(await page.evaluate(() => window.__callArgs.CloseTab[0])).toEqual(["stale-reconnect-tab"]);
     await expect(page.locator("#conn-pill")).not.toHaveClass(/\bup\b/);
     expect(await page.evaluate(() => window.__voicx.state.lastConnect)).toBeNull();
 });
@@ -1928,7 +2032,9 @@ test("keeps onboarding semantics and focus when each step rerenders", async ({ p
     await page.evaluate(() => {
         window.__voicx.state.settings.onboarding_done = false;
         window.__voicxMeta.maybeOnboard();
+        window.__voicxMeta.maybeOnboard();
     });
+    await expect(page.locator(".onboarding")).toHaveCount(1);
     await expect(page.getByRole("dialog", { name: "Welcome to voicx" })).toBeVisible();
     await expect(page.locator(".ob-nick")).toBeFocused();
     await page.getByRole("button", { name: "Next" }).click();

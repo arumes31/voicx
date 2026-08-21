@@ -547,7 +547,7 @@ func (a *App) ClientVersion() string {
 	return version.String()
 }
 
-// ClientVersionShort returns the short version (base + build number).
+// ClientVersionShort returns the canonical semantic build identity.
 func (a *App) ClientVersionShort() string {
 	return version.Short()
 }

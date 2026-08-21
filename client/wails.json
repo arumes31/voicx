@@ -2,6 +2,13 @@
   "$schema": "https://wails.io/schemas/config.v2.json",
   "name": "voicx-client",
   "outputfilename": "voicx-client",
+  "info": {
+    "companyName": "VoicX",
+    "productName": "VoicX",
+    "productVersion": "0.4.0",
+    "copyright": "Copyright 2026 VoicX",
+    "comments": "VoicX desktop voice and collaboration client"
+  },
   "frontend:install": "npm install",
   "frontend:build": "npm run build",
   "frontend:dev:watcher": "npm run dev",
