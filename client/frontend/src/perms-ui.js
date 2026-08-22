@@ -5,6 +5,7 @@
 import { pickIcon } from "./image-tools.js";
 import { closeDialog, isCurrentServerDialog, mountServerDialog, registerDialogLifecycle } from "./modal.js";
 import { imageDataURL } from "./safe-media.js";
+import { parseRuntimeObject } from "./runtime-json.js";
 
 const V = () => window.__voicx;
 const App = () => window.go.main.App;
@@ -246,10 +247,10 @@ function openPermissionManager() {
             </div>
             <div class="pm-right">
                 <div class="pm-right-head">
-                    <input class="pm-filter dlg-input" placeholder="filter permissions… (154)" />
-                    <button class="pm-matrix icon-btn" title="Compare this client's effective permissions across sub-channels (726)">▦</button>
-                    <button class="pm-export icon-btn" title="Export this target's permissions as JSON (148)">⬇</button>
-                    <button class="pm-export-csv icon-btn" title="Export this target's permissions as CSV (148)">CSV</button>
+                    <input class="pm-filter dlg-input" placeholder="filter permissions…" />
+                    <button class="pm-matrix icon-btn" title="Compare this client's effective permissions across sub-channels">▦</button>
+                    <button class="pm-export icon-btn" title="Export this target's permissions as JSON">⬇</button>
+                    <button class="pm-export-csv icon-btn" title="Export this target's permissions as CSV">CSV</button>
                 </div>
                 <div class="pm-grid"></div>
                 <div class="pm-trace"></div>
@@ -723,8 +724,8 @@ function renderGroupActions(actions, type) {
         <button class="ga-new" title="Create group">+ New</button>
         <button class="ga-rename" title="Rename selected">Rename</button>
         <button class="ga-delete" title="Delete selected">Delete</button>
-        <button class="ga-icon" title="Upload group icon (177)">Icon</button>
-        ${type === "server" ? `<button class="ga-look" title="Nickname colour, hoisting and sort order (178/179)">Appearance…</button>` : ""}`;
+        <button class="ga-icon" title="Upload group icon">Icon</button>
+        ${type === "server" ? `<button class="ga-look" title="Nickname colour, hoisting and sort order">Appearance…</button>` : ""}`;
     renderTemplateButton(actions, tabTier(pm.tab));
     renderCopyButton(actions);
 
@@ -852,7 +853,7 @@ function renderCopyButton(actions) {
     if (!canPermManage()) return;
     const btn = document.createElement("button");
     btn.textContent = "Copy perms…";
-    btn.title = "Copy this target's permission entries onto another target (141)";
+    btn.title = "Copy this target's permission entries onto another target";
     btn.onclick = () => {
         if (!pm.target) return V().toast("select a source target first", "warn");
         const kind = copyKindOf(pm.target.tier);
@@ -964,7 +965,7 @@ function renderTemplateButton(actions, tier) {
     if (!canPermManage()) return;
     const btn = document.createElement("button");
     btn.textContent = "Template…";
-    btn.title = "Apply a built-in permission template (142)";
+    btn.title = "Apply a built-in permission template";
     btn.onclick = async () => {
         const manager = pm;
         if (!currentManager(manager) || !manager.target) return V().toast("select a target first", "warn");
@@ -1051,10 +1052,10 @@ async function renderMembers() {
                     `<option value="${esc(c.unique_id)}">${esc(c.nickname || c.unique_id)}</option>`).join("")}
             </select>
             <input class="dlg-input mem-uid" placeholder="or unique ID" />
-            <input class="dlg-input mem-min" type="number" min="0" value="0" title="duration in minutes (0 = permanent) (145)" />
+            <input class="dlg-input mem-min" type="number" min="0" value="0" title="duration in minutes (0 = permanent)" />
             <button class="mem-add">Assign</button>
         </div>
-        <div class="pm-drop-hint">drag users from the tree here to assign (140)</div>`;
+        <div class="pm-drop-hint">drag users from the tree here to assign</div>`;
 
     const chanSel = area.querySelector(".mem-channel");
     if (chanSel) {
@@ -1079,7 +1080,7 @@ async function renderMembers() {
                 const row = document.createElement("div");
                 row.className = "pm-member";
                 row.innerHTML = `<span class="pm-member-name"></span>
-                    ${m.expires_at ? `<span class="pm-member-exp mono" title="timed membership (145)">→ ${fmtTime(m.expires_at)}</span>` : ""}
+                    ${m.expires_at ? `<span class="pm-member-exp mono" title="timed membership">→ ${fmtTime(m.expires_at)}</span>` : ""}
                     <button class="mem-del" title="Unassign">✕</button>`;
                 row.querySelector(".pm-member-name").textContent = m.nickname || m.unique_id;
                 row.title = m.unique_id;
@@ -1968,12 +1969,8 @@ export function initPermsUI() {
 
     // Redemption is silent on the wire; the grant lands as this event.
     window.runtime.EventsOn("event", (json) => {
-        let env;
-        try {
-            env = JSON.parse(json);
-        } catch {
-            return;
-        }
+        const env = parseRuntimeObject(json);
+        if (!env) return;
         if (env.type !== "token_used") return;
         const d = env.data || {};
         if (d.client_id && d.client_id !== V().state.myClientID) return;

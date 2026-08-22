@@ -42,25 +42,28 @@
                 <span class="wordmark">voicx</span>
                 <span id="alpha-badge" title="alpha software — click for details">α</span>
                 <span id="conn-lock" class="hidden" title="control channel TLS + chat payload encryption on">🔒</span>
-                <button id="notif-bell" class="icon-btn" title="Notifications (346)" aria-label="Notifications">🔔<span id="notif-badge" class="hidden"></span></button>
+                <button id="notif-bell" class="icon-btn" title="Notifications" aria-label="Notifications, 0 unread">🔔<span id="notif-badge" class="hidden"></span></button>
                 <span id="conn-pill" class="pill">offline</span>
             </div>
             <div class="pane-head sidebar-head"><h2 id="channels-heading">CHANNELS</h2><button id="channel-create-btn" class="icon-btn pane-head-btn" title="Create channel" aria-label="Create channel">+</button></div>
             <div id="tree-tools">
                 <label class="sr-only" for="tree-filter">Filter channels and users</label>
-                <input id="tree-filter" placeholder="filter… (319)" autocomplete="off" />
-                <button id="tree-collapse" class="icon-btn" title="Collapse all (302)" aria-label="Collapse all channels">▾</button>
-                <button id="tree-expand" class="icon-btn" title="Expand all (302)" aria-label="Expand all channels">▸</button>
+                <input id="tree-filter" placeholder="filter…" autocomplete="off" />
+                <button id="tree-collapse" class="icon-btn" title="Collapse all" aria-label="Collapse all channels">▾</button>
+                <button id="tree-expand" class="icon-btn" title="Expand all" aria-label="Expand all channels">▸</button>
             </div>
             <div id="channel-tree"></div>
         </aside>
 
         <main id="center" tabindex="-1" aria-label="Voice and chat workspace">
-            <div id="center-tabs" role="group" aria-label="Workspace views">
-                <button id="tab-chat" class="active" aria-pressed="true">Chat</button>
-                <button id="tab-files" aria-pressed="false" aria-controls="files-pane">Files</button>
-                <button id="tab-transfers" class="icon-btn" title="Transfers" aria-label="Open transfers">⇅</button>
+            <div id="center-tabs">
+                <div id="workspace-tablist" role="tablist" aria-label="Workspace views">
+                    <button id="tab-chat" class="active" role="tab" aria-selected="true" aria-controls="chat-pane" tabindex="0">Chat</button>
+                    <button id="tab-files" role="tab" aria-selected="false" aria-controls="files-pane" tabindex="-1">Files</button>
+                </div>
+                <button id="tab-transfers" class="icon-btn" title="Transfers" aria-label="Open transfers" aria-haspopup="dialog">⇅</button>
             </div>
+            <section id="chat-pane" role="tabpanel" aria-labelledby="tab-chat">
             <div id="banner-box"></div>
             <div id="voice-bar" role="group" aria-label="Voice controls">
                 <button id="ptt-btn" title="Hold to talk (configure PTT in Settings)" aria-label="Push to talk" aria-pressed="false">🎙</button>
@@ -101,8 +104,6 @@
             <div id="pm-tabs" class="hidden"></div>
             <div id="chat-wrap">
                 <div id="chat-log" aria-labelledby="chat-head-title"></div>
-                <div id="chat-announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
-                <div id="alert-announcer" class="sr-only" role="alert" aria-live="assertive" aria-atomic="true"></div>
                 <button id="chat-newpill" class="hidden" aria-label="Jump to new messages"></button>
             </div>
             <div id="chat-typing" class="hidden" role="status" aria-live="polite"></div>
@@ -125,7 +126,10 @@
                 <button id="chat-emoji" class="icon-btn" title="Emoji picker" aria-label="Open emoji picker">😊</button>
                 <button id="chat-send">SEND</button>
             </div>
-            <div id="files-pane" role="region" aria-label="Channel files" aria-hidden="true"></div>
+            </section>
+            <section id="files-pane" role="tabpanel" aria-labelledby="tab-files" hidden></section>
+            <div id="chat-announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+            <div id="alert-announcer" class="sr-only" role="alert" aria-live="assertive" aria-atomic="true"></div>
             <video id="remote-video" autoplay playsinline class="hidden" aria-label="Remote video"></video>
             <video id="local-video" autoplay playsinline muted class="hidden" aria-label="Local camera preview"></video>
         </main>

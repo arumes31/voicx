@@ -7,7 +7,9 @@ import (
 	"archive/zip"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -18,9 +20,22 @@ import (
 	"voicx/internal/version"
 )
 
+type logArchiveWriter interface {
+	Create(name string) (io.Writer, error)
+	Close() error
+}
+
+var (
+	newLogArchiveWriter = func(out io.Writer) logArchiveWriter { return zip.NewWriter(out) }
+	readLogEntries      = func(root *os.Root) ([]fs.DirEntry, error) { return fs.ReadDir(root.FS(), ".") }
+	readLogFile         = func(root *os.Root, name string) ([]byte, error) { return root.ReadFile(name) }
+	metaUserConfigDir   = os.UserConfigDir
+	shortVersion        = version.Short
+)
+
 // logDir returns the client log directory (<UserConfigDir>/voicx).
 func logDir() (string, error) {
-	dir, err := os.UserConfigDir()
+	dir, err := metaUserConfigDir()
 	if err != nil {
 		return "", err
 	}
@@ -68,25 +83,31 @@ func exportLogsTo(root *os.Root, dest string) (retErr error) {
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, out.Close()) }()
-	zw := zip.NewWriter(out)
-	entries, _ := fs.ReadDir(root.FS(), ".")
+	zw := newLogArchiveWriter(out)
+	defer func() { retErr = errors.Join(retErr, zw.Close()) }()
+	entries, err := readLogEntries(root)
+	if err != nil {
+		return fmt.Errorf("list log directory: %w", err)
+	}
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || filepath.Ext(name) != ".log" {
 			continue
 		}
-		raw, err := root.ReadFile(name)
+		raw, err := readLogFile(root, name)
 		if err != nil {
-			continue // a missing log is fine
+			if errors.Is(err, fs.ErrNotExist) {
+				continue // a log can vanish while rotation is running.
+			}
+			return fmt.Errorf("read log %q: %w", name, err)
 		}
 		w, err := zw.Create(name)
 		if err != nil {
-			continue
+			return fmt.Errorf("create zip entry %q: %w", name, err)
 		}
-		_, _ = w.Write(raw)
-	}
-	if err := zw.Close(); err != nil {
-		return err
+		if _, err := w.Write(raw); err != nil {
+			return fmt.Errorf("write zip entry %q: %w", name, err)
+		}
 	}
 	return nil
 }
@@ -161,12 +182,19 @@ var whatsNewNotes = map[string]string{
 // WhatsNew returns the release notes when the client version changed since
 // the last run (and marks it seen). "" when nothing new.
 func (a *App) WhatsNew() string {
-	cur := version.Short()
+	cur := shortVersion()
+	a.settingsMu.Lock()
 	if a.settings.LastSeenVersion == cur {
+		a.settingsMu.Unlock()
 		return ""
 	}
-	a.settings.LastSeenVersion = cur
-	_ = a.save()
+	a.settingsMu.Unlock()
+	if _, err := a.updateSettings(func(settings Settings) Settings {
+		settings.LastSeenVersion = cur
+		return settings
+	}); err != nil {
+		log.Printf("saving what's-new marker failed: %v", err)
+	}
 	for v, notes := range whatsNewNotes {
 		if cur == v || len(cur) > len(v) && cur[:len(v)] == v {
 			return notes

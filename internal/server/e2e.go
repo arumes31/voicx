@@ -23,14 +23,14 @@ import (
 func (s *TCPServer) handleKeyPublish(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.KeyPublish
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed key_publish: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed key_publish: "+err.Error())
 	}
 	raw, err := base64.StdEncoding.DecodeString(msg.PublicKey)
 	if err != nil || len(raw) != 32 {
-		return s.sendError(client, errCodeMalformed, "invalid public key (want 32-byte base64 X25519)")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "invalid public key (want 32-byte base64 X25519)")
 	}
 	if s.deps == nil || s.deps.State == nil {
-		return s.sendError(client, errCodeUnavailable, "state backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "state backend unavailable")
 	}
 
 	s.deps.State.SetE2EPublicKey(client.ID, msg.PublicKey)
@@ -58,13 +58,21 @@ func (s *TCPServer) handleKeyPublish(ctx context.Context, client *Client, f *net
 // handleKeyRequest answers a public-key lookup: online clients resolve from
 // state (covers guests), registered users from the database. An empty key
 // means the user never published one (old client).
-func (s *TCPServer) handleKeyRequest(_ context.Context, client *Client, f *netproto.Frame) error {
+func (s *TCPServer) handleKeyRequest(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.KeyRequest
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed key_request: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed key_request: "+err.Error())
 	}
 	if msg.UniqueID == "" {
-		return s.sendError(client, errCodeMalformed, "unique_id is required")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "unique_id is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// Keep public-key lookups separate from chat traffic, while still
+	// bounding their database cost and preventing user enumeration at scale.
+	if s.chatRate != nil && !s.chatRate.allow(client.UniqueID+":key", time.Now()) {
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "key lookup rate limit exceeded — slow down")
 	}
 
 	var pub string
@@ -74,14 +82,19 @@ func (s *TCPServer) handleKeyRequest(_ context.Context, client *Client, f *netpr
 		}
 	}
 	if pub == "" && s.deps != nil && s.deps.Auth != nil {
-		if key, err := s.deps.Auth.GetE2EPublicKey(context.Background(), msg.UniqueID); err == nil {
+		if key, err := s.deps.Auth.GetE2EPublicKey(ctx, msg.UniqueID); err == nil {
 			pub = key
+		} else if ctx.Err() != nil {
+			return ctx.Err()
 		} else if !errors.Is(err, auth.ErrUserNotFound) {
 			s.logger.Debug("e2e key lookup failed",
 				zap.String("unique_id", msg.UniqueID),
 				zap.Error(err),
 			)
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	return s.writeMessage(client, netproto.MsgKeyResponse, netproto.KeyResponse{
 		UniqueID:  msg.UniqueID,
@@ -105,28 +118,14 @@ func (s *TCPServer) deliverScopeKey(ctx context.Context, client *Client, scope i
 	}
 	gen, _, err := s.chatKeys.EnsureScope(ctx, scope)
 	if err != nil {
-		s.logger.Warn("ensuring chat key failed",
-			zap.String("client_id", client.ID),
-			zap.Int64("scope", scope),
-			zap.Error(err),
-		)
-		return err
+		return fmt.Errorf("ensuring scope key: %w", err)
 	}
 	ck, err := s.chatKeys.sealFor(ctx, scope, gen, sc.E2EPublicKey)
 	if err != nil {
-		s.logger.Warn("sealing chat key failed",
-			zap.String("client_id", client.ID),
-			zap.Int64("scope", scope),
-			zap.Error(err),
-		)
-		return err
+		return fmt.Errorf("sealing scope key: %w", err)
 	}
 	if err := s.writeMessage(client, netproto.MsgChannelKey, ck); err != nil {
-		s.logger.Debug("delivering chat key failed",
-			zap.String("client_id", client.ID),
-			zap.Error(err),
-		)
-		return err
+		return fmt.Errorf("writing scope key: %w", err)
 	}
 	return nil
 }
@@ -187,7 +186,13 @@ func (s *TCPServer) rotateScopeKey(ctx context.Context, channelID int64) {
 	}
 	s.rotPending[channelID] = true
 	s.rotMu.Unlock()
-	time.AfterFunc(window, func() {
+	after := s.rotationAfter
+	if after == nil {
+		after = func(delay time.Duration, callback func()) {
+			time.AfterFunc(delay, callback)
+		}
+	}
+	after(window, func() {
 		s.rotMu.Lock()
 		delete(s.rotPending, channelID)
 		s.rotMu.Unlock()
@@ -237,20 +242,20 @@ func (s *TCPServer) doRotateScopeKey(ctx context.Context, channelID int64) {
 func (s *TCPServer) handleChatKeyRequest(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.ChatKeyRequest
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed chat_key_request: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed chat_key_request: "+err.Error())
 	}
 	if len(msg.KeyIDs) == 0 || len(msg.KeyIDs) > maxKeysPerResponse {
-		return s.sendError(client, errCodeMalformed, "key_ids count must be 1..64")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "key_ids count must be 1..64")
 	}
 	if s.chatRate != nil && !s.chatRate.allow(client.UniqueID, time.Now()) {
-		return s.sendError(client, errCodeMalformed, "chat rate limit exceeded — slow down")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "chat rate limit exceeded — slow down")
 	}
 	if s.deps == nil || s.deps.State == nil || s.chatKeys == nil {
-		return s.sendError(client, errCodeUnavailable, "chat key manager unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "chat key manager unavailable")
 	}
 	sc, ok := s.deps.State.GetClient(client.ID)
 	if !ok || sc.E2EPublicKey == "" {
-		return s.sendError(client, errCodePermissionDenied, "e2e public key not published")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "e2e public key not published")
 	}
 	if !s.scopeReadable(ctx, client, msg.ChannelID) {
 		return s.writeMessage(client, netproto.MsgChatKeyBundle, netproto.ChatKeyBundle{

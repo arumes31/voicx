@@ -43,6 +43,17 @@ type ChannelInfo struct {
 	SlowModeSeconds int
 }
 
+// ChannelCreateParams carries the complete channel creation input used by
+// ServerQuery and gRPC. A typed parameter prevents adapters from silently
+// dropping parent or capacity limits as the control surface evolves.
+type ChannelCreateParams struct {
+	Name       string
+	Topic      string
+	ParentID   int64
+	MaxClients int
+	Type       int // 0=temporary, 1=semi-permanent, 2=permanent
+}
+
 // ChannelEditParams carries channeledit arguments. Nil pointers leave the
 // field unchanged.
 type ChannelEditParams struct {
@@ -167,10 +178,11 @@ type Backend interface {
 	// (target is a client ID), 2 = channel (target is a channel ID),
 	// 3 = global.
 	SendText(ctx context.Context, targetMode int, target, msg string) error
-	// CreateChannel creates a channel and returns its ID. channelType:
-	// 0=temporary, 1=semi-permanent, 2=permanent.
-	CreateChannel(ctx context.Context, name, topic string, channelType int) (int64, error)
-	DeleteChannel(ctx context.Context, channelID int64) error
+	// CreateChannel creates a channel and returns its ID.
+	CreateChannel(ctx context.Context, params ChannelCreateParams) (int64, error)
+	// DeleteChannel removes a channel subtree. reason is retained for audit and
+	// event consumers; ServerQuery passes an empty reason for compatibility.
+	DeleteChannel(ctx context.Context, channelID int64, reason string) error
 	// ChannelInfo returns one channel's details (ok=false when unknown).
 	ChannelInfo(ctx context.Context, channelID int64) (ChannelInfo, bool)
 	// EditChannel applies non-nil fields of params to a channel.
@@ -200,8 +212,9 @@ type Backend interface {
 	// Shutdown gracefully stops the server; restart=true documents that a
 	// supervisor (docker restart policy) brings it back.
 	Shutdown(ctx context.Context, restart bool) error
-	// PermOverview returns the resolved permissions of a user (219).
-	PermOverview(ctx context.Context, uniqueID string, channelID int64) ([]PermLine, error)
+	// PermOverview returns the resolved permissions and authoritative admin
+	// status of a user (219).
+	PermOverview(ctx context.Context, uniqueID string, channelID int64) (lines []PermLine, isAdmin bool, err error)
 	// Channel tier permissions (220). actor is the query user (audit).
 	ChannelPermList(ctx context.Context, channelID int64) ([]ChannelPerm, error)
 	ChannelAddPerm(ctx context.Context, actor string, channelID int64, key string, value, grant int, skip, negate bool) error

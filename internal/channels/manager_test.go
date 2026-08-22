@@ -605,6 +605,20 @@ func TestCleanupCallback_ClaimsExactTimerToken(t *testing.T) {
 	if _, ok := sm.GetChannel(channelID); !ok {
 		t.Fatal("stale callback removed the state channel")
 	}
+
+	// The active callback still owns the replacement token and performs the
+	// deletion. Calling it directly keeps this ownership test independent of
+	// wall-clock timer scheduling.
+	mgr.cleanupCallback(channelID, replacement)
+	if channelExistsInDB(t, s, channelID) {
+		t.Fatal("active callback did not delete the channel")
+	}
+	if _, ok := sm.GetChannel(channelID); ok {
+		t.Fatal("active callback did not remove the state channel")
+	}
+	if got := mgr.CleanupTimersCount(); got != 0 {
+		t.Fatalf("cleanup timers after active callback = %d, want 0", got)
+	}
 }
 
 func TestMoveClient_LinearizableWithTemporaryCleanup(t *testing.T) {
@@ -891,7 +905,6 @@ func TestTemporaryParentSurvivesUntilItsLastChildIsDeleted(t *testing.T) {
 	if got := mgr.CleanupTimersCount(); got != 0 {
 		t.Fatalf("cleanup timers with child present = %d, want 0", got)
 	}
-	time.Sleep(120 * time.Millisecond)
 	if !channelExistsInDB(t, s, parentID) || !channelExistsInDB(t, s, childID) {
 		t.Fatal("temporary parent cleanup cascaded through an existing child")
 	}
@@ -902,9 +915,10 @@ func TestTemporaryParentSurvivesUntilItsLastChildIsDeleted(t *testing.T) {
 	if got := mgr.CleanupTimersCount(); got != 1 {
 		t.Fatalf("cleanup timers after last child deletion = %d, want 1", got)
 	}
-	pollCondition(t, time.Second, func() bool {
-		return !channelExistsInDB(t, s, parentID)
-	}, "temporary parent was not cleaned after becoming an empty leaf")
+	mgr.cleanupCallback(parentID, activeCleanupToken(t, mgr, parentID))
+	if channelExistsInDB(t, s, parentID) {
+		t.Fatal("temporary parent was not cleaned after becoming an empty leaf")
+	}
 }
 
 // TestMoveClient_CancelsCleanup verifies that joining through the lifecycle
@@ -1093,7 +1107,7 @@ func insertChannelRow(t *testing.T, s *store.Store, name string, parentID int64,
 func TestLoadIntoState(t *testing.T) {
 	mgr, s, sm := testEnv(t)
 
-	if _, err := s.DB().Exec("DELETE FROM channels"); err != nil {
+	if _, err := s.DB().ExecContext(t.Context(), "DELETE FROM channels"); err != nil {
 		t.Fatalf("failed to clean channels table: %v", err)
 	}
 

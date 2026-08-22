@@ -8,6 +8,7 @@ package server
 import (
 	"context"
 	"errors"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -30,6 +31,10 @@ const (
 	// cue, flash the taskbar (32) and remember who to whisper back to (33).
 	eventWhisper = "whisper"
 )
+
+// mediaPermissionTimeout bounds backend permission work triggered by voice
+// callbacks, which have no request context to inherit.
+const mediaPermissionTimeout = time.Second
 
 // whisperTargeter is the optional VoiceBackend capability that reports which
 // clients a speaker's active whisper currently reaches. webrtc.Voice
@@ -72,8 +77,9 @@ type prioritySpeakerEvent struct {
 // speakingEvent is the payload of speaking_changed events, emitted when a
 // client's VAD speaking state toggles.
 type speakingEvent struct {
-	ClientID string `json:"client_id"`
-	Speaking bool   `json:"speaking"`
+	ClientID  string `json:"client_id"`
+	ChannelID int64  `json:"channel_id,omitempty"`
+	Speaking  bool   `json:"speaking"`
 	// Whisper marks the transmission as a whisper (32). It names no targets —
 	// this event is broadcast, and who is being whispered to is only disclosed
 	// to those targets, via eventWhisper.
@@ -93,13 +99,13 @@ type positionEvent struct {
 // the SDP offer to the voice backend and replies with the SDP answer. Local
 // ICE candidates are pushed to the client asynchronously as ICECandidate
 // messages.
-func (s *TCPServer) handleWebRTCOffer(_ context.Context, client *Client, f *netproto.Frame) error {
+func (s *TCPServer) handleWebRTCOffer(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.WebRTCOffer
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed webrtc_offer: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed webrtc_offer: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Voice == nil {
-		return s.sendError(client, errCodeUnavailable, "voice backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "voice backend unavailable")
 	}
 
 	// The slot declaration has to land BEFORE the offer is applied: the
@@ -130,36 +136,35 @@ func (s *TCPServer) handleWebRTCOffer(_ context.Context, client *Client, f *netp
 			zap.String("client_id", client.ID),
 			zap.Error(err),
 		)
-		return s.sendError(client, errCodeUnavailable, "webrtc offer failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "webrtc offer failed")
 	}
-	s.metricsSink().SetWebRTCPeers(s.deps.Voice.PeerCount())
 	return s.writeMessage(client, netproto.MsgWebRTCAnswer, netproto.WebRTCAnswer{SDP: answer})
 }
 
 // handleWebRTCAnswer applies an SDP answer from the client (used when the
 // server initiated renegotiation).
-func (s *TCPServer) handleWebRTCAnswer(_ context.Context, client *Client, f *netproto.Frame) error {
+func (s *TCPServer) handleWebRTCAnswer(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.WebRTCAnswer
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed webrtc_answer: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed webrtc_answer: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Voice == nil {
-		return s.sendError(client, errCodeUnavailable, "voice backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "voice backend unavailable")
 	}
 	if err := s.deps.Voice.HandleAnswer(client.ID, msg.SDP); err != nil {
-		return s.sendError(client, errCodeNotFound, "webrtc answer failed: no active session")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "webrtc answer failed: no active session")
 	}
 	return nil
 }
 
 // handleICECandidate applies a trickle ICE candidate from the client.
-func (s *TCPServer) handleICECandidate(_ context.Context, client *Client, f *netproto.Frame) error {
+func (s *TCPServer) handleICECandidate(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.ICECandidate
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed ice_candidate: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed ice_candidate: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Voice == nil {
-		return s.sendError(client, errCodeUnavailable, "voice backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "voice backend unavailable")
 	}
 	if err := s.deps.Voice.AddICECandidate(client.ID, msg.Candidate, msg.SDPMid, msg.SDPMLineIndex); err != nil {
 		s.logger.Debug("ice candidate rejected",
@@ -177,18 +182,18 @@ func (s *TCPServer) handleICECandidate(_ context.Context, client *Client, f *net
 func (s *TCPServer) handleWhisperSet(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.WhisperSet
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed whisper_set: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed whisper_set: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Voice == nil {
-		return s.sendError(client, errCodeUnavailable, "voice backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "voice backend unavailable")
 	}
 
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	if !pc.whisperAllowed() {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyClientWhisperPower))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyClientWhisperPower))
 	}
 
 	clientIDs := make([]string, 0, len(msg.UniqueIDs))
@@ -211,18 +216,18 @@ func (s *TCPServer) handleWhisperSet(ctx context.Context, client *Client, f *net
 // handlePositionUpdate relays the client's 3D position to the other members
 // of its channel. Positions are low-rate metadata, so they travel over the
 // control channel (broadcaster events) rather than a WebRTC DataChannel.
-func (s *TCPServer) handlePositionUpdate(_ context.Context, client *Client, f *netproto.Frame) error {
+func (s *TCPServer) handlePositionUpdate(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.PositionUpdate
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed position_update: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed position_update: "+err.Error())
 	}
 	if s.deps == nil || s.deps.State == nil || s.deps.Broadcast == nil {
-		return s.sendError(client, errCodeUnavailable, "state backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "state backend unavailable")
 	}
 
 	sc, ok := s.deps.State.GetClient(client.ID)
 	if !ok || sc.ChannelID == 0 {
-		return s.sendError(client, errCodeNotFound, "not in a channel")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "not in a channel")
 	}
 
 	payload, err := eventEnvelope(eventPosition, positionEvent{
@@ -245,18 +250,18 @@ func (s *TCPServer) handlePositionUpdate(_ context.Context, client *Client, f *n
 func (s *TCPServer) handlePrioritySpeaker(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.PrioritySpeaker
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed priority_speaker: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed priority_speaker: "+err.Error())
 	}
 	if s.deps == nil || s.deps.State == nil {
-		return s.sendError(client, errCodeUnavailable, "state backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "state backend unavailable")
 	}
 
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	if !pc.granted(permissions.PermissionKeyClientPrioritySpeaker) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyClientPrioritySpeaker))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyClientPrioritySpeaker))
 	}
 
 	s.deps.State.SetPrioritySpeaker(client.ID, msg.Active)
@@ -278,16 +283,16 @@ func (s *TCPServer) handlePrioritySpeaker(ctx context.Context, client *Client, f
 
 // handleVideoQuality sets the client's preferred simulcast layer for the
 // video it receives.
-func (s *TCPServer) handleVideoQuality(_ context.Context, client *Client, f *netproto.Frame) error {
+func (s *TCPServer) handleVideoQuality(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.VideoQuality
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed video_quality: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed video_quality: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Voice == nil {
-		return s.sendError(client, errCodeUnavailable, "voice backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "voice backend unavailable")
 	}
 	if err := s.deps.Voice.SetVideoQuality(client.ID, msg.Quality); err != nil {
-		return s.sendError(client, errCodeMalformed, err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, err.Error())
 	}
 	return nil
 }
@@ -297,24 +302,24 @@ func (s *TCPServer) handleVideoQuality(_ context.Context, client *Client, f *net
 func (s *TCPServer) handleRecordingControl(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.RecordingControl
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed recording_control: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed recording_control: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Recorder == nil || s.deps.Voice == nil {
-		return s.sendError(client, errCodeUnavailable, "recording backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "recording backend unavailable")
 	}
 
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	if !pc.admin && !pc.granted(permissions.PermissionKeyVirtualserverRecording) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyVirtualserverRecording))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyVirtualserverRecording))
 	}
 
 	switch msg.Action {
 	case "start":
 		if s.deps.Channels == nil {
-			return s.sendError(client, errCodeUnavailable, "channel backend unavailable")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "channel backend unavailable")
 		}
 		var session *recorder.Session
 		err := s.deps.Channels.WithChannelLifecycle(msg.ChannelID, func() error {
@@ -324,12 +329,12 @@ func (s *TCPServer) handleRecordingControl(ctx context.Context, client *Client, 
 		})
 		if err != nil {
 			if errors.Is(err, channels.ErrChannelNotFound) {
-				return s.sendError(client, errCodeNotFound, "channel not found")
+				return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "channel not found")
 			}
-			return s.sendError(client, errCodeUnavailable, "recording start failed: "+err.Error())
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "recording start failed: "+err.Error())
 		}
 		if session == nil {
-			return s.sendError(client, errCodeUnavailable, "recording start failed: empty session")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "recording start failed: empty session")
 		}
 		s.logger.Info("recording started",
 			zap.String("client_id", client.ID),
@@ -338,14 +343,14 @@ func (s *TCPServer) handleRecordingControl(ctx context.Context, client *Client, 
 		)
 	case "stop":
 		if err := s.deps.Recorder.Stop(msg.ChannelID); err != nil {
-			return s.sendError(client, errCodeNotFound, "recording stop failed: "+err.Error())
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "recording stop failed: "+err.Error())
 		}
 		s.logger.Info("recording stopped",
 			zap.String("client_id", client.ID),
 			zap.Int64("channel_id", msg.ChannelID),
 		)
 	default:
-		return s.sendError(client, errCodeMalformed, "unknown recording action: "+msg.Action)
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "unknown recording action: "+msg.Action)
 	}
 	return nil
 }
@@ -360,7 +365,9 @@ func (s *TCPServer) canTalk(clientID string) bool {
 	if !ok {
 		return false
 	}
-	pc, err := s.permCheckerFor(context.Background(), client)
+	ctx, cancel := context.WithTimeout(context.Background(), mediaPermissionTimeout)
+	defer cancel()
+	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
 		return false
 	}
@@ -374,7 +381,9 @@ func (s *TCPServer) canPublishVideo(clientID string) bool {
 	if !ok {
 		return false
 	}
-	pc, err := s.permCheckerFor(context.Background(), client)
+	ctx, cancel := context.WithTimeout(context.Background(), mediaPermissionTimeout)
+	defer cancel()
+	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
 		return false
 	}
@@ -382,9 +391,9 @@ func (s *TCPServer) canPublishVideo(clientID string) bool {
 }
 
 // onSpeakingChanged is the router's speaking-state callback: it updates the
-// state manager and announces the transition to all clients. The event
-// carries no channel ID; clients already track membership via snapshots and
-// user_moved events.
+// state manager and announces the transition to all clients. The channel is
+// read back from the synchronized state manager after the speaking update, so
+// it is the channel current at publication time.
 //
 // When the speaker is whispering, each target additionally gets a directed
 // whisper event naming the whisperer (32/33).
@@ -393,15 +402,20 @@ func (s *TCPServer) onSpeakingChanged(clientID string, speaking bool) {
 		return
 	}
 	s.deps.State.SetSpeaking(clientID, speaking)
+	stateClient, ok := s.deps.State.GetClient(clientID)
+	if !ok {
+		return
+	}
 
 	var targets []string
 	if wt, ok := s.deps.Voice.(whisperTargeter); ok {
 		targets = wt.WhisperTargets(clientID)
 	}
 	s.broadcastEvent(eventSpeakingChanged, speakingEvent{
-		ClientID: clientID,
-		Speaking: speaking,
-		Whisper:  len(targets) > 0,
+		ClientID:  clientID,
+		ChannelID: stateClient.ChannelID,
+		Speaking:  speaking,
+		Whisper:   len(targets) > 0,
 	})
 	if len(targets) == 0 || s.deps.Broadcast == nil {
 		return

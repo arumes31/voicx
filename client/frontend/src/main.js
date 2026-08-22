@@ -37,6 +37,7 @@ import { extractPresentedFingerprint } from "./security.js";
 import { isActivationKey } from "./a11y.js";
 import { createLiveAnnouncementQueue } from "./live-announcer.js";
 import { dialogFocusableSelector, initModalSystem, mountServerDialog } from "./modal.js";
+import { parseRuntimeObject } from "./runtime-json.js";
 
 const P = () => window.__voicxPerms;
 window.__voicxChat = chatUI;
@@ -182,7 +183,10 @@ function applyAppearance() {
     root.style.setProperty("--font-body", fonts[s.ui_font] || fonts.outfit);
     root.style.fontSize = (s.ui_font_size || 14) + "px";
     // (293) restore compact mode.
-    document.body.classList.toggle("compact", !!s.compact_mode);
+    const compact = !!s.compact_mode;
+    if (compact) window.__voicxFiles?.activateWorkspaceTab?.("chat", { focus: false });
+    document.body.classList.toggle("compact", compact);
+    if (compact) window.__voicxFiles?.restoreVisibleWorkspaceFocus?.();
 }
 
 // ---------------------------------------------------------------------------
@@ -638,15 +642,22 @@ async function reconnectLastServerNow() {
     }
 }
 
-window.runtime.EventsOn("tray_reconnect", () => { reconnectLastServerNow(); });
-window.runtime.EventsOn("tray_disconnect", () => { disconnect(); });
+window.runtime.EventsOn("tray_reconnect", () => { void reconnectLastServerNow(); });
+window.runtime.EventsOn("tray_disconnect", () => { void disconnect(); });
 
 async function disconnect() {
     reconnectGeneration++;
     state.lastConnect = null; // intentional disconnect: no reconnect
     clearReconnectTimer();
     chatUI.cancelReconnectAnnouncementBatch();
-    await window.go.main.App.Disconnect();
+    try {
+        await window.go.main.App.Disconnect();
+    } catch {
+        // The local cancellation above is still intentional even when the
+        // bridge is already gone. Surface one actionable connection warning
+        // instead of leaking an unhandled tray-event rejection.
+        toast("disconnect failed", "warn", "conn");
+    }
 }
 
 window.runtime.EventsOn("disconnected", () => {
@@ -817,7 +828,8 @@ const lastKnownChannel = new Map();
 const LAST_CHANNEL_MAX = 200;
 
 window.runtime.EventsOn("snapshot", (json) => {
-    const snap = JSON.parse(json);
+    const snap = parseRuntimeObject(json);
+    if (!snap) return;
     // broadcast.ClientInfo does not serialize priority_speaker, so carry the
     // flags over from the previous state (they arrive via
     // priority_speaker_changed events).
@@ -934,7 +946,8 @@ function flattenChannel(node) {
 }
 
 window.runtime.EventsOn("channellist", (json) => {
-    const list = JSON.parse(json);
+    const list = parseRuntimeObject(json);
+    if (!list) return;
     for (const ch of list.channels || []) {
         if (!state.channels.find((c) => c.ChannelID === Number(ch.id))) {
             state.channels.push({ ChannelID: Number(ch.id), ParentID: 0, Name: ch.name, HasIcon: false });
@@ -944,7 +957,8 @@ window.runtime.EventsOn("channellist", (json) => {
 });
 
 window.runtime.EventsOn("event", (json) => {
-    const env = JSON.parse(json);
+    const env = parseRuntimeObject(json);
+    if (!env) return;
     const d = env.data || {};
     switch (env.type) {
         case "user_joined": {
@@ -2046,6 +2060,10 @@ async function startVoice(expectedEpoch = voiceSessionEpoch) {
     const pc = iceServers && iceServers.length
         ? new RTCPeerConnection({ iceServers })
         : new RTCPeerConnection();
+    // A replacement peer owns a new ICE-restart ladder. Dispose the previous
+    // current owner's timer before publishing the replacement; callbacks from
+    // that old peer can never affect the new one.
+    if (state.pc && state.pc !== pc) resetICERestart(state.pc);
     state.pc = pc;
 
     const audioTrack = state.localStream.getAudioTracks()[0];
@@ -2072,8 +2090,12 @@ async function startVoice(expectedEpoch = voiceSessionEpoch) {
 
     pc.onicecandidate = (e) => {
         if (e.candidate) {
-            window.go.main.App.SendICECandidate(
-                e.candidate.candidate, e.candidate.sdpMid || "", e.candidate.sdpMLineIndex || 0);
+            // A candidate can arrive while teardown has already closed the
+            // control bridge. There is nothing useful to show for that race,
+            // but its rejected promise must not become an unhandled one.
+            void window.go.main.App.SendICECandidate(
+                e.candidate.candidate, e.candidate.sdpMid || "", e.candidate.sdpMLineIndex || 0,
+            ).catch(() => {});
         }
     };
     // (59) ICE restart: re-offer with iceRestart on failed/disconnected,
@@ -2196,62 +2218,96 @@ $("voice-prio").onclick = async () => {
 const ICE_BACKOFF_MS = [1000, 2000, 5000, 15000];
 let iceFailures = 0;
 let iceTimer = null;
+let iceFailureNotified = false;
+let iceRestartPC = null;
+
+function ownsICERestart(pc) {
+    return state.pc === pc && iceRestartPC === pc;
+}
+
+function claimICERestart(pc) {
+    if (state.pc !== pc) return false;
+    if (iceRestartPC === pc) return true;
+    // This can only be reached by the current peer. A prior owner's timer is
+    // stale at this point and must not keep the current ladder blocked.
+    if (iceTimer !== null) clearTimeout(iceTimer);
+    iceRestartPC = pc;
+    iceFailures = 0;
+    iceTimer = null;
+    iceFailureNotified = false;
+    return true;
+}
 
 function onICEStateChange(pc) {
+    if (pc !== state.pc) return;
     const s = pc.iceConnectionState;
     if (s === "connected" || s === "completed") {
-        resetICERestart();
+        resetICERestart(pc);
         return;
     }
-    if ((s === "failed" || s === "disconnected") && iceTimer === null) {
-        scheduleICERestart();
+    if (s === "failed" || s === "disconnected") {
+        scheduleICERestart(pc);
     }
 }
 
-function resetICERestart() {
+function resetICERestart(pc) {
+    if (!ownsICERestart(pc)) return;
+    if (iceTimer !== null) clearTimeout(iceTimer);
     iceFailures = 0;
-    if (iceTimer !== null) {
-        clearTimeout(iceTimer);
-        iceTimer = null;
-    }
+    iceFailureNotified = false;
+    iceTimer = null;
+    iceRestartPC = null;
 }
 
-function scheduleICERestart() {
-    if (!state.pc) return;
+function scheduleICERestart(pc) {
+    if (state.pc !== pc || !claimICERestart(pc) || !ownsICERestart(pc)) return;
+    if (iceTimer !== null) return;
     if (iceFailures >= ICE_BACKOFF_MS.length) {
-        toast("Voice connection unstable — reconnect if it does not recover", "warn", "conn");
+        if (!iceFailureNotified) {
+            iceFailureNotified = true;
+            toast("Voice connection unstable — reconnect if it does not recover", "warn", "conn");
+        }
         return;
     }
     const delay = ICE_BACKOFF_MS[iceFailures++];
-    iceTimer = setTimeout(async () => {
+    let timer = null;
+    timer = setTimeout(async () => {
+        if (!ownsICERestart(pc) || iceTimer !== timer) return;
         iceTimer = null;
-        const pc = state.pc;
-        if (!pc) return;
         const s = pc.iceConnectionState;
         if (s === "connected" || s === "completed" || s === "closed") {
-            resetICERestart();
+            resetICERestart(pc);
             return;
         }
         try {
             const offer = await pc.createOffer({ iceRestart: true });
+            if (!ownsICERestart(pc)) return;
             await pc.setLocalDescription(offer);
+            if (!ownsICERestart(pc)) return;
             const answerSDP = await window.go.main.App.WebRTCOffer(offer.sdp, trackSlots());
+            if (!ownsICERestart(pc)) return;
             await pc.setRemoteDescription({ type: "answer", sdp: answerSDP });
-        } catch (e) {
-            sysMsg("ice restart failed: " + e);
+        } catch {
+            // Retry scheduling below owns failure feedback. Per-attempt chat
+            // lines would flood the conversation during a bad network spell.
         }
         // Still not connected: oniceconnectionstatechange may not fire again
         // for a persistent failure, so chain the next backoff step explicitly.
-        if (state.pc === pc && !["connected", "completed", "closed"].includes(pc.iceConnectionState)) {
-            scheduleICERestart();
+        if (ownsICERestart(pc) && !["connected", "completed", "closed"].includes(pc.iceConnectionState)) {
+            scheduleICERestart(pc);
         }
     }, delay);
+    if (!ownsICERestart(pc)) {
+        clearTimeout(timer);
+        return;
+    }
+    iceTimer = timer;
 }
 
 function teardownVoice() {
     stopVoiceMonitor();
     stopMicMeter();
-    resetICERestart();
+    resetICERestart(state.pc);
     if (unduckTimer) {
         clearTimeout(unduckTimer);
         unduckTimer = null;
@@ -2414,7 +2470,8 @@ async function retryMicrophoneCapture() {
 // Server->client ICE and renegotiation.
 window.runtime.EventsOn("ice", (json) => {
     if (!state.pc) return;
-    const c = JSON.parse(json);
+    const c = parseRuntimeObject(json);
+    if (!c) return;
     state.pc.addIceCandidate({
         candidate: c.candidate,
         sdpMid: c.sdp_mid || null,
@@ -2422,13 +2479,26 @@ window.runtime.EventsOn("ice", (json) => {
     }).catch(() => {});
 });
 
-window.runtime.EventsOn("offer", async (json) => {
-    if (!state.pc) return;
-    const o = JSON.parse(json);
-    await state.pc.setRemoteDescription({ type: "offer", sdp: o.sdp });
-    const answer = await state.pc.createAnswer();
-    await state.pc.setLocalDescription(answer);
-    window.go.main.App.WebRTCAnswer(answer.sdp);
+window.runtime.EventsOn("offer", (json) => {
+    const pc = state.pc;
+    const o = parseRuntimeObject(json);
+    if (!pc || !o || typeof o.sdp !== "string") return;
+    const generation = state.serverGeneration;
+    // Wails does not observe a returned event-handler promise. Contain every
+    // async rejection here so a failed renegotiation cannot surface globally.
+    // A tab reset may replace both the active backend and its peer while the
+    // offer is pending, so never answer through the new backend for old SDP.
+    void (async () => {
+        try {
+            await pc.setRemoteDescription({ type: "offer", sdp: o.sdp });
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            if (generation !== state.serverGeneration || state.pc !== pc) return;
+            await window.go.main.App.WebRTCAnswer(answer.sdp);
+        } catch {
+            // The peer may have closed or a later negotiation may have won.
+        }
+    })();
 });
 
 // Mute / deafen / PTT ---------------------------------------------------------
@@ -2864,7 +2934,9 @@ window.runtime.EventsOn("hotkey", (action) => {
 // only. Toggled from the View menu or the compact hotkey.
 function toggleCompact() {
     const on = !document.body.classList.contains("compact");
+    if (on) window.__voicxFiles?.activateWorkspaceTab?.("chat", { focus: false });
     document.body.classList.toggle("compact", on);
+    window.__voicxFiles?.restoreVisibleWorkspaceFocus?.();
     if (state.settings) {
         state.settings.compact_mode = on;
         window.go.main.App.SaveSettings(state.settings);

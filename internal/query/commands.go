@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+
+	"voicx/internal/auth"
 )
 
 // session holds per-connection query state. It is transport-agnostic (224):
@@ -187,17 +189,22 @@ func (s *Server) write(sess *session, text string) bool {
 	return err == nil
 }
 
-// cmdLogin authenticates the session. Brute-force protection: after
-// MaxLoginFailures failed attempts from one IP, logins from it are refused
-// for LockoutDuration.
+// cmdLogin authenticates the session. Brute-force protection is scoped by
+// remote source and normalized principal, so one failed identity cannot lock
+// out an unrelated administrator using the same address.
 func (s *Server) cmdLogin(ctx context.Context, sess *session, cmd command) bool {
-	if s.lockedOut(sess.remoteIP) {
-		return s.write(sess, errorLine(errLoginFailed, "too many failed logins, try again later"))
-	}
 	if len(cmd.positional) < 2 {
 		return s.write(sess, errorLine(errInvalidParameter, "usage: login <unique_id> <password>"))
 	}
 	uniqueID, password := cmd.positional[0], cmd.positional[1]
+	sourceScope := auth.LoginFailureScope("query:"+sess.remoteIP, "")
+	principalScope := auth.LoginFailureScope("", uniqueID)
+	attempt, allowed := s.ReserveLoginAttempt(sourceScope, principalScope)
+	if !allowed {
+		s.RecordAuthFailure("query", "locked_out")
+		return s.write(sess, errorLine(errLoginFailed, "too many failed logins, try again later"))
+	}
+	defer attempt.Cancel()
 
 	ok, admin, err := s.backend.Authenticate(ctx, uniqueID, password)
 	if err != nil {
@@ -205,15 +212,18 @@ func (s *Server) cmdLogin(ctx context.Context, sess *session, cmd command) bool 
 		return s.write(sess, errorLine(errServerError, "internal error"))
 	}
 	if !ok {
-		s.recordLoginFailure(sess.remoteIP)
+		attempt.Fail()
+		s.RecordAuthFailure("query", "invalid_credentials")
 		return s.write(sess, errorLine(errLoginFailed, "invalid loginname or password"))
 	}
 	if !admin {
 		// Only server admins may use ServerQuery.
+		attempt.Fail()
+		s.RecordAuthFailure("query", "not_admin")
 		return s.write(sess, errorLine(errInsufficientPermissions, "insufficient permissions"))
 	}
 
-	s.clearLoginFailures(sess.remoteIP)
+	attempt.Succeed(principalScope)
 	sess.authed = true
 	sess.username = uniqueID
 	s.logger.Info("query client logged in",
@@ -223,47 +233,33 @@ func (s *Server) cmdLogin(ctx context.Context, sess *session, cmd command) bool 
 	return s.write(sess, errorLine(errOK, "ok"))
 }
 
-func (s *Server) lockedOut(ip string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	until, ok := s.lockouts[ip]
-	if !ok {
-		return false
-	}
-	if time.Now().After(until) {
-		delete(s.lockouts, ip)
-		return false
-	}
-	return true
-}
-
-func (s *Server) recordLoginFailure(ip string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.loginFails[ip]++
-	if s.loginFails[ip] >= s.MaxLoginFailures {
-		s.lockouts[ip] = time.Now().Add(s.LockoutDuration)
-		delete(s.loginFails, ip)
-		s.logger.Warn("query login lockout", zap.String("ip", ip))
-	}
-}
-
-func (s *Server) clearLoginFailures(ip string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.loginFails, ip)
-	delete(s.lockouts, ip)
-}
-
 // LoginAllowed reports whether the shared ServerQuery brute-force limiter
-// currently permits another attempt from ip.
-func (s *Server) LoginAllowed(ip string) bool { return !s.lockedOut(ip) }
+// currently permits another attempt from scope.
+func (s *Server) LoginAllowed(scope string) bool {
+	return s.loginFailureLimiter().Allowed(scope)
+}
+
+// ReserveLoginAttempt atomically reserves one bounded password-verification
+// slot for scope. Callers must finish the returned attempt.
+func (s *Server) ReserveLoginAttempt(scopes ...string) (*auth.LoginAttempt, bool) {
+	return s.loginFailureLimiter().Reserve(scopes...)
+}
 
 // RecordLoginFailure feeds a failed attempt into the shared limiter.
-func (s *Server) RecordLoginFailure(ip string) { s.recordLoginFailure(ip) }
+func (s *Server) RecordLoginFailure(scope string) {
+	s.loginFailureLimiter().RecordFailure(scope)
+}
 
 // ClearLoginFailures clears the shared limiter after a successful login.
-func (s *Server) ClearLoginFailures(ip string) { s.clearLoginFailures(ip) }
+func (s *Server) ClearLoginFailures(scope string) {
+	s.loginFailureLimiter().Clear(scope)
+}
+
+// RecordAuthFailure increments the bounded auth-failure metric for a stable
+// transport and reason pair.
+func (s *Server) RecordAuthFailure(transport, reason string) {
+	s.metricsSink().IncAuthFailure(transport, reason)
+}
 
 // cmdClientlist lists online clients.
 func (s *Server) cmdClientlist(ctx context.Context, sess *session) bool {
@@ -355,7 +351,11 @@ func (s *Server) cmdChannelcreate(ctx context.Context, sess *session, cmd comman
 	if cmd.args["channel_flag_permanent"] == "1" {
 		channelType = 2
 	}
-	id, err := s.backend.CreateChannel(ctx, name, cmd.args["channel_topic"], channelType)
+	id, err := s.backend.CreateChannel(ctx, ChannelCreateParams{
+		Name:  name,
+		Topic: cmd.args["channel_topic"],
+		Type:  channelType,
+	})
 	if err != nil {
 		return s.write(sess, errorLine(errServerError, err.Error()))
 	}
@@ -369,7 +369,7 @@ func (s *Server) cmdChanneldelete(ctx context.Context, sess *session, cmd comman
 	if err != nil {
 		return s.write(sess, errorLine(errInvalidParameter, "usage: channeldelete cid=<id> [force=1]"))
 	}
-	if err := s.backend.DeleteChannel(ctx, cid); err != nil {
+	if err := s.backend.DeleteChannel(ctx, cid, ""); err != nil {
 		return s.write(sess, errorLine(errInvalidParameter, err.Error()))
 	}
 	return s.write(sess, errorLine(errOK, "ok"))
@@ -810,7 +810,7 @@ func (s *Server) cmdPermoverview(ctx context.Context, sess *session, cmd command
 			return s.write(sess, errorLine(errInvalidParameter, "invalid cid"))
 		}
 	}
-	lines, err := s.backend.PermOverview(ctx, uid, channelID)
+	lines, _, err := s.backend.PermOverview(ctx, uid, channelID)
 	if err != nil {
 		return s.write(sess, errorLine(errInvalidParameter, err.Error()))
 	}

@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	dto "github.com/prometheus/client_model/go"
 )
@@ -17,9 +19,10 @@ import (
 // the Go collector.
 func TestRegistryGather(t *testing.T) {
 	m := New()
-	m.SetClientsConnected(3)
+	m.RegisterStateStats(func() (int, int) { return 3, 1 })
 	m.IncChatMessage("global")
 	m.IncRTPForwarded("audio", 5)
+	m.IncAuthFailure("tcp", "invalid_credentials")
 
 	families, err := m.Registry().Gather()
 	if err != nil {
@@ -31,7 +34,7 @@ func TestRegistryGather(t *testing.T) {
 	}
 	for _, want := range []string{
 		"voicx_clients_connected", "voicx_chat_messages_total",
-		"voicx_rtp_packets_forwarded_total", "go_goroutines",
+		"voicx_rtp_packets_forwarded_total", "voicx_auth_failures_total", "go_goroutines",
 	} {
 		if !names[want] {
 			t.Errorf("metric family %q not gathered", want)
@@ -69,9 +72,10 @@ func TestCounterValues(t *testing.T) {
 
 func TestGaugeValuesCannotBecomeNegative(t *testing.T) {
 	m := New()
-	m.SetClientsConnected(-1)
-	m.SetChannelsActive(-2)
-	m.SetWebRTCPeers(-3)
+	m.RegisterStateStats(func() (int, int) { return -1, -2 })
+	m.RegisterWebRTCPeerCount(func() int { return -3 })
+	m.RegisterUDPInboundQueueDepth(func() int { return -4 })
+	m.RegisterRecorderSessionCount(func() int { return -5 })
 
 	families, err := m.Registry().Gather()
 	if err != nil {
@@ -81,6 +85,8 @@ func TestGaugeValuesCannotBecomeNegative(t *testing.T) {
 		"voicx_clients_connected",
 		"voicx_channels_active",
 		"voicx_webrtc_peers",
+		"voicx_udp_inbound_queue_depth",
+		"voicx_recordings_active",
 	} {
 		family := metricFamily(t, families, name)
 		if got := family.GetMetric()[0].GetGauge().GetValue(); got != 0 {
@@ -92,10 +98,10 @@ func TestGaugeValuesCannotBecomeNegative(t *testing.T) {
 // TestMetricsHandler verifies the /metrics endpoint serves the text format.
 func TestMetricsHandler(t *testing.T) {
 	m := New()
-	m.SetWebRTCPeers(2)
+	m.RegisterWebRTCPeerCount(func() int { return 2 })
 
 	rec := httptest.NewRecorder()
-	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	m.Handler().ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), "GET", "/metrics", nil))
 	if rec.Code != 200 {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -105,9 +111,155 @@ func TestMetricsHandler(t *testing.T) {
 	}
 }
 
+func TestGaugeFuncsSampleCallbacksAndKeepFirstRegistration(t *testing.T) {
+	m := New()
+	var clients atomic.Int64
+	clients.Store(3)
+	m.RegisterStateStats(func() (int, int) { return int(clients.Load()), 2 })
+	m.RegisterStateStats(func() (int, int) { return 99, 99 })
+	m.RegisterWebRTCPeerCount(func() int { return 4 })
+	m.RegisterUDPInboundQueueDepth(func() int { return 5 })
+	m.RegisterRecorderSessionCount(func() int { return 6 })
+
+	assertGauge := func(name string, want float64) {
+		t.Helper()
+		families, err := m.Registry().Gather()
+		if err != nil {
+			t.Fatalf("Gather: %v", err)
+		}
+		if got := metricFamily(t, families, name).GetMetric()[0].GetGauge().GetValue(); got != want {
+			t.Fatalf("%s = %v, want %v", name, got, want)
+		}
+	}
+	assertGauge("voicx_clients_connected", 3)
+	assertGauge("voicx_channels_active", 2)
+	assertGauge("voicx_webrtc_peers", 4)
+	assertGauge("voicx_udp_inbound_queue_depth", 5)
+	assertGauge("voicx_recordings_active", 6)
+	clients.Store(7)
+	assertGauge("voicx_clients_connected", 7)
+}
+
+func TestBoundedCollectorsUseFixedLabelsAndBuckets(t *testing.T) {
+	m := New()
+	m.IncUDPPacketsRateLimited()
+	m.IncRecordingError("start")
+	m.IncRecordingError("close")
+	m.IncChatCryptoFailure("decrypt")
+	m.IncChatCryptoFailure("untrusted input")
+	m.ObserveReadiness("postgres", "ok", 10*time.Millisecond)
+	m.ObserveReadiness("storage", "ok", 5*time.Millisecond)
+	m.ObserveReadiness("redis", "error", 25*time.Millisecond)
+	m.ObserveReadiness(
+		"untrusted component",
+		"untrusted result",
+		-time.Second,
+	)
+	m.ObserveBroadcastSnapshot(-time.Second)
+	m.ObserveBroadcastClientBacklog(-1)
+
+	families, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	if got := metricFamily(t, families, "voicx_udp_packets_rate_limited_total").GetMetric()[0].GetCounter().GetValue(); got != 1 {
+		t.Fatalf("rate-limited UDP packets = %v, want 1", got)
+	}
+	for _, name := range []string{
+		"voicx_recording_errors_total",
+		"voicx_chat_crypto_failures_total",
+	} {
+		for _, metric := range metricFamily(t, families, name).GetMetric() {
+			for _, label := range metric.GetLabel() {
+				if label.GetValue() == "untrusted input" || label.GetValue() == "close" {
+					t.Fatalf("%s leaked unbounded label value %q", name, label.GetValue())
+				}
+			}
+		}
+	}
+	for _, name := range []string{
+		"voicx_broadcast_snapshot_duration_seconds",
+		"voicx_broadcast_client_backlog_depth",
+		"voicx_readiness_probe_duration_seconds",
+	} {
+		family := metricFamily(t, families, name)
+		if family.GetType() != dto.MetricType_HISTOGRAM {
+			t.Fatalf("%s type = %s, want HISTOGRAM", name, family.GetType())
+		}
+		for _, metric := range family.GetMetric() {
+			if metric.GetHistogram().GetSampleCount() == 0 {
+				t.Fatalf("%s has an empty histogram", name)
+			}
+		}
+	}
+	histogramFor := func(name string, labels map[string]string) *dto.Histogram {
+		t.Helper()
+		for _, metric := range metricFamily(t, families, name).GetMetric() {
+			matched := true
+			for _, label := range metric.GetLabel() {
+				if labels[label.GetName()] != label.GetValue() {
+					matched = false
+					break
+				}
+			}
+			if matched && len(metric.GetLabel()) == len(labels) {
+				return metric.GetHistogram()
+			}
+		}
+		t.Fatalf("%s missing labels %v", name, labels)
+		return nil
+	}
+	if got := histogramFor("voicx_broadcast_snapshot_duration_seconds", nil).GetSampleSum(); got != 0 {
+		t.Fatalf("negative snapshot duration sum = %v, want 0", got)
+	}
+	if got := histogramFor("voicx_broadcast_client_backlog_depth", nil).GetSampleSum(); got != 0 {
+		t.Fatalf("negative broadcast backlog sum = %v, want 0", got)
+	}
+	postgresOK := histogramFor("voicx_readiness_probe_duration_seconds", map[string]string{
+		"component": "postgres",
+		"result":    "ok",
+	})
+	if postgresOK.GetSampleCount() != 1 || postgresOK.GetSampleSum() != .01 {
+		t.Fatalf("postgres readiness count/sum = %d/%v, want 1/0.01", postgresOK.GetSampleCount(), postgresOK.GetSampleSum())
+	}
+	storageOK := histogramFor("voicx_readiness_probe_duration_seconds", map[string]string{
+		"component": "storage",
+		"result":    "ok",
+	})
+	if storageOK.GetSampleCount() != 1 || storageOK.GetSampleSum() != .005 {
+		t.Fatalf("storage readiness count/sum = %d/%v, want 1/0.005", storageOK.GetSampleCount(), storageOK.GetSampleSum())
+	}
+	redisError := histogramFor("voicx_readiness_probe_duration_seconds", map[string]string{
+		"component": "redis",
+		"result":    "error",
+	})
+	if redisError.GetSampleCount() != 1 || redisError.GetSampleSum() != .025 {
+		t.Fatalf("Redis readiness count/sum = %d/%v, want 1/0.025", redisError.GetSampleCount(), redisError.GetSampleSum())
+	}
+	unknownReadiness := histogramFor("voicx_readiness_probe_duration_seconds", map[string]string{
+		"component": "unknown",
+		"result":    "unknown",
+	})
+	if unknownReadiness.GetSampleCount() != 1 || unknownReadiness.GetSampleSum() != 0 {
+		t.Fatalf("unknown readiness count/sum = %d/%v, want 1/0", unknownReadiness.GetSampleCount(), unknownReadiness.GetSampleSum())
+	}
+	if got := len(metricFamily(t, families, "voicx_readiness_probe_duration_seconds").GetMetric()); got != 4 {
+		t.Fatalf("readiness metric series = %d, want bounded 4", got)
+	}
+
+	durationBuckets := metricFamily(t, families, "voicx_broadcast_snapshot_duration_seconds").GetMetric()[0].GetHistogram().GetBucket()
+	if len(durationBuckets) != 11 || durationBuckets[0].GetUpperBound() != .001 || durationBuckets[10].GetUpperBound() != 5 {
+		t.Fatalf("duration buckets = %+v, want fixed .001..5 buckets", durationBuckets)
+	}
+	backlogBuckets := metricFamily(t, families, "voicx_broadcast_client_backlog_depth").GetMetric()[0].GetHistogram().GetBucket()
+	if len(backlogBuckets) != 7 || backlogBuckets[0].GetUpperBound() != 0 || backlogBuckets[6].GetUpperBound() != 16 {
+		t.Fatalf("backlog buckets = %+v, want fixed 0..16 buckets", backlogBuckets)
+	}
+}
+
 func TestMetricsHandlerNegotiatesOpenMetrics(t *testing.T) {
 	m := New()
-	req := httptest.NewRequest("GET", "/metrics", nil)
+	req := httptest.NewRequestWithContext(t.Context(), "GET", "/metrics", nil)
 	req.Header.Set("Accept", "application/openmetrics-text")
 	rec := httptest.NewRecorder()
 	m.Handler().ServeHTTP(rec, req)
@@ -130,6 +282,7 @@ func TestLabelsHaveBoundedCardinality(t *testing.T) {
 	m.IncRTPForwarded("attacker-controlled-media", -10)
 	m.IncRTPForwarded("attacker-controlled-media", 2)
 	m.IncFileTransfer("attacker-controlled-direction", "attacker-controlled-result")
+	m.IncAuthFailure("attacker-controlled-transport", "attacker-controlled-reason")
 
 	families, err := m.Registry().Gather()
 	if err != nil {
@@ -140,6 +293,7 @@ func TestLabelsHaveBoundedCardinality(t *testing.T) {
 		"voicx_chat_messages_total",
 		"voicx_rtp_packets_forwarded_total",
 		"voicx_file_transfers_total",
+		"voicx_auth_failures_total",
 	} {
 		family := metricFamily(t, families, familyName)
 		if len(family.GetMetric()) != 1 {
@@ -153,6 +307,33 @@ func TestLabelsHaveBoundedCardinality(t *testing.T) {
 	}
 	if got := metricFamily(t, families, "voicx_rtp_packets_forwarded_total").GetMetric()[0].GetCounter().GetValue(); got != 2 {
 		t.Fatalf("RTP forwarded count = %v, want 2", got)
+	}
+}
+
+func TestAuthFailureMetricsUseOnlyStableLabels(t *testing.T) {
+	m := New()
+	m.IncAuthFailure("tcp", "invalid_credentials")
+	m.IncAuthFailure("grpc", "locked_out")
+	m.IncAuthFailure("ws", "invalid_credentials")
+	m.IncAuthFailure("tcp", "198.51.100.1:attacker@example.invalid")
+
+	families, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	family := metricFamily(t, families, "voicx_auth_failures_total")
+	if len(family.GetMetric()) != 4 {
+		t.Fatalf("auth failure metric count = %d, want 4", len(family.GetMetric()))
+	}
+	for _, metric := range family.GetMetric() {
+		if len(metric.GetLabel()) != 2 || metric.GetLabel()[0].GetName() != "reason" || metric.GetLabel()[1].GetName() != "transport" {
+			t.Fatalf("auth failure labels = %+v, want reason and transport", metric.GetLabel())
+		}
+		for _, label := range metric.GetLabel() {
+			if label.GetValue() == "198.51.100.1:attacker@example.invalid" {
+				t.Fatalf("attacker-controlled value leaked into %s", label.GetName())
+			}
+		}
 	}
 }
 
@@ -214,7 +395,10 @@ func (inertDriver) Open(string) (driver.Conn, error) {
 // TestNoop verifies the Noop sink satisfies Sink and does not panic.
 func TestNoop(t *testing.T) {
 	var s Sink = Noop{}
-	s.SetClientsConnected(1)
+	s.IncUDPPacketsRateLimited()
 	s.IncChatMessage("channel")
 	s.IncFileTransfer("download", "error")
+	s.IncAuthFailure("tcp", "invalid_credentials")
+	s.IncRecordingError("start")
+	s.IncChatCryptoFailure("decrypt")
 }

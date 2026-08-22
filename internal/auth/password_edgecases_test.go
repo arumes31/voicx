@@ -35,6 +35,53 @@ func TestHashPasswordRejectsEmptyPassword(t *testing.T) {
 	}
 }
 
+func TestPasswordLengthLimits(t *testing.T) {
+	t.Parallel()
+
+	overlong := strings.Repeat("x", MaxPasswordBytes+1)
+	if _, err := HashPassword(overlong); !errors.Is(err, ErrPasswordTooLong) {
+		t.Fatalf("HashPassword(overlong) error = %v, want ErrPasswordTooLong", err)
+	}
+	if err := VerifyPassword(overlong, "not-a-hash"); !errors.Is(err, ErrPasswordTooLong) {
+		t.Fatalf("VerifyPassword(overlong) error = %v, want ErrPasswordTooLong", err)
+	}
+}
+
+func TestRegistrationPasswordPolicyAndExistingShortHashCompatibility(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		password string
+		wantErr  error
+	}{
+		{name: "too short", password: "short", wantErr: ErrPasswordTooShort},
+		{name: "minimum length", password: strings.Repeat("x", minRegistrationPasswordBytes)},
+		{name: "too long", password: strings.Repeat("x", MaxPasswordBytes+1), wantErr: ErrPasswordTooLong},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateRegistrationPassword(test.password); !errors.Is(err, test.wantErr) {
+				t.Fatalf("validateRegistrationPassword() error = %v, want %v", err, test.wantErr)
+			}
+		})
+	}
+
+	hash, err := HashPassword("short")
+	if err != nil {
+		t.Fatalf("HashPassword(short): %v", err)
+	}
+	if err := VerifyPassword("short", hash); err != nil {
+		t.Fatalf("VerifyPassword(short existing hash): %v", err)
+	}
+}
+
+func TestDummyPasswordHashIsValid(t *testing.T) {
+	if err := VerifyPassword("voicx-dummy-password", dummyPasswordHash); err != nil {
+		t.Fatalf("VerifyPassword(dummyPasswordHash): %v", err)
+	}
+}
+
 func TestParseEncodedHashRejectsHostileFields(t *testing.T) {
 	t.Parallel()
 

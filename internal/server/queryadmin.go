@@ -18,20 +18,21 @@ type ResolvedPerm struct {
 	Tier  string
 }
 
-// PermOverview returns the resolved permission set of a user in an optional
-// channel context: one entry per key present in any tier, resolved through
-// the tier hierarchy (same rules as the client-facing permissions_query).
-func (s *TCPServer) PermOverview(ctx context.Context, uniqueID string, channelID int64) ([]ResolvedPerm, error) {
+// PermOverview returns the resolved permission set and authoritative admin
+// flag of a user in an optional channel context: one entry per key present in
+// any tier, resolved through the tier hierarchy (same rules as the
+// client-facing permissions_query).
+func (s *TCPServer) PermOverview(ctx context.Context, uniqueID string, channelID int64) ([]ResolvedPerm, bool, error) {
 	if s.deps == nil || s.deps.Auth == nil || s.deps.Perms == nil || s.deps.Resolver == nil {
-		return nil, errPermsUnavailable
+		return nil, false, errPermsUnavailable
 	}
 	user, err := s.deps.Auth.LookupUser(ctx, uniqueID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	tp, err := s.deps.Perms.LoadForClient(ctx, user.ID, channelID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	var out []ResolvedPerm
 	seen := make(map[permissions.PermissionKey]bool)
@@ -57,7 +58,7 @@ func (s *TCPServer) PermOverview(ctx context.Context, uniqueID string, channelID
 			})
 		}
 	}
-	return out, nil
+	return out, user.IsAdmin, nil
 }
 
 // EffectiveMaxClients returns the current connection cap. Runtime server UI

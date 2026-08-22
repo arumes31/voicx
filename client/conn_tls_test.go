@@ -5,6 +5,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,6 +14,94 @@ import (
 
 	"voicx/internal/tlscert"
 )
+
+func TestDialTransportTrustStoreFailureNeverFallsBackToPlaintext(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		store func(t *testing.T) *knownServers
+	}{
+		{
+			name: "corrupt store",
+			store: func(t *testing.T) *knownServers {
+				path := filepath.Join(t.TempDir(), "known_servers.json")
+				if err := os.WriteFile(path, []byte("{bad json"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return loadKnownServersAt(path)
+			},
+		},
+		{
+			name: "canonical collision",
+			store: func(t *testing.T) *knownServers {
+				path := filepath.Join(t.TempDir(), "known_servers.json")
+				if err := os.WriteFile(path, []byte(`{"servers":{"EXAMPLE.com.:123":"one","example.com:123":"two"}}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return loadKnownServersAt(path)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cert, _, err := tlscert.Ensure(t.TempDir(), "", "", nil)
+			if err != nil {
+				t.Fatalf("create TLS certificate: %v", err)
+			}
+			listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("listen: %v", err)
+			}
+			defer func() { _ = listener.Close() }()
+			tcpListener := listener.(*net.TCPListener)
+			tlsSeen := make(chan struct{}, 1)
+			plainSeen := make(chan struct{}, 1)
+			serverDone := make(chan struct{})
+			go func() {
+				defer close(serverDone)
+				_ = tcpListener.SetDeadline(time.Now().Add(2 * time.Second))
+				conn, acceptErr := listener.Accept()
+				if acceptErr != nil {
+					return
+				}
+				tlsSeen <- struct{}{}
+				_ = tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13}).HandshakeContext(t.Context())
+				_ = conn.Close()
+				_ = tcpListener.SetDeadline(time.Now().Add(100 * time.Millisecond))
+				conn, acceptErr = listener.Accept()
+				if acceptErr == nil {
+					plainSeen <- struct{}{}
+					_ = conn.Close()
+				}
+			}()
+
+			manager := newConnManager(context.Background())
+			manager.knownServers = test.store(t)
+			manager.allowPlaintext = true
+			conn, err := manager.dialTransport(listener.Addr().String())
+			if conn != nil {
+				_ = conn.Close()
+				t.Fatal("trust-store failure unexpectedly connected")
+			}
+			if !errors.Is(err, errTrustStoreUnavailable) {
+				t.Fatalf("dial error = %v, want trust-store unavailable", err)
+			}
+			select {
+			case <-tlsSeen:
+			case <-time.After(time.Second):
+				t.Fatal("trust-store failure did not make its TLS attempt")
+			}
+			select {
+			case <-serverDone:
+			case <-time.After(time.Second):
+				t.Fatal("dual-mode listener did not finish")
+			}
+			select {
+			case <-plainSeen:
+				t.Fatal("trust-store failure retried over plaintext")
+			default:
+			}
+		})
+	}
+}
 
 func TestDialTransportPreservesFingerprintMismatch(t *testing.T) {
 	cert, presentedFingerprint, err := tlscert.Ensure(t.TempDir(), "", "", nil)
@@ -34,7 +124,7 @@ func TestDialTransportPreservesFingerprintMismatch(t *testing.T) {
 			return
 		}
 		if tlsConn, ok := conn.(*tls.Conn); ok {
-			_ = tlsConn.Handshake()
+			_ = tlsConn.HandshakeContext(t.Context())
 		}
 		_ = conn.Close()
 	}()
@@ -110,7 +200,7 @@ func TestDialTransportRetainsAcceptedCertificateValidity(t *testing.T) {
 			return
 		}
 		if tlsConn, ok := conn.(*tls.Conn); ok {
-			_ = tlsConn.Handshake()
+			_ = tlsConn.HandshakeContext(t.Context())
 		}
 		_ = conn.Close()
 	}()
@@ -138,7 +228,7 @@ func TestDialTransportRetainsAcceptedCertificateValidity(t *testing.T) {
 			leaf.NotAfter,
 		)
 	}
-	if got := store.verify(addr, presentedFingerprint); got != trustOK {
+	if got, err := store.verify(addr, presentedFingerprint); err != nil || got != trustOK {
 		t.Fatalf("first-seen fingerprint status = %v, want trustOK", got)
 	}
 	app := appWithCM(manager)

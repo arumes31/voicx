@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"strconv"
@@ -115,6 +117,20 @@ func startService(exits chan<- serviceExit, name string, start func() error) {
 	go func() {
 		exits <- serviceExit{name: name, err: start()}
 	}()
+}
+
+// registerPprofEndpoints adds the explicit runtime diagnostic handlers to the
+// health server's private mux. It intentionally never uses the default mux:
+// enabling pprof does not expose it on unrelated HTTP listeners.
+func registerPprofEndpoints(healthServer *health.Server, enabled bool) {
+	if !enabled {
+		return
+	}
+	healthServer.HandleLocalGET("/debug/pprof/", http.HandlerFunc(pprof.Index))
+	healthServer.HandleLocalGET("/debug/pprof/cmdline", http.HandlerFunc(pprof.Cmdline))
+	healthServer.HandleLocalGET("/debug/pprof/profile", http.HandlerFunc(pprof.Profile))
+	healthServer.HandleLocalGET("/debug/pprof/symbol", http.HandlerFunc(pprof.Symbol))
+	healthServer.HandleLocalGET("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
 }
 
 func unexpectedServiceExit(exit serviceExit) error {
@@ -454,10 +470,23 @@ func run() (retErr error) {
 		}
 	}
 
+	// Construct bounded metrics before any service starts. Component counters
+	// are registered as scrape-time callbacks below as their dependencies are
+	// constructed.
+	m := metrics.New()
+	m.RegisterDBPool(dbStore.DB())
+	m.RegisterStateStats(func() (int, int) {
+		stats := stateManager.Stats()
+		return stats.ClientCount, stats.ChannelCount
+	})
+
 	// Initialize the broadcaster. It builds snapshots of the channel tree and
 	// active users and delivers them to registered clients via per-client
 	// outbound channels.
-	broadcaster := broadcast.New(logger, stateManager)
+	broadcaster := broadcast.New(logger, stateManager, broadcast.Observers{
+		ObserveSnapshotDuration: m.ObserveBroadcastSnapshot,
+		ObserveClientBacklog:    m.ObserveBroadcastClientBacklog,
+	})
 	defer broadcaster.Close()
 	logger.Info("broadcaster ready")
 
@@ -476,25 +505,9 @@ func run() (retErr error) {
 	logger.Info("permissions ready")
 
 	go func() {
-		run := func() {
-			count, err := dbStore.CompressPermissionAudit(ctx, time.Now().AddDate(0, 0, -30))
-			if err != nil && ctx.Err() == nil {
-				logger.Warn("permission audit compression failed", zap.Error(err))
-			} else if count > 0 {
-				logger.Info("permission audit compressed", zap.Int64("rows", count))
-			}
-		}
-		run()
 		ticker := time.NewTicker(24 * time.Hour)
 		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				run()
-			case <-ctx.Done():
-				return
-			}
-		}
+		runPermissionAuditLoop(ctx, logger, ticker.C, dbStore.CompressPermissionAudit)
 	}()
 
 	// Initialize the Pion WebRTC engine and the voice facade (engine + SFU
@@ -510,6 +523,7 @@ func run() (retErr error) {
 	}()
 	voiceRouter := webrtc.NewRouter(logger)
 	voice := webrtc.NewVoice(engine, voiceRouter, logger)
+	m.RegisterWebRTCPeerCount(voice.PeerCount)
 	voice.SetEchoChannel(echoChannelID)
 	// Per-channel Opus audio configuration (21-25): SDP fmtp rewriting and
 	// music-channel talk-gate bypass read the channel's stored settings.
@@ -529,74 +543,59 @@ func run() (retErr error) {
 
 	// Initialize the recorder. It manages ffmpeg subprocesses that record
 	// channel streams; it is inert unless recording.enabled is set.
-	rec := recorder.New(recorderConfig(cfg.Recording), logger)
+	rec := recorder.New(recorderConfig(cfg.Recording), logger, recorder.Observers{
+		OnError: m.IncRecordingError,
+	})
+	m.RegisterRecorderSessionCount(rec.SessionCount)
 	defer func() {
 		if err := rec.Close(); err != nil {
 			logger.Warn("recorder shutdown error", zap.Error(err))
 		}
 	}()
 
-	// Initialize the Redis client when enabled. Redis backs later-phase
-	// features (pub/sub, rate limiting); when it is unreachable the server
-	// logs a warning and continues without it.
+	// Initialize the optional Redis client. A startup ping failure is degraded
+	// rather than fatal, but the client is retained so later readiness probes
+	// can observe go-redis reconnecting without a process restart.
+	var redisClient *redisx.Client
 	if cfg.RedisEnabled && cfg.RedisAddr != "" {
-		rdb := redisx.New(cfg.RedisAddr, cfg.RedisPassword, logger)
+		redisClient, err = redisx.New(redisx.Options{
+			Addr:          cfg.RedisAddr,
+			Password:      cfg.RedisPassword,
+			DialTimeout:   cfg.RedisDialTimeout,
+			ReadTimeout:   cfg.RedisReadTimeout,
+			WriteTimeout:  cfg.RedisWriteTimeout,
+			TLSEnabled:    cfg.RedisTLSEnabled,
+			TLSServerName: cfg.RedisTLSServerName,
+			TLSCAFile:     cfg.RedisTLSCAFile,
+		}, logger)
+		if err != nil {
+			return fmt.Errorf("configuring Redis client: %w", err)
+		}
+		defer func() {
+			if err := redisClient.Close(); err != nil {
+				logger.Warn("redis close error", zap.Error(err))
+			}
+		}()
 		pingCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		pingErr := rdb.Ping(pingCtx)
+		pingErr := redisClient.Ping(pingCtx)
 		cancel()
 		if pingErr != nil {
-			logger.Warn("redis unavailable, continuing without it",
+			logger.Warn("redis unavailable, continuing in degraded mode",
 				zap.String("addr", cfg.RedactedRedisAddr()),
 				zap.Error(pingErr),
 			)
-			_ = rdb.Close()
 		} else {
 			logger.Info("redis connected", zap.String("addr", cfg.RedactedRedisAddr()))
-			defer func() {
-				if err := rdb.Close(); err != nil {
-					logger.Warn("redis close error", zap.Error(err))
-				}
-			}()
 		}
 	} else {
 		logger.Info("redis disabled")
 	}
 
-	// Start the health/readiness HTTP endpoint. /healthz reports liveness;
-	// /readyz pings Postgres. /metrics serves Prometheus metrics.
-	m := metrics.New()
-	m.RegisterDBPool(dbStore.DB())
-	voiceRouter.SetForwardObserver(m.IncRTPForwarded)
-	var servingReady atomic.Bool
-	healthServer := health.New(cfg.HealthAddr, logger, func(ctx context.Context) error {
-		if !servingReady.Load() {
-			return errors.New("server startup is not complete")
-		}
-		// Retry once on transient pool errors (e.g. "driver: bad connection"
-		// right after the database container restarts).
-		err := dbStore.DB().PingContext(ctx)
-		if err != nil && strings.Contains(err.Error(), "bad connection") {
-			timer := time.NewTimer(100 * time.Millisecond)
-			defer timer.Stop()
-			select {
-			case <-timer.C:
-				err = dbStore.DB().PingContext(ctx)
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-		return err
-	})
-	if cfg.MetricsAllowRemote {
-		healthServer.HandleGET("/metrics", m.Handler())
-	} else {
-		healthServer.HandleLocalGET("/metrics", m.Handler())
-	}
-	healthServer.Handle("/api/v1/schema/version", health.SchemaVersionHandler(dbStore.SchemaVersion))
-	// At most seven services are launched below. The spare slot ensures every
-	// reporter can finish even after the first exit initiates shutdown.
-	serviceExits := make(chan serviceExit, 8)
-	startService(serviceExits, "health HTTP server", healthServer.Start)
+	// Construct the UDP listener and register its scrape-time queue callback
+	// before the metrics endpoint starts serving.
+	udpServer := server.NewUDP(cfg, logger)
+	udpServer.Metrics = m
+	m.RegisterUDPInboundQueueDepth(udpServer.InboundQueueDepth)
 
 	// TLS material is minted ONCE here and handed to both listeners: the data
 	// port must present the same certificate as the control channel so the
@@ -612,6 +611,20 @@ func run() (retErr error) {
 		if err != nil {
 			return fmt.Errorf("preparing TLS material: %w", err)
 		}
+		notAfter, expiryErr := tlscert.NotAfter(&tlsCert)
+		if expiryErr != nil {
+			return fmt.Errorf("reading TLS certificate expiry: %w", expiryErr)
+		}
+		expiresSoon, expiryErr := tlscert.ExpiresBy(&tlsCert, time.Now().Add(30*24*time.Hour))
+		if expiryErr != nil {
+			return fmt.Errorf("evaluating TLS certificate expiry: %w", expiryErr)
+		}
+		if expiresSoon {
+			logger.Warn("TLS certificate expires within 30 days or is already expired; rotate it deliberately to preserve client TOFU pins",
+				zap.Time("not_after", notAfter),
+				zap.String("fingerprint", tlsFP),
+			)
+		}
 	}
 	fileTLS := cfg.TLSEnabled && cfg.FileTLSEnabled
 	if cfg.FileTLSEnabled && !cfg.TLSEnabled {
@@ -625,6 +638,7 @@ func run() (retErr error) {
 		Addr:            cfg.FileAddr,
 		RootDir:         cfg.FileRoot,
 		MaxKBps:         cfg.FileMaxKBps,
+		MaxConnections:  cfg.FileMaxConnections,
 		QuietHoursStart: cfg.FileQuietHoursStart,
 		QuietHoursEnd:   cfg.FileQuietHoursEnd,
 		ChannelQuotaMB:  cfg.FileChannelQuotaMB,
@@ -634,15 +648,57 @@ func run() (retErr error) {
 		Fingerprint:     tlsFP,
 	}, dbStore, logger)
 	ftServer.OnTransferComplete = m.IncFileTransfer
-	// Download links (267): the control channel mints expiring tokens; the
-	// health HTTP server serves them (LAN-friendly, no extra auth).
-	healthServer.Handle("/dl/", ftServer.Links())
-	if err := ftServer.CheckRoot(); err != nil {
+	storageProbe := newCachedProbe(storageProbeTTL, time.Now, ftServer.CheckRoot)
+	if err := storageProbe.Check(context.Background()); err != nil {
 		logger.Warn("file storage root not writable, file transfers will fail",
 			zap.String("root", cfg.FileRoot),
 			zap.Error(err),
 		)
 	}
+
+	// Health/readiness is constructed only after every dependency it checks is
+	// available. The handler's single three-second request context is shared
+	// by the mandatory Postgres/storage checks and optional Redis check.
+	components := []readinessComponent{
+		{
+			name:     "postgres",
+			required: true,
+			check: func(ctx context.Context) error {
+				return retryOnce(ctx, readinessRetryDelay, dbStore.Ping)
+			},
+		},
+	}
+	components = append(components, readinessComponent{
+		name:     "storage",
+		required: true,
+		check:    storageProbe.Check,
+	})
+	if redisClient != nil {
+		components = append(components, readinessComponent{
+			name:     "redis",
+			required: false,
+			check:    redisClient.Ping,
+		})
+	}
+	readiness := newReadinessChecker(components, m.ObserveReadiness)
+	voiceRouter.SetForwardObserver(m.IncRTPForwarded)
+	var servingReady atomic.Bool
+	healthServer := health.New(cfg.HealthAddr, logger, func(ctx context.Context) error {
+		if !servingReady.Load() {
+			return errors.New("server startup is not complete")
+		}
+		return readiness(ctx)
+	})
+	if cfg.MetricsAllowRemote {
+		healthServer.HandleGET("/metrics", m.Handler())
+	} else {
+		healthServer.HandleLocalGET("/metrics", m.Handler())
+	}
+	registerPprofEndpoints(healthServer, cfg.PprofEnabled)
+	healthServer.Handle("/api/v1/schema/version", health.SchemaVersionHandler(logger, dbStore.SchemaVersion))
+	// Download links (267): the control channel mints expiring tokens; the
+	// health HTTP server serves them (LAN-friendly, no extra auth).
+	healthServer.Handle("/dl/", ftServer.Links())
 
 	// Global server password (plaintext in config, hashed once at startup
 	// with Argon2id). Empty means an open server.
@@ -655,6 +711,9 @@ func run() (retErr error) {
 		serverPasswordHash = hash
 		logger.Info("server password enabled")
 	}
+	// One limiter owns every expensive credential verification in this process.
+	// Transports use separate source scopes while sharing this KDF gate.
+	loginLimiter := auth.NewLoginFailureLimiter(auth.LoginFailureLimiterConfig{})
 	for _, warning := range server.AssetStorageSecurityWarnings() {
 		logger.Error("ASSET STORAGE SECURITY LIMITATION", zap.String("warning", warning))
 	}
@@ -700,6 +759,7 @@ func run() (retErr error) {
 		Groups:             dbStore,
 		BanAdmin:           dbStore,
 		Metrics:            m,
+		LoginLimiter:       loginLimiter,
 		Rules:              rulesSvc,
 		ScopeKeys:          dbStore,
 		ChatKEK:            chatKEK,
@@ -709,7 +769,9 @@ func run() (retErr error) {
 		DefaultGuestGroupID:  defaultGuestGroupID,
 		DefaultMemberGroupID: defaultMemberGroupID,
 	})
-	channelMgr.SetCleanupDeleteHandler(tcpServer.ApplyChannelDeletion)
+	channelMgr.SetCleanupDeleteHandler(func(result channels.DeleteResult) {
+		tcpServer.ApplyChannelDeletion(result, "")
+	})
 	// Reconcile only after the cleanup callback is installed. LoadIntoState
 	// starts temporary-channel timers: deletions that commit before this point
 	// are now visible as orphans, while concurrent/later deletions invoke the
@@ -740,8 +802,6 @@ func run() (retErr error) {
 	if err := tcpServer.EncryptLegacyChatHistory(context.Background(), cfg.ChatLegacyHistory); err != nil {
 		return fmt.Errorf("encrypting legacy chat history: %w", err)
 	}
-
-	startService(serviceExits, "TCP control server", func() error { return tcpServer.Start(ctx) })
 
 	// Timed group memberships (145): reap expired rows every 60s, invalidate
 	// the permission cache, and notify affected online users.
@@ -789,34 +849,43 @@ func run() (retErr error) {
 		rules:      rulesSvc,
 	}
 	queryServer := query.New(cfg.QueryAddr, logger, qBackend)
-	startService(serviceExits, "ServerQuery server", func() error { return queryServer.Start(ctx) })
-
+	queryServer.SetLoginLimiter(loginLimiter)
+	queryServer.SetMetrics(m)
 	// (231) the event stream for bots, on the health listener next to
 	// /metrics. Same credentials as ServerQuery: the stream reveals who is
 	// where, so it is admin-only.
-	healthServer.Handle("/events", eventbus.Handler(events, qBackend.Authenticate, logger))
+	healthServer.Handle("/events", eventbus.HandlerWithLoginProtection(events, qBackend.Authenticate, logger, loginLimiter, m))
 	registerEventBusMetrics(m.Registry(), events, logger)
 
 	// (232) the gRPC API on the reserved port: same backend, same
 	// admin-only credentials, plus Events.Subscribe on the event bus.
 	grpcServer := grpcserver.New(cfg.GRPCAddr, qBackend, events, logger, queryServer)
-	startService(serviceExits, "gRPC server", func() error { return grpcServer.Start(ctx) })
+	grpcServer.ShutdownTimeout = cfg.ShutdownTimeout
+	// gRPC has a dedicated run context. The shared shutdown context below owns
+	// its graceful stop deterministically, rather than letting Start's
+	// cancellation watcher race to manufacture a second deadline.
+	grpcRunCtx, cancelGRPCRun := context.WithCancel(context.Background())
+	defer cancelGRPCRun()
 
 	// (224) the same command set over SSH, opt-in.
 	var sshQuery *query.SSHServer
 	if cfg.QuerySSHEnabled {
 		sshQuery = query.NewSSH(cfg.QuerySSHAddr, cfg.QuerySSHHostKey, queryServer)
-		startService(serviceExits, "ServerQuery SSH server", func() error { return sshQuery.Start(ctx) })
 	}
 
-	// Start the file-transfer listener.
+	// Routes and listener objects are complete before any socket is opened.
+	// The spare slot ensures every reporter can finish after one exit triggers
+	// shutdown (seven services at most, including optional SSH).
+	serviceExits := make(chan serviceExit, 8)
+	startService(serviceExits, "health HTTP server", healthServer.Start)
+	startService(serviceExits, "TCP control server", func() error { return tcpServer.Start(ctx) })
+	startService(serviceExits, "ServerQuery server", func() error { return queryServer.Start(ctx) })
+	startService(serviceExits, "gRPC server", func() error { return grpcServer.Start(grpcRunCtx) })
+	if sshQuery != nil {
+		startService(serviceExits, "ServerQuery SSH server", func() error { return sshQuery.Start(ctx) })
+	}
 	startService(serviceExits, "file-transfer server", func() error { return ftServer.Start(ctx) })
-
-	// Start the UDP media/signaling listener.
-	udpServer := server.NewUDP(cfg, logger)
-	udpServer.Metrics = m
 	startService(serviceExits, "UDP media server", func() error { return udpServer.Start(ctx) })
-
 	servingReady.Store(true)
 	logger.Info("voicx server running, waiting for shutdown signal")
 	var runErr error
@@ -829,21 +898,24 @@ func run() (retErr error) {
 		runErr = unexpectedServiceExit(exit)
 	}
 	servingReady.Store(false)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	defer cancel()
 	stop()
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	grpcShutdown := make(chan error, 1)
+	go func() {
+		grpcShutdown <- grpcServer.Shutdown(shutdownCtx)
+	}()
 	if err := healthServer.Shutdown(shutdownCtx); err != nil {
 		runErr = joinShutdownError(runErr, "health HTTP server", err)
 	}
 
-	runErr = joinShutdownError(runErr, "TCP control server", tcpServer.Shutdown())
+	runErr = joinShutdownError(runErr, "TCP control server", tcpServer.Shutdown(shutdownCtx))
 	runErr = joinShutdownError(runErr, "ServerQuery server", queryServer.Close())
 	if sshQuery != nil {
 		runErr = joinShutdownError(runErr, "ServerQuery SSH server", sshQuery.Close())
 	}
-	// Event subscriptions are open-ended, so this cannot wait for them.
-	grpcServer.Stop()
+	runErr = joinShutdownError(runErr, "gRPC server", <-grpcShutdown)
 	runErr = joinShutdownError(runErr, "file-transfer server", ftServer.Close())
 	runErr = joinShutdownError(runErr, "UDP media server", udpServer.Shutdown())
 	stats := udpServer.Stats()
@@ -851,8 +923,47 @@ func run() (retErr error) {
 		zap.Uint64("packets_received", stats.PacketsReceived),
 		zap.Uint64("packets_dropped", stats.PacketsDropped),
 		zap.Uint64("packets_processed", stats.PacketsProcessed),
+		zap.Uint64("packets_rate_limited", stats.PacketsRateLimited),
 	)
 	return runErr
+}
+
+type permissionAuditCompressor func(context.Context, time.Time) (int64, error)
+
+// runPermissionAuditCompression isolates one maintenance invocation. A bug in
+// compression must be visible to operators without killing the periodic loop.
+func runPermissionAuditCompression(ctx context.Context, logger *zap.Logger, compress permissionAuditCompressor) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			logger.Error("permission audit compression panic",
+				zap.String("panic_type", fmt.Sprintf("%T", recovered)),
+				zap.Stack("stack"),
+			)
+		}
+	}()
+	count, err := compress(ctx, time.Now().AddDate(0, 0, -30))
+	if err != nil && ctx.Err() == nil {
+		logger.Warn("permission audit compression failed", zap.Error(err))
+	} else if count > 0 {
+		logger.Info("permission audit compressed", zap.Int64("rows", count))
+	}
+}
+
+func runPermissionAuditLoop(
+	ctx context.Context,
+	logger *zap.Logger,
+	ticks <-chan time.Time,
+	compress permissionAuditCompressor,
+) {
+	runPermissionAuditCompression(ctx, logger, compress)
+	for {
+		select {
+		case <-ticks:
+			runPermissionAuditCompression(ctx, logger, compress)
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // ensureServerGroup returns the ID of the named server group, creating it
@@ -935,22 +1046,32 @@ func registerEventBusMetrics(reg *prometheus.Registry, bus *eventbus.Bus, logger
 // queryBackend adapts the server's building blocks to the query.Backend
 // interface. Only admins may log in; every operation after that is trusted.
 type queryBackend struct {
-	authSvc    *auth.AuthService
-	stateMgr   *state.Manager
-	channelMgr *channels.ChannelManager
-	tcp        *server.TCPServer
-	db         *store.Store
-	permLoader *permissions.Loader
-	shutdown   func(restart bool)
-	startedAt  time.Time
-	serverName string
-	maxClients int
+	authSvc               *auth.AuthService
+	passwordAuthenticator func(context.Context, string, string) (bool, error)
+	stateMgr              *state.Manager
+	channelMgr            *channels.ChannelManager
+	tcp                   *server.TCPServer
+	db                    *store.Store
+	permLoader            *permissions.Loader
+	shutdown              func(restart bool)
+	startedAt             time.Time
+	serverName            string
+	maxClients            int
 	// rules serves the server rules shown on first join (215).
 	rules *rules.Service
 }
 
 func (q *queryBackend) Authenticate(ctx context.Context, uniqueID, password string) (bool, bool, error) {
-	ok, err := q.authSvc.AuthenticatePassword(ctx, uniqueID, password)
+	authenticate := q.passwordAuthenticator
+	if authenticate == nil {
+		authenticate = q.authSvc.AuthenticatePassword
+	}
+	ok, err := authenticate(ctx, uniqueID, password)
+	if errors.Is(err, auth.ErrUserNotFound) {
+		// The AuthService has already performed dummy Argon2 work. ServerQuery
+		// must present an unknown account exactly like a wrong password.
+		return false, false, nil
+	}
 	if err != nil || !ok {
 		return false, false, err
 	}
@@ -1059,44 +1180,46 @@ func (q *queryBackend) ServerInfo(ctx context.Context) query.Info {
 	}
 }
 
-func (q *queryBackend) MoveClient(_ context.Context, clientID string, channelID int64) error {
-	return q.tcp.MoveClient(clientID, channelID)
+func (q *queryBackend) MoveClient(ctx context.Context, clientID string, channelID int64) error {
+	return q.tcp.MoveClient(ctx, clientID, channelID)
 }
 
-func (q *queryBackend) KickClient(_ context.Context, clientID string, fromServer bool, reason string) error {
-	return q.tcp.KickClient("serverquery", clientID, fromServer, reason)
+func (q *queryBackend) KickClient(ctx context.Context, clientID string, fromServer bool, reason string) error {
+	return q.tcp.KickClient(ctx, "serverquery", clientID, fromServer, reason)
 }
 
 func (q *queryBackend) SendText(_ context.Context, targetMode int, target, msg string) error {
 	return q.tcp.SendServerText(targetMode, target, msg)
 }
 
-func (q *queryBackend) CreateChannel(ctx context.Context, name, topic string, channelType int) (int64, error) {
-	parsedType, err := channels.ParseChannelType(channelType)
+func (q *queryBackend) CreateChannel(ctx context.Context, params query.ChannelCreateParams) (int64, error) {
+	parsedType, err := channels.ParseChannelType(params.Type)
 	if err != nil {
 		return 0, err
 	}
 	id, err := q.channelMgr.CreateChannel(ctx, channels.ChannelSpec{
-		Name:  name,
-		Topic: topic,
-		Type:  parsedType,
+		Name:       params.Name,
+		Topic:      params.Topic,
+		ParentID:   params.ParentID,
+		MaxClients: params.MaxClients,
+		Type:       parsedType,
 	})
 	if err != nil {
 		return 0, err
 	}
-	q.db.Audit(ctx, "serverquery", "channel_create", strconv.FormatInt(id, 10), name)
+	q.db.Audit(ctx, "serverquery", "channel_create", strconv.FormatInt(id, 10), params.Name)
 	return id, nil
 }
 
-func (q *queryBackend) DeleteChannel(ctx context.Context, channelID int64) error {
+func (q *queryBackend) DeleteChannel(ctx context.Context, channelID int64, reason string) error {
 	result, err := q.channelMgr.DeleteChannelSubtree(ctx, channelID)
 	if err != nil {
 		return err
 	}
 	if q.tcp != nil {
-		q.tcp.ApplyChannelDeletion(result)
+		q.tcp.ApplyChannelDeletion(result, reason)
 	}
-	q.db.Audit(ctx, "serverquery", "channel_delete", strconv.FormatInt(channelID, 10), "")
+	q.db.Audit(ctx, "serverquery", "channel_delete", strconv.FormatInt(channelID, 10), reason)
 	return nil
 }
 
@@ -1237,16 +1360,16 @@ func (q *queryBackend) Shutdown(_ context.Context, restart bool) error {
 	return nil
 }
 
-func (q *queryBackend) PermOverview(ctx context.Context, uniqueID string, channelID int64) ([]query.PermLine, error) {
-	lines, err := q.tcp.PermOverview(ctx, uniqueID, channelID)
+func (q *queryBackend) PermOverview(ctx context.Context, uniqueID string, channelID int64) ([]query.PermLine, bool, error) {
+	lines, isAdmin, err := q.tcp.PermOverview(ctx, uniqueID, channelID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	out := make([]query.PermLine, 0, len(lines))
 	for _, l := range lines {
 		out = append(out, query.PermLine{Key: l.Key, Value: l.Value, Grant: l.Grant, Tier: l.Tier})
 	}
-	return out, nil
+	return out, isAdmin, nil
 }
 
 func (q *queryBackend) ChannelPermList(ctx context.Context, channelID int64) ([]query.ChannelPerm, error) {

@@ -149,6 +149,9 @@ type Config struct {
 	RootDir string
 	// MaxKBps is the per-connection bandwidth cap in KiB/s. 0 = unlimited.
 	MaxKBps int
+	// MaxConnections bounds accepted file-port connections. Values at or below
+	// zero use the safe standalone default of 128.
+	MaxConnections int
 	// QuietHoursStart/End lift MaxKBps during a local-time window (276):
 	// both 0-23, equal = disabled, and a start after the end wraps past
 	// midnight. The window is evaluated when a transfer starts, so a transfer
@@ -203,10 +206,11 @@ type channelCleanup struct {
 
 // Server is the file-transfer listener and token registry.
 type Server struct {
-	cfg    Config
-	store  FileStore
-	logger *zap.Logger
-	port   int
+	cfg     Config
+	store   FileStore
+	logger  *zap.Logger
+	port    int
+	addrErr error
 
 	// links is the download-link registry (267), served by the health HTTP
 	// server at /dl/<token>.
@@ -227,9 +231,11 @@ type Server struct {
 	started     bool
 	closed      bool
 
-	stopOnce sync.Once
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
+	stopOnce  sync.Once
+	stopCh    chan struct{}
+	wg        sync.WaitGroup
+	connSlots chan struct{}
+	accepted  map[net.Conn]struct{}
 
 	// fileOpsMu makes filesystem-producing mutations linearizable with a
 	// channel tombstone. Deletion takes the write side only long enough to
@@ -247,18 +253,21 @@ func New(cfg Config, st FileStore, logger *zap.Logger) *Server {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	port := 0
-	if _, p, err := net.SplitHostPort(cfg.Addr); err == nil {
-		port, _ = strconv.Atoi(p)
+	if cfg.MaxConnections <= 0 {
+		cfg.MaxConnections = 128
 	}
+	port, addrErr := parseListenPort(cfg.Addr)
 	s := &Server{
 		cfg:             cfg,
 		store:           st,
 		logger:          logger,
 		port:            port,
+		addrErr:         addrErr,
 		links:           NewLinkRegistry(cfg.RootDir),
 		moveBlobFn:      moveBlob,
 		stopCh:          make(chan struct{}),
+		connSlots:       make(chan struct{}, cfg.MaxConnections),
+		accepted:        make(map[net.Conn]struct{}),
 		transfers:       make(map[string]*transfer),
 		activeTransfers: make(map[string]*activeTransfer),
 		deletedChannels: make(map[int64]*channelCleanup),
@@ -267,10 +276,22 @@ func New(cfg Config, st FileStore, logger *zap.Logger) *Server {
 	return s
 }
 
-// Port returns the configured file-transfer port (0 when the address has no
-// numeric port), used in FileTransferInitResponse.
+// Port returns the configured file-transfer port, used in
+// FileTransferInitResponse.
 func (s *Server) Port() int {
 	return s.port
+}
+
+func parseListenPort(address string) (int, error) {
+	_, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		return 0, fmt.Errorf("parsing file transfer address %q: %w", address, err)
+	}
+	port, err := strconv.ParseUint(portText, 10, 16)
+	if err != nil {
+		return 0, fmt.Errorf("parsing file transfer port in %q: %w", address, err)
+	}
+	return int(port), nil
 }
 
 // Fingerprint returns the SHA-256 fingerprint of the certificate this port
@@ -842,13 +863,55 @@ func sanitizeName(name string) (string, error) {
 	if name == "" || name == "." || name == ".." {
 		return "", fmt.Errorf("%w: %q", ErrInvalidName, name)
 	}
+	if strings.HasSuffix(name, ".") || strings.HasSuffix(name, " ") {
+		return "", fmt.Errorf("%w: %q", ErrInvalidName, name)
+	}
 	if strings.ContainsAny(name, "/\\") || strings.Contains(name, "..") {
 		return "", fmt.Errorf("%w: %q", ErrInvalidName, name)
 	}
 	if filepath.IsAbs(name) || filepath.Base(name) != name {
 		return "", fmt.Errorf("%w: %q", ErrInvalidName, name)
 	}
+	if isDOSDeviceName(name) {
+		return "", fmt.Errorf("%w: %q", ErrInvalidName, name)
+	}
 	return name, nil
+}
+
+// isDOSDeviceName applies Windows' reserved-device rule on every platform so
+// data accepted on one server is safe to migrate to another. Windows ignores
+// a final run of dots/spaces and every suffix after the first dot for these
+// names; sanitizeName rejects final dots/spaces before reaching here.
+func isDOSDeviceName(name string) bool {
+	stem, _, _ := strings.Cut(name, ".")
+	stem = strings.TrimRight(stem, " .")
+	switch strings.ToUpper(stem) {
+	case "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$":
+		return true
+	}
+	upper := strings.ToUpper(stem)
+	for _, prefix := range []string{"COM", "LPT"} {
+		if !strings.HasPrefix(upper, prefix) {
+			continue
+		}
+		suffix := strings.TrimPrefix(upper, prefix)
+		if isDOSDeviceNumber(suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func isDOSDeviceNumber(value string) bool {
+	if len([]rune(value)) != 1 {
+		return false
+	}
+	switch value {
+	case "1", "2", "3", "4", "5", "6", "7", "8", "9", "¹", "²", "³":
+		return true
+	default:
+		return false
+	}
 }
 
 // sanitizeFolder validates a virtual folder path (261): "" is the channel
@@ -965,6 +1028,10 @@ func (s *Server) Start(ctx context.Context) error {
 		s.lifecycleMu.Unlock()
 		return nil
 	}
+	if s.addrErr != nil {
+		s.lifecycleMu.Unlock()
+		return s.addrErr
+	}
 	if s.started {
 		s.lifecycleMu.Unlock()
 		return errors.New("filetransfer server already started")
@@ -976,8 +1043,13 @@ func (s *Server) Start(ctx context.Context) error {
 	s.lifecycleMu.Unlock()
 	defer s.wg.Done()
 
-	ln, err := net.Listen("tcp", s.cfg.Addr)
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", s.cfg.Addr)
 	if err != nil {
+		s.lifecycleMu.Lock()
+		if !s.closed {
+			s.started = false
+		}
+		s.lifecycleMu.Unlock()
 		return fmt.Errorf("filetransfer listen on %s: %w", s.cfg.Addr, err)
 	}
 	if s.cfg.TLSEnabled {
@@ -1030,12 +1102,60 @@ func (s *Server) Start(ctx context.Context) error {
 				return fmt.Errorf("filetransfer accept: %w", err)
 			}
 		}
-		s.wg.Add(1)
+		if !s.admit(conn) {
+			_ = conn.Close()
+			continue
+		}
 		go func() {
-			defer s.wg.Done()
+			defer s.release(conn)
 			s.serve(ctx, conn)
 		}()
 	}
+}
+
+// admit reserves one bounded connection slot and registers conn before its
+// worker starts. Close can therefore close every blocking accepted connection
+// without racing an admission that would escape its snapshot.
+func (s *Server) admit(conn net.Conn) bool {
+	select {
+	case <-s.stopCh:
+		return false
+	default:
+	}
+	select {
+	case s.connSlots <- struct{}{}:
+	default:
+		return false
+	}
+
+	s.lifecycleMu.Lock()
+	if s.closed {
+		s.lifecycleMu.Unlock()
+		<-s.connSlots
+		return false
+	}
+	// Recheck after reserving a slot: Close serializes this registration with
+	// its connection snapshot, so an admitted connection is either closed by
+	// Close or released by its worker exactly once.
+	select {
+	case <-s.stopCh:
+		s.lifecycleMu.Unlock()
+		<-s.connSlots
+		return false
+	default:
+	}
+	s.accepted[conn] = struct{}{}
+	s.wg.Add(1)
+	s.lifecycleMu.Unlock()
+	return true
+}
+
+func (s *Server) release(conn net.Conn) {
+	s.lifecycleMu.Lock()
+	delete(s.accepted, conn)
+	s.lifecycleMu.Unlock()
+	<-s.connSlots
+	s.wg.Done()
 }
 
 // Close stops the listener and waits for active transfers. It is safe to
@@ -1048,9 +1168,18 @@ func (s *Server) Close() error {
 		close(s.stopCh)
 		ln := s.listener
 		s.listener = nil
+		accepted := make([]net.Conn, 0, len(s.accepted))
+		for conn := range s.accepted {
+			accepted = append(accepted, conn)
+		}
 		s.lifecycleMu.Unlock()
 		if ln != nil {
 			err = ln.Close()
+		}
+		// Do not hold lifecycleMu while closing sockets: a worker may need it
+		// to unregister itself as Close unblocks its I/O.
+		for _, conn := range accepted {
+			_ = conn.Close()
 		}
 	})
 	s.wg.Wait()

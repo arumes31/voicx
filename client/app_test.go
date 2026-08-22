@@ -26,7 +26,13 @@ func nextFrame(t *testing.T, frames <-chan *netproto.Frame, want netproto.Messag
 }
 
 func TestAppOfflineContracts(t *testing.T) {
-	t.Parallel()
+	oldRoot, oldProtection := identityRootOverride, keyProtectionSetting
+	identityRootOverride = t.TempDir()
+	keyProtectionSetting = func() string { return "off" }
+	t.Cleanup(func() {
+		identityRootOverride = oldRoot
+		keyProtectionSetting = oldProtection
+	})
 
 	constructed := NewApp()
 	if constructed.tabs == nil || constructed.hotkeys == nil {
@@ -52,8 +58,8 @@ func TestAppOfflineContracts(t *testing.T) {
 	if got := a.ClientID(); got != "" {
 		t.Fatalf("ClientID = %q", got)
 	}
-	if got := a.IdentityUID(); got != "" {
-		t.Fatalf("IdentityUID = %q", got)
+	if got := a.IdentityUID(); got == "" {
+		t.Fatal("offline IdentityUID did not generate the active identity")
 	}
 	if got := a.TrustServerFingerprint("addr", "fp"); got != "trust store unavailable" {
 		t.Fatalf("TrustServerFingerprint offline = %q", got)
@@ -265,7 +271,7 @@ func TestAppConnectedBindings(t *testing.T) {
 	if got := app.TrustServerFingerprint("server.test:12333", strings.ToUpper(replacementFingerprint)); got != "" {
 		t.Fatalf("TrustServerFingerprint = %q", got)
 	}
-	if got := cm.knownServers.verify("server.test:12333", replacementFingerprint); got != trustOK {
+	if got, err := cm.knownServers.verify("server.test:12333", replacementFingerprint); err != nil || got != trustOK {
 		t.Fatalf("trusted fingerprint status = %v", got)
 	}
 	if got := app.TrustServerFingerprint("server.test:12333", "CC:DD"); !strings.HasPrefix(got, "invalid fingerprint:") {

@@ -64,7 +64,7 @@ func TestDeleteChannelDataRevokesCapabilitiesAndRemovesDirectory(t *testing.T) {
 	}
 
 	recorder := httptest.NewRecorder()
-	s.Links().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dl/"+linkToken, nil))
+	s.Links().ServeHTTP(recorder, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/dl/"+linkToken, nil))
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("revoked link status = %d, want 404", recorder.Code)
 	}
@@ -147,7 +147,7 @@ func TestLinkRegistryRevokeWaitsForOpenRegistration(t *testing.T) {
 	serveDone := make(chan struct{})
 	go func() {
 		recorder := httptest.NewRecorder()
-		registry.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dl/"+token, nil))
+		registry.ServeHTTP(recorder, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/dl/"+token, nil))
 		close(serveDone)
 	}()
 	<-openEntered
@@ -290,7 +290,7 @@ func TestDeleteChannelDataRevokesBeforeContextBoundedDrain(t *testing.T) {
 		t.Fatalf("InitUpload during deferred drain = %v, want ErrChannelDeleted", err)
 	}
 	recorder := httptest.NewRecorder()
-	s.Links().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dl/"+linkToken, nil))
+	s.Links().ServeHTTP(recorder, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/dl/"+linkToken, nil))
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("link during deferred drain status = %d, want 404", recorder.Code)
 	}

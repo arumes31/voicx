@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"voicx/internal/auth"
+	"voicx/internal/config"
 	"voicx/internal/netproto"
 	"voicx/internal/permissions"
 	"voicx/internal/state"
@@ -532,11 +533,37 @@ func TestFileLink(t *testing.T) {
 	if err := netproto.Decode(f, &resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if resp.Path == "" || resp.ExpiresAt == 0 || resp.HealthPort == 0 {
+	if resp.Path == "" || resp.Scheme != "http" || resp.ExpiresAt == 0 || resp.HealthPort == 0 {
 		t.Fatalf("link response = %+v", resp)
 	}
 	if resp.Path != "/dl/deadbeef" {
 		t.Fatalf("path = %q, want /dl/deadbeef", resp.Path)
+	}
+}
+
+func TestFileLinkRejectsMalformedHealthAddress(t *testing.T) {
+	env := startTestEnvFull(t, nil, func(cfg *config.Config) {
+		cfg.HealthAddr = "not-a-listen-address"
+	})
+	defer env.stop()
+	env.ft.files = []store.FileRecord{{ChannelID: 1, Name: "a.txt", Size: 1, Uploader: "user-uid"}}
+
+	conn, _ := dialAuthed(t, env.addr, "user-uid")
+	defer closeFileTestResource(t, conn)
+	send(t, conn, netproto.MsgFileLink, netproto.FileLink{ChannelID: 1, Name: "a.txt"})
+	if response := readError(t, conn); response.Code != errCodeUnavailable {
+		t.Fatalf("link response = %+v, want unavailable", response)
+	}
+}
+
+func TestPortFromAddressRejectsUnusableAddresses(t *testing.T) {
+	if port, err := portFromAddress("[::1]:12337"); err != nil || port != 12337 {
+		t.Fatalf("portFromAddress(valid) = %d, %v", port, err)
+	}
+	for _, address := range []string{"not-a-listen-address", "127.0.0.1:not-a-port", ":0"} {
+		if _, err := portFromAddress(address); err == nil {
+			t.Fatalf("portFromAddress(%q) accepted an unusable address", address)
+		}
 	}
 }
 

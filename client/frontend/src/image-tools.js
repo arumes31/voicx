@@ -144,6 +144,11 @@ function base64Bytes(b64) {
     return Math.floor(b64.length * 3 / 4) - padding;
 }
 
+// These small, side-effect-free boundaries are also used by the upload flows
+// above; exporting them keeps their compatibility tests independent of DOM
+// image decoding.
+export { base64Bytes, generationCurrent };
+
 // cropDialog shows the 256x256 preview/crop editor (268): zoom slider and
 // drag-to-reposition on a canvas, output PNG.
 function cropDialog(file, options = {}) {

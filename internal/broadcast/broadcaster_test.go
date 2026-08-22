@@ -82,6 +82,91 @@ func TestBroadcastSnapshotDeliversToAll(t *testing.T) {
 	}
 }
 
+func TestTelemetryObserversRunAfterBroadcastLocks(t *testing.T) {
+	sm := state.New(zap.NewNop())
+	var broadcaster *Broadcaster
+	snapshotDuration := make(chan time.Duration, 1)
+	backlogDepth := make(chan int, 1)
+	var unregisterOnce sync.Once
+	broadcaster = New(zap.NewNop(), sm, Observers{
+		ObserveSnapshotDuration: func(duration time.Duration) {
+			_ = broadcaster.Stats()
+			snapshotDuration <- duration
+		},
+		ObserveClientBacklog: func(depth int) {
+			// Re-enter a write-locked operation. If telemetry ran under mu or
+			// sendMu this blocks the broadcast rather than completing below.
+			unregisterOnce.Do(func() { broadcaster.Unregister("c1") })
+			backlogDepth <- depth
+		},
+	})
+	defer broadcaster.Close()
+	if _, err := broadcaster.Register("c1"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		broadcaster.BroadcastSnapshot(false, "")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("broadcast blocked while invoking telemetry observer")
+	}
+	select {
+	case duration := <-snapshotDuration:
+		if duration < 0 {
+			t.Fatalf("snapshot duration = %s, want non-negative", duration)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("snapshot observer was not called")
+	}
+	if extra := len(snapshotDuration); extra != 0 {
+		t.Fatalf("snapshot observer calls = %d, want exactly 1", extra+1)
+	}
+	select {
+	case depth := <-backlogDepth:
+		if depth < 0 || depth > clientBufferSize {
+			t.Fatalf("backlog depth = %d, want 0..%d", depth, clientBufferSize)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("backlog observer was not called")
+	}
+}
+
+func TestBacklogObserverReportsFullQueueDepth(t *testing.T) {
+	var depths []int
+	var depthsMu sync.Mutex
+	b := New(zap.NewNop(), state.New(zap.NewNop()), Observers{
+		ObserveClientBacklog: func(depth int) {
+			depthsMu.Lock()
+			depths = append(depths, depth)
+			depthsMu.Unlock()
+		},
+	})
+	defer b.Close()
+	if _, err := b.Register("c1"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	for range clientBufferSize {
+		if err := b.BroadcastToClient("c1", []byte("fill")); err != nil {
+			t.Fatalf("fill queue: %v", err)
+		}
+	}
+	if err := b.BroadcastToClient("c1", []byte("full")); !errors.Is(err, ErrChannelFull) {
+		t.Fatalf("full queue error = %v, want ErrChannelFull", err)
+	}
+	depthsMu.Lock()
+	defer depthsMu.Unlock()
+	if len(depths) != clientBufferSize+1 {
+		t.Fatalf("backlog observations = %d, want %d", len(depths), clientBufferSize+1)
+	}
+	if got := depths[len(depths)-1]; got != clientBufferSize {
+		t.Fatalf("full queue backlog depth = %d, want %d", got, clientBufferSize)
+	}
+}
+
 // TestBroadcastSnapshotHidesInvisible verifies the viewer/admin flags reach
 // BuildSnapshot: a fan-out must not leak invisible users (381).
 func TestBroadcastSnapshotHidesInvisible(t *testing.T) {

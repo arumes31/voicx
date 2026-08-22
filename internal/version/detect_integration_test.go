@@ -1,5 +1,3 @@
-//go:build integration
-
 package version
 
 import (
@@ -176,7 +174,7 @@ func TestDetectGitStates(t *testing.T) {
 
 func runTestGit(t *testing.T, root string, args ...string) {
 	t.Helper()
-	command := exec.Command("git", append([]string{"-C", root}, args...)...)
+	command := exec.CommandContext(t.Context(), "git", append([]string{"-C", root}, args...)...)
 	command.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_OPTIONAL_LOCKS=0")
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)

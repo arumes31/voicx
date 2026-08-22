@@ -77,10 +77,10 @@ message ChannelDeletedEvent {
 }
 
 message UserMovedEvent {
-  string user_id = 1;
+  string user_id = 1; // connected client/session ID, not persistent unique_id
   string from_channel_id = 2;
   string to_channel_id = 3;
-  string moved_by = 4; // user id of the actor
+  string moved_by = 4; // connected client/session ID of the actor
 }
 
 message UserKickedEvent {
@@ -95,4 +95,5 @@ message UserBannedEvent {
   string banned_by = 2;
   string reason = 3;
   int64 expires_at = 4; // unix millis; 0 means permanent
+  string channel_id = 5;
 }

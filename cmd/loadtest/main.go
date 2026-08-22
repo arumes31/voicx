@@ -197,18 +197,27 @@ func dialControl(opts options) (net.Conn, error) {
 		return nil, err
 	}
 	if !useTLS {
-		return net.DialTimeout("tcp", opts.addr, 5*time.Second)
+		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(context.Background(), "tcp", opts.addr)
 	}
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", opts.addr, tlsConfig)
+	dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: 5 * time.Second},
+		Config:    tlsConfig,
+	}
+	conn, err := dialer.DialContext(context.Background(), "tcp", opts.addr)
 	if err != nil {
 		return nil, err
 	}
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		_ = conn.Close()
+		return nil, fmt.Errorf("TLS dial returned a non-TLS connection")
+	}
 	loggedFP.Do(func() {
-		if pc := conn.ConnectionState().PeerCertificates; len(pc) > 0 {
+		if pc := tlsConn.ConnectionState().PeerCertificates; len(pc) > 0 {
 			fmt.Printf("loadtest: server TLS fingerprint: %s\n", tlscert.FingerprintDER(pc[0].Raw))
 		}
 	})
-	return conn, nil
+	return tlsConn, nil
 }
 
 func controlTLSConfig(opts options) (*tls.Config, bool, error) {

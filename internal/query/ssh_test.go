@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/binary"
 	"net"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -17,7 +19,7 @@ import (
 // returns its address.
 func startSSHQuery(t *testing.T, backend Backend) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -32,7 +34,7 @@ func startSSHQuery(t *testing.T, backend Backend) string {
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		conn, err := net.Dial("tcp", addr)
+		conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", addr)
 		if err == nil {
 			_ = conn.Close()
 			break
@@ -51,7 +53,7 @@ func startSSHQuery(t *testing.T, backend Backend) string {
 // session's read timeout (224).
 func TestSSHCloseWithActiveSession(t *testing.T) {
 	backend := newFakeBackend()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -65,7 +67,7 @@ func TestSSHCloseWithActiveSession(t *testing.T) {
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if c, err := net.Dial("tcp", addr); err == nil {
+		if c, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", addr); err == nil {
 			_ = c.Close()
 			break
 		}
@@ -235,6 +237,46 @@ func TestSSHHostKeyIsStable(t *testing.T) {
 	}
 	if ssh.FingerprintSHA256(first.PublicKey()) != ssh.FingerprintSHA256(second.PublicKey()) {
 		t.Fatal("host key changed between starts")
+	}
+}
+
+func TestLoadOrCreateHostKeyRejectsPermissiveExistingKey(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not provide POSIX file modes")
+	}
+	path := filepath.Join(t.TempDir(), "host.key")
+	if _, err := loadOrCreateHostKey(path); err != nil {
+		t.Fatalf("create host key: %v", err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatalf("chmod host key: %v", err)
+	}
+	if _, err := loadOrCreateHostKey(path); err == nil {
+		t.Fatal("permissive host key was accepted")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat host key: %v", err)
+	}
+	if info.Mode().Perm() != 0o644 {
+		t.Fatalf("host key mode = %o, want it unchanged at 644", info.Mode().Perm())
+	}
+}
+
+func TestLoadOrCreateHostKeyCreatesRestrictedFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not provide POSIX file modes")
+	}
+	path := filepath.Join(t.TempDir(), "new", "host.key")
+	if _, err := loadOrCreateHostKey(path); err != nil {
+		t.Fatalf("create host key: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat host key: %v", err)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("host key mode = %o, want no group/other access", info.Mode().Perm())
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 // TestRingBufTee verifies log lines land in the ring and Recent returns them
 // chronologically with filtering.
 func TestRingBufTee(t *testing.T) {
+	isolateRing(t)
 	logger := zap.NewExample().WithOptions(Tee())
 	logger.Info("first message")
 	logger.Warn("second message with marker")
@@ -29,6 +30,12 @@ func TestRingBufTee(t *testing.T) {
 
 	if none := Recent(10, "no-such-substring"); len(none) != 0 {
 		t.Fatalf("unexpected match: %v", none)
+	}
+}
+
+func TestSanitizeRingLineEscapesAllEmbeddedBreaksButOneSuffix(t *testing.T) {
+	if got, want := sanitizeRingLine("a\r\nb\n"), `a\r\nb`; got != want {
+		t.Fatalf("sanitizeRingLine = %q, want %q", got, want)
 	}
 }
 

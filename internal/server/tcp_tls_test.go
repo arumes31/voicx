@@ -32,14 +32,14 @@ func startTLSTestServer(t *testing.T, tlsEnabled bool) (string, *TCPServer, func
 
 	probe := func() bool {
 		if tlsEnabled {
-			conn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // test client
+			conn, err := (&tls.Dialer{NetDialer: &net.Dialer{}, Config: &tls.Config{InsecureSkipVerify: true}}).DialContext(t.Context(), "tcp", addr) //nolint:gosec // test client
 			if err == nil {
 				_ = conn.Close()
 				return true
 			}
 			return false
 		}
-		conn, err := net.Dial("tcp", addr)
+		conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", addr)
 		if err == nil {
 			_ = conn.Close()
 			return true
@@ -57,7 +57,7 @@ func startTLSTestServer(t *testing.T, tlsEnabled bool) (string, *TCPServer, func
 	return addr, srv, func() {
 		cancel()
 		<-startErr
-		_ = srv.Shutdown()
+		_ = srv.Shutdown(context.Background())
 	}
 }
 
@@ -68,13 +68,17 @@ func TestTLSHandshakeAndFingerprint(t *testing.T) {
 	env := startTestEnv(t, nil)
 	defer env.stop()
 
-	conn, err := tls.Dial("tcp", env.addr, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // test client
+	conn, err := (&tls.Dialer{NetDialer: &net.Dialer{}, Config: &tls.Config{InsecureSkipVerify: true}}).DialContext(t.Context(), "tcp", env.addr) //nolint:gosec // test client
 	if err != nil {
 		t.Fatalf("tls dial: %v", err)
 	}
 	defer func() { _ = conn.Close() }()
 
-	state := conn.ConnectionState()
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		t.Fatalf("TLS dial returned %T, want *tls.Conn", conn)
+	}
+	state := tlsConn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
 		t.Fatal("no peer certificates presented")
 	}
@@ -99,7 +103,7 @@ func TestTLSRejectsPlaintext(t *testing.T) {
 	addr, _, stop := startTLSTestServer(t, true)
 	defer stop()
 
-	conn, err := net.Dial("tcp", addr)
+	conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", addr)
 	if err != nil {
 		t.Fatalf("tcp dial: %v", err)
 	}
@@ -120,25 +124,29 @@ func TestTLSRequiresVersion13(t *testing.T) {
 	addr, _, stop := startTLSTestServer(t, true)
 	defer stop()
 
-	legacy, err := tls.Dial("tcp", addr, &tls.Config{
+	legacy, err := (&tls.Dialer{NetDialer: &net.Dialer{}, Config: &tls.Config{
 		InsecureSkipVerify: true, //nolint:gosec // protocol-version test
 		MinVersion:         tls.VersionTLS12,
 		MaxVersion:         tls.VersionTLS12,
-	})
+	}}).DialContext(t.Context(), "tcp", addr)
 	if err == nil {
 		_ = legacy.Close()
 		t.Fatal("TLS 1.2 handshake succeeded, want rejection")
 	}
 
-	current, err := tls.Dial("tcp", addr, &tls.Config{
+	current, err := (&tls.Dialer{NetDialer: &net.Dialer{}, Config: &tls.Config{
 		InsecureSkipVerify: true, //nolint:gosec // test client
 		MinVersion:         tls.VersionTLS13,
-	})
+	}}).DialContext(t.Context(), "tcp", addr)
 	if err != nil {
 		t.Fatalf("TLS 1.3 dial: %v", err)
 	}
 	defer func() { _ = current.Close() }()
-	if version := current.ConnectionState().Version; version != tls.VersionTLS13 {
+	currentTLS, ok := current.(*tls.Conn)
+	if !ok {
+		t.Fatalf("TLS dial returned %T, want *tls.Conn", current)
+	}
+	if version := currentTLS.ConnectionState().Version; version != tls.VersionTLS13 {
 		t.Fatalf("negotiated TLS version = %#x, want TLS 1.3", version)
 	}
 }
@@ -152,7 +160,7 @@ func TestPlaintextStillAllowed(t *testing.T) {
 	if srv.TLSFingerprint() != "" {
 		t.Fatal("plaintext server reports a TLS fingerprint")
 	}
-	conn, err := net.Dial("tcp", addr)
+	conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", addr)
 	if err != nil {
 		t.Fatalf("tcp dial: %v", err)
 	}

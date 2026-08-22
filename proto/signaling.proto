@@ -4,9 +4,11 @@ package voicx.v1;
 
 option go_package = "voicx/v1;voicxv1";
 
-// Signaling service handles WebRTC negotiation between clients and the server.
-// The server acts as a signaling relay and SFU controller.
+// Deprecated: Signaling is intentionally unserved. WebRTC negotiation stays
+// on the control channel; the message types remain for descriptor and source
+// compatibility while clients migrate away from this RPC service.
 service Signaling {
+  option deprecated = true;
   // Bidirectional stream: clients send signaling messages and receive
   // signaling events (offers, answers, ICE candidates) from the server.
   rpc Signal(stream SignalMessage) returns (stream SignalMessage);

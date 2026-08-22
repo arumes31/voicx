@@ -6,9 +6,12 @@
 // virtual (derived from file rows — empty folders do not persist).
 import { humanBytes } from "./clientinfo.js";
 import { pickIcon } from "./image-tools.js";
-import { closeDialog, isCurrentServerDialog, mountServerDialog } from "./modal.js";
+import { closeDialog, confirmDialog, isCurrentServerDialog, mountServerDialog, promptDialog } from "./modal.js";
 import { wrappedIndex } from "./a11y.js";
 import { imageDataURL } from "./safe-media.js";
+import { parseRuntimeObject } from "./runtime-json.js";
+import { captureScope, runScopedDialogAction, scopeIsCurrent } from "./scoped-actions.js";
+import { buildFileLink } from "./file-links.js";
 
 const V = () => window.__voicx;
 const App = () => window.go.main.App;
@@ -23,6 +26,71 @@ const fb = {
     open: false,
 };
 let serverViewGeneration = 0;
+
+function readFileView() {
+    return {
+        generation: serverViewGeneration,
+        channelID: fb.channelID,
+        folder: fb.folder,
+    };
+}
+
+function fileViewIsCurrent(scope) {
+    return scopeIsCurrent(scope, readFileView);
+}
+
+// activateWorkspaceTab owns the accessible selection and panel visibility for
+// the workspace tabs. Other modes can safely restore the chat surface through
+// this one path before hiding the tab controls themselves.
+export function activateWorkspaceTab(name, { focus = false } = {}) {
+    if (name !== "chat" && name !== "files") return false;
+    const files = name === "files";
+    const tabChat = document.getElementById("tab-chat");
+    const tabFiles = document.getElementById("tab-files");
+    const chatPane = document.getElementById("chat-pane");
+    const filesPane = document.getElementById("files-pane");
+    if (!tabChat || !tabFiles || !chatPane || !filesPane) return false;
+
+    fb.open = files;
+    tabChat.classList.toggle("active", !files);
+    tabFiles.classList.toggle("active", files);
+    tabChat.setAttribute("aria-selected", String(!files));
+    tabFiles.setAttribute("aria-selected", String(files));
+    tabChat.tabIndex = files ? -1 : 0;
+    tabFiles.tabIndex = files ? 0 : -1;
+    chatPane.hidden = files;
+    filesPane.hidden = !files;
+    if (files) {
+        fb.channelID = V().state.myChannelID;
+        refreshFiles();
+    }
+    if (focus) (files ? tabFiles : tabChat).focus();
+    return true;
+}
+
+function isVisibleFocusTarget(element) {
+    if (!element?.isConnected || element === document.body || element.hidden || element.closest("[hidden]")) return false;
+    const style = window.getComputedStyle(element);
+    return style.display !== "none" && style.visibility !== "hidden" && element.getClientRects().length > 0;
+}
+
+// restoreVisibleWorkspaceFocus is called after compact/zen have changed the
+// layout. Switching Files back to Chat before hiding the tabs can otherwise
+// leave the browser's active element inside a hidden subtree.
+export function restoreVisibleWorkspaceFocus() {
+    const active = document.activeElement;
+    const inactiveTab = active?.getAttribute?.("role") === "tab" && active.tabIndex === -1;
+    if (isVisibleFocusTarget(active) && !inactiveTab) return false;
+
+    const candidates = ["voice-mute", "ptt-btn", "voice-prio", "center"];
+    for (const id of candidates) {
+        const target = document.getElementById(id);
+        if (!isVisibleFocusTarget(target) || target.disabled || typeof target.focus !== "function") continue;
+        target.focus({ preventScroll: true });
+        return true;
+    }
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // Transfers registry (278) + sparkline data (277)
@@ -252,9 +320,9 @@ function fileRow(e) {
         link.title = "sealed files cannot be linked directly";
     }
     btn("✓", "verify checksum (re-downloads and compares)", () => verifyFile(e, tr));
-    btn("▾", "versions (264)", () => toggleVersions(e, tr));
+    btn("▾", "versions", () => toggleVersions(e, tr));
     btn("✎", "rename / move within this channel", () => renameFile(e));
-    btn("⇄", "move to another channel (262)", () => moveToChannel(e));
+    btn("⇄", "move to another channel", () => moveToChannel(e));
     btn("🗑", "delete", () => deleteFile(e));
     return tr;
 }
@@ -297,21 +365,21 @@ async function downloadFile(e) {
 }
 
 async function linkFile(e) {
-    const generation = serverViewGeneration;
-    const channelID = fb.channelID;
-    const folder = fb.folder;
-    const host = (V().state.lastConnect?.addr || location.host).split(":")[0];
+    const scope = captureScope(readFileView);
+    const controlAddress = V().state.lastConnect?.addr;
     try {
-        const resp = await App().FileLink(channelID, folder, e.name);
-        if (generation !== serverViewGeneration) return;
-        // The client builds the URL from its own control host (the server
-        // cannot know its published address behind Docker/NAT).
-        const url = `http://${host}:${resp.health_port}${resp.path}`;
+        const resp = await App().FileLink(scope.channelID, scope.folder, e.name);
+        if (!fileViewIsCurrent(scope)) return;
+        const url = buildFileLink(controlAddress, resp);
+        if (!url) {
+            V().toast("link failed: server returned an invalid download address", "warn");
+            return;
+        }
         await navigator.clipboard.writeText(url);
-        if (generation !== serverViewGeneration) return;
+        if (!fileViewIsCurrent(scope)) return;
         V().toast("download link copied (valid until " + fmtDate(resp.expires_at * 1000) + ")");
     } catch (err) {
-        if (generation === serverViewGeneration) V().toast("link failed: " + err, "warn");
+        if (fileViewIsCurrent(scope)) V().toast("link failed: " + err, "warn");
     }
 }
 
@@ -320,15 +388,22 @@ async function verifyFile(e, tr) {
     const channelID = fb.channelID;
     const folder = fb.folder;
     const sha = tr.querySelector(".fb-sha");
+    const current = () => generation === serverViewGeneration && channelID === fb.channelID &&
+        folder === fb.folder && tr.isConnected && sha?.isConnected && tr.querySelector(".fb-sha") === sha;
+    if (!current()) return;
     sha.textContent = "…";
     try {
         const ok = await App().VerifyFile(channelID, folder, e.name, e.sha256);
-        if (generation !== serverViewGeneration || !tr.isConnected) return;
+        if (!current()) return;
         sha.textContent = ok ? "✓ ok" : "✗ BAD";
         sha.className = "mono fb-sha " + (ok ? "verify-ok" : "verify-bad");
-        setTimeout(() => { sha.textContent = e.sha256.slice(0, 8); sha.className = "mono fb-sha"; }, 4000);
+        setTimeout(() => {
+            if (!current()) return;
+            sha.textContent = e.sha256.slice(0, 8);
+            sha.className = "mono fb-sha";
+        }, 4000);
     } catch (err) {
-        if (generation !== serverViewGeneration || !tr.isConnected) return;
+        if (!current()) return;
         sha.textContent = "err";
         V().toast("verify failed: " + err, "warn");
     }
@@ -376,28 +451,37 @@ async function toggleVersions(e, tr) {
 }
 
 async function renameFile(e) {
-    const name = prompt("New name (or folder/name to move):", (fb.folder ? fb.folder + "/" : "") + e.name);
-    if (!name || name === e.name) return;
-    let newFolder = "";
-    let newName = name;
-    const i = name.lastIndexOf("/");
-    if (i >= 0) {
-        newFolder = name.slice(0, i);
-        newName = name.slice(i + 1);
-    }
-    const generation = serverViewGeneration;
-    const channelID = fb.channelID;
-    const folder = fb.folder;
-    const err = await App().FileRename(channelID, folder, e.name, newFolder, newName, 0);
-    if (generation !== serverViewGeneration) return;
-    if (err) V().toast("rename failed: " + err, "warn");
-    setTimeout(refreshFiles, 400);
+    await runScopedDialogAction({
+        readScope: readFileView,
+        openDialog: (scope) => promptDialog({
+            title: "Rename file",
+            label: "New name (or folder/name to move)",
+            value: (scope.folder ? scope.folder + "/" : "") + e.name,
+            confirmLabel: "Rename",
+            serverScoped: true,
+        }),
+        isAccepted: (name) => !!name && name !== e.name,
+        perform: async (scope, name) => {
+            let newFolder = "";
+            let newName = name;
+            const index = name.lastIndexOf("/");
+            if (index >= 0) {
+                newFolder = name.slice(0, index);
+                newName = name.slice(index + 1);
+            }
+            const err = await App().FileRename(scope.channelID, scope.folder, e.name, newFolder, newName, 0);
+            if (!fileViewIsCurrent(scope)) return;
+            if (err) V().toast("rename failed: " + err, "warn");
+            setTimeout(refreshFiles, 400);
+        },
+    });
 }
 
 // moveToChannel moves a file into another channel (262). The server checks
 // both channels, so a target the user cannot upload to is refused there.
 async function moveToChannel(e) {
-    const channels = (V().state.channels || []).filter((c) => c.ChannelID !== fb.channelID);
+    const scope = captureScope(readFileView);
+    const channels = (V().state.channels || []).filter((c) => c.ChannelID !== scope.channelID);
     if (channels.length === 0) {
         V().toast("no other channel to move into", "warn");
         return;
@@ -429,16 +513,13 @@ async function moveToChannel(e) {
     overlay.querySelector(".dlg-cancel").onclick = close;
     overlay.onclick = (ev) => { if (ev.target === overlay) close(); };
     overlay.querySelector(".dlg-ok").onclick = async () => {
-        if (!isCurrentServerDialog(overlay)) return;
+        if (!isCurrentServerDialog(overlay) || !fileViewIsCurrent(scope)) return;
         const target = parseInt(sel.value, 10);
         const folder = overlay.querySelector(".fb-move-folder").value.replace(/^\/+|\/+$/g, "");
-        const sourceChannelID = fb.channelID;
-        const sourceFolder = fb.folder;
-        const generation = serverViewGeneration;
         const targetName = sel.options[sel.selectedIndex].textContent;
         close();
-        const err = await App().FileRename(sourceChannelID, sourceFolder, e.name, folder, e.name, target);
-        if (generation !== serverViewGeneration) return;
+        const err = await App().FileRename(scope.channelID, scope.folder, e.name, folder, e.name, target);
+        if (!fileViewIsCurrent(scope)) return;
         if (err) V().toast("move failed: " + err, "warn");
         else V().toast(`moved ${e.name} to ${targetName}`);
         setTimeout(refreshFiles, 400);
@@ -447,14 +528,23 @@ async function moveToChannel(e) {
 }
 
 async function deleteFile(e) {
-    if (!confirm(`Delete ${e.name}?`)) return;
-    const generation = serverViewGeneration;
-    const channelID = fb.channelID;
-    const folder = fb.folder;
-    const err = await App().FileDelete(channelID, folder, e.name);
-    if (generation !== serverViewGeneration) return;
-    if (err) V().toast("delete failed: " + err, "warn");
-    setTimeout(refreshFiles, 400);
+    await runScopedDialogAction({
+        readScope: readFileView,
+        openDialog: () => confirmDialog({
+            title: "Delete file?",
+            message: `This permanently deletes “${e.name}” from this channel. This cannot be undone.`,
+            confirmLabel: "Delete file",
+            danger: true,
+            serverScoped: true,
+        }),
+        isAccepted: Boolean,
+        perform: async (scope) => {
+            const err = await App().FileDelete(scope.channelID, scope.folder, e.name);
+            if (!fileViewIsCurrent(scope)) return;
+            if (err) V().toast("delete failed: " + err, "warn");
+            setTimeout(refreshFiles, 400);
+        },
+    });
 }
 
 // --- upload queue (257/260) -----------------------------------------------------
@@ -533,6 +623,10 @@ function bytesToBase64(bytes) {
     }
     return btoa(chunks.join(""));
 }
+
+// Export the data-only attachment boundaries so their behavior can be checked
+// without constructing the complete file-browser DOM.
+export { bytesToBase64, isChatAttachment };
 
 async function pumpUploads() {
     if (uploadActive || uploadQueue.length === 0) return;
@@ -919,10 +1013,17 @@ async function renderEmojiList(overlay) {
         ren.title = "rename (messages already sent keep the old name)";
         ren.onclick = async () => {
             if (!isCurrentServerDialog(overlay)) return;
-            const next = prompt("New emoji name (a-z 0-9 _ -):", e.name);
-            if (!next || next === e.name) return;
+            const generation = serverViewGeneration;
+            const next = await promptDialog({
+                title: "Rename custom emoji",
+                label: "New emoji name (a-z, 0-9, _ or -)",
+                value: e.name,
+                confirmLabel: "Rename",
+                serverScoped: true,
+            });
+            if (!next || next === e.name || generation !== serverViewGeneration || !isCurrentServerDialog(overlay)) return;
             const err = await App().EmojiRename(e.name, next);
-            if (!isCurrentServerDialog(overlay)) return;
+            if (generation !== serverViewGeneration || !isCurrentServerDialog(overlay)) return;
             if (err) V().toast("rename failed: " + err, "warn");
             setTimeout(() => renderEmojiList(overlay), 400);
         };
@@ -932,9 +1033,17 @@ async function renderEmojiList(overlay) {
         del.title = "delete";
         del.onclick = async () => {
             if (!isCurrentServerDialog(overlay)) return;
-            if (!confirm(`Delete :${e.name}:?`)) return;
+            const generation = serverViewGeneration;
+            const confirmed = await confirmDialog({
+                title: "Delete custom emoji?",
+                message: `This permanently deletes :${e.name}: from this server. This cannot be undone.`,
+                confirmLabel: "Delete emoji",
+                danger: true,
+                serverScoped: true,
+            });
+            if (!confirmed || generation !== serverViewGeneration || !isCurrentServerDialog(overlay)) return;
             const err = await App().EmojiDelete(e.name);
-            if (!isCurrentServerDialog(overlay)) return;
+            if (generation !== serverViewGeneration || !isCurrentServerDialog(overlay)) return;
             if (err) V().toast("delete failed: " + err, "warn");
             setTimeout(() => renderEmojiList(overlay), 400);
         };
@@ -944,12 +1053,18 @@ async function renderEmojiList(overlay) {
 }
 
 async function addEmoji(overlay) {
-    const name = prompt("Emoji name (a-z 0-9 _ -):");
-    if (!name) return;
+    const generation = serverViewGeneration;
+    const name = await promptDialog({
+        title: "Upload custom emoji",
+        label: "Emoji name (a-z, 0-9, _ or -)",
+        confirmLabel: "Continue",
+        serverScoped: true,
+    });
+    if (!name || generation !== serverViewGeneration || !isCurrentServerDialog(overlay)) return;
     const img = await pickIcon(128, 0.9);
-    if (!img || !isCurrentServerDialog(overlay)) return;
+    if (!img || generation !== serverViewGeneration || !isCurrentServerDialog(overlay)) return;
     const err = await App().EmojiUpload(name, img.dataBase64);
-    if (!isCurrentServerDialog(overlay)) return;
+    if (generation !== serverViewGeneration || !isCurrentServerDialog(overlay)) return;
     if (err) {
         V().toast("upload failed: " + err, "warn");
         return;
@@ -968,7 +1083,7 @@ export function initFilesUI() {
             <button class="icon-btn fb-refresh" title="Refresh" aria-label="Refresh files">⟳</button>
             <button class="icon-btn fb-upload" title="Upload files"><span aria-hidden="true">⬆</span><span>Upload</span></button>
             <button class="icon-btn fb-mkdir" title="New folder (virtual — persists only while it contains files)" aria-label="Create folder">📁+</button>
-            <button class="icon-btn fb-emoji" title="Custom emoji manager (272)" aria-label="Manage custom emoji">😀</button>
+            <button class="icon-btn fb-emoji" title="Custom emoji manager" aria-label="Manage custom emoji">😀</button>
             <button class="icon-btn fb-banner" title="Set the server banner (admin, 270)" aria-label="Set server banner">🖼</button>
             <button class="icon-btn fb-transfers" title="Transfers" aria-label="Open transfers">⇅</button>
         </div>
@@ -986,17 +1101,28 @@ export function initFilesUI() {
         const paths = await App().PickUploadPaths();
         if (generation === serverViewGeneration && paths && paths.length) queueUploadPaths(paths);
     };
-    pane.querySelector(".fb-mkdir").onclick = () => {
-        const name = prompt("New folder name (virtual — persists only while it contains files):");
-        if (!name) return;
-        const clean = name.replace(/^\/+|\/+$/g, "");
-        if (!clean || clean.includes("..") || clean.includes("\\")) {
-            V().toast("invalid folder name", "warn");
-            return;
-        }
-        fb.folder = fb.folder ? fb.folder + "/" + clean : clean;
-        refreshFiles();
-        V().toast("folder ready — upload or move files into it");
+    pane.querySelector(".fb-mkdir").onclick = async () => {
+        await runScopedDialogAction({
+            readScope: readFileView,
+            openDialog: () => promptDialog({
+                title: "Create folder",
+                label: "New folder name",
+                message: "Folders are virtual and persist only while they contain files.",
+                confirmLabel: "Create folder",
+                serverScoped: true,
+            }),
+            isAccepted: Boolean,
+            perform: async (scope, name) => {
+                const clean = name.replace(/^\/+|\/+$/g, "");
+                if (!clean || clean.includes("..") || clean.includes("\\")) {
+                    V().toast("invalid folder name", "warn");
+                    return;
+                }
+                fb.folder = scope.folder ? scope.folder + "/" + clean : clean;
+                refreshFiles();
+                V().toast("folder ready — upload or move files into it");
+            },
+        });
     };
 
     // (257) drag & drop upload onto the whole pane.
@@ -1014,28 +1140,17 @@ export function initFilesUI() {
     // Tab switching (chat <-> files).
     const tabChat = document.getElementById("tab-chat");
     const tabFiles = document.getElementById("tab-files");
-    const setTab = (files) => {
-        fb.open = files;
-        document.getElementById("center").classList.toggle("files-active", files);
-        tabChat.classList.toggle("active", !files);
-        tabFiles.classList.toggle("active", files);
-        tabChat.setAttribute("aria-pressed", String(!files));
-        tabFiles.setAttribute("aria-pressed", String(files));
-        pane.setAttribute("aria-hidden", String(!files));
-        if (files) {
-            fb.channelID = V().state.myChannelID;
-            refreshFiles();
-        }
-    };
-    tabChat.onclick = () => setTab(false);
-    tabFiles.onclick = () => setTab(true);
-    [tabChat, tabFiles].forEach((tab, index, tabs) => {
+    const tabs = [tabChat, tabFiles];
+    tabChat.onclick = () => activateWorkspaceTab("chat");
+    tabFiles.onclick = () => activateWorkspaceTab("files");
+    tabs.forEach((tab, index) => {
         tab.addEventListener("keydown", (event) => {
-            if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+            if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
             event.preventDefault();
-            const next = wrappedIndex(index, tabs.length, event.key === "ArrowRight" ? 1 : -1);
-            tabs[next].focus();
-            tabs[next].click();
+            const next = event.key === "Home" ? 0
+                : event.key === "End" ? tabs.length - 1
+                    : wrappedIndex(index, tabs.length, event.key === "ArrowRight" ? 1 : -1);
+            activateWorkspaceTab(next === 1 ? "files" : "chat", { focus: true });
         });
     });
     document.getElementById("tab-transfers").onclick = openTransfers;
@@ -1045,12 +1160,8 @@ export function initFilesUI() {
     // (270/271) branding changes announced by the server: drop the cached copy
     // so the next paint shows the new image instead of waiting for a reconnect.
     window.runtime.EventsOn("event", (json) => {
-        let env;
-        try {
-            env = JSON.parse(json);
-        } catch {
-            return;
-        }
+        const env = parseRuntimeObject(json);
+        if (!env) return;
         if (env.type === "server_banner_changed") {
             loadServerBanner();
         } else if (env.type === "channel_icon_changed") {
@@ -1065,7 +1176,7 @@ export function initFilesUI() {
     watchChannelIcons();
 
     window.__voicxFiles = {
-        refreshFiles, openTransfers, loadServerIcon, resetServerView,
+        activateWorkspaceTab, restoreVisibleWorkspaceFocus, refreshFiles, openTransfers, loadServerIcon, resetServerView,
         // Follows channel changes (256): browsing follows the channel I'm in.
         onChannelChanged() {
             if (fb.open) {

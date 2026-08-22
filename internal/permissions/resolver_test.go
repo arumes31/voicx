@@ -131,7 +131,6 @@ func TestResolve_TableDriven(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			r := NewResolver()
 			got, tier, err := r.Resolve(tc.tp, tc.key)
@@ -400,7 +399,6 @@ func TestTierString(t *testing.T) {
 		{Tier(99), "unknown"},
 	}
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.want, func(t *testing.T) {
 			if got := tc.tier.String(); got != tc.want {
 				t.Errorf("tier.String() = %q, want %q", got, tc.want)

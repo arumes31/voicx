@@ -294,7 +294,7 @@ func executableFingerprint() string {
 	if err != nil {
 		return ""
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	return readerFingerprint(file)
 }
 

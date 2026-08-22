@@ -1338,6 +1338,7 @@ mark { background: var(--warn); color: #3a2a05; border-radius: 2px; padding: 0 1
 
 /* center tabs */
 #center-tabs { display: flex; gap: 2px; padding: 4px 8px 0; border-bottom: 1px solid var(--border); }
+#workspace-tablist { display: flex; gap: 2px; }
 #center-tabs button {
     background: none; border: none; color: var(--text-dim); cursor: pointer;
     font: 600 0.8571rem var(--font-body); letter-spacing: 0.04em; text-transform: uppercase;
@@ -1347,20 +1348,10 @@ mark { background: var(--warn); color: #3a2a05; border-radius: 2px; padding: 0 1
 #center-tabs button.active { color: var(--accent); border-bottom-color: var(--accent); }
 #center-tabs #tab-transfers { margin-left: auto; }
 
-/* files tab replaces the chat column */
-#center.files-active #banner-box,
-#center.files-active #voice-bar,
-#center.files-active #talk-banner,
-#center.files-active #video-grid,
-#center.files-active #chat-head,
-#center.files-active #chat-search-row,
-#center.files-active #pm-tabs,
-#center.files-active #chat-wrap,
-#center.files-active #reply-bar,
-#center.files-active #file-preview-row,
-#center.files-active #chat-input-row { display: none; }
+/* Workspace tabs own one visible panel at a time. */
+#chat-pane { display: flex; flex: 1; flex-direction: column; gap: 10px; min-height: 0; }
 #files-pane { display: none; }
-#center.files-active #files-pane {
+#files-pane:not([hidden]) {
     display: flex; flex-direction: column; flex: 1; min-height: 0; padding: 8px;
     gap: 6px;
 }

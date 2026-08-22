@@ -7,6 +7,7 @@ import (
 	"net"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"voicx/internal/netproto"
@@ -63,6 +64,234 @@ func TestTabLifecycle(t *testing.T) {
 	if a.cmLoad() != nil {
 		t.Fatal("cm set with no tabs")
 	}
+}
+
+func TestTabOrderAndActiveCloseNeighborAreDeterministic(t *testing.T) {
+	a := newTabApp(t)
+	first, _ := a.newTab()
+	middle, _ := a.newTab()
+	last, _ := a.newTab()
+	a.activate(middle)
+	a.CloseTab(middle)
+	if got := a.cmLoad(); got == nil {
+		t.Fatal("closing the middle active tab left no active tab")
+	}
+	tabs := a.ListTabs()
+	if len(tabs) != 2 || tabs[0].ID != first || tabs[1].ID != last || !tabs[1].Active {
+		t.Fatalf("tab order/active after middle close = %+v", tabs)
+	}
+
+	a.CloseTab(last)
+	tabs = a.ListTabs()
+	if len(tabs) != 1 || tabs[0].ID != first || !tabs[0].Active {
+		t.Fatalf("last active tab did not select its left neighbor: %+v", tabs)
+	}
+}
+
+func TestContainsMentionUsesUnicodeCaseFoldAndExactBoundary(t *testing.T) {
+	for _, test := range []struct {
+		text, nickname string
+		want           bool
+	}{
+		{"hello @ÄLICE!", "älice", true},
+		{"hello @K!", "k", true},
+		{"hello @k!", "K", true},
+		{"hello @ſ!", "s", true},
+		{"hello @s!", "ſ", true},
+		{"hello @ann", "ann", true},
+		{"hello @annex", "ann", false},
+		{"hello @ann_2", "ann", false},
+		{"hello @ann-2", "ann", false},
+		{"hello @Kx", "k", false},
+		{"hello @K-2", "k", false},
+		{"hello @ann.", "ann", true},
+		{"hello @foo.bar!", "foo.bar", true},
+		{"hello @foo.bar2", "foo.bar", false},
+		{"hello @fox🙂!", "fox🙂", true},
+		{"hello @fox🙂x", "fox🙂", false},
+		{"hello @🙂", "🙂", true},
+	} {
+		if got := containsMention(test.text, test.nickname); got != test.want {
+			t.Errorf("containsMention(%q, %q) = %v, want %v", test.text, test.nickname, got, test.want)
+		}
+	}
+}
+
+func TestCloseTabCommitCannotReinstateClosedActiveOrRouteLateEvent(t *testing.T) {
+	a := newTabApp(t)
+	closedID, closed := a.newTab()
+	remainingID, remaining := a.newTab()
+	a.activate(closedID)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); <-start; a.CloseTab(closedID) }()
+	go func() { defer wg.Done(); <-start; a.SetActiveTab(remainingID) }()
+	close(start)
+	wg.Wait()
+
+	a.tabsMu.Lock()
+	_, removed := a.tabs[closedID]
+	activeID := a.activeID
+	a.tabsMu.Unlock()
+	if removed || activeID == closedID || a.cmLoad() == closed.cm {
+		t.Fatalf("closed tab remained active: active=%q removed=%v", activeID, removed)
+	}
+	if activeID != remainingID || a.cmLoad() != remaining.cm {
+		t.Fatalf("remaining tab not active: active=%q", activeID)
+	}
+	before := len(remaining.journal)
+	var emitted atomic.Int32
+	a.eventEmit = func(string, any) { emitted.Add(1) }
+	a.relayTabEvent(closedID, "event", `{"type":"chat","data":{"text":"late"}}`)
+	if len(remaining.journal) != before {
+		t.Fatal("late removed-tab event was delivered to remaining tab")
+	}
+	if emitted.Load() != 0 {
+		t.Fatal("late removed-tab event was emitted to the webview")
+	}
+}
+
+func TestActivationPublicationDropsSupersededReplayBatch(t *testing.T) {
+	a := newTabApp(t)
+	firstID, first := a.newTab()
+	secondID, second := a.newTab()
+	first.journal = []journalEntry{{name: "event", payload: "first-journal"}}
+	second.journal = []journalEntry{{name: "event", payload: "second-journal"}}
+
+	firstReset := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var mu sync.Mutex
+	var events []journalEntry
+	a.eventEmit = func(name string, payload any) {
+		if name == "tab_reset" && payload == firstID {
+			select {
+			case <-firstReset:
+			default:
+				close(firstReset)
+				<-releaseFirst
+			}
+		}
+		text, _ := payload.(string)
+		mu.Lock()
+		events = append(events, journalEntry{name: name, payload: text})
+		mu.Unlock()
+	}
+
+	firstDone := make(chan struct{})
+	go func() { a.activate(firstID); close(firstDone) }()
+	<-firstReset
+	secondDone := make(chan struct{})
+	go func() { a.activate(secondID); close(secondDone) }()
+	close(releaseFirst)
+	<-firstDone
+	<-secondDone
+
+	mu.Lock()
+	defer mu.Unlock()
+	lastReset := -1
+	for i, event := range events {
+		if event.name == "tab_reset" {
+			lastReset = i
+		}
+	}
+	if lastReset < 0 || events[lastReset].payload != secondID {
+		t.Fatalf("last reset = %#v, want second tab %q", events, secondID)
+	}
+	for _, event := range events[lastReset+1:] {
+		if event.name == "event" && event.payload == "first-journal" {
+			t.Fatalf("superseded first replay published after second reset: %#v", events)
+		}
+	}
+}
+
+func TestRelayAndActivationSharePublicationSequencer(t *testing.T) {
+	t.Run("old relay cannot follow new reset", func(t *testing.T) {
+		a := newTabApp(t)
+		oldID, _ := a.newTab()
+		newID, _ := a.newTab()
+		a.activate(oldID)
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		var mu sync.Mutex
+		var events []journalEntry
+		a.eventEmit = func(name string, payload any) {
+			text, _ := payload.(string)
+			if name == "event" && text == "old" {
+				close(entered)
+				<-release
+			}
+			mu.Lock()
+			events = append(events, journalEntry{name: name, payload: text})
+			mu.Unlock()
+		}
+		relayDone := make(chan struct{})
+		go func() { a.relayTabEvent(oldID, "event", "old"); close(relayDone) }()
+		<-entered
+		activateDone := make(chan struct{})
+		go func() { a.activate(newID); close(activateDone) }()
+		close(release)
+		<-relayDone
+		<-activateDone
+		mu.Lock()
+		defer mu.Unlock()
+		oldAt, resetAt := -1, -1
+		for i, event := range events {
+			if event.name == "event" && event.payload == "old" {
+				oldAt = i
+			}
+			if event.name == "tab_reset" && event.payload == newID {
+				resetAt = i
+			}
+		}
+		if oldAt < 0 || resetAt < 0 || oldAt > resetAt {
+			t.Fatalf("old relay/reset order = %#v", events)
+		}
+	})
+
+	t.Run("new relay cannot precede its reset", func(t *testing.T) {
+		a := newTabApp(t)
+		oldID, _ := a.newTab()
+		newID, _ := a.newTab()
+		a.activate(oldID)
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		var mu sync.Mutex
+		var events []journalEntry
+		a.eventEmit = func(name string, payload any) {
+			text, _ := payload.(string)
+			if name == "tab_reset" && text == newID {
+				close(entered)
+				<-release
+			}
+			mu.Lock()
+			events = append(events, journalEntry{name: name, payload: text})
+			mu.Unlock()
+		}
+		activateDone := make(chan struct{})
+		go func() { a.activate(newID); close(activateDone) }()
+		<-entered
+		relayDone := make(chan struct{})
+		go func() { a.relayTabEvent(newID, "event", "new"); close(relayDone) }()
+		close(release)
+		<-activateDone
+		<-relayDone
+		mu.Lock()
+		defer mu.Unlock()
+		resetAt, newAt := -1, -1
+		for i, event := range events {
+			if event.name == "tab_reset" && event.payload == newID {
+				resetAt = i
+			}
+			if event.name == "event" && event.payload == "new" {
+				newAt = i
+			}
+		}
+		if resetAt < 0 || newAt < 0 || newAt < resetAt {
+			t.Fatalf("new reset/relay order = %#v", events)
+		}
+	})
 }
 
 // TestTabJournalAndBadges covers background-event journaling, badge

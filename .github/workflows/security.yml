@@ -1,11 +1,7 @@
 name: Security Analysis
 
 on:
-  push:
-    branches: [main, dev]
-    tags: ['v*']
-  pull_request:
-    branches: [main, dev]
+  workflow_call:
   schedule:
     - cron: "0 6 * * 1"
 
@@ -74,6 +70,12 @@ jobs:
             go.sum
             client/go.sum
 
+      - name: prepare embedded frontend for client analysis
+        if: matrix.module == 'client'
+        run: |
+          mkdir -p client/frontend/dist
+          touch client/frontend/dist/.security-placeholder
+
       - name: Install govulncheck v1.6.0
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
 
@@ -82,28 +84,17 @@ jobs:
         run: govulncheck ./...
 
   gosec:
-    name: Gosec (${{ matrix.scan }})
+    name: Gosec (${{ matrix.module }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         include:
-          - scan: server-commands
+          - module: root
             directory: .
-            packages: ./cmd/...
-          - scan: server-core
-            directory: .
-            packages: ./internal/auth/... ./internal/channels/... ./internal/chatcrypto/... ./internal/config/... ./internal/filetransfer/... ./internal/netproto/... ./internal/permissions/...
-          - scan: server-services
-            directory: .
-            packages: ./internal/query/... ./internal/recorder/... ./internal/safecast/... ./internal/server/... ./internal/store/...
-          - scan: server-platform
-            directory: .
-            packages: . ./internal/tlscert/... ./internal/turn/... ./internal/version/... ./internal/webrtc/... ./v1/...
-          - scan: client
+          - module: client
             directory: client
-            packages: ./...
 
     steps:
       - name: Checkout repository
@@ -119,12 +110,18 @@ jobs:
             go.sum
             client/go.sum
 
+      - name: prepare embedded frontend for client analysis
+        if: matrix.module == 'client'
+        run: |
+          mkdir -p client/frontend/dist
+          touch client/frontend/dist/.security-placeholder
+
       - name: Install gosec v2.28.0
         run: go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
 
-      - name: Scan ${{ matrix.scan }}
+      - name: Scan ${{ matrix.module }} module
         working-directory: ${{ matrix.directory }}
-        run: gosec -quiet -exclude-generated ${{ matrix.packages }}
+        run: gosec -quiet -exclude-generated ./...
 
   npm-audit:
     name: Frontend npm audit

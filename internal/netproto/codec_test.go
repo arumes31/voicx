@@ -1,10 +1,34 @@
 package netproto
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"testing"
 )
+
+func TestFileLinkResponseSchemeCompatibility(t *testing.T) {
+	response := FileLinkResponse{
+		Path:       "/dl/0123456789abcdef0123456789abcdef",
+		Scheme:     "http",
+		HealthPort: 12337,
+		ExpiresAt:  123456,
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) != `{"path":"/dl/0123456789abcdef0123456789abcdef","scheme":"http","health_port":12337,"expires_at":123456}` {
+		t.Fatalf("encoded FileLinkResponse = %s", encoded)
+	}
+	var legacy FileLinkResponse
+	if err := json.Unmarshal([]byte(`{"path":"/dl/0123456789abcdef0123456789abcdef","health_port":12337,"expires_at":123456}`), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Scheme != "" || legacy.Path != response.Path || legacy.HealthPort != response.HealthPort || legacy.ExpiresAt != response.ExpiresAt {
+		t.Fatalf("legacy FileLinkResponse = %+v", legacy)
+	}
+}
 
 func TestMessageTypeString(t *testing.T) {
 	names := []string{

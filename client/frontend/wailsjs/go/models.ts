@@ -1102,6 +1102,7 @@ export namespace netproto {
 	}
 	export class FileLinkResponse {
 	    path: string;
+	    scheme?: string;
 	    health_port: number;
 	    expires_at: number;
 	
@@ -1112,6 +1113,7 @@ export namespace netproto {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.path = source["path"];
+	        this.scheme = source["scheme"];
 	        this.health_port = source["health_port"];
 	        this.expires_at = source["expires_at"];
 	    }

@@ -71,18 +71,18 @@ func groupTypeOf(t string) string {
 }
 
 // handleGroupList lists groups with member counts and cosmetics.
-func (s *TCPServer) handleGroupList(_ context.Context, client *Client, f *netproto.Frame) error {
+func (s *TCPServer) handleGroupList(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.GroupList
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed group_list: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed group_list: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Groups == nil {
-		return s.sendError(client, errCodeUnavailable, "group store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group store unavailable")
 	}
 	groupType := groupTypeOf(msg.Type)
-	resp, err := s.groupListResponse(context.Background(), groupType)
+	resp, err := s.groupListResponse(ctx, groupType)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "group list failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group list failed")
 	}
 	return s.writeMessage(client, netproto.MsgGroupListResponse, resp)
 }
@@ -91,31 +91,31 @@ func (s *TCPServer) handleGroupList(_ context.Context, client *Client, f *netpro
 func (s *TCPServer) handleGroupCreate(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.GroupCreate
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed group_create: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed group_create: "+err.Error())
 	}
 	if msg.Name == "" {
-		return s.sendError(client, errCodeMalformed, "group name is required")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "group name is required")
 	}
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	key := groupManageKey(msg.Type)
 	if !pc.granted(key) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(key))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(key))
 	}
 	if s.deps == nil || s.deps.Groups == nil {
-		return s.sendError(client, errCodeUnavailable, "group store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group store unavailable")
 	}
 	groupType := groupTypeOf(msg.Type)
 	id, err := s.deps.Groups.CreateGroup(ctx, groupType, msg.Name, msg.SortID)
 	if err != nil {
-		return s.sendError(client, errCodeMalformed, "group create failed: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "group create failed: "+err.Error())
 	}
 	s.audit(ctx, client.UniqueID, "group_create", groupType+":"+msg.Name, fmt.Sprintf("id=%d", id))
 	resp, err := s.groupListResponse(ctx, groupType)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "group list failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group list failed")
 	}
 	return s.writeMessage(client, netproto.MsgGroupListResponse, resp)
 }
@@ -124,21 +124,21 @@ func (s *TCPServer) handleGroupCreate(ctx context.Context, client *Client, f *ne
 func (s *TCPServer) handleGroupRename(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.GroupRename
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed group_rename: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed group_rename: "+err.Error())
 	}
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	key := groupManageKey(msg.Type)
 	if !pc.granted(key) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(key))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(key))
 	}
 	if s.deps == nil || s.deps.Groups == nil {
-		return s.sendError(client, errCodeUnavailable, "group store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group store unavailable")
 	}
 	if err := s.deps.Groups.RenameGroup(ctx, msg.Type, msg.GroupID, msg.Name); err != nil {
-		return s.sendError(client, errCodeNotFound, "rename failed: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "rename failed: "+err.Error())
 	}
 	s.audit(ctx, client.UniqueID, "group_rename", fmt.Sprintf("%s:%d", msg.Type, msg.GroupID), msg.Name)
 	return nil
@@ -148,18 +148,18 @@ func (s *TCPServer) handleGroupRename(ctx context.Context, client *Client, f *ne
 func (s *TCPServer) handleGroupDelete(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.GroupDelete
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed group_delete: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed group_delete: "+err.Error())
 	}
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	key := groupManageKey(msg.Type)
 	if !pc.granted(key) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(key))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(key))
 	}
 	if s.deps == nil || s.deps.Groups == nil {
-		return s.sendError(client, errCodeUnavailable, "group store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group store unavailable")
 	}
 	// The members are the audience of the invalidation, so they have to be
 	// read while the memberships still exist (151).
@@ -185,12 +185,12 @@ func (s *TCPServer) handleGroupDelete(ctx context.Context, client *Client, f *ne
 				s.deps.Perms.InvalidateAll()
 			}
 			s.notifyPermsInvalid("group_delete", audience)
-			return s.sendError(client, errCodeUnavailable, "group deletion outcome is indeterminate")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group deletion outcome is indeterminate")
 		}
 		if errors.Is(err, errGroupDeleteAssetUnavailable) {
-			return s.sendError(client, errCodeUnavailable, "group icon lifecycle unavailable")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group icon lifecycle unavailable")
 		}
-		return s.sendError(client, errCodeMalformed, "delete failed: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "delete failed: "+err.Error())
 	}
 	s.audit(ctx, client.UniqueID, "group_delete", fmt.Sprintf("%s:%d", msg.Type, msg.GroupID), fmt.Sprintf("force=%t", msg.Force))
 	if s.deps.Perms != nil {
@@ -198,7 +198,7 @@ func (s *TCPServer) handleGroupDelete(ctx context.Context, client *Client, f *ne
 	}
 	s.notifyPermsInvalid("group_delete", audience)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "group deleted but icon cleanup failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group deleted but icon cleanup failed")
 	}
 	return nil
 }
@@ -231,26 +231,26 @@ func validGroupColor(c string) bool {
 func (s *TCPServer) handleGroupEdit(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.GroupEdit
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed group_edit: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed group_edit: "+err.Error())
 	}
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	if !pc.granted(permissions.PermissionKeyServerGroupManage) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyServerGroupManage))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyServerGroupManage))
 	}
 	if s.deps == nil || s.deps.Groups == nil {
-		return s.sendError(client, errCodeUnavailable, "group store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group store unavailable")
 	}
 	if msg.Color == nil && msg.Hoist == nil && msg.SortID == nil {
-		return s.sendError(client, errCodeMalformed, "group_edit carries no fields")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "group_edit carries no fields")
 	}
 	if msg.Color != nil && !validGroupColor(*msg.Color) {
-		return s.sendError(client, errCodeMalformed, "color must be #rrggbb or empty")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "color must be #rrggbb or empty")
 	}
 	if err := s.deps.Groups.SetGroupCosmetics(ctx, msg.GroupID, msg.Color, msg.Hoist, msg.SortID); err != nil {
-		return s.sendError(client, errCodeNotFound, "group edit failed: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "group edit failed: "+err.Error())
 	}
 	detail := ""
 	if msg.Color != nil {
@@ -268,7 +268,7 @@ func (s *TCPServer) handleGroupEdit(ctx context.Context, client *Client, f *netp
 	s.notifyPermsInvalid("group_edit", s.serverGroupAudience(ctx, msg.GroupID))
 	resp, err := s.groupListResponse(ctx, "server")
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "group list failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group list failed")
 	}
 	return s.writeMessage(client, netproto.MsgGroupListResponse, resp)
 }
@@ -280,35 +280,35 @@ func (s *TCPServer) handleGroupEdit(ctx context.Context, client *Client, f *netp
 func (s *TCPServer) handleGroupAssign(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.GroupAssign
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed group_assign: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed group_assign: "+err.Error())
 	}
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	key := groupManageKey(msg.Type)
 	if !pc.granted(key) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(key))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(key))
 	}
 	if s.deps == nil || s.deps.Groups == nil || s.deps.Auth == nil {
-		return s.sendError(client, errCodeUnavailable, "group store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group store unavailable")
 	}
 	user, err := s.deps.Auth.LookupUser(ctx, msg.UniqueID)
 	if err != nil {
-		return s.sendError(client, errCodeNotFound, "target user not found")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "target user not found")
 	}
 
 	expiresIn := time.Duration(msg.ExpiresInSeconds) * time.Second
 	if msg.Type == "channel" {
 		if msg.ChannelID == 0 {
-			return s.sendError(client, errCodeMalformed, "channel_id is required for channel groups")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "channel_id is required for channel groups")
 		}
 		if err := s.deps.Groups.AssignChannelGroup(ctx, msg.GroupID, user.ID, msg.ChannelID); err != nil {
-			return s.sendError(client, errCodeUnavailable, "assign failed: "+err.Error())
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "assign failed: "+err.Error())
 		}
 	} else {
 		if err := s.deps.Groups.AssignServerGroup(ctx, msg.GroupID, user.ID, expiresIn); err != nil {
-			return s.sendError(client, errCodeUnavailable, "assign failed: "+err.Error())
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "assign failed: "+err.Error())
 		}
 	}
 	s.audit(ctx, client.UniqueID, "group_assign", fmt.Sprintf("%s:%d", msg.Type, msg.GroupID),
@@ -331,31 +331,31 @@ func (s *TCPServer) handleGroupAssign(ctx context.Context, client *Client, f *ne
 func (s *TCPServer) handleGroupUnassign(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.GroupUnassign
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed group_unassign: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed group_unassign: "+err.Error())
 	}
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	key := groupManageKey(msg.Type)
 	if !pc.granted(key) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(key))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(key))
 	}
 	if s.deps == nil || s.deps.Groups == nil || s.deps.Auth == nil {
-		return s.sendError(client, errCodeUnavailable, "group store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group store unavailable")
 	}
 	user, err := s.deps.Auth.LookupUser(ctx, msg.UniqueID)
 	if err != nil {
-		return s.sendError(client, errCodeNotFound, "target user not found")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "target user not found")
 	}
 
 	if msg.Type == "channel" {
 		if err := s.deps.Groups.UnassignChannelGroup(ctx, user.ID, msg.ChannelID); err != nil {
-			return s.sendError(client, errCodeUnavailable, "unassign failed: "+err.Error())
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "unassign failed: "+err.Error())
 		}
 	} else {
 		if err := s.deps.Groups.UnassignServerGroup(ctx, msg.GroupID, user.ID); err != nil {
-			return s.sendError(client, errCodeUnavailable, "unassign failed: "+err.Error())
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "unassign failed: "+err.Error())
 		}
 	}
 	s.audit(ctx, client.UniqueID, "group_unassign", fmt.Sprintf("%s:%d", msg.Type, msg.GroupID), "user="+msg.UniqueID)
@@ -551,31 +551,31 @@ func (s *TCPServer) ReapExpiredGroups(ctx context.Context) {
 func (s *TCPServer) handleGroupIconSet(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.GroupIconSet
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed group_icon_set: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed group_icon_set: "+err.Error())
 	}
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	if !pc.granted(permissions.PermissionKeyServerGroupManage) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyServerGroupManage))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyServerGroupManage))
 	}
 	if msg.GroupID <= 0 {
-		return s.sendError(client, errCodeMalformed, "group_id must be positive")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "group_id must be positive")
 	}
 	if s.deps == nil || s.deps.Groups == nil {
-		return s.sendError(client, errCodeUnavailable, "group store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group store unavailable")
 	}
 	raw, ext, err := decodeImage(msg.DataBase64)
 	if err != nil {
-		return s.sendError(client, errCodeMalformed, err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, err.Error())
 	}
 	fileName, err := s.assets().writeGroupIconWithMetadata(ctx, msg.GroupID, ext, raw, s.deps.Groups)
 	if err != nil {
 		if errors.Is(err, errAssetGroupMissing) {
-			return s.sendError(client, errCodeNotFound, "server group not found")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "server group not found")
 		}
-		return s.sendError(client, errCodeUnavailable, "group icon update failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group icon update failed")
 	}
 	s.audit(ctx, client.UniqueID, "group_icon_set", fmt.Sprintf("server:%d", msg.GroupID), fileName)
 	return nil
@@ -586,10 +586,10 @@ func (s *TCPServer) handleGroupIconSet(ctx context.Context, client *Client, f *n
 func (s *TCPServer) handleGroupIconGet(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.GroupIconGet
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed group_icon_get: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed group_icon_get: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Groups == nil {
-		return s.sendError(client, errCodeUnavailable, "group store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group store unavailable")
 	}
 	raw, image, err := s.assets().readGroupIcon(ctx, msg.GroupID, s.deps.Groups)
 	if err == nil {
@@ -600,7 +600,7 @@ func (s *TCPServer) handleGroupIconGet(ctx context.Context, client *Client, f *n
 		})
 	}
 	if errors.Is(err, errGroupIconMetadataRead) {
-		return s.sendError(client, errCodeUnavailable, "group icon lookup failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group icon lookup failed")
 	}
 	return s.writeMessage(client, netproto.MsgGroupIconData, netproto.GroupIconData{GroupID: msg.GroupID})
 }
@@ -610,23 +610,23 @@ func (s *TCPServer) handleGroupIconGet(ctx context.Context, client *Client, f *n
 func (s *TCPServer) handleGroupMembers(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.GroupMembers
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed group_members: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed group_members: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Groups == nil {
-		return s.sendError(client, errCodeUnavailable, "group store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group store unavailable")
 	}
 	var members []store.GroupMember
 	var err error
 	if msg.Type == "channel" {
 		if msg.ChannelID == 0 {
-			return s.sendError(client, errCodeMalformed, "channel_id is required for channel groups")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "channel_id is required for channel groups")
 		}
 		members, err = s.deps.Groups.ListChannelGroupMembers(ctx, msg.GroupID, msg.ChannelID)
 	} else {
 		members, err = s.deps.Groups.ListServerGroupMembers(ctx, msg.GroupID)
 	}
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "member list failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "member list failed")
 	}
 	resp := netproto.GroupMembersResponse{Type: groupTypeOf(msg.Type), GroupID: msg.GroupID, Members: []netproto.GroupMemberEntry{}}
 	for _, m := range members {
@@ -731,35 +731,35 @@ func (s *TCPServer) grantCapOkWrite(pc *permChecker, current map[string]store.Pe
 func (s *TCPServer) handlePermSet(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.PermSet
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed perm_set: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed perm_set: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Groups == nil {
-		return s.sendError(client, errCodeUnavailable, "group store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group store unavailable")
 	}
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	if !pc.granted(permissions.PermissionKeyPermissionManage) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyPermissionManage))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyPermissionManage))
 	}
 	tier, target, err := s.permTarget(ctx, msg.Tier, msg.UniqueID, msg.GroupID, msg.ChannelID)
 	if err != nil {
-		return s.sendError(client, errCodeMalformed, err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, err.Error())
 	}
 	s.permWriteMu.Lock()
 	current, err := s.currentPerms(ctx, pc, tier, target)
 	if err != nil {
 		s.permWriteMu.Unlock()
-		return s.sendError(client, errCodeUnavailable, "perm lookup failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "perm lookup failed")
 	}
 	if !s.grantCapOkWrite(pc, current, msg.Key, msg.Value, msg.Grant) {
 		s.permWriteMu.Unlock()
-		return s.sendError(client, errCodePermissionDenied, "grant cap exceeded: you may only set values <= your own grant for this key")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "grant cap exceeded: you may only set values <= your own grant for this key")
 	}
 	if err := s.deps.Groups.SetPermission(ctx, tier, target, msg.Key, msg.Value, msg.Grant, msg.Skip, msg.Negate); err != nil {
 		s.permWriteMu.Unlock()
-		return s.sendError(client, errCodeUnavailable, "perm set failed: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "perm set failed: "+err.Error())
 	}
 	s.permWriteMu.Unlock()
 	s.audit(ctx, client.UniqueID, "perm_set", fmt.Sprintf("%s/%s", msg.Tier, msg.Key),
@@ -776,25 +776,25 @@ func (s *TCPServer) handlePermSet(ctx context.Context, client *Client, f *netpro
 func (s *TCPServer) handlePermList(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.PermList
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed perm_list: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed perm_list: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Groups == nil {
-		return s.sendError(client, errCodeUnavailable, "group store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group store unavailable")
 	}
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	if !pc.granted(permissions.PermissionKeyPermissionManage) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyPermissionManage))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyPermissionManage))
 	}
 	tier, target, err := s.permTarget(ctx, msg.Tier, msg.UniqueID, msg.GroupID, msg.ChannelID)
 	if err != nil {
-		return s.sendError(client, errCodeMalformed, err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, err.Error())
 	}
 	entries, err := s.deps.Groups.ListPermissions(ctx, tier, target)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "perm list failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "perm list failed")
 	}
 	resp := netproto.PermListResponse{Tier: string(tier), Entries: []netproto.PermissionEntry{}}
 	for _, e := range entries {
@@ -809,21 +809,21 @@ func (s *TCPServer) handlePermList(ctx context.Context, client *Client, f *netpr
 func (s *TCPServer) handlePermUnset(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.PermUnset
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed perm_unset: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed perm_unset: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Groups == nil {
-		return s.sendError(client, errCodeUnavailable, "group store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group store unavailable")
 	}
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	if !pc.granted(permissions.PermissionKeyPermissionManage) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyPermissionManage))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyPermissionManage))
 	}
 	tier, target, err := s.permTarget(ctx, msg.Tier, msg.UniqueID, msg.GroupID, msg.ChannelID)
 	if err != nil {
-		return s.sendError(client, errCodeMalformed, err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, err.Error())
 	}
 	// Removing an entry is a write like setting it, and the cap has to be
 	// measured against the entry being deleted: otherwise a low-power operator
@@ -832,15 +832,15 @@ func (s *TCPServer) handlePermUnset(ctx context.Context, client *Client, f *netp
 	current, err := s.currentPerms(ctx, pc, tier, target)
 	if err != nil {
 		s.permWriteMu.Unlock()
-		return s.sendError(client, errCodeUnavailable, "perm lookup failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "perm lookup failed")
 	}
 	if !s.grantCapOkWrite(pc, current, msg.Key, 0, 0) {
 		s.permWriteMu.Unlock()
-		return s.sendError(client, errCodePermissionDenied, "grant cap exceeded: you may only unset entries within your own grant for this key")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "grant cap exceeded: you may only unset entries within your own grant for this key")
 	}
 	if err := s.deps.Groups.UnsetPermission(ctx, tier, target, msg.Key); err != nil {
 		s.permWriteMu.Unlock()
-		return s.sendError(client, errCodeUnavailable, "perm unset failed: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "perm unset failed: "+err.Error())
 	}
 	s.permWriteMu.Unlock()
 	s.audit(ctx, client.UniqueID, "perm_unset", fmt.Sprintf("%s/%s", msg.Tier, msg.Key), fmt.Sprintf("target=%+v", target))
@@ -898,35 +898,35 @@ func (s *TCPServer) permCopyTarget(ctx context.Context, kind, id string, channel
 func (s *TCPServer) handlePermCopy(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.PermCopy
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed perm_copy: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed perm_copy: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Groups == nil {
-		return s.sendError(client, errCodeUnavailable, "group store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group store unavailable")
 	}
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	if !pc.granted(permissions.PermissionKeyPermissionManage) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyPermissionManage))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyPermissionManage))
 	}
 	fromTier, fromTarget, err := s.permCopyTarget(ctx, msg.FromKind, msg.FromID, msg.ChannelID)
 	if err != nil {
-		return s.sendError(client, errCodeMalformed, "source: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "source: "+err.Error())
 	}
 	toTier, toTarget, err := s.permCopyTarget(ctx, msg.ToKind, msg.ToID, msg.ChannelID)
 	if err != nil {
-		return s.sendError(client, errCodeMalformed, "destination: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "destination: "+err.Error())
 	}
 	if fromTier == toTier && fromTarget == toTarget {
-		return s.sendError(client, errCodeMalformed, "source and destination are the same target")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "source and destination are the same target")
 	}
 
 	s.permWriteMu.Lock()
 	errCode, errMessage, src := s.doPermCopyLocked(ctx, pc, fromTier, fromTarget, toTier, toTarget, msg.Replace)
 	s.permWriteMu.Unlock()
 	if errMessage != "" {
-		return s.sendError(client, errCode, errMessage)
+		return s.sendErrorFor(client, requestOrigin(ctx), errCode, errMessage)
 	}
 
 	s.audit(ctx, client.UniqueID, "perm_copy",
@@ -1067,28 +1067,28 @@ var permTemplates = map[string]map[string]permTemplateEntry{
 func (s *TCPServer) handlePermTemplateApply(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.PermTemplateApply
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed perm_template_apply: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed perm_template_apply: "+err.Error())
 	}
 	tmpl, ok := permTemplates[msg.Template]
 	if !ok {
-		return s.sendError(client, errCodeMalformed, "unknown template (want guest|member|moderator|admin)")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "unknown template (want guest|member|moderator|admin)")
 	}
 	if s.deps == nil || s.deps.Groups == nil {
-		return s.sendError(client, errCodeUnavailable, "group store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "group store unavailable")
 	}
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	if !pc.granted(permissions.PermissionKeyPermissionManage) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyPermissionManage))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyPermissionManage))
 	}
 	tier, target, err := s.permTarget(ctx, msg.Tier, msg.UniqueID, msg.GroupID, 0)
 	if err != nil {
-		return s.sendError(client, errCodeMalformed, err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, err.Error())
 	}
 	if tier != store.PermTierServerGroup && tier != store.PermTierClient {
-		return s.sendError(client, errCodeMalformed, "templates apply to server_group or client tiers")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "templates apply to server_group or client tiers")
 	}
 	// A template is a batch of perm_set writes: cap every key it carries
 	// against the value it writes and the entry it would replace, or the admin
@@ -1098,16 +1098,16 @@ func (s *TCPServer) handlePermTemplateApply(ctx context.Context, client *Client,
 	defer s.permWriteMu.Unlock()
 	current, err := s.currentPerms(ctx, pc, tier, target)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "perm lookup failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "perm lookup failed")
 	}
 	for key, e := range tmpl {
 		if !s.grantCapOkWrite(pc, current, key, e.Value, e.Grant) {
-			return s.sendError(client, errCodePermissionDenied, "grant cap exceeded: the template's "+key+" is outside your own grant")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "grant cap exceeded: the template's "+key+" is outside your own grant")
 		}
 	}
 	for key, e := range tmpl {
 		if err := s.deps.Groups.SetPermission(ctx, tier, target, key, e.Value, e.Grant, false, e.Negate); err != nil {
-			return s.sendError(client, errCodeUnavailable, "template apply failed: "+err.Error())
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "template apply failed: "+err.Error())
 		}
 	}
 	s.audit(ctx, client.UniqueID, "perm_template_apply", msg.Template, fmt.Sprintf("tier=%s target=%+v", msg.Tier, target))
@@ -1125,26 +1125,26 @@ func (s *TCPServer) handlePermTemplateApply(ctx context.Context, client *Client,
 func (s *TCPServer) handlePermTrace(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.PermTrace
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed perm_trace: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed perm_trace: "+err.Error())
 	}
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	// Trace is a permission-management view: gate it like editing.
 	if !pc.granted(permissions.PermissionKeyPermissionManage) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyPermissionManage))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyPermissionManage))
 	}
 	if s.deps == nil || s.deps.Auth == nil {
-		return s.sendError(client, errCodeUnavailable, "auth backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "auth backend unavailable")
 	}
 	user, err := s.deps.Auth.LookupUser(ctx, msg.UniqueID)
 	if err != nil {
-		return s.sendError(client, errCodeNotFound, "target user not found")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "target user not found")
 	}
 	tp, err := s.deps.Perms.LoadForClient(ctx, user.ID, msg.ChannelID)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "loading permissions failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "loading permissions failed")
 	}
 
 	key := permissions.PermissionKey(msg.Key)
@@ -1187,21 +1187,21 @@ func (s *TCPServer) handlePermTrace(ctx context.Context, client *Client, f *netp
 func (s *TCPServer) handleAuditLog(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.AuditLog
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed audit_log: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed audit_log: "+err.Error())
 	}
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	if !pc.granted(permissions.PermissionKeyAuditView) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyAuditView))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyAuditView))
 	}
 	if s.deps == nil || s.deps.Groups == nil {
-		return s.sendError(client, errCodeUnavailable, "audit store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "audit store unavailable")
 	}
 	entries, err := s.deps.Groups.AuditList(ctx, msg.BeforeID, msg.Limit)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "audit query failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "audit query failed")
 	}
 	resp := netproto.AuditLogResponse{Entries: []netproto.AuditEntry{}}
 	for _, e := range entries {

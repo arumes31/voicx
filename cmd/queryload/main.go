@@ -8,6 +8,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"sort"
@@ -51,46 +52,92 @@ type result struct {
 	latency    []time.Duration
 }
 
+type queryloadTicker interface {
+	Chan() <-chan time.Time
+	Stop()
+}
+
+type stdQueryloadTicker struct{ *time.Ticker }
+
+func (t stdQueryloadTicker) Chan() <-chan time.Time { return t.C }
+
+type queryloadDeps struct {
+	dialAndLogin func(options) (net.Conn, *bufio.Reader, error)
+	newTicker    func(time.Duration) queryloadTicker
+	now          func() time.Time
+	report       func(options, *result)
+}
+
 func run(parent context.Context, o options) error {
+	return runWithDeps(parent, o, queryloadDeps{
+		dialAndLogin: dialAndLogin,
+		newTicker: func(interval time.Duration) queryloadTicker {
+			return stdQueryloadTicker{Ticker: time.NewTicker(interval)}
+		},
+		now:    time.Now,
+		report: printReport,
+	})
+}
+
+func runWithDeps(parent context.Context, o options, deps queryloadDeps) error {
 	ctx, cancel := context.WithTimeout(parent, o.duration)
 	defer cancel()
 	jobs := make(chan struct{}, o.connections*2)
 	res := &result{latency: make([]time.Duration, 0, o.rate*int(o.duration/time.Second))}
-	var wg sync.WaitGroup
+	type workerConn struct {
+		conn   net.Conn
+		reader *bufio.Reader
+	}
+	workers := make([]workerConn, 0, o.connections)
+	closeWorkers := func() {
+		for _, worker := range workers {
+			_ = worker.conn.Close()
+		}
+	}
 	for i := 0; i < o.connections; i++ {
-		conn, reader, err := dialAndLogin(o)
+		conn, reader, err := deps.dialAndLogin(o)
 		if err != nil {
-			cancel()
+			closeWorkers()
 			return fmt.Errorf("connection %d: %w", i, err)
 		}
+		workers = append(workers, workerConn{conn: conn, reader: reader})
+	}
+	var wg sync.WaitGroup
+	for _, worker := range workers {
 		wg.Add(1)
-		go func() {
+		go func(conn net.Conn, reader *bufio.Reader) {
 			defer wg.Done()
 			defer func() { _ = conn.Close() }()
 			for range jobs {
-				start := time.Now()
+				start := deps.now()
 				if _, err := fmt.Fprintln(conn, o.command); err != nil || readResponse(reader) != nil {
 					res.failed.Add(1)
 					continue
 				}
 				res.ok.Add(1)
 				res.mu.Lock()
-				res.latency = append(res.latency, time.Since(start))
+				res.latency = append(res.latency, deps.now().Sub(start))
 				res.mu.Unlock()
 			}
-		}()
+		}(worker.conn, worker.reader)
 	}
 
 	interval := time.Second / time.Duration(o.rate)
-	ticker := time.NewTicker(interval)
+	ticker := deps.newTicker(interval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			close(jobs)
+			// Closing active connections before joining workers unblocks a
+			// ReadString in readResponse when the query server goes silent.
+			// net.Conn permits concurrent Close and Read, and worker defers make
+			// the duplicate close harmless.
+			closeWorkers()
 			wg.Wait()
-			printReport(o, res)
+			deps.report(o, res)
 			return nil
-		case <-ticker.C:
+		case <-ticker.Chan():
 			select {
 			case jobs <- struct{}{}:
 			default:
@@ -101,7 +148,11 @@ func run(parent context.Context, o options) error {
 }
 
 func dialAndLogin(o options) (net.Conn, *bufio.Reader, error) {
-	conn, err := net.DialTimeout("tcp", o.addr, 5*time.Second)
+	return dialAndLoginWithDial(o, net.DialTimeout)
+}
+
+func dialAndLoginWithDial(o options, dial func(string, string, time.Duration) (net.Conn, error)) (net.Conn, *bufio.Reader, error) {
+	conn, err := dial("tcp", o.addr, 5*time.Second)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -148,6 +199,10 @@ func escape(value string) string {
 }
 
 func printReport(o options, r *result) {
+	printReportTo(os.Stdout, o, r)
+}
+
+func printReportTo(out io.Writer, o options, r *result) {
 	r.mu.Lock()
 	latency := append([]time.Duration(nil), r.latency...)
 	r.mu.Unlock()
@@ -160,6 +215,8 @@ func printReport(o options, r *result) {
 		return latency[idx]
 	}
 	ok := r.ok.Load()
-	fmt.Printf("queryload target=%d/s achieved=%.0f/s ok=%d failed=%d p50=%s p95=%s p99=%s\n",
-		o.rate, float64(ok)/o.duration.Seconds(), ok, r.failed.Load(), percentile(.50), percentile(.95), percentile(.99))
+	if _, err := fmt.Fprintf(out, "queryload target=%d/s achieved=%.0f/s ok=%d failed=%d p50=%s p95=%s p99=%s\n",
+		o.rate, float64(ok)/o.duration.Seconds(), ok, r.failed.Load(), percentile(.50), percentile(.95), percentile(.99)); err != nil {
+		return
+	}
 }

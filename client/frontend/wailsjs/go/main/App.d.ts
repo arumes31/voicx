@@ -239,6 +239,8 @@ export function RegenerateIdentity():Promise<string>;
 
 export function RenameIdentity(arg1:string,arg2:string):Promise<string>;
 
+export function SaveChatAttachment(arg1:number,arg2:string,arg3:string,arg4:string):Promise<string>;
+
 export function SaveSettings(arg1:main.Settings):Promise<string>;
 
 export function SendChat(arg1:string,arg2:string,arg3:string):Promise<string>;

@@ -2,8 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -35,6 +38,10 @@ func TestSettingsRoundTrip(t *testing.T) {
 	if info.Size() == 0 {
 		t.Fatal("settings file is empty")
 	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+		got := info.Mode().Perm()
+		t.Fatalf("settings mode = %#o, want 0600", got)
+	}
 
 	loaded := loadSettingsAt(path)
 	if loaded.ChatMaxLines != 42 || loaded.Volume != 150 || loaded.HotkeyPTT != "F5" {
@@ -45,6 +52,167 @@ func TestSettingsRoundTrip(t *testing.T) {
 	}
 	if len(loaded.WhisperClients) != 1 || loaded.WhisperClients[0] != "uid-1" {
 		t.Fatalf("whisper clients = %+v", loaded.WhisperClients)
+	}
+}
+
+func TestSettingsPresentationBoundsOnSaveAndLoad(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	s := DefaultSettings()
+	s.WindowOpacity = 20
+	s.UIFontSize = 10
+	s.ChatFontSize = 18
+	s.SidebarWidth = 160
+	s.DetailsWidth = 560
+	s.ChatMaxLines = 5000
+	if err := saveSettingsAt(path, s); err != nil {
+		t.Fatalf("save lower/upper bounds: %v", err)
+	}
+	got := loadSettingsAt(path)
+	if got.WindowOpacity != 20 || got.UIFontSize != 10 || got.ChatFontSize != 18 ||
+		got.SidebarWidth != 160 || got.DetailsWidth != 560 || got.ChatMaxLines != 5000 {
+		t.Fatalf("boundary settings = %+v", got)
+	}
+
+	s.WindowOpacity = -1
+	s.UIFontSize = 99
+	s.ChatFontSize = -1
+	s.SidebarWidth = 99
+	s.DetailsWidth = 999
+	s.ChatMaxLines = 99999
+	if err := saveSettingsAt(path, s); err != nil {
+		t.Fatalf("save normalized settings: %v", err)
+	}
+	got = loadSettingsAt(path)
+	if got.WindowOpacity != 20 || got.UIFontSize != 20 || got.ChatFontSize != 12 ||
+		got.SidebarWidth != 160 || got.DetailsWidth != 560 || got.ChatMaxLines != 5000 {
+		t.Fatalf("normalized settings = %+v", got)
+	}
+	// Loading cannot rely on saveSettingsAt having repaired the file: a manual
+	// edit or an older buggy client can leave out-of-range values on disk.
+	raw, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("marshal invalid settings: %v", err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write invalid settings: %v", err)
+	}
+	got = loadSettingsAt(path)
+	if got.WindowOpacity != 20 || got.UIFontSize != 20 || got.ChatFontSize != 12 ||
+		got.SidebarWidth != 160 || got.DetailsWidth != 560 || got.ChatMaxLines != 5000 {
+		t.Fatalf("load did not normalize persisted invalid settings = %+v", got)
+	}
+}
+
+func TestSaveSettingsInvalidInputLeavesCurrentSettingsUntouched(t *testing.T) {
+	a := &App{
+		settings:     DefaultSettings(),
+		hotkeys:      map[string]*hotkeyReg{},
+		settingsPath: filepath.Join(t.TempDir(), "settings.json"),
+	}
+	before := a.GetSettings()
+	invalid := cloneSettings(before)
+	invalid.Volume = 201
+	if got := a.SaveSettings(invalid); got == "" {
+		t.Fatal("invalid settings were accepted")
+	}
+	after := a.GetSettings()
+	if after.Volume != before.Volume || after.ChatMaxLines != before.ChatMaxLines || after.HotkeyPTT != before.HotkeyPTT {
+		t.Fatalf("invalid save changed settings: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestAtomicSettingsRenameFailurePreservesExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	old := DefaultSettings()
+	old.Volume = 101
+	if err := saveSettingsAt(path, old); err != nil {
+		t.Fatalf("write old settings: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read old settings: %v", err)
+	}
+
+	originalRename := settingsRename
+	settingsRename = func(_, _ string) error { return errors.New("injected rename failure") }
+	t.Cleanup(func() { settingsRename = originalRename })
+	newer := DefaultSettings()
+	newer.Volume = 199
+	if err := saveSettingsAt(path, newer); err == nil {
+		t.Fatal("save unexpectedly succeeded")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read after failed save: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("failed atomic save changed the existing settings file")
+	}
+}
+
+func TestEmptySettingsPathFailsOutsideExplicitTestGate(t *testing.T) {
+	old := allowEmptySettingsSnapshot
+	allowEmptySettingsSnapshot = false
+	t.Cleanup(func() { allowEmptySettingsSnapshot = old })
+	if err := saveSettingsAt("", DefaultSettings()); err == nil {
+		t.Fatal("saveSettingsAt accepted an empty path")
+	}
+	if err := saveSettingsSnapshot("", DefaultSettings()); err == nil {
+		t.Fatal("saveSettingsSnapshot accepted an empty path outside its test gate")
+	}
+}
+
+func TestSettingsMutatorsRollbackMemoryAndEffectsOnRenameFailure(t *testing.T) {
+	type mutator struct {
+		name string
+		run  func(*App) string
+	}
+	for _, test := range []mutator{
+		{
+			name: "save settings",
+			run: func(a *App) string {
+				candidate := a.GetSettings()
+				candidate.WindowOpacity = 45
+				candidate.HotkeyPTT = "Ctrl+X"
+				candidate.AlwaysOnTop = true
+				return a.SaveSettings(candidate)
+			},
+		},
+		{name: "opacity", run: func(a *App) string { return a.SetWindowOpacity(45) }},
+		{name: "one hotkey", run: func(a *App) string { return a.SetHotkey("ptt", "Ctrl+X") }},
+		{name: "hotkeys", run: func(a *App) string { return a.SetHotkeys("Ctrl+X", "Ctrl+Y", "Ctrl+Z") }},
+		{name: "always on top", run: func(a *App) string { a.SetAlwaysOnTop(true); return "" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			a, recorder := newEffectTestApp(t)
+			before := a.GetSettings()
+			if err := saveSettingsAt(a.settingsPath, before); err != nil {
+				t.Fatalf("seed settings: %v", err)
+			}
+			originalRename := settingsRename
+			settingsRename = func(_, _ string) error { return errors.New("injected rename failure") }
+			t.Cleanup(func() { settingsRename = originalRename })
+			beforeOpacity, beforePTT, beforeAOT := recorder.lastOpacity(), recorder.lastPTT(), recorder.lastAOT()
+
+			if got := test.run(a); test.name != "always on top" && got == "" {
+				t.Fatal("mutator reported success after a failed atomic write")
+			}
+			if after := a.GetSettings(); !reflect.DeepEqual(after, before) {
+				t.Fatalf("failed save changed in-memory settings: got=%+v want=%+v", after, before)
+			}
+			if disk := loadSettingsAt(a.settingsPath); !reflect.DeepEqual(disk, before) {
+				t.Fatalf("failed save changed on-disk settings: got=%+v want=%+v", disk, before)
+			}
+			if got := recorder.lastOpacity(); got != beforeOpacity {
+				t.Fatalf("failed save changed opacity effect: got=%v want=%v", got, beforeOpacity)
+			}
+			if got := recorder.lastPTT(); got != beforePTT {
+				t.Fatalf("failed save changed hotkey effect: got=%v want=%v", got, beforePTT)
+			}
+			if got := recorder.lastAOT(); got != beforeAOT {
+				t.Fatalf("failed save changed always-on-top effect: got=%v want=%v", got, beforeAOT)
+			}
+		})
 	}
 }
 

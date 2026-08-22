@@ -17,10 +17,12 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 )
 
@@ -40,16 +42,33 @@ func Ensure(dir, certFile, keyFile string, hosts []string) (tls.Certificate, str
 		keyFile = filepath.Join(dir, "key.pem")
 	}
 
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err == nil {
+	certPEM, certErr := os.ReadFile(certFile) // #nosec G304 -- operator-selected certificate path.
+	keyPEM, keyErr := readPrivateKeyFile(keyFile)
+	if certErr == nil && keyErr == nil {
+		cert, err := tls.X509KeyPair(certPEM, keyPEM)
+		if err != nil {
+			return tls.Certificate{}, "", fmt.Errorf("loading TLS certificate: %w", err)
+		}
 		fp, err := Fingerprint(&cert)
 		return cert, fp, err
 	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return tls.Certificate{}, "", fmt.Errorf("loading TLS certificate: %w", err)
+	certMissing := errors.Is(certErr, os.ErrNotExist)
+	keyMissing := errors.Is(keyErr, os.ErrNotExist)
+	switch {
+	case certMissing && keyErr == nil:
+		return tls.Certificate{}, "", fmt.Errorf("TLS certificate is missing while private key exists: %w", certErr)
+	case keyMissing && certErr == nil:
+		return tls.Certificate{}, "", fmt.Errorf("TLS private key is missing while certificate exists: %w", keyErr)
+	case certMissing && keyMissing:
+		// A completely absent pair is the only state in which auto-generation
+		// is safe. Partial material is an operator error and must fail closed.
+	case certErr != nil:
+		return tls.Certificate{}, "", fmt.Errorf("loading TLS certificate: %w", certErr)
+	case keyErr != nil:
+		return tls.Certificate{}, "", fmt.Errorf("loading TLS private key: %w", keyErr)
 	}
 
-	cert, err = generate(hosts)
+	cert, err := generate(hosts)
 	if err != nil {
 		return tls.Certificate{}, "", fmt.Errorf("generating TLS certificate: %w", err)
 	}
@@ -63,15 +82,64 @@ func Ensure(dir, certFile, keyFile string, hosts []string) (tls.Certificate, str
 	return cert, fp, err
 }
 
-// Fingerprint returns the SHA-256 fingerprint of the certificate's leaf as
-// colon-separated lowercase hex (the value clients pin via TOFU).
-func Fingerprint(cert *tls.Certificate) (string, error) {
-	if len(cert.Certificate) == 0 {
-		return "", errors.New("tlscert: certificate has no chain")
+// readPrivateKeyFile reads and checks an existing private key from one opened
+// descriptor. It never changes an operator-managed file's permissions.
+func readPrivateKeyFile(path string) ([]byte, error) {
+	// #nosec G304 -- Ensure accepts an administrator-selected private-key path.
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("TLS private key %q permissions %o are too permissive; remove group and other access", path, info.Mode().Perm())
+	}
+	return io.ReadAll(f)
+}
+
+// Leaf returns the parsed leaf certificate. It performs no I/O and is useful
+// to callers deciding whether a persisted certificate needs operator action.
+func Leaf(cert *tls.Certificate) (*x509.Certificate, error) {
+	if cert == nil || len(cert.Certificate) == 0 {
+		return nil, errors.New("tlscert: certificate has no chain")
 	}
 	leaf, err := x509.ParseCertificate(cert.Certificate[0])
 	if err != nil {
-		return "", fmt.Errorf("parsing leaf certificate: %w", err)
+		return nil, fmt.Errorf("parsing leaf certificate: %w", err)
+	}
+	return leaf, nil
+}
+
+// NotAfter returns the leaf certificate expiry without consulting the clock.
+func NotAfter(cert *tls.Certificate) (time.Time, error) {
+	leaf, err := Leaf(cert)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return leaf.NotAfter, nil
+}
+
+// ExpiresBy reports whether the certificate has expired or will expire at or
+// before deadline. The inclusive boundary keeps a certificate exactly 30 days
+// from expiry visible to the operator's rotation warning.
+func ExpiresBy(cert *tls.Certificate, deadline time.Time) (bool, error) {
+	notAfter, err := NotAfter(cert)
+	if err != nil {
+		return false, err
+	}
+	return !notAfter.After(deadline), nil
+}
+
+// Fingerprint returns the SHA-256 fingerprint of the certificate's leaf as
+// colon-separated lowercase hex (the value clients pin via TOFU).
+func Fingerprint(cert *tls.Certificate) (string, error) {
+	leaf, err := Leaf(cert)
+	if err != nil {
+		return "", err
 	}
 	return FingerprintDER(leaf.Raw), nil
 }

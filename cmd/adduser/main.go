@@ -30,6 +30,10 @@ import (
 )
 
 func main() {
+	os.Exit(runMain())
+}
+
+func runMain() int {
 	nickname := flag.String("nickname", "", "user nickname (required)")
 	password := flag.String("password", "", "user password (required)")
 	admin := flag.Bool("admin", false, "grant server admin (users.is_admin)")
@@ -40,7 +44,7 @@ func main() {
 
 	if *nickname == "" || *password == "" {
 		fmt.Fprintln(os.Stderr, "adduser: -nickname and -password are required")
-		os.Exit(1)
+		return 1
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -48,11 +52,12 @@ func main() {
 	if err := run(ctx, *nickname, *password, *admin, *dsn, *migrationTimeout); err != nil {
 		if errors.Is(err, auth.ErrUserExists) {
 			fmt.Printf("user %q already exists (no changes made)\n", *nickname)
-			return
+			return 0
 		}
 		fmt.Fprintf(os.Stderr, "adduser: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 func run(

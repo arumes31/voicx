@@ -45,10 +45,12 @@ const maxConcurrentDeletedRecorderStops = 8
 
 // userEvent is the payload of user_joined / user_left / user_moved events.
 type userEvent struct {
-	ClientID  string `json:"client_id"`
-	UniqueID  string `json:"unique_id,omitempty"`
-	Nickname  string `json:"nickname,omitempty"`
-	ChannelID int64  `json:"channel_id,omitempty"`
+	ClientID      string `json:"client_id"`
+	UniqueID      string `json:"unique_id,omitempty"`
+	Nickname      string `json:"nickname,omitempty"`
+	ChannelID     int64  `json:"channel_id,omitempty"`
+	FromChannelID int64  `json:"from_channel_id,omitempty"`
+	ByClientID    string `json:"by_client_id,omitempty"`
 }
 
 // channelEvent is the payload of channel_created / channel_deleted events.
@@ -57,6 +59,7 @@ type channelEvent struct {
 	ChannelIDs []int64 `json:"channel_ids,omitempty"`
 	Name       string  `json:"name,omitempty"`
 	ParentID   int64   `json:"parent_id,omitempty"`
+	Reason     string  `json:"reason,omitempty"`
 }
 
 // channelUpdatedEvent is the payload of channel_updated events, carrying the
@@ -83,10 +86,12 @@ type channelUpdatedEvent struct {
 // kickEvent is the payload of kicked events.
 type kickEvent struct {
 	ClientID   string `json:"client_id"`
+	ChannelID  int64  `json:"channel_id,omitempty"`
 	ByClientID string `json:"by_client_id"`
 	Reason     string `json:"reason,omitempty"`
 	FromServer bool   `json:"from_server"`
 	Ban        bool   `json:"ban"`
+	ExpiresAt  int64  `json:"expires_at,omitempty"`
 }
 
 // authChallengeTTL is how long a pending challenge-response challenge remains
@@ -105,10 +110,10 @@ const authChallengeTTL = 30 * time.Second
 func (s *TCPServer) handleAuthenticate(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.Authenticate
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed authenticate: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed authenticate: "+err.Error())
 	}
 	if client.isAuthed() {
-		return s.sendError(client, errCodeMalformed, "already authenticated")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "already authenticated")
 	}
 	// (133) the encryption key is captured before any auth path branches, so
 	// finishAuth can seal the global generation and the MOTD into the reply
@@ -117,27 +122,42 @@ func (s *TCPServer) handleAuthenticate(ctx context.Context, client *Client, f *n
 		client.setX25519(msg.X25519PublicKey)
 	}
 	if s.deps == nil || s.deps.Auth == nil {
-		return s.sendError(client, errCodeUnavailable, "authentication backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "authentication backend unavailable")
+	}
+
+	// Reject banned clients before verifying any password. IP bans apply to
+	// everyone, including guests, while account bans apply to the presented ID.
+	ip := remoteIP(client.Conn)
+	serverPasswordScope := auth.LoginFailureScope("tcp-server-password:"+ip, "")
+	accountSourceScope := auth.LoginFailureScope("tcp:"+ip, "")
+	principalScope := auth.LoginFailureScope("", msg.Username)
+	if reason, err := s.banRejectReason(ctx, client, msg.Username, ip); err != nil {
+		return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "internal error"})
+	} else if reason != "" {
+		s.metricsSink().IncAuthFailure("tcp", "banned")
+		return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: reason})
 	}
 
 	// Global server password: when set, the client must supply it.
 	if s.deps.ServerPasswordHash != "" {
-		if err := auth.VerifyPassword(msg.ServerPassword, s.deps.ServerPasswordHash); err != nil {
+		attempt, allowed := s.loginLimiter.Reserve(serverPasswordScope)
+		if !allowed {
+			s.metricsSink().IncAuthFailure("tcp", "locked_out")
+			return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "too many failed logins, try again later"})
+		}
+		defer attempt.Cancel()
+		if err := s.verifyServerPassword(msg.ServerPassword, s.deps.ServerPasswordHash); err != nil {
+			attempt.Fail()
+			s.metricsSink().IncAuthFailure("tcp", "server_password")
 			return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "invalid server password"})
 		}
+		attempt.Succeed(serverPasswordScope)
 	}
 
 	if msg.Anonymous && msg.Password != "" {
+		s.loginLimiter.RecordFailure(accountSourceScope, principalScope)
+		s.metricsSink().IncAuthFailure("tcp", "invalid_credentials")
 		return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "anonymous login takes no password"})
-	}
-
-	// Reject banned clients before anything else (unique-ID bans apply to
-	// the presented ID; IP bans apply to everyone, including guests).
-	ip := remoteIP(client.Conn)
-	if reason, err := s.banRejectReason(ctx, client, msg.Username, ip); err != nil {
-		return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "internal error"})
-	} else if reason != "" {
-		return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: reason})
 	}
 
 	// Immediate ephemeral guest login.
@@ -147,6 +167,15 @@ func (s *TCPServer) handleAuthenticate(ctx context.Context, client *Client, f *n
 
 	// No password: challenge-response handshake.
 	if msg.Password == "" {
+		// Reserve and release immediately to atomically reject lockouts before
+		// issuing a challenge. The signature verification below reserves the
+		// same scopes for its entire expensive authentication step.
+		attempt, allowed := s.loginLimiter.Reserve(accountSourceScope, principalScope)
+		if !allowed {
+			s.metricsSink().IncAuthFailure("tcp", "locked_out")
+			return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "too many failed logins, try again later"})
+		}
+		attempt.Cancel()
 		challenge, err := auth.GenerateChallenge()
 		if err != nil {
 			s.logger.Warn("challenge generation failed",
@@ -159,35 +188,19 @@ func (s *TCPServer) handleAuthenticate(ctx context.Context, client *Client, f *n
 		return s.writeMessage(client, netproto.MsgAuthChallenge, netproto.AuthChallenge{Challenge: challenge})
 	}
 
-	ok, err := s.deps.Auth.AuthenticatePassword(ctx, msg.Username, msg.Password)
+	attempt, allowed := s.loginLimiter.Reserve(accountSourceScope, principalScope)
+	if !allowed {
+		s.metricsSink().IncAuthFailure("tcp", "locked_out")
+		return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "too many failed logins, try again later"})
+	}
+	defer attempt.Cancel()
+
+	user, err := s.deps.Auth.AuthenticateIdentifier(ctx, msg.Username, msg.Password)
 	if err != nil {
 		if errors.Is(err, auth.ErrUserNotFound) {
-			// Not a unique ID: try nickname login (TS3 model — the account is
-			// found by nickname, the client's identity key gets bound).
-			user, err := s.deps.Auth.AuthenticateNickname(ctx, msg.Username, msg.Password)
-			if err != nil {
-				if errors.Is(err, auth.ErrUserNotFound) {
-					return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "invalid credentials"})
-				}
-				s.logger.Warn("nickname auth failed",
-					zap.String("client_id", client.ID),
-					zap.Error(err),
-				)
-				return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "internal error"})
-			}
-			if user == nil {
-				return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "invalid credentials"})
-			}
-			// Bind the client's identity key so future challenge logins work.
-			if msg.PublicKey != "" {
-				if err := s.deps.Auth.BindPublicKey(ctx, user.ID, msg.PublicKey); err != nil {
-					s.logger.Warn("public key binding failed",
-						zap.String("client_id", client.ID),
-						zap.Error(err),
-					)
-				}
-			}
-			return s.completeAuthForUser(ctx, client, user)
+			attempt.Fail()
+			s.metricsSink().IncAuthFailure("tcp", "invalid_credentials")
+			return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "invalid credentials"})
 		}
 		s.logger.Warn("authenticate failed",
 			zap.String("client_id", client.ID),
@@ -195,11 +208,30 @@ func (s *TCPServer) handleAuthenticate(ctx context.Context, client *Client, f *n
 		)
 		return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "internal error"})
 	}
-	if !ok {
+	if user == nil {
+		attempt.Fail()
+		s.metricsSink().IncAuthFailure("tcp", "invalid_credentials")
 		return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "invalid credentials"})
 	}
 
-	return s.completeAuth(ctx, client, msg.Username)
+	// Bind the client's identity key so future challenge logins work.
+	if msg.PublicKey != "" {
+		if err := s.deps.Auth.BindPublicKey(ctx, user.ID, msg.PublicKey); err != nil {
+			s.logger.Warn("public key binding failed",
+				zap.String("client_id", client.ID),
+				zap.Error(err),
+			)
+		}
+	}
+	attempt.Succeed(principalScope)
+	return s.completeAuthForUser(ctx, client, user)
+}
+
+func (s *TCPServer) verifyServerPassword(password, encodedHash string) error {
+	if s.deps != nil && s.deps.VerifyServerPassword != nil {
+		return s.deps.VerifyServerPassword(password, encodedHash)
+	}
+	return auth.VerifyPassword(password, encodedHash)
 }
 
 // handleAuthSignature completes the challenge-response handshake: it verifies
@@ -208,10 +240,10 @@ func (s *TCPServer) handleAuthenticate(ctx context.Context, client *Client, f *n
 func (s *TCPServer) handleAuthSignature(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.AuthSignature
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed auth_signature: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed auth_signature: "+err.Error())
 	}
 	if client.isAuthed() {
-		return s.sendError(client, errCodeMalformed, "already authenticated")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "already authenticated")
 	}
 	// The guest/challenge path leaves Authenticate.PublicKey empty and carries
 	// its keys here instead, so the encryption key is captured here too (133).
@@ -219,21 +251,35 @@ func (s *TCPServer) handleAuthSignature(ctx context.Context, client *Client, f *
 		client.setX25519(msg.X25519PublicKey)
 	}
 	if s.deps == nil || s.deps.Auth == nil {
-		return s.sendError(client, errCodeUnavailable, "authentication backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "authentication backend unavailable")
 	}
 
 	if msg.PublicKey != "" {
 		return s.handleGuestSignature(ctx, client, msg)
 	}
 
+	ip := remoteIP(client.Conn)
+	sourceScope := auth.LoginFailureScope("tcp:"+ip, "")
+	principalScope := auth.LoginFailureScope("", msg.UniqueID)
+	attempt, allowed := s.loginLimiter.Reserve(sourceScope, principalScope)
+	if !allowed {
+		s.metricsSink().IncAuthFailure("tcp", "locked_out")
+		return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "too many failed logins, try again later"})
+	}
+	defer attempt.Cancel()
+
 	challenge, _, ok := client.takeChallenge(msg.UniqueID)
 	if !ok {
+		attempt.Fail()
+		s.metricsSink().IncAuthFailure("tcp", "invalid_credentials")
 		return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "no pending challenge"})
 	}
 
 	verified, err := s.deps.Auth.AuthenticateChallenge(ctx, msg.UniqueID, challenge, msg.Signature)
 	if err != nil {
 		if errors.Is(err, auth.ErrUserNotFound) {
+			attempt.Fail()
+			s.metricsSink().IncAuthFailure("tcp", "invalid_credentials")
 			return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "invalid credentials"})
 		}
 		s.logger.Warn("challenge verification failed",
@@ -243,9 +289,12 @@ func (s *TCPServer) handleAuthSignature(ctx context.Context, client *Client, f *
 		return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "internal error"})
 	}
 	if !verified {
+		attempt.Fail()
+		s.metricsSink().IncAuthFailure("tcp", "invalid_credentials")
 		return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "invalid credentials"})
 	}
 
+	attempt.Succeed(principalScope)
 	return s.completeAuth(ctx, client, msg.UniqueID)
 }
 
@@ -253,30 +302,52 @@ func (s *TCPServer) handleAuthSignature(ctx context.Context, client *Client, f *
 // key and authenticates the client as a registered user (if the derived
 // unique ID has a users row) or as a guest with the key-derived unique ID.
 func (s *TCPServer) handleGuestSignature(ctx context.Context, client *Client, msg netproto.AuthSignature) error {
+	ip := remoteIP(client.Conn)
+	sourceScope := auth.LoginFailureScope("tcp:"+ip, "")
+	principalScope := auth.LoginFailureScope("", msg.PublicKey)
 	uniqueID, err := auth.UniqueIDFromPublicKey(msg.PublicKey)
 	if err != nil {
+		attempt, allowed := s.loginLimiter.Reserve(sourceScope, principalScope)
+		if !allowed {
+			s.metricsSink().IncAuthFailure("tcp", "locked_out")
+			return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "too many failed logins, try again later"})
+		}
+		attempt.Fail()
+		s.metricsSink().IncAuthFailure("tcp", "invalid_credentials")
 		return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "invalid public key"})
 	}
+	principalScope = auth.LoginFailureScope("", uniqueID)
 
 	// A guest could bypass the Authenticate-time unique-ID ban check by
 	// withholding the ID until now; re-check with the derived ID.
-	ip := remoteIP(client.Conn)
 	if reason, err := s.banRejectReason(ctx, client, uniqueID, ip); err != nil {
 		return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "internal error"})
 	} else if reason != "" {
+		s.metricsSink().IncAuthFailure("tcp", "banned")
 		return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: reason})
 	}
+	attempt, allowed := s.loginLimiter.Reserve(sourceScope, principalScope)
+	if !allowed {
+		s.metricsSink().IncAuthFailure("tcp", "locked_out")
+		return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "too many failed logins, try again later"})
+	}
+	defer attempt.Cancel()
 
 	challenge, nickname, ok := client.takeChallenge("")
 	if !ok {
+		attempt.Fail()
+		s.metricsSink().IncAuthFailure("tcp", "invalid_credentials")
 		return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "no pending challenge"})
 	}
 	if err := auth.VerifyChallenge(msg.PublicKey, challenge, msg.Signature); err != nil {
+		attempt.Fail()
+		s.metricsSink().IncAuthFailure("tcp", "invalid_credentials")
 		return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "invalid credentials"})
 	}
 
 	// Registered user with this identity? Then it is a normal login.
 	if _, err := s.deps.Auth.LookupUser(ctx, uniqueID); err == nil {
+		attempt.Succeed(principalScope)
 		return s.completeAuth(ctx, client, uniqueID)
 	} else if !errors.Is(err, auth.ErrUserNotFound) {
 		s.logger.Warn("user lookup failed",
@@ -289,6 +360,7 @@ func (s *TCPServer) handleGuestSignature(ctx context.Context, client *Client, ms
 	// Account with this key bound via a nickname login? The account's unique
 	// ID stays canonical even though it differs from the key-derived one.
 	if user, err := s.deps.Auth.LookupUserByPublicKey(ctx, msg.PublicKey); err == nil {
+		attempt.Succeed(principalScope)
 		return s.completeAuthForUser(ctx, client, user)
 	} else if !errors.Is(err, auth.ErrUserNotFound) {
 		s.logger.Warn("user lookup by public key failed",
@@ -298,6 +370,7 @@ func (s *TCPServer) handleGuestSignature(ctx context.Context, client *Client, ms
 		return s.writeMessage(client, netproto.MsgAuthResponse, netproto.AuthResponse{Reason: "internal error"})
 	}
 
+	attempt.Succeed(principalScope)
 	return s.completeGuestAuth(ctx, client, uniqueID, nickname)
 }
 
@@ -495,10 +568,6 @@ func (s *TCPServer) finishAuth(ctx context.Context, client *Client, id authIdent
 	// and a failing rules read costs it none of that.
 	s.sendPendingRules(ctx, client, id.guest)
 
-	if s.deps.State != nil {
-		s.metricsSink().SetClientsConnected(s.deps.State.ClientCount())
-	}
-
 	s.broadcastEvent(eventUserJoined, userEvent{
 		ClientID: client.ID,
 		UniqueID: id.uniqueID,
@@ -621,10 +690,10 @@ func (s *TCPServer) sendPendingRules(ctx context.Context, client *Client, guest 
 func (s *TCPServer) handleServerRulesAccept(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.ServerRulesAccept
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed server_rules_accept: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed server_rules_accept: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Rules == nil {
-		return s.sendError(client, errCodeUnavailable, "server rules unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "server rules unavailable")
 	}
 	text, hash, err := s.deps.Rules.Text(ctx)
 	if err != nil {
@@ -632,10 +701,10 @@ func (s *TCPServer) handleServerRulesAccept(ctx context.Context, client *Client,
 			zap.String("client_id", client.ID),
 			zap.Error(err),
 		)
-		return s.sendError(client, errCodeUnavailable, "server rules unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "server rules unavailable")
 	}
 	if hash == "" || msg.Hash != hash {
-		if err := s.sendError(client, errCodeMalformed, "the server rules changed since they were shown"); err != nil {
+		if err := s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "the server rules changed since they were shown"); err != nil {
 			return err
 		}
 		client.setRulesPending(hash != "")
@@ -649,7 +718,7 @@ func (s *TCPServer) handleServerRulesAccept(ctx context.Context, client *Client,
 				zap.String("client_id", client.ID),
 				zap.Error(err),
 			)
-			return s.sendError(client, errCodeUnavailable, "recording the acceptance failed")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "recording the acceptance failed")
 		}
 	}
 	client.setRulesPending(false)
@@ -697,20 +766,20 @@ func newGuestUniqueID() string {
 func (s *TCPServer) handleCreateChannel(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.CreateChannel
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed create_channel: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed create_channel: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Channels == nil {
-		return s.sendError(client, errCodeUnavailable, "channel backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "channel backend unavailable")
 	}
 
 	ct, err := channels.ParseChannelType(msg.Type)
 	if err != nil {
-		return s.sendError(client, errCodeMalformed, "invalid channel type")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "invalid channel type")
 	}
 
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	var permKey permissions.PermissionKey
 	switch ct {
@@ -722,13 +791,13 @@ func (s *TCPServer) handleCreateChannel(ctx context.Context, client *Client, f *
 		permKey = permissions.PermissionKeyChannelCreateTemporary
 	}
 	if !pc.granted(permKey) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permKey))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permKey))
 	}
 	// A caller may not set a needed join power above their own join power
 	// (admins bypass), mirroring the TS3 power-cap rule.
 	if msg.NeededJoinPower > 0 && !pc.admin &&
 		pc.power(permissions.PermissionKeyChannelJoinPower) < msg.NeededJoinPower {
-		return s.sendError(client, errCodePermissionDenied, "cannot set needed join power above your own join power")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "cannot set needed join power above your own join power")
 	}
 
 	s.configMu.RLock()
@@ -769,7 +838,7 @@ func (s *TCPServer) handleCreateChannel(ctx context.Context, client *Client, f *
 			zap.String("client_id", client.ID),
 			zap.Error(err),
 		)
-		return s.sendError(client, errCodeMalformed, "create channel failed: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "create channel failed: "+err.Error())
 	}
 
 	s.broadcastEvent(eventChannelCreated, channelEvent{
@@ -778,9 +847,6 @@ func (s *TCPServer) handleCreateChannel(ctx context.Context, client *Client, f *
 		ParentID:  msg.ParentID,
 	})
 	s.audit(ctx, client.UniqueID, "channel_create", fmt.Sprintf("%d", channelID), msg.Name)
-	if s.deps.State != nil {
-		s.metricsSink().SetChannelsActive(s.deps.State.ChannelCount())
-	}
 	return s.writeMessage(client, netproto.MsgChannelList, s.channelListResponse())
 }
 
@@ -789,37 +855,37 @@ func (s *TCPServer) handleCreateChannel(ctx context.Context, client *Client, f *
 func (s *TCPServer) handleDeleteChannel(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.DeleteChannel
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed delete_channel: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed delete_channel: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Channels == nil {
-		return s.sendError(client, errCodeUnavailable, "channel backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "channel backend unavailable")
 	}
 
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	if !pc.granted(permissions.PermissionKeyChannelDelete) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyChannelDelete))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyChannelDelete))
 	}
 
 	result, err := s.deps.Channels.DeleteChannelSubtree(ctx, msg.ChannelID)
 	if err != nil {
 		if errors.Is(err, channels.ErrChannelNotFound) {
-			return s.sendError(client, errCodeNotFound, "channel not found")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "channel not found")
 		}
 		s.logger.Warn("delete channel failed",
 			zap.String("client_id", client.ID),
 			zap.Int64("channel_id", msg.ChannelID),
 			zap.Error(err),
 		)
-		return s.sendError(client, errCodeUnavailable, "delete channel failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "delete channel failed")
 	}
 
 	if result.RootID == 0 {
 		result.RootID = msg.ChannelID
 	}
-	s.ApplyChannelDeletion(result)
+	s.ApplyChannelDeletion(result, "")
 	s.audit(ctx, client.UniqueID, "channel_delete", fmt.Sprintf("%d", msg.ChannelID), "")
 	return nil
 }
@@ -827,7 +893,7 @@ func (s *TCPServer) handleDeleteChannel(ctx context.Context, client *Client, f *
 // ApplyChannelDeletion publishes every side effect shared by explicit and
 // automatic channel-subtree deletion. ChannelManager releases its lifecycle
 // lock before invoking this method as the temporary-cleanup sink.
-func (s *TCPServer) ApplyChannelDeletion(result channels.DeleteResult) {
+func (s *TCPServer) ApplyChannelDeletion(result channels.DeleteResult, reason string) {
 	if s == nil || s.deps == nil || len(result.ChannelIDs) == 0 {
 		return
 	}
@@ -847,6 +913,7 @@ func (s *TCPServer) ApplyChannelDeletion(result channels.DeleteResult) {
 	s.broadcastEvent(eventChannelDeleted, channelEvent{
 		ChannelID:  result.RootID,
 		ChannelIDs: result.ChannelIDs,
+		Reason:     reason,
 	})
 	if s.deps.Voice != nil {
 		for _, member := range result.Members {
@@ -858,9 +925,6 @@ func (s *TCPServer) ApplyChannelDeletion(result channels.DeleteResult) {
 	// database/blob move; clients, metrics, and recorders still need to observe
 	// the committed deletion immediately.
 	s.pushSubscriptionStateTo(result.SubscriberIDs)
-	if s.deps.State != nil {
-		s.metricsSink().SetChannelsActive(s.deps.State.ChannelCount())
-	}
 	s.stopDeletedChannelRecordings(result.ChannelIDs)
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cleanupCancel()
@@ -916,32 +980,32 @@ func (s *TCPServer) stopDeletedChannelRecordings(channelIDs []int64) {
 func (s *TCPServer) handleChannelEdit(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.ChannelEdit
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed channel_edit: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed channel_edit: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Channels == nil || s.deps.State == nil {
-		return s.sendError(client, errCodeUnavailable, "channel backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "channel backend unavailable")
 	}
 	channel, ok := s.deps.State.GetChannel(msg.ChannelID)
 	if !ok {
-		return s.sendError(client, errCodeNotFound, "channel not found")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "channel not found")
 	}
 
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	if !pc.granted(permissions.PermissionKeyChannelModify) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyChannelModify))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyChannelModify))
 	}
 	// Same power cap as channel creation (160): an editor may not raise the
 	// needed join power above their own join power, or they could lock
 	// themselves and their peers out of a channel they still administer.
 	if msg.NeededJoinPower != nil && !pc.admin {
 		if pc.power(permissions.PermissionKeyChannelJoinPower) < *msg.NeededJoinPower {
-			return s.sendError(client, errCodePermissionDenied, "cannot set needed join power above your own join power")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "cannot set needed join power above your own join power")
 		}
 		if *msg.NeededJoinPower < channel.NeededJoinPower {
-			return s.sendError(client, errCodePermissionDenied, "cannot reduce the channel's needed join power")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "cannot reduce the channel's needed join power")
 		}
 	}
 
@@ -960,17 +1024,17 @@ func (s *TCPServer) handleChannelEdit(ctx context.Context, client *Client, f *ne
 		InheritPermissions: msg.InheritPermissions,
 	}); err != nil {
 		if errors.Is(err, channels.ErrInvalidMove) {
-			return s.sendError(client, errCodeMalformed, err.Error())
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, err.Error())
 		}
 		if errors.Is(err, channels.ErrChannelNotFound) {
-			return s.sendError(client, errCodeNotFound, "channel not found")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "channel not found")
 		}
 		s.logger.Warn("channel edit failed",
 			zap.String("client_id", client.ID),
 			zap.Int64("channel_id", msg.ChannelID),
 			zap.Error(err),
 		)
-		return s.sendError(client, errCodeMalformed, "channel edit failed: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "channel edit failed: "+err.Error())
 	}
 
 	// (157) re-parenting or flipping inheritance changes the resolved channel
@@ -1032,40 +1096,40 @@ func channelUpdatedEventFor(ch *state.Channel) channelUpdatedEvent {
 func (s *TCPServer) handleJoinChannel(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.JoinChannel
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed join_channel: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed join_channel: "+err.Error())
 	}
 	if s.deps == nil || s.deps.State == nil {
-		return s.sendError(client, errCodeUnavailable, "state backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "state backend unavailable")
 	}
 	// (215) acceptance is a condition of entry, not a notice: an unanswered
 	// rules prompt keeps the client in the lobby, where the only thing it can
 	// still do is answer.
 	if client.rulesBlocked() {
-		return s.sendError(client, errCodePermissionDenied, "accept the server rules before joining a channel")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "accept the server rules before joining a channel")
 	}
 	ch, ok := s.deps.State.GetChannel(msg.ChannelID)
 	if !ok {
-		return s.sendError(client, errCodeNotFound, "channel not found")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "channel not found")
 	}
 
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	// Inheriting sub-channels are gated by the strongest needed power on their
 	// chain (157/168), so a child cannot be used as a back door into a gated
 	// parent's subtree.
 	if !pc.joinAllowed(s.deps.State.EffectiveJoinPower(ch.ChannelID)) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyChannelJoinPower))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyChannelJoinPower))
 	}
 	if ch.PasswordHash != "" && !pc.granted(permissions.PermissionKeyChannelJoinIgnorePassword) {
 		if err := auth.VerifyPassword(msg.Password, ch.PasswordHash); err != nil {
-			return s.sendError(client, errCodePermissionDenied, "invalid channel password")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "invalid channel password")
 		}
 	}
 
-	if err := s.moveClient(client.ID, msg.ChannelID); err != nil {
-		return s.sendError(client, errCodeNotFound, err.Error())
+	if err := s.moveClient(ctx, client.ID, msg.ChannelID, client.ID); err != nil {
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, err.Error())
 	}
 	return nil
 }
@@ -1075,30 +1139,30 @@ func (s *TCPServer) handleJoinChannel(ctx context.Context, client *Client, f *ne
 func (s *TCPServer) handleMoveClient(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.MoveClient
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed move_client: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed move_client: "+err.Error())
 	}
 	if s.deps == nil || s.deps.State == nil {
-		return s.sendError(client, errCodeUnavailable, "state backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "state backend unavailable")
 	}
 	if _, ok := s.deps.State.GetChannel(msg.ChannelID); !ok {
-		return s.sendError(client, errCodeNotFound, "channel not found")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "channel not found")
 	}
 	target, ok := s.clientByID(msg.ClientID)
 	if !ok || !target.isAuthed() {
-		return s.sendError(client, errCodeNotFound, "target client not found")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "target client not found")
 	}
 	if target.rulesBlocked() {
-		return s.sendError(client, errCodePermissionDenied, "target must accept the server rules before joining a channel")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "target must accept the server rules before joining a channel")
 	}
 
 	if err := s.checkPowerOver(ctx, client, target,
 		permissions.PermissionKeyClientMovePower,
 		permissions.PermissionKeyClientNeededMovePower); err != nil {
-		return s.sendError(client, errCodePermissionDenied, err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, err.Error())
 	}
 
-	if err := s.moveClient(target.ID, msg.ChannelID); err != nil {
-		return s.sendError(client, errCodeNotFound, err.Error())
+	if err := s.moveClient(ctx, target.ID, msg.ChannelID, client.ID); err != nil {
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, err.Error())
 	}
 	return nil
 }
@@ -1108,14 +1172,14 @@ func (s *TCPServer) handleMoveClient(ctx context.Context, client *Client, f *net
 func (s *TCPServer) handleKickClient(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.KickClient
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed kick_client: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed kick_client: "+err.Error())
 	}
 	if s.deps == nil || s.deps.State == nil {
-		return s.sendError(client, errCodeUnavailable, "state backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "state backend unavailable")
 	}
 	target, ok := s.clientByID(msg.ClientID)
 	if !ok || !target.isAuthed() {
-		return s.sendError(client, errCodeNotFound, "target client not found")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "target client not found")
 	}
 
 	powerKey := permissions.PermissionKeyClientKickFromChannelPower
@@ -1129,22 +1193,25 @@ func (s *TCPServer) handleKickClient(ctx context.Context, client *Client, f *net
 		neededKey = permissions.PermissionKeyClientNeededBanPower
 	}
 	if err := s.checkPowerOver(ctx, client, target, powerKey, neededKey); err != nil {
-		return s.sendError(client, errCodePermissionDenied, err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, err.Error())
 	}
 
+	var expiresAt time.Time
 	if msg.Ban {
-		if err := s.recordBan(ctx, client, target, msg.Reason, msg.DurationSeconds); err != nil {
+		var err error
+		expiresAt, err = s.recordBan(ctx, client, target, msg.Reason, msg.DurationSeconds)
+		if err != nil {
 			s.logger.Warn("recording ban failed",
 				zap.String("client_id", client.ID),
 				zap.String("target_id", target.ID),
 				zap.Error(err),
 			)
-			return s.sendError(client, errCodeUnavailable, "recording ban failed")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "recording ban failed")
 		}
 	}
 
-	if err := s.performKick(client.ID, target.ID, msg.FromServer || msg.Ban, msg.Ban, msg.Reason); err != nil {
-		return s.sendError(client, errCodeNotFound, err.Error())
+	if err := s.performKick(client.ID, target.ID, msg.FromServer || msg.Ban, msg.Ban, msg.Reason, expiresAt); err != nil {
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, err.Error())
 	}
 	action := "kick"
 	if msg.Ban {
@@ -1171,31 +1238,31 @@ const maxChatBytes = 16 * 1024
 func (s *TCPServer) handleChatSend(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.ChatSend
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed chat_send: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed chat_send: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Broadcast == nil {
-		return s.sendError(client, errCodeUnavailable, "broadcast backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "broadcast backend unavailable")
 	}
 	// (215) same gate as the join: rules the user has not answered would
 	// otherwise be advisory, and DMs would route around a channel-only check.
 	if client.rulesBlocked() {
-		return s.sendError(client, errCodePermissionDenied, "accept the server rules before sending messages")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "accept the server rules before sending messages")
 	}
 
 	if len(msg.Text) > maxChatBytes {
-		return s.sendError(client, errCodeMalformed, "chat message too large")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "chat message too large")
 	}
 	if !msg.Enc && !s.cfg.ChatAllowPlaintext {
-		return s.sendError(client, errCodePermissionDenied, "plaintext chat is disabled on this server — update your client (chat encryption is mandatory)")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "plaintext chat is disabled on this server — update your client (chat encryption is mandatory)")
 	}
 	if msg.Enc && msg.KeyID == 0 && msg.ChannelID != "" {
-		return s.sendError(client, errCodeMalformed, "channel chat requires a scope key id")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "channel chat requires a scope key id")
 	}
 
 	isDM := msg.ToUniqueID != "" || msg.ToClientID != ""
 	if s.chatRate != nil && !s.chatRate.allowLimit(client.UniqueID, time.Now(), s.chatActionLimit(ctx, client)) {
 		s.metricsSink().IncChatMessage("rejected")
-		return s.sendError(client, errCodeMalformed, "chat rate limit exceeded — slow down")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "chat rate limit exceeded — slow down")
 	}
 
 	// Channel/global scopes run the moderation pipeline (wave 5a): rate
@@ -1205,7 +1272,7 @@ func (s *TCPServer) handleChatSend(ctx context.Context, client *Client, f *netpr
 		if msg.ChannelID != "" {
 			id, err := strconv.ParseInt(msg.ChannelID, 10, 64)
 			if err != nil {
-				return s.sendError(client, errCodeMalformed, "invalid channel_id: "+msg.ChannelID)
+				return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "invalid channel_id: "+msg.ChannelID)
 			}
 			channelID = id
 		}
@@ -1215,30 +1282,30 @@ func (s *TCPServer) handleChatSend(ctx context.Context, client *Client, f *netpr
 		// attacker-supplied channel id is a disk-exhaustion DoS (91).
 		if channelID != 0 {
 			if s.deps.State == nil {
-				return s.sendError(client, errCodeUnavailable, "state backend unavailable")
+				return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "state backend unavailable")
 			}
 			if !s.scopeReadable(ctx, client, channelID) {
-				return s.sendError(client, errCodePermissionDenied, "not a member or subscriber of this channel")
+				return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "not a member or subscriber of this channel")
 			}
 		}
 		if msg.Enc {
 			if s.chatKeys == nil {
-				return s.sendError(client, errCodeUnavailable, "chat key manager unavailable")
+				return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "chat key manager unavailable")
 			}
 			// Non-minting lookup: an unknown scope is "rejoin", never a mint.
 			currentID, _, err := s.chatKeys.current(ctx, channelID)
 			if errors.Is(err, ErrNoScopeKey) {
-				return s.sendError(client, errCodeUnavailable, "no chat key for this channel yet — rejoin the channel")
+				return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "no chat key for this channel yet — rejoin the channel")
 			}
 			if err != nil {
-				return s.sendError(client, errCodeUnavailable, "chat key unavailable")
+				return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "chat key unavailable")
 			}
 			if msg.KeyID != currentID {
 				scope := "channel"
 				if channelID == 0 {
 					scope = "global scope"
 				}
-				return s.sendError(client, errCodeMalformed, "stale chat key for "+scope+" (key rotated; wait for re-key)")
+				return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "stale chat key for "+scope+" (key rotated; wait for re-key)")
 			}
 		}
 		return s.routeScopedChat(ctx, client, msg, channelID)
@@ -1266,7 +1333,7 @@ func (s *TCPServer) handleChatSend(ctx context.Context, client *Client, f *netpr
 		return s.sendDirectByUniqueID(ctx, client, msg.ToUniqueID, payload, msg.Text, msg.Enc)
 	default: // msg.ToClientID != ""
 		if err := s.deps.Broadcast.BroadcastToClient(msg.ToClientID, payload); err != nil {
-			return s.sendError(client, errCodeNotFound, "target client not reachable")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "target client not reachable")
 		}
 		// Echo the direct message back to the sender.
 		_ = s.deps.Broadcast.BroadcastToClient(client.ID, payload)
@@ -1281,23 +1348,23 @@ func (s *TCPServer) handleChatSend(ctx context.Context, client *Client, f *netpr
 // delivery at their next login.
 func (s *TCPServer) sendDirectByUniqueID(ctx context.Context, client *Client, toUniqueID string, payload []byte, text string, enc bool) error {
 	if s.deps.Auth == nil {
-		return s.sendError(client, errCodeUnavailable, "authentication backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "authentication backend unavailable")
 	}
 	target, err := s.deps.Auth.LookupUser(ctx, toUniqueID)
 	if err != nil {
 		if errors.Is(err, auth.ErrUserNotFound) {
-			return s.sendError(client, errCodeNotFound, "target user not found")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "target user not found")
 		}
 		s.logger.Warn("user lookup failed",
 			zap.String("client_id", client.ID),
 			zap.Error(err),
 		)
-		return s.sendError(client, errCodeUnavailable, "user lookup failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "user lookup failed")
 	}
 
 	if tc, ok := s.clientByUniqueID(toUniqueID); ok {
 		if err := s.deps.Broadcast.BroadcastToClient(tc.ID, payload); err != nil {
-			return s.sendError(client, errCodeNotFound, "target client not reachable")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "target client not reachable")
 		}
 		_ = s.deps.Broadcast.BroadcastToClient(client.ID, payload)
 		s.metricsSink().IncChatMessage("direct")
@@ -1305,14 +1372,14 @@ func (s *TCPServer) sendDirectByUniqueID(ctx context.Context, client *Client, to
 	}
 
 	if s.deps.Spool == nil {
-		return s.sendError(client, errCodeNotFound, "target user is offline")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "target user is offline")
 	}
 	// A DM has no scope key, so the server cannot seal one on the sender's
 	// behalf: a plaintext DM to an offline user would land in the spool in
 	// the clear. Relaying it live is the sender's choice; persisting it is
 	// not, so the escape hatch stops at the spool (91).
 	if !enc {
-		return s.sendError(client, errCodePermissionDenied, "target user is offline and plaintext direct messages are never spooled — encrypt the message")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "target user is offline and plaintext direct messages are never spooled — encrypt the message")
 	}
 	// E2EE DMs are spooled as ciphertext the server cannot read; the sender's
 	// unique ID travels along so the recipient can fetch the public key.
@@ -1321,7 +1388,7 @@ func (s *TCPServer) sendDirectByUniqueID(ctx context.Context, client *Client, to
 			zap.String("client_id", client.ID),
 			zap.Error(err),
 		)
-		return s.sendError(client, errCodeUnavailable, "spooling message failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "spooling message failed")
 	}
 	s.logger.Info("message spooled for offline user",
 		zap.String("client_id", client.ID),
@@ -1385,7 +1452,7 @@ func (s *TCPServer) deliverSpooled(ctx context.Context, client *Client, userID i
 }
 
 // handlePing replies with a Pong.
-func (s *TCPServer) handlePing(_ context.Context, client *Client, _ *netproto.Frame) error {
+func (s *TCPServer) handlePing(ctx context.Context, client *Client, _ *netproto.Frame) error {
 	s.logger.Debug("ping received", zap.String("client_id", client.ID))
 	return s.writeMessage(client, netproto.MsgPong, netproto.Pong{})
 }
@@ -1405,7 +1472,7 @@ func remoteIP(conn net.Conn) string {
 // moveClient moves a client into a channel in the state manager, performs the
 // temp-channel cleanup bookkeeping for the source and target channels, keeps
 // the voice router's membership in sync, and announces the move.
-func (s *TCPServer) moveClient(clientID string, channelID int64) error {
+func (s *TCPServer) moveClient(ctx context.Context, clientID string, channelID int64, movedBy string) error {
 	afterMove := func(previousChannelID int64) {
 		if s.deps.Voice != nil {
 			if previousChannelID != 0 && previousChannelID != channelID {
@@ -1419,12 +1486,25 @@ func (s *TCPServer) moveClient(clientID string, channelID int64) error {
 			s.rotateScopeKey(context.Background(), previousChannelID)
 		}
 		if client, ok := s.clientByID(clientID); ok {
-			_ = s.deliverScopeKey(context.Background(), client, channelID)
+			// The move is already committed when this lifecycle callback runs.
+			// A cancelled request or key backend failure must not undo it.
+			if err := s.deliverScopeKey(ctx, client, channelID); err != nil {
+				s.logger.Warn("delivering channel key after move failed",
+					zap.String("client_id", client.ID),
+					zap.Int64("channel_id", channelID),
+					zap.Error(err),
+				)
+			}
 			// (312) the channel a client stands in is implicitly subscribed, so a
 			// move changes the authoritative set even though nothing was asked.
 			_ = s.sendSubscriptionState(client)
 		}
-		s.broadcastEvent(eventUserMoved, userEvent{ClientID: clientID, ChannelID: channelID})
+		s.broadcastEvent(eventUserMoved, userEvent{
+			ClientID:      clientID,
+			FromChannelID: previousChannelID,
+			ChannelID:     channelID,
+			ByClientID:    movedBy,
+		})
 	}
 	if s.deps.Channels != nil {
 		_, err := s.deps.Channels.MoveClientWithLifecycle(clientID, channelID, afterMove)
@@ -1462,18 +1542,43 @@ func (s *TCPServer) checkPowerOver(ctx context.Context, caller, target *Client, 
 	return nil
 }
 
-// recordBan inserts a unique-ID ban for the target. durationSeconds > 0 makes
-// the ban temporary (171); 0 is permanent.
-func (s *TCPServer) recordBan(ctx context.Context, caller, target *Client, reason string, durationSeconds int64) error {
+// banExpiration computes a temporary ban's expiry once. A zero result means a
+// permanent ban and is deliberately reused for both persistence and event
+// publication so the two cannot drift by even a millisecond.
+func banExpiration(durationSeconds int64) time.Time {
+	if durationSeconds <= 0 {
+		return time.Time{}
+	}
+	return time.Now().UTC().Add(time.Duration(durationSeconds) * time.Second)
+}
+
+func persistentBanExpiration(expiresAt time.Time) any {
+	if expiresAt.IsZero() {
+		return nil
+	}
+	return expiresAt
+}
+
+func banExpirationMillis(expiresAt time.Time) int64 {
+	if expiresAt.IsZero() {
+		return 0
+	}
+	return expiresAt.UnixMilli()
+}
+
+// recordBan inserts a unique-ID ban for the target and returns the exact
+// expiry used for persistence. durationSeconds > 0 makes the ban temporary
+// (171); zero or below is permanent.
+func (s *TCPServer) recordBan(ctx context.Context, caller, target *Client, reason string, durationSeconds int64) (time.Time, error) {
 	var bannedBy any
 	if caller.UserID != 0 {
 		bannedBy = caller.UserID
 	}
-	var expiresAt any
-	if durationSeconds > 0 {
-		expiresAt = time.Now().Add(time.Duration(durationSeconds) * time.Second)
+	expiresAt := banExpiration(durationSeconds)
+	if err := s.insertBan(ctx, target.UniqueID, reason, bannedBy, persistentBanExpiration(expiresAt)); err != nil {
+		return time.Time{}, err
 	}
-	return s.insertBan(ctx, target.UniqueID, reason, bannedBy, expiresAt)
+	return expiresAt, nil
 }
 
 // insertBan inserts a unique-ID ban into the bans table. expiresAt nil (or

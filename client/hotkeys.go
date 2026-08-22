@@ -60,7 +60,9 @@ var hotkeyActions = []string{
 
 // specFor returns the configured spec for an action (empty = unbound).
 func (a *App) specFor(action string) string {
-	s := a.settings
+	a.settingsMu.Lock()
+	s := cloneSettings(a.settings)
+	a.settingsMu.Unlock()
 	switch action {
 	case "ptt":
 		return s.HotkeyPTT
@@ -82,11 +84,14 @@ func (a *App) specFor(action string) string {
 
 // profileSpecs merges a named hotkey profile over the defaults (300).
 func (a *App) profileSpecs(name string) map[string]string {
+	a.settingsMu.Lock()
+	s := cloneSettings(a.settings)
+	a.settingsMu.Unlock()
 	specs := map[string]string{}
 	for _, action := range hotkeyActions {
-		specs[action] = a.specFor(action)
+		specs[action] = hotkeySpecFor(s, action)
 	}
-	p, ok := a.settings.HotkeyProfiles[name]
+	p, ok := s.HotkeyProfiles[name]
 	if !ok || name == "" || name == "default" {
 		return specs
 	}
@@ -101,6 +106,26 @@ func (a *App) profileSpecs(name string) map[string]string {
 		}
 	}
 	return specs
+}
+
+func hotkeySpecFor(s Settings, action string) string {
+	switch action {
+	case "ptt":
+		return s.HotkeyPTT
+	case "mute_toggle":
+		return s.HotkeyMute
+	case "deafen_toggle":
+		return s.HotkeyDeafen
+	case "whisper_reply":
+		return s.WhisperReplyHotkey
+	case "quick_connect":
+		return s.HotkeyQuickConnect
+	case "compact_toggle":
+		return s.HotkeyCompact
+	case "zen_toggle":
+		return s.HotkeyZen
+	}
+	return ""
 }
 
 // ApplyHotkeyProfile switches the live registrations to a profile (called
@@ -274,15 +299,18 @@ func (a *App) SetHotkeys(pttSpec, muteSpec, whisperReplySpec string) string {
 	if err := validateHotkeySpec(whisperReplySpec); err != nil {
 		return "whisper reply: " + err.Error()
 	}
-	a.settings.HotkeyPTT = pttSpec
-	a.settings.HotkeyMute = muteSpec
-	a.settings.WhisperReplyHotkey = whisperReplySpec
-	if err := a.save(); err != nil {
+	generation, err := a.updateSettings(func(settings Settings) Settings {
+		settings.HotkeyPTT = pttSpec
+		settings.HotkeyMute = muteSpec
+		settings.WhisperReplyHotkey = whisperReplySpec
+		return settings
+	})
+	if err != nil {
 		return err.Error()
 	}
-	a.applyHotkey("ptt", pttSpec)
-	a.applyHotkey("mute_toggle", muteSpec)
-	a.applyHotkey("whisper_reply", whisperReplySpec)
+	if err := a.applyHotkeyEffect(generation); err != nil {
+		return err.Error()
+	}
 	return ""
 }
 
@@ -300,27 +328,48 @@ func (a *App) SetHotkey(action, spec string) string {
 	if err := validateHotkeySpec(spec); err != nil {
 		return err.Error()
 	}
-	switch action {
-	case "ptt":
-		a.settings.HotkeyPTT = spec
-	case "mute_toggle":
-		a.settings.HotkeyMute = spec
-	case "deafen_toggle":
-		a.settings.HotkeyDeafen = spec
-	case "whisper_reply":
-		a.settings.WhisperReplyHotkey = spec
-	case "quick_connect":
-		a.settings.HotkeyQuickConnect = spec
-	case "compact_toggle":
-		a.settings.HotkeyCompact = spec
-	case "zen_toggle":
-		a.settings.HotkeyZen = spec
-	}
-	if err := a.save(); err != nil {
+	generation, err := a.updateSettings(func(settings Settings) Settings {
+		switch action {
+		case "ptt":
+			settings.HotkeyPTT = spec
+		case "mute_toggle":
+			settings.HotkeyMute = spec
+		case "deafen_toggle":
+			settings.HotkeyDeafen = spec
+		case "whisper_reply":
+			settings.WhisperReplyHotkey = spec
+		case "quick_connect":
+			settings.HotkeyQuickConnect = spec
+		case "compact_toggle":
+			settings.HotkeyCompact = spec
+		case "zen_toggle":
+			settings.HotkeyZen = spec
+		}
+		return settings
+	})
+	if err != nil {
 		return err.Error()
 	}
-	a.applyHotkey(action, spec)
+	if err := a.applyHotkeyEffect(generation); err != nil {
+		return err.Error()
+	}
 	return ""
+}
+
+// applySettingsHotkeys applies all settings-owned registrations from one
+// current snapshot. It is intentionally outside settingsMu.
+var settingsHotkeyApplier = func(a *App, action, spec string) {
+	a.applyHotkey(action, spec)
+}
+
+func (a *App) applySettingsHotkeys(s Settings) {
+	settingsHotkeyApplier(a, "ptt", s.HotkeyPTT)
+	settingsHotkeyApplier(a, "mute_toggle", s.HotkeyMute)
+	settingsHotkeyApplier(a, "deafen_toggle", s.HotkeyDeafen)
+	settingsHotkeyApplier(a, "quick_connect", s.HotkeyQuickConnect)
+	settingsHotkeyApplier(a, "compact_toggle", s.HotkeyCompact)
+	settingsHotkeyApplier(a, "whisper_reply", s.WhisperReplyHotkey)
+	settingsHotkeyApplier(a, "zen_toggle", s.HotkeyZen)
 }
 
 // emitHotkey sends a hotkey event to the frontend.

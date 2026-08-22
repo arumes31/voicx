@@ -126,7 +126,7 @@ func TestWSRequiresAdminCredentials(t *testing.T) {
 		{"not an admin", "user-uid", "pw", true, http.StatusUnauthorized},
 		{"backend error", "boom", "pw", true, http.StatusInternalServerError},
 	} {
-		req, err := http.NewRequest(http.MethodGet, httpURL, nil)
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, httpURL, nil)
 		if err != nil {
 			t.Fatalf("%s: request: %v", tc.name, err)
 		}

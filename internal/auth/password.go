@@ -36,7 +36,9 @@ var (
 // argon2idVersion is the Argon2 version reported in the encoded hash. Argon2id
 // is parameterized by version 0x13 (19) in the reference implementation.
 const (
-	argon2idVersion       = 19
+	argon2idVersion = 19
+	// MaxPasswordBytes bounds user-controlled password work before Argon2.
+	MaxPasswordBytes      = 256
 	argonMaxEncodedLength = 1024
 	argonMaxMemory        = 256 * 1024 // KiB (256 MiB)
 	argonMaxTime          = 10
@@ -46,7 +48,15 @@ const (
 )
 
 // ErrMalformedHash is returned when an encoded password hash cannot be parsed.
-var ErrMalformedHash = errors.New("malformed argon2id hash")
+var (
+	ErrMalformedHash   = errors.New("malformed argon2id hash")
+	ErrPasswordTooLong = errors.New("password exceeds maximum length")
+)
+
+// dummyPasswordHash is calculated once at process startup. Unknown-account
+// authentication verifies against it so a database miss takes the same Argon2
+// path as a stored password hash.
+var dummyPasswordHash = makeDummyPasswordHash()
 
 // GenerateSalt returns n cryptographically random bytes from crypto/rand.
 func GenerateSalt(n int) ([]byte, error) {
@@ -70,6 +80,9 @@ func GenerateSalt(n int) ([]byte, error) {
 func HashPassword(password string) (string, error) {
 	if password == "" {
 		return "", errors.New("password must not be empty")
+	}
+	if len(password) > MaxPasswordBytes {
+		return "", ErrPasswordTooLong
 	}
 	salt, err := GenerateSalt(argonSaltLen)
 	if err != nil {
@@ -95,6 +108,9 @@ func encodeHash(salt, hash []byte) string {
 // same parameters and salt, and compares the result in constant time. It
 // returns nil on a match and an error on mismatch or a malformed hash.
 func VerifyPassword(password, encodedHash string) error {
+	if len(password) > MaxPasswordBytes {
+		return ErrPasswordTooLong
+	}
 	salt, hash, memory, time, threads, err := parseEncodedHash(encodedHash)
 	if err != nil {
 		return err
@@ -109,6 +125,13 @@ func VerifyPassword(password, encodedHash string) error {
 		return errors.New("password does not match hash")
 	}
 	return nil
+}
+
+func makeDummyPasswordHash() string {
+	const password = "voicx-dummy-password"
+	salt := []byte("voicx-dummy-salt")
+	hash := argon2.IDKey([]byte(password), salt, argonTime, argonMemory, argonThreads, argonKeyLen)
+	return encodeHash(salt, hash)
 }
 
 // parseEncodedHash parses an "argon2id$v=19$m=...,t=...,p=...$<salt>$<hash>"

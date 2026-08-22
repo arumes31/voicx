@@ -8,12 +8,45 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"time"
 
 	"voicx/internal/netproto"
 	"voicx/internal/permissions"
 	"voicx/internal/recorder"
 	"voicx/internal/webrtc"
 )
+
+func TestVoicePermissionCallbacksHaveBoundedContext(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	conn, clientID := dialAuthed(t, env.addr, "user-uid")
+	defer closeVoiceTestResource(t, conn)
+
+	env.perms.loadForClientFn = func(ctx context.Context, _, _ int64) (permissions.TieredPermissions, error) {
+		<-ctx.Done()
+		return permissions.TieredPermissions{}, ctx.Err()
+	}
+	for _, callback := range []struct {
+		name string
+		fn   func(string) bool
+	}{
+		{name: "talk", fn: env.srv.canTalk},
+		{name: "video", fn: env.srv.canPublishVideo},
+	} {
+		t.Run(callback.name, func(t *testing.T) {
+			result := make(chan bool, 1)
+			go func() { result <- callback.fn(clientID) }()
+			select {
+			case allowed := <-result:
+				if allowed {
+					t.Fatal("permission callback failed open after loader timeout")
+				}
+			case <-time.After(mediaPermissionTimeout + 500*time.Millisecond):
+				t.Fatal("permission callback did not cancel its loader")
+			}
+		})
+	}
+}
 
 func closeVoiceTestResource(t *testing.T, closer io.Closer) {
 	t.Helper()
@@ -648,5 +681,36 @@ func TestVideoGateInstalled(t *testing.T) {
 	defer env.voice.mu.Unlock()
 	if env.voice.canVideoFn == nil {
 		t.Fatal("video gate not installed by server.New")
+	}
+}
+
+func TestSpeakingEventCarriesCurrentChannel(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	conn, clientID := dialAuthed(t, env.addr, "user-uid")
+	defer closeVoiceTestResource(t, conn)
+	env.state.AddChannel(testChannel(1))
+	if err := env.state.MoveClient(clientID, 1); err != nil {
+		t.Fatalf("position speaker: %v", err)
+	}
+
+	events := make(chan speakingEvent, 1)
+	env.deps.Broadcast.SetEventTap(func(eventType string, payload []byte) {
+		if eventType != eventSpeakingChanged {
+			return
+		}
+		var event speakingEvent
+		if err := json.Unmarshal(payload, &event); err == nil {
+			events <- event
+		}
+	})
+	env.srv.onSpeakingChanged(clientID, true)
+	select {
+	case event := <-events:
+		if event.ClientID != clientID || event.ChannelID != 1 || !event.Speaking {
+			t.Fatalf("speaking event = %+v, want current channel 1", event)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for speaking event")
 	}
 }

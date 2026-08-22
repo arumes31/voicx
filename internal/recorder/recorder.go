@@ -410,6 +410,9 @@ type Session struct {
 type Recorder struct {
 	cfg    Config
 	logger *zap.Logger
+	// onError is an immutable constructor callback used for bounded lifecycle
+	// telemetry. Recorder deliberately does not import the metrics package.
+	onError func(operation string)
 
 	// Exec starts the ffmpeg process. It defaults to os/exec and is exported
 	// so tests can inject a fake.
@@ -433,13 +436,18 @@ type Recorder struct {
 
 // New constructs a Recorder. cfg fields left at their zero value get
 // defaults (see Config.withDefaults).
-func New(cfg Config, logger *zap.Logger) *Recorder {
+func New(cfg Config, logger *zap.Logger, observers ...Observers) *Recorder {
 	if logger == nil {
 		logger = zap.NewNop()
+	}
+	var telemetry Observers
+	if len(observers) > 0 {
+		telemetry = observers[0]
 	}
 	return &Recorder{
 		cfg:             cfg.withDefaults(),
 		logger:          logger,
+		onError:         telemetry.OnError,
 		Exec:            defaultExec,
 		sessions:        make(map[int64]*Session),
 		starting:        make(map[int64]*startReservation),
@@ -450,11 +458,27 @@ func New(cfg Config, logger *zap.Logger) *Recorder {
 	}
 }
 
+// Observers contains optional, bounded lifecycle telemetry hooks.
+type Observers struct {
+	OnError func(operation string)
+}
+
+func (r *Recorder) reportError(operation string) {
+	if r != nil && r.onError != nil {
+		r.onError(operation)
+	}
+}
+
 // Start begins recording the given channel: it allocates loopback UDP ports,
 // writes an SDP file describing the streams, starts ffmpeg, and registers
 // taps in the router so a copy of the channel's audio and video reaches the
 // process.
 func (r *Recorder) Start(ctx context.Context, channelID int64, router TapRouter) (_ *Session, retErr error) {
+	defer func() {
+		if retErr != nil {
+			r.reportError("start")
+		}
+	}()
 	if !r.cfg.Enabled {
 		return nil, ErrDisabled
 	}
@@ -830,7 +854,12 @@ func (r *Recorder) startCancellationError(cause error) error {
 // Stop ends the recording for the channel: it removes the router taps, asks
 // ffmpeg to quit gracefully (the "q" command on stdin), and kills the
 // process if it does not exit within the grace period.
-func (r *Recorder) Stop(channelID int64) error {
+func (r *Recorder) Stop(channelID int64) (retErr error) {
+	defer func() {
+		if retErr != nil {
+			r.reportError("stop")
+		}
+	}()
 	r.mu.Lock()
 	s, ok := r.sessions[channelID]
 	starting := r.starting[channelID]
@@ -979,6 +1008,7 @@ func (r *Recorder) closeAll() error {
 		go func() {
 			defer stops.Done()
 			if err := r.stopSession(session); err != nil {
+				r.reportError("stop")
 				errs <- fmt.Errorf("stopping channel %d: %w", session.channelID, err)
 			}
 		}()
@@ -1393,6 +1423,7 @@ func (r *Recorder) monitor(s *Session, processResult *processWait) {
 	}
 
 	if !s.stopping.Load() {
+		r.reportError("unexpected_exit")
 		fields := []zap.Field{
 			zap.Int64("channel_id", s.channelID),
 			zap.String("output", s.filePath),

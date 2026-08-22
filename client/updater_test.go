@@ -14,6 +14,7 @@ import (
 	"os"
 	"testing"
 
+	"voicx/internal/updatemanifest"
 	"voicx/internal/version"
 )
 
@@ -195,7 +196,7 @@ func TestVerifySignedManifest(t *testing.T) {
 	}
 	withUpdatePublicKeys(t, base64.StdEncoding.EncodeToString(publicKey))
 
-	manifest := []byte(manifestVersionPrefix + "v1.2.3\nabc  " + clientAssetName + "\n")
+	manifest := []byte(updatemanifest.VersionPrefix + "v1.2.3\nabc  " + clientAssetName + "\n")
 	signature := []byte(base64.StdEncoding.EncodeToString(ed25519.Sign(privateKey, manifest)))
 	if err := verifySignedManifest(manifest, signature, "v1.2.3"); err != nil {
 		t.Fatalf("verify signed manifest: %v", err)

@@ -23,6 +23,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"voicx/internal/auth"
 	"voicx/internal/chatcrypto"
 	"voicx/internal/config"
 	"voicx/internal/metrics"
@@ -250,7 +251,23 @@ type TCPServer struct {
 	deps     *Deps
 	configMu sync.RWMutex
 
-	listener net.Listener
+	// lifecycleMu protects the listener lifecycle, raw accepted-connection
+	// registry, and every connWG.Add. Shutdown transitions to stopping while
+	// holding this lock, so Wait can never race a later Add.
+	lifecycleMu      sync.Mutex
+	lifecycleState   tcpLifecycleState
+	listener         net.Listener
+	acceptedConns    map[net.Conn]struct{}
+	connWG           sync.WaitGroup
+	listen           func(context.Context, string, string) (net.Listener, error)
+	prepareTLS       func() (tls.Certificate, string, error)
+	startup          *tcpStartup
+	started          chan struct{}
+	acceptDone       chan struct{}
+	shutdownDone     chan struct{}
+	shutdownErr      error
+	shutdownDoneOK   bool
+	shutdownTimedOut bool
 
 	// tlsFingerprint is the SHA-256 fingerprint of the control-channel
 	// certificate (empty when TLS is disabled). Set in Start, or earlier by
@@ -271,16 +288,22 @@ type TCPServer struct {
 	// rotPending coalesces channel key rotations inside
 	// chat_key_rotate_min_seconds so a flapping client cannot mint one
 	// persisted generation per reconnect.
-	rotMu      sync.Mutex
-	rotPending map[int64]bool
+	rotMu         sync.Mutex
+	rotPending    map[int64]bool
+	rotationAfter func(time.Duration, func())
 
 	// Chat infrastructure (wave 5a): rate limiter, spam tracker, slow-mode
 	// tracker, and the memoised runtime moderation lists (117/118).
-	chatRate    *chatRateLimiter
-	chatSpam    *spamTracker
-	chatSlow    *slowTracker
-	typingRate  *typingTracker
-	chatFilters *chatFilterCache
+	chatRate     *chatRateLimiter
+	chatSpam     *spamTracker
+	chatSlow     *slowTracker
+	typingRate   *typingTracker
+	chatFilters  *chatFilterCache
+	pokes        pokeTracker
+	beforeHandle func()
+	afterAccept  func()
+
+	loginLimiter *auth.LoginFailureLimiter
 
 	permWriteMu sync.Mutex
 
@@ -294,6 +317,23 @@ type TCPServer struct {
 	stopCh   chan struct{}
 }
 
+type tcpLifecycleState uint8
+
+const (
+	tcpLifecycleNew tcpLifecycleState = iota
+	tcpLifecycleStarting
+	tcpLifecycleRunning
+	tcpLifecycleStopping
+	tcpLifecycleStopped
+)
+
+// tcpStartup owns listener preparation before publication. Shutdown cancels
+// it and waits for done before declaring the terminal lifecycle result.
+type tcpStartup struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
 // New constructs a TCPServer wired to the given backend dependencies. The
 // listener is created lazily in Start so that construction never blocks and
 // Shutdown is always safe to call. deps may be nil; handlers that need a
@@ -301,22 +341,44 @@ type TCPServer struct {
 func New(cfg *config.Config, logger *zap.Logger, deps *Deps) *TCPServer {
 	var scopeKeys ScopeKeyStore
 	var kek *chatcrypto.KEKRing
+	var chatCryptoFailure func(string)
+	loginLimiter := auth.NewLoginFailureLimiter(auth.LoginFailureLimiterConfig{})
 	if deps != nil {
 		scopeKeys, kek = deps.ScopeKeys, deps.ChatKEK
+		if deps.Metrics != nil {
+			chatCryptoFailure = deps.Metrics.IncChatCryptoFailure
+		}
+		if deps.LoginLimiter != nil {
+			loginLimiter = deps.LoginLimiter
+		}
 	}
 	s := &TCPServer{
-		cfg:        cfg,
-		logger:     logger,
-		deps:       deps,
-		clients:    make(map[string]*Client),
-		stopCh:     make(chan struct{}),
-		startedAt:  time.Now(),
-		chatKeys:   newChatKeyManager(scopeKeys, kek, logger),
-		rotPending: make(map[int64]bool),
-		chatRate:   newChatRateLimiter(cfg.ChatRateMsgs, time.Duration(cfg.ChatRateWindowSeconds)*time.Second),
-		chatSpam:   newSpamTracker(),
-		chatSlow:   newSlowTracker(),
-		typingRate: newTypingTracker(),
+		cfg:           cfg,
+		logger:        logger,
+		deps:          deps,
+		acceptedConns: make(map[net.Conn]struct{}),
+		listen: func(ctx context.Context, network, address string) (net.Listener, error) {
+			return (&net.ListenConfig{}).Listen(ctx, network, address)
+		},
+		prepareTLS: func() (tls.Certificate, string, error) {
+			return tlscert.Ensure(cfg.TLSDir, cfg.TLSCertFile, cfg.TLSKeyFile,
+				[]string{"localhost", cfg.ServerName})
+		},
+		shutdownDone: make(chan struct{}),
+		started:      make(chan struct{}),
+		clients:      make(map[string]*Client),
+		stopCh:       make(chan struct{}),
+		startedAt:    time.Now(),
+		chatKeys:     newChatKeyManager(scopeKeys, kek, logger, chatCryptoFailure),
+		rotPending:   make(map[int64]bool),
+		rotationAfter: func(delay time.Duration, callback func()) {
+			time.AfterFunc(delay, callback)
+		},
+		chatRate:     newChatRateLimiter(cfg.ChatRateMsgs, time.Duration(cfg.ChatRateWindowSeconds)*time.Second),
+		chatSpam:     newSpamTracker(),
+		chatSlow:     newSlowTracker(),
+		typingRate:   newTypingTracker(),
+		loginLimiter: loginLimiter,
 
 		chatFilters: &chatFilterCache{},
 	}
@@ -341,66 +403,151 @@ func New(cfg *config.Config, logger *zap.Logger, deps *Deps) *TCPServer {
 // tls_enabled is set the listener is wrapped in TLS (self-signed cert from
 // tls_dir or the configured cert/key files).
 func (s *TCPServer) Start(ctx context.Context) error {
-	ln, err := net.Listen("tcp", s.cfg.TCPAddr)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	s.lifecycleMu.Lock()
+	if s.lifecycleState != tcpLifecycleNew {
+		s.lifecycleMu.Unlock()
+		return nil
+	}
+	startCtx, cancelStart := context.WithCancel(ctx)
+	startup := &tcpStartup{cancel: cancelStart, done: make(chan struct{})}
+	s.lifecycleState = tcpLifecycleStarting
+	s.startup = startup
+	tlsCert, tlsFingerprint, tlsCertSet := s.tlsCert, s.tlsFingerprint, s.tlsCertSet
+	s.lifecycleMu.Unlock()
+	defer cancelStart()
+	defer close(startup.done)
+
+	var cert tls.Certificate
+	if s.cfg.TLSEnabled {
+		if tlsCertSet {
+			cert = *tlsCert
+		} else {
+			preparedCert, fingerprint, err := s.prepareTLS()
+			if err != nil {
+				if s.finishStartFailure(startup) {
+					return fmt.Errorf("preparing control-channel TLS: %w", err)
+				}
+				return nil
+			}
+			cert, tlsFingerprint = preparedCert, fingerprint
+		}
+	}
+	if err := startCtx.Err(); err != nil {
+		if s.finishStartFailure(startup) {
+			return err
+		}
+		return nil
+	}
+
+	ln, err := s.listen(startCtx, "tcp", s.cfg.TCPAddr)
 	if err != nil {
-		return fmt.Errorf("tcp listen on %s: %w", s.cfg.TCPAddr, err)
+		if s.finishStartFailure(startup) {
+			return fmt.Errorf("tcp listen on %s: %w", s.cfg.TCPAddr, err)
+		}
+		return nil
+	}
+	if err := startCtx.Err(); err != nil {
+		_ = ln.Close()
+		if s.finishStartFailure(startup) {
+			return err
+		}
+		return nil
 	}
 	if s.cfg.TLSEnabled {
-		var (
-			cert tls.Certificate
-			fp   string
-		)
-		if s.tlsCertSet {
-			cert, fp = *s.tlsCert, s.tlsFingerprint
-		} else {
-			c, f, err := tlscert.Ensure(s.cfg.TLSDir, s.cfg.TLSCertFile, s.cfg.TLSKeyFile,
-				[]string{"localhost", s.cfg.ServerName})
-			if err != nil {
-				_ = ln.Close()
-				return fmt.Errorf("preparing control-channel TLS: %w", err)
-			}
-			cert, fp = c, f
-		}
-		s.tlsFingerprint = fp
 		ln = tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13})
+	}
+
+	// Start and Shutdown only serialize the state transition itself. Listener
+	// and TLS preparation stay outside the mutex, so a stalled startup cannot
+	// make Shutdown miss its caller deadline. A shutdown that wins this final
+	// check closes this unpublished listener instead of ever exposing it.
+	s.lifecycleMu.Lock()
+	if s.lifecycleState != tcpLifecycleStarting || s.startup != startup {
+		s.lifecycleMu.Unlock()
+		_ = ln.Close()
+		return nil
+	}
+	acceptDone := make(chan struct{})
+	s.listener = ln
+	s.acceptDone = acceptDone
+	s.lifecycleState = tcpLifecycleRunning
+	s.startup = nil
+	s.tlsFingerprint = tlsFingerprint
+	close(s.started)
+	s.lifecycleMu.Unlock()
+	if s.cfg.TLSEnabled {
 		s.logger.Info("TCP control listener started (TLS)",
 			zap.String("addr", s.cfg.TCPAddr),
-			zap.String("tls_fingerprint", fp),
+			zap.String("tls_fingerprint", tlsFingerprint),
 		)
 	} else {
 		s.logger.Info("TCP control listener started (plaintext!)", zap.String("addr", s.cfg.TCPAddr))
 	}
-	s.listener = ln
 
 	// Close the listener when the context is cancelled so Accept unblocks.
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = s.Shutdown()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout())
+			_ = s.Shutdown(shutdownCtx)
+			cancel()
 		case <-s.stopCh:
 		}
 	}()
 
+	defer close(acceptDone)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			// Expected during shutdown: listener closed.
-			select {
-			case <-s.stopCh:
+			if s.stopping() {
 				return nil
-			default:
-				return fmt.Errorf("tcp accept: %w", err)
 			}
+			s.stopOnce.Do(s.beginShutdown)
+			return fmt.Errorf("tcp accept: %w", err)
 		}
+		if s.afterAccept != nil {
+			s.afterAccept()
+		}
+		s.lifecycleMu.Lock()
+		if s.lifecycleState != tcpLifecycleRunning || s.listener != ln {
+			s.lifecycleMu.Unlock()
+			_ = conn.Close()
+			continue
+		}
+		s.acceptedConns[conn] = struct{}{}
+		s.connWG.Add(1)
+		s.lifecycleMu.Unlock()
 		s.logger.Debug("TCP connection accepted", zap.String("remote", conn.RemoteAddr().String()))
 		s.metricsSink().IncTCPConnections()
-		go s.handleConn(ctx, conn)
+		go s.serveConn(ctx, conn)
 	}
+}
+
+// finishStartFailure clears a startup claim only when shutdown did not win it.
+// It reports whether Start should return the original startup error.
+func (s *TCPServer) finishStartFailure(startup *tcpStartup) bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.lifecycleState != tcpLifecycleStarting || s.startup != startup {
+		return false
+	}
+	s.lifecycleState = tcpLifecycleNew
+	s.startup = nil
+	return true
 }
 
 // TLSFingerprint returns the SHA-256 fingerprint of the control-channel
 // certificate, or "" when TLS is disabled.
 func (s *TCPServer) TLSFingerprint() string {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	return s.tlsFingerprint
 }
 
@@ -409,6 +556,8 @@ func (s *TCPServer) TLSFingerprint() string {
 // and two independent tlscert.Ensure calls on a fresh install would race to
 // create two different self-signed certs. Call before Start.
 func (s *TCPServer) UseTLSMaterial(cert tls.Certificate, fingerprint string) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
 	s.tlsCert, s.tlsFingerprint, s.tlsCertSet = &cert, fingerprint, true
 }
 
@@ -420,24 +569,158 @@ func (s *TCPServer) EnsureGlobalScopeKey(ctx context.Context) error {
 	return err
 }
 
-// Shutdown stops accepting new connections and closes the listener. Existing
-// per-connection goroutines will exit when their reads fail. It is safe to
-// call multiple times.
-func (s *TCPServer) Shutdown() error {
-	var err error
-	s.stopOnce.Do(func() {
-		close(s.stopCh)
-		if s.listener != nil {
-			err = s.listener.Close()
+// Shutdown permanently stops the listener, closes every accepted raw
+// connection, and waits for their handlers to exit. Callers share one
+// terminal result; the first incomplete caller deadline becomes that result.
+func (s *TCPServer) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.stopOnce.Do(s.beginShutdown)
+
+	select {
+	case <-s.shutdownDone:
+		return s.shutdownResult()
+	case <-ctx.Done():
+		// A completed graceful shutdown wins a simultaneous context deadline.
+		select {
+		case <-s.shutdownDone:
+			return s.shutdownResult()
+		default:
 		}
-	})
-	return err
+		return s.recordShutdownDeadline(ctx.Err())
+	}
+}
+
+func (s *TCPServer) beginShutdown() {
+	s.lifecycleMu.Lock()
+	s.lifecycleState = tcpLifecycleStopping
+	startup := s.startup
+	s.startup = nil
+	listener := s.listener
+	acceptDone := s.acceptDone
+	connections := make([]net.Conn, 0, len(s.acceptedConns))
+	for conn := range s.acceptedConns {
+		connections = append(connections, conn)
+	}
+	s.lifecycleMu.Unlock()
+	if startup != nil {
+		startup.cancel()
+	}
+
+	close(s.stopCh)
+	go func() {
+		var shutdownErr error
+		shutdownErr = joinTCPShutdownError(shutdownErr, closeTCPListener(listener))
+		for _, conn := range connections {
+			shutdownErr = joinTCPShutdownError(shutdownErr, conn.Close())
+		}
+		if startup != nil {
+			<-startup.done
+		}
+		if acceptDone != nil {
+			<-acceptDone
+		}
+		s.connWG.Wait()
+		s.completeShutdown(shutdownErr)
+	}()
+}
+
+func closeTCPListener(listener net.Listener) error {
+	if listener == nil {
+		return nil
+	}
+	return listener.Close()
+}
+
+func joinTCPShutdownError(current, err error) error {
+	if err == nil || errors.Is(err, net.ErrClosed) {
+		return current
+	}
+	return errors.Join(current, err)
+}
+
+func (s *TCPServer) shutdownResult() error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	return s.shutdownErr
+}
+
+func (s *TCPServer) completeShutdown(closeErr error) {
+	s.lifecycleMu.Lock()
+	timedOut := s.shutdownTimedOut
+	if !timedOut {
+		s.shutdownErr = errors.Join(s.shutdownErr, closeErr)
+	}
+	s.lifecycleState = tcpLifecycleStopped
+	s.shutdownDoneOK = true
+	close(s.shutdownDone)
+	s.lifecycleMu.Unlock()
+
+	if timedOut && closeErr != nil {
+		s.logger.Warn("TCP shutdown cleanup error after deadline", zap.Error(closeErr))
+	}
+}
+
+// recordShutdownDeadline makes the first caller deadline the shared terminal
+// result. Later callers cannot observe a successful result after an earlier
+// bounded shutdown has already timed out.
+func (s *TCPServer) recordShutdownDeadline(ctxErr error) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.shutdownDoneOK {
+		return s.shutdownErr
+	}
+	if !s.shutdownTimedOut {
+		if s.shutdownErr == nil {
+			s.shutdownErr = ctxErr
+		} else {
+			s.shutdownErr = errors.Join(s.shutdownErr, ctxErr)
+		}
+		s.shutdownTimedOut = true
+	}
+	return s.shutdownErr
+}
+
+func (s *TCPServer) stopping() bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	return s.lifecycleState >= tcpLifecycleStopping
+}
+
+func (s *TCPServer) shutdownTimeout() time.Duration {
+	if s.cfg != nil && s.cfg.ShutdownTimeout > 0 {
+		return s.cfg.ShutdownTimeout
+	}
+	return 30 * time.Second
+}
+
+// serveConn is deliberately the outermost handler boundary. handleConn's
+// cleanup defers run first on a panic; only then does this wrapper log the
+// fixed, non-payload panic metadata and retire lifecycle bookkeeping.
+func (s *TCPServer) serveConn(ctx context.Context, conn net.Conn) {
+	defer s.connWG.Done()
+	defer func() {
+		s.lifecycleMu.Lock()
+		delete(s.acceptedConns, conn)
+		s.lifecycleMu.Unlock()
+	}()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.logger.Error("TCP connection handler panic",
+				zap.String("panic_type", fmt.Sprintf("%T", recovered)),
+				zap.Stack("stack"),
+			)
+		}
+	}()
+
+	s.handleConn(ctx, conn)
 }
 
 // handleConn services a single client connection for its lifetime.
 func (s *TCPServer) handleConn(ctx context.Context, conn net.Conn) {
 	defer func() {
-		if err := conn.Close(); err != nil {
+		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			s.logger.Debug("closing client connection", zap.Error(err))
 		}
 	}()
@@ -455,7 +738,7 @@ func (s *TCPServer) handleConn(ctx context.Context, conn net.Conn) {
 	// (217) max-clients enforcement: config max_clients, tightened by the
 	// serveredit override. 0 = unlimited.
 	if max := s.EffectiveMaxClients(ctx); max > 0 && s.clientCount() > max {
-		_ = s.sendError(client, errCodeUnavailable, "server is full")
+		_ = s.sendGlobalError(client, errCodeUnavailable, "server is full")
 		return
 	}
 
@@ -467,8 +750,18 @@ func (s *TCPServer) handleConn(ctx context.Context, conn net.Conn) {
 	// Server-initiated keepalive: Ping every 15s; matching Pongs feed the
 	// smoothed RTT reported in Client Info.
 	pingStop := make(chan struct{})
-	defer close(pingStop)
-	go s.pingLoop(client, pingStop)
+	pingDone := make(chan struct{})
+	defer func() {
+		close(pingStop)
+		// A ping write can be blocked while the connection handler is leaving.
+		// Closing the raw connection before waiting guarantees the child exits.
+		_ = conn.Close()
+		<-pingDone
+	}()
+	go s.servePingLoop(client, pingStop, pingDone)
+	if s.beforeHandle != nil {
+		s.beforeHandle()
+	}
 
 	for {
 		select {
@@ -513,12 +806,13 @@ func (s *TCPServer) handleConn(ctx context.Context, conn net.Conn) {
 // authenticated.
 func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Frame) error {
 	mt := netproto.MessageType(f.Type)
+	ctx = context.WithValue(ctx, requestOriginContextKey{}, mt)
 
 	if !client.isAuthed() && mt != netproto.MsgAuthenticate && mt != netproto.MsgAuthSignature && mt != netproto.MsgPing {
-		return s.sendError(client, errCodeNotAuthenticated, "not authenticated")
+		return s.sendErrorFor(client, mt, errCodeNotAuthenticated, "not authenticated")
 	}
 	if client.rulesBlocked() && !allowedWhileRulesPending[mt] {
-		return s.sendError(client, errCodePermissionDenied, "accept the server rules before continuing")
+		return s.sendErrorFor(client, mt, errCodePermissionDenied, "accept the server rules before continuing")
 	}
 
 	switch mt {
@@ -708,8 +1002,19 @@ func (s *TCPServer) dispatch(ctx context.Context, client *Client, f *netproto.Fr
 			zap.String("client_id", client.ID),
 			zap.Uint16("msg_type", f.Type),
 		)
-		return s.sendError(client, errCodeUnknown, fmt.Sprintf("unknown message type %d", f.Type))
+		return s.sendErrorFor(client, mt, errCodeUnknown, fmt.Sprintf("unknown message type %d", f.Type))
 	}
+}
+
+// requestOriginContextKey keeps the immutable origin local to one dispatch
+// call. Helpers already receive ctx, so forwarding it avoids mutable Client
+// state while retaining explicit sendErrorFor origin arguments at every call
+// site.
+type requestOriginContextKey struct{}
+
+func requestOrigin(ctx context.Context) netproto.MessageType {
+	origin, _ := ctx.Value(requestOriginContextKey{}).(netproto.MessageType)
+	return origin
 }
 
 // allowedWhileRulesPending is deliberately small: central dispatch denies new
@@ -720,9 +1025,24 @@ var allowedWhileRulesPending = map[netproto.MessageType]bool{
 	netproto.MsgPong:              true,
 }
 
+// servePingLoop contains the per-connection child goroutine so a panic there
+// cannot escape the process or outlive handleConn's cleanup boundary.
+func (s *TCPServer) servePingLoop(client *Client, stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.logger.Error("TCP ping loop panic",
+				zap.String("panic_type", fmt.Sprintf("%T", recovered)),
+				zap.Stack("stack"),
+			)
+		}
+	}()
+	s.pingLoop(client, stop)
+}
+
 // pingLoop sends a server-initiated Ping every 15s until stopped; matching
 // Pongs feed the client's smoothed RTT.
-func (s *TCPServer) pingLoop(client *Client, stop chan struct{}) {
+func (s *TCPServer) pingLoop(client *Client, stop <-chan struct{}) {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -804,11 +1124,6 @@ func (s *TCPServer) onDisconnect(client *Client) {
 				zap.Error(err),
 			)
 		}
-		s.metricsSink().SetWebRTCPeers(s.deps.Voice.PeerCount())
-	}
-
-	if s.deps.State != nil {
-		s.metricsSink().SetClientsConnected(s.deps.State.ClientCount())
 	}
 }
 
@@ -850,8 +1165,18 @@ func (s *TCPServer) writeFrame(client *Client, frame *netproto.Frame) error {
 	return nil
 }
 
-// sendError writes an Error frame to the client.
-func (s *TCPServer) sendError(client *Client, code uint16, message string) error {
+// sendErrorFor writes an Error frame explicitly correlated to one inbound
+// request. The origin travels as an immutable argument; it is never stored on
+// Client, so concurrent dispatches cannot leak one request's origin into
+// another response.
+func (s *TCPServer) sendErrorFor(client *Client, origin netproto.MessageType, code uint16, message string) error {
+	errMsg := netproto.Error{Code: code, Message: message, OriginType: uint16(origin)}
+	return s.writeMessage(client, netproto.MsgError, errMsg)
+}
+
+// sendGlobalError is for asynchronous server-originated failures, which have
+// no inbound request to correlate.
+func (s *TCPServer) sendGlobalError(client *Client, code uint16, message string) error {
 	return s.writeMessage(client, netproto.MsgError, netproto.Error{Code: code, Message: message})
 }
 

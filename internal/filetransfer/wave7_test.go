@@ -166,7 +166,7 @@ func TestDownloadLink(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/dl/"+token, nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/dl/"+token, nil)
 	s.Links().ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("link status = %d", rec.Code)
@@ -177,7 +177,7 @@ func TestDownloadLink(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	s.Links().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dl/nope", nil))
+	s.Links().ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/dl/nope", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("unknown token status = %d", rec.Code)
 	}
@@ -210,7 +210,7 @@ func TestDownloadLinkRejectsSymlinkSwap(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	s.Links().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dl/"+token, nil))
+	s.Links().ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/dl/"+token, nil))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("symlink-swapped link status = %d, want 404", rec.Code)
 	}

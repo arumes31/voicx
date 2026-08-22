@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1.24.0@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89
+# Keep rclone in a separate pinned source image so the backup runtime does not
+# install packages at startup.
+FROM rclone/rclone:1.72.0@sha256:0eb18825ac9732c21c11d654007170572bbd495352bb6dbb624f18e4f462c496 AS rclone
+
+FROM postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+
+# rclone's official image installs its binary at this path.
+COPY --from=rclone /usr/local/bin/rclone /usr/local/bin/rclone
+# The PostgreSQL Alpine image removes the temporary CA dependency used to build
+# gosu; retain rclone's CA bundle without installing packages at runtime.
+COPY --from=rclone /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY scripts/secret-env.sh /usr/local/lib/voicx/secret-env.sh
+COPY scripts/postgres-backup.sh /usr/local/bin/postgres-backup.sh
+COPY scripts/postgres-backup-entrypoint.sh /usr/local/bin/postgres-backup-entrypoint.sh
+COPY scripts/postgres-backup-scheduler.sh /usr/local/bin/postgres-backup-scheduler.sh
+RUN chmod 0555 /usr/local/lib/voicx/secret-env.sh \
+    /usr/local/bin/postgres-backup.sh \
+    /usr/local/bin/postgres-backup-entrypoint.sh \
+    /usr/local/bin/postgres-backup-scheduler.sh
+
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["/usr/local/bin/postgres-backup-entrypoint.sh"]
+CMD ["/usr/local/bin/postgres-backup-scheduler.sh"]

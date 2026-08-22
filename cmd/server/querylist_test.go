@@ -43,7 +43,7 @@ func TestQueryBackendCreateChannelRejectsNarrowingWraparound(t *testing.T) {
 	t.Parallel()
 
 	q := &queryBackend{}
-	if _, err := q.CreateChannel(context.Background(), "invalid", "", 256); err == nil {
+	if _, err := q.CreateChannel(context.Background(), query.ChannelCreateParams{Name: "invalid", Type: 256}); err == nil {
 		t.Fatal("CreateChannel accepted type 256 as temporary channel type 0")
 	}
 }

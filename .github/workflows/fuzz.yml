@@ -13,26 +13,45 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  discover:
+    name: Discover fuzz targets
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Discover fuzz declarations
+        id: targets
+        shell: bash
+        run: |
+          go run ./cmd/fuzzdiscover > fuzz-targets.json
+          if ! jq -e 'type == "array" and length > 0' fuzz-targets.json >/dev/null; then
+            echo "No Go fuzz targets were discovered." >&2
+            exit 1
+          fi
+          matrix="$(jq -c . fuzz-targets.json)"
+          echo "Discovered fuzz targets: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   fuzz:
-    name: ${{ matrix.target }}
+    name: ${{ matrix.module }} ${{ matrix.package }} ${{ matrix.target }}
+    needs: discover
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - package: ./internal/netproto
-            target: FuzzReadFrame
-          - package: ./internal/netproto
-            target: FuzzDecodeChatSend
-          - package: ./internal/query
-            target: FuzzEscapeUnescape
-          - package: ./internal/query
-            target: FuzzParseCommand
-          - package: ./internal/auth
-            target: FuzzParseEncodedHash
-          - package: ./internal/chatcrypto
-            target: FuzzParseRing
+        include: ${{ fromJSON(needs.discover.outputs.matrix) }}
 
     steps:
       - name: Checkout repository
@@ -45,5 +64,24 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Set up Node for client fuzzing
+        if: matrix.module == 'client'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: client/frontend/package-lock.json
+
+      - name: Prepare client fuzz target
+        if: matrix.module == 'client'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxtst-dev libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev
+          cd client/frontend
+          npm ci
+          npm run build
+
       - name: Fuzz ${{ matrix.target }}
+        working-directory: ${{ matrix.module }}
         run: go test -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime=2m ${{ matrix.package }}

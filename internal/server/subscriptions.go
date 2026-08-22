@@ -48,23 +48,23 @@ const (
 func (s *TCPServer) handleChannelSubscribe(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.ChannelSubscribe
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed channel_subscribe: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed channel_subscribe: "+err.Error())
 	}
 	if len(msg.ChannelIDs) == 0 || len(msg.ChannelIDs) > maxSubscribeTargets {
-		return s.sendError(client, errCodeMalformed,
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed,
 			fmt.Sprintf("channel_ids count must be 1..%d", maxSubscribeTargets))
 	}
 	if s.deps == nil || s.deps.State == nil {
-		return s.sendError(client, errCodeUnavailable, "state backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "state backend unavailable")
 	}
 	if client.rulesBlocked() {
-		return s.sendError(client, errCodePermissionDenied,
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied,
 			"accept the server rules before subscribing to channel chat")
 	}
 	// Same bucket as a chat send: an accepted target seals a key and a
 	// dropped one is re-checked on the next relay, so the loop has a cost.
 	if s.chatRate != nil && !s.chatRate.allow(client.UniqueID, time.Now()) {
-		return s.sendError(client, errCodeMalformed, "chat rate limit exceeded — slow down")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "chat rate limit exceeded — slow down")
 	}
 
 	if !msg.Subscribe {
@@ -76,15 +76,15 @@ func (s *TCPServer) handleChannelSubscribe(ctx context.Context, client *Client, 
 
 	currentChannelID, e2ePublicKey, ok := s.deps.State.ClientChannelState(client.ID)
 	if !ok {
-		return s.sendError(client, errCodeUnavailable, "state backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "state backend unavailable")
 	}
 	if s.chatKeys == nil || !s.chatKeys.configured() {
-		return s.sendError(client, errCodeUnavailable, "chat key manager unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "chat key manager unavailable")
 	}
 	if e2ePublicKey == "" {
 		// Relaying to this client would be ciphertext it provably cannot
 		// open, and a silent subscription is worse than none (312).
-		return s.sendError(client, errCodePermissionDenied,
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied,
 			"publish an encryption key before subscribing — a subscriber that cannot be sealed to could not read the channel")
 	}
 
@@ -117,7 +117,7 @@ func (s *TCPServer) handleChannelSubscribe(ctx context.Context, client *Client, 
 		}
 	}
 	if len(held) > maxSubscriptions {
-		return s.sendError(client, errCodeMalformed,
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed,
 			fmt.Sprintf("too many subscriptions (max %d) — unsubscribe first", maxSubscriptions))
 	}
 
@@ -145,7 +145,7 @@ func (s *TCPServer) handleChannelSubscribe(ctx context.Context, client *Client, 
 		}
 	}
 	if len(refused) > 0 {
-		_ = s.sendError(client, errCodePermissionDenied,
+		_ = s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied,
 			"not subscribed to channel(s): "+strings.Join(refused, ", "))
 	}
 	return s.sendSubscriptionState(client)

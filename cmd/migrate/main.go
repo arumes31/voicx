@@ -18,6 +18,10 @@ import (
 )
 
 func main() {
+	os.Exit(runMain())
+}
+
+func runMain() int {
 	timeout := flag.Duration("timeout", 5*time.Minute,
 		"maximum time to wait for the migration lock and apply migrations")
 	flag.Parse()
@@ -25,8 +29,9 @@ func main() {
 	defer stop()
 	if err := run(ctx, *timeout); err != nil {
 		fmt.Fprintf(os.Stderr, "voicx-migrate: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
 func run(ctx context.Context, timeout time.Duration) (runErr error) {

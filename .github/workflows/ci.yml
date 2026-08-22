@@ -3,6 +3,8 @@ name: CI
 on:
   push:
   pull_request:
+    # Label changes must rerun the visible, reviewable one-time breaking skip.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
   contents: read
@@ -12,6 +14,62 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  proto-contract:
+    name: Proto contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # Breaking-change checks compare the exact PR base SHA, so shallow
+      # history is not sufficient.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # Pinned official Buf action, used only to install the exact CLI. The
+      # individual checks below remain visible in the CI log.
+      - name: Set up Buf 1.72.0
+        uses: bufbuild/buf-action@fd21066df7214747548607aaa45548ba2b9bc1ff # v1
+        with:
+          setup_only: true
+          version: 1.72.0
+
+      - name: verify proto-contract policy scope
+        run: bash scripts/verify-proto-contract.sh
+
+      - name: lint protobuf contracts
+        run: buf lint
+
+      - name: regenerate committed Go protobuf stubs
+        run: |
+          buf generate
+          if [[ -n "$(git status --porcelain --untracked-files=all -- v1)" ]]; then
+            echo "generated protobuf stubs under v1 are not clean"
+            git status --porcelain --untracked-files=all -- v1
+            exit 1
+          fi
+
+      - name: test generated protobuf contracts
+        run: >-
+          go test ./internal/grpcserver -run
+          '^(TestGeneratedServiceContracts|TestGeneratedAuthenticationReservationContracts|TestUserBannedEventChannelFieldContract|TestChannelDeletedEventIncludesDeleteReason)$'
+
+      - name: check protobuf breaking changes
+        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'buf skip breaking')
+        run: >-
+          buf breaking --against
+          "${{ github.event.repository.clone_url }}#format=git,commit=${{ github.event.pull_request.base.sha }}"
+
+      - name: record approved breaking-check skip
+        if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'buf skip breaking')
+        run: |
+          echo "::warning::Buf breaking check skipped because this PR has the explicit 'buf skip breaking' label."
+          echo "Remove the label to rerun breaking-change detection against ${{ github.event.pull_request.base.sha }}."
+
   frontend-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -21,6 +79,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -32,6 +91,35 @@ jobs:
       - run: npm run build
       - run: npm run test:unit
       - run: npm run test:e2e
+
+  client-windows:
+    name: Client Windows validation
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: client/go.mod
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: client/frontend/package-lock.json
+
+      - name: build frontend assets
+        working-directory: client/frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: test client
+        working-directory: client
+        run: go test -count=1 ./...
 
   test:
     runs-on: ubuntu-latest
@@ -57,6 +145,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -99,6 +188,9 @@ jobs:
         run: |
           go build ./...
           (cd client && go build ./...)
+
+      - name: benchmark smoke
+        run: go test -count=1 -run '^$' -bench=. -benchtime=1x ./internal/netproto ./internal/chatcrypto ./internal/permissions ./internal/filetransfer
 
       - name: test and enforce coverage
         run: |
@@ -174,65 +266,15 @@ jobs:
           test "$source_ledger" = "$restore_ledger"
 
   security-gate:
-    name: Release security gate
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    name: Security analysis
+    uses: ./.github/workflows/security.yml
     permissions:
+      actions: read
       contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: |
-            go.sum
-            client/go.sum
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 24.19.0
-          cache: npm
-          cache-dependency-path: client/frontend/package-lock.json
-
-      - name: install pinned Go security analyzers
-        run: |
-          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
-          go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
-          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
-
-      - name: scan reachable Go vulnerabilities
-        run: |
-          govulncheck ./...
-          (cd client && govulncheck ./...)
-
-      - name: scan Go source security
-        run: |
-          gosec -quiet -exclude-generated ./cmd/...
-          gosec -quiet -exclude-generated ./internal/auth/... ./internal/channels/... ./internal/chatcrypto/... ./internal/config/... ./internal/filetransfer/... ./internal/netproto/... ./internal/permissions/...
-          gosec -quiet -exclude-generated ./internal/query/... ./internal/recorder/... ./internal/safecast/... ./internal/server/... ./internal/store/...
-          gosec -quiet -exclude-generated . ./internal/tlscert/... ./internal/turn/... ./internal/version/... ./internal/webrtc/... ./v1/...
-          (cd client && gosec -quiet -exclude-generated ./...)
-
-      - name: audit frontend dependencies
-        working-directory: client/frontend
-        run: |
-          npm ci
-          npm audit --audit-level=high
-
-      - name: lint GitHub Actions workflows
-        run: actionlint
-
-      - name: scan repository secrets
-        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      security-events: write
 
   docker:
-    needs: [test, frontend-e2e, security-gate]
+    needs: [proto-contract, test, frontend-e2e, security-gate]
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -301,8 +343,8 @@ jobs:
           provenance: mode=max
           sbom: true
 
-  release:
-    needs: [test, frontend-e2e, security-gate]
+  release-build:
+    needs: [proto-contract, test, frontend-e2e, client-windows, security-gate]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: windows-latest
     timeout-minutes: 45
@@ -310,7 +352,9 @@ jobs:
       VOICX_UPDATE_PUBLIC_KEYS: ${{ vars.VOICX_UPDATE_PUBLIC_KEYS }}
       VOICX_UPDATE_REPO: ${{ github.repository }}
     permissions:
-      contents: write
+      attestations: write
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -329,17 +373,11 @@ jobs:
         shell: bash
         run: go run ./cmd/version -check -format github >> "$GITHUB_ENV"
 
-      - name: validate update signing configuration
+      - name: validate update public-key configuration
         shell: bash
-        env:
-          VOICX_UPDATE_SIGNING_KEY: ${{ secrets.VOICX_UPDATE_SIGNING_KEY }}
         run: |
           test -n "$VOICX_UPDATE_PUBLIC_KEYS" || {
             echo "repository variable VOICX_UPDATE_PUBLIC_KEYS is required" >&2
-            exit 1
-          }
-          test -n "$VOICX_UPDATE_SIGNING_KEY" || {
-            echo "repository secret VOICX_UPDATE_SIGNING_KEY is required" >&2
             exit 1
           }
 
@@ -362,27 +400,141 @@ jobs:
               -X=voicx/internal/version.UpdateRepo=$VOICX_UPDATE_REPO" \
             -o voicx-server-linux-amd64 ./cmd/server
 
-      - name: checksums
+      - name: stage release binaries
         shell: bash
         run: |
           cp client/build/bin/voicx-client.exe voicx-client-windows-amd64.exe
-          printf '# voicx-version: %s\n' "$GITHUB_REF_NAME" > checksums.txt
-          sha256sum voicx-client-windows-amd64.exe voicx-server-linux-amd64 >> checksums.txt
-          cat checksums.txt
 
-      - name: sign update manifest
+      - name: attest release binary build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            voicx-client-windows-amd64.exe
+            voicx-server-linux-amd64
+
+      - name: upload release binaries for signing
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-binaries
+          path: |
+            voicx-client-windows-amd64.exe
+            voicx-server-linux-amd64
+          if-no-files-found: error
+          retention-days: 1
+
+  release-sign:
+    needs: release-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VOICX_UPDATE_PUBLIC_KEYS: ${{ vars.VOICX_UPDATE_PUBLIC_KEYS }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: download release binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-binaries
+          path: release
+
+      - name: create release manifest
+        shell: bash
+        run: |
+          test -n "$VOICX_UPDATE_PUBLIC_KEYS" || {
+            echo "repository variable VOICX_UPDATE_PUBLIC_KEYS is required" >&2
+            exit 1
+          }
+          printf '# voicx-version: %s\n' "$GITHUB_REF_NAME" > release/checksums.txt
+          sha256sum release/voicx-client-windows-amd64.exe release/voicx-server-linux-amd64 \
+            | sed 's#  release/#  #' >> release/checksums.txt
+
+      - name: build release signer
+        shell: bash
+        run: go build -trimpath -o "$RUNNER_TEMP/signrelease" ./cmd/signrelease
+
+      - name: sign release manifest
         shell: bash
         env:
           VOICX_UPDATE_SIGNING_KEY: ${{ secrets.VOICX_UPDATE_SIGNING_KEY }}
-        run: go run ./cmd/signrelease -in checksums.txt -out checksums.txt.sig
+        run: '"$RUNNER_TEMP/signrelease" -in release/checksums.txt -out release/checksums.txt.sig -version "$GITHUB_REF_NAME"'
 
-      - name: upload to GitHub Release
+      - name: verify signed release assets
+        shell: bash
+        run: |
+          go run ./cmd/signrelease -verify -in release/checksums.txt \
+            -out release/checksums.txt.sig -version "$GITHUB_REF_NAME"
+          (
+            cd release
+            test "$(head -n 1 checksums.txt)" = "# voicx-version: $GITHUB_REF_NAME"
+            test "$(tail -n +2 checksums.txt | wc -l)" -eq 2
+            test "$(tail -n +2 checksums.txt | awk '{print $2}')" = "$(printf '%s\n%s' voicx-client-windows-amd64.exe voicx-server-linux-amd64)"
+            tail -n +2 checksums.txt | sha256sum --check --strict
+          )
+
+      - name: upload signed release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          path: release
+          if-no-files-found: error
+          retention-days: 1
+
+  release-publish:
+    needs: release-sign
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VOICX_UPDATE_PUBLIC_KEYS: ${{ vars.VOICX_UPDATE_PUBLIC_KEYS }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: compute version metadata
+        shell: bash
+        run: go run ./cmd/version -check -format github >> "$GITHUB_ENV"
+
+      - name: download signed release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: release
+
+      - name: verify signed release manifest
+        shell: bash
+        run: |
+          go run ./cmd/signrelease -verify -in release/checksums.txt \
+            -out release/checksums.txt.sig -version "$GITHUB_REF_NAME"
+          (
+            cd release
+            test "$(head -n 1 checksums.txt)" = "# voicx-version: $GITHUB_REF_NAME"
+            test "$(tail -n +2 checksums.txt | wc -l)" -eq 2
+            test "$(tail -n +2 checksums.txt | awk '{print $2}')" = "$(printf '%s\n%s' voicx-client-windows-amd64.exe voicx-server-linux-amd64)"
+            tail -n +2 checksums.txt | sha256sum --check --strict
+          )
+
+      - name: upload verified release assets
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           prerelease: ${{ env.VOICX_PRERELEASE == 'true' }}
           make_latest: ${{ env.VOICX_PRERELEASE == 'false' }}
           files: |
-            voicx-client-windows-amd64.exe
-            voicx-server-linux-amd64
-            checksums.txt
-            checksums.txt.sig
+            release/voicx-client-windows-amd64.exe
+            release/voicx-server-linux-amd64
+            release/checksums.txt
+            release/checksums.txt.sig

@@ -117,6 +117,9 @@ evicted:
 	if slow.Dropped() == 0 {
 		t.Fatal("evicted subscriber reports no drops")
 	}
+	if got := slow.CloseReason(); got != CloseReasonSlowConsumer {
+		t.Fatalf("slow close reason = %v, want %v", got, CloseReasonSlowConsumer)
+	}
 	stats := bus.Stats()
 	if stats.Evicted != 1 || stats.Dropped == 0 {
 		t.Fatalf("stats = %+v", stats)
@@ -139,6 +142,9 @@ func TestUnsubscribeAndClose(t *testing.T) {
 	if _, ok := <-sub.C; ok {
 		t.Fatal("channel still open after Unsubscribe")
 	}
+	if got := sub.CloseReason(); got != CloseReasonUnsubscribed {
+		t.Fatalf("unsubscribe close reason = %v, want %v", got, CloseReasonUnsubscribed)
+	}
 	// Publishing to nobody must not panic and must still advance the sequence.
 	bus.Publish("user_joined", []byte(`{}`))
 	if got := bus.Stats().Published; got != 1 {
@@ -150,6 +156,13 @@ func TestUnsubscribeAndClose(t *testing.T) {
 	bus.Close() // idempotent
 	if _, ok := <-other.C; ok {
 		t.Fatal("channel still open after Close")
+	}
+	if got := other.CloseReason(); got != CloseReasonBusClosed {
+		t.Fatalf("bus-close reason = %v, want %v", got, CloseReasonBusClosed)
+	}
+	other.Unsubscribe() // cleanup must not overwrite the terminal cause.
+	if got := other.CloseReason(); got != CloseReasonBusClosed {
+		t.Fatalf("close reason after cleanup = %v, want %v", got, CloseReasonBusClosed)
 	}
 	if bus.Subscribe("late", nil, 0) != nil {
 		t.Fatal("Subscribe succeeded on a closed bus")

@@ -26,8 +26,11 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// Signaling service handles WebRTC negotiation between clients and the server.
-// The server acts as a signaling relay and SFU controller.
+// Deprecated: Signaling is intentionally unserved. WebRTC negotiation stays
+// on the control channel; the message types remain for descriptor and source
+// compatibility while clients migrate away from this RPC service.
+//
+// Deprecated: Do not use.
 type SignalingClient interface {
 	// Bidirectional stream: clients send signaling messages and receive
 	// signaling events (offers, answers, ICE candidates) from the server.
@@ -38,6 +41,7 @@ type signalingClient struct {
 	cc grpc.ClientConnInterface
 }
 
+// Deprecated: Do not use.
 func NewSignalingClient(cc grpc.ClientConnInterface) SignalingClient {
 	return &signalingClient{cc}
 }
@@ -59,8 +63,11 @@ type Signaling_SignalClient = grpc.BidiStreamingClient[SignalMessage, SignalMess
 // All implementations must embed UnimplementedSignalingServer
 // for forward compatibility.
 //
-// Signaling service handles WebRTC negotiation between clients and the server.
-// The server acts as a signaling relay and SFU controller.
+// Deprecated: Signaling is intentionally unserved. WebRTC negotiation stays
+// on the control channel; the message types remain for descriptor and source
+// compatibility while clients migrate away from this RPC service.
+//
+// Deprecated: Do not use.
 type SignalingServer interface {
 	// Bidirectional stream: clients send signaling messages and receive
 	// signaling events (offers, answers, ICE candidates) from the server.
@@ -88,6 +95,7 @@ type UnsafeSignalingServer interface {
 	mustEmbedUnimplementedSignalingServer()
 }
 
+// Deprecated: Do not use.
 func RegisterSignalingServer(s grpc.ServiceRegistrar, srv SignalingServer) {
 	// If the following call pancis, it indicates UnimplementedSignalingServer was
 	// embedded by pointer and is nil.  This will cause panics if an

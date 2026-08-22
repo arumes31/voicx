@@ -55,14 +55,12 @@ func establishVoiceSession(t *testing.T, v *Voice, clientPC *webrtc.PeerConnecti
 
 // offerRecorder collects renegotiation offers delivered via SetOfferSender.
 type offerRecorder struct {
-	mu    sync.Mutex
-	times []time.Time
-	sdps  []string
+	mu   sync.Mutex
+	sdps []string
 }
 
 func (o *offerRecorder) add(sdp string) {
 	o.mu.Lock()
-	o.times = append(o.times, time.Now())
 	o.sdps = append(o.sdps, sdp)
 	o.mu.Unlock()
 }
@@ -70,13 +68,7 @@ func (o *offerRecorder) add(sdp string) {
 func (o *offerRecorder) count() int {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	return len(o.times)
-}
-
-func (o *offerRecorder) gap(i, j int) time.Duration {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return o.times[j].Sub(o.times[i])
+	return len(o.sdps)
 }
 
 func (o *offerRecorder) sdp(i int) string {
@@ -85,26 +77,80 @@ func (o *offerRecorder) sdp(i int) string {
 	return o.sdps[i]
 }
 
-// waitForOffers polls until n offers were recorded or the timeout expires.
-func waitForOffers(t *testing.T, rec *offerRecorder, n int, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if rec.count() >= n {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %d offers, got %d", n, rec.count())
+type manualRenegClock struct {
+	mu     sync.Mutex
+	now    time.Time
+	timers []*manualRenegTimer
 }
 
-// withRenegTiming temporarily shrinks the renegotiation debounce and rate
-// limit for the duration of a test.
-func withRenegTiming(t *testing.T, debounce, rateLimit time.Duration) {
-	t.Helper()
-	oldDebounce, oldRateLimit := renegDebounce, renegRateLimit
-	renegDebounce, renegRateLimit = debounce, rateLimit
-	t.Cleanup(func() { renegDebounce, renegRateLimit = oldDebounce, oldRateLimit })
+type manualRenegTimer struct {
+	clock    *manualRenegClock
+	due      time.Time
+	callback func()
+	stopped  bool
+	fired    bool
+}
+
+func newManualRenegClock(now time.Time) *manualRenegClock {
+	return &manualRenegClock{now: now, timers: []*manualRenegTimer{}}
+}
+
+func (c *manualRenegClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *manualRenegClock) AfterFunc(delay time.Duration, callback func()) renegTimer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	timer := &manualRenegTimer{clock: c, due: c.now.Add(delay), callback: callback}
+	c.timers = append(c.timers, timer)
+	return timer
+}
+
+func (c *manualRenegClock) Advance(duration time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(duration)
+	callbacks := []func(){}
+	for _, timer := range c.timers {
+		if !timer.stopped && !timer.fired && !timer.due.After(c.now) {
+			timer.fired = true
+			callbacks = append(callbacks, timer.callback)
+		}
+	}
+	c.mu.Unlock()
+	for _, callback := range callbacks {
+		callback()
+	}
+}
+
+func (c *manualRenegClock) Pending() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	count := 0
+	for _, timer := range c.timers {
+		if !timer.stopped && !timer.fired {
+			count++
+		}
+	}
+	return count
+}
+
+func (t *manualRenegTimer) Stop() bool {
+	t.clock.mu.Lock()
+	defer t.clock.mu.Unlock()
+	if t.stopped || t.fired {
+		return false
+	}
+	t.stopped = true
+	return true
+}
+
+func useManualRenegClock(v *Voice, clock *manualRenegClock, debounce, rateLimit time.Duration) {
+	v.renegClock = clock
+	v.renegDebounce = debounce
+	v.renegRateLimit = rateLimit
 }
 
 // TestRenegotiationDebounceAndRateLimit verifies a burst of membership
@@ -115,8 +161,6 @@ func TestRenegotiationDebounceAndRateLimit(t *testing.T) {
 		debounce  = 50 * time.Millisecond
 		rateLimit = 400 * time.Millisecond
 	)
-	withRenegTiming(t, debounce, rateLimit)
-
 	e, err := New(testLogger(), nil, false)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -124,6 +168,8 @@ func TestRenegotiationDebounceAndRateLimit(t *testing.T) {
 	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 	v := NewVoice(e, r, testLogger())
+	clock := newManualRenegClock(time.Unix(0, 0))
+	useManualRenegClock(v, clock, debounce, rateLimit)
 	defer func() { _ = v.ClosePeer("c1") }() // stops pending renegotiation timers
 
 	clientPC := newClientPC(t)
@@ -157,22 +203,32 @@ func TestRenegotiationDebounceAndRateLimit(t *testing.T) {
 	r.JoinChannel(1, "b")
 	r.JoinChannel(1, "c")
 	r.JoinChannel(1, "d")
-	waitForOffers(t, rec, 1, 3*time.Second)
+	if got := clock.Pending(); got != 1 {
+		t.Fatalf("pending debounce callbacks = %d, want 1", got)
+	}
+	clock.Advance(debounce - time.Nanosecond)
+	if got := rec.count(); got != 0 {
+		t.Fatalf("offers before debounce expires = %d, want 0", got)
+	}
+	clock.Advance(time.Nanosecond)
+	if got := rec.count(); got != 1 {
+		t.Fatalf("offers after debounce = %d, want 1", got)
+	}
 
 	// A change right after the first offer is rate-limited: no offer within
 	// most of the rate-limit window, then exactly one more.
 	r.JoinChannel(1, "e")
-	time.Sleep(rateLimit / 2)
+	clock.Advance(rateLimit - time.Nanosecond)
 	if got := rec.count(); got != 1 {
 		t.Fatalf("offers during rate-limit window = %d, want 1 (rate limited)", got)
 	}
-	waitForOffers(t, rec, 2, 3*time.Second)
-	if gap := rec.gap(0, 1); gap < rateLimit*7/8 {
-		t.Fatalf("gap between offers = %v, want >= ~%v (rate limit)", gap, rateLimit)
+	clock.Advance(time.Nanosecond)
+	if got := rec.count(); got != 2 {
+		t.Fatalf("offers at the rate-limit boundary = %d, want 2", got)
 	}
 
 	// Settled: no further offers.
-	time.Sleep(2 * debounce)
+	clock.Advance(2 * debounce)
 	if got := rec.count(); got != 2 {
 		t.Fatalf("total offers = %d, want 2", got)
 	}
@@ -187,8 +243,6 @@ func TestRenegotiationUnansweredTolerance(t *testing.T) {
 		debounce  = 50 * time.Millisecond
 		rateLimit = 300 * time.Millisecond
 	)
-	withRenegTiming(t, debounce, rateLimit)
-
 	e, err := New(testLogger(), nil, false)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -196,6 +250,8 @@ func TestRenegotiationUnansweredTolerance(t *testing.T) {
 	defer func() { _ = e.Close() }()
 	r := NewRouter(nil)
 	v := NewVoice(e, r, testLogger())
+	clock := newManualRenegClock(time.Unix(0, 0))
+	useManualRenegClock(v, clock, debounce, rateLimit)
 	defer func() { _ = v.ClosePeer("c1") }() // stops pending renegotiation timers
 
 	clientPC := newClientPC(t)
@@ -208,14 +264,20 @@ func TestRenegotiationUnansweredTolerance(t *testing.T) {
 	establishVoiceSession(t, v, clientPC, "c1")
 	r.JoinChannel(1, "c1")
 	r.JoinChannel(1, "b")
-	waitForOffers(t, rec, 1, 3*time.Second)
+	clock.Advance(debounce)
+	if got := rec.count(); got != 1 {
+		t.Fatalf("initial offers = %d, want 1", got)
+	}
 
 	// The client never answers; the next change is skipped (warning logged)
 	// and must not produce an offer or wedge the scheduler.
 	r.JoinChannel(1, "c")
-	time.Sleep(rateLimit + 4*debounce)
+	clock.Advance(rateLimit)
 	if got := rec.count(); got != 1 {
 		t.Fatalf("offers while previous is unanswered = %d, want 1 (skipped)", got)
+	}
+	if got := clock.Pending(); got != 0 {
+		t.Fatalf("pending callbacks after unanswered skip = %d, want 0", got)
 	}
 
 	// The client answers the first offer late: renegotiation resumes.
@@ -236,7 +298,10 @@ func TestRenegotiationUnansweredTolerance(t *testing.T) {
 	}
 
 	r.JoinChannel(1, "d")
-	waitForOffers(t, rec, 2, 3*time.Second)
+	clock.Advance(debounce)
+	if got := rec.count(); got != 2 {
+		t.Fatalf("offers after late answer recovery = %d, want 2", got)
+	}
 }
 
 // TestCreateOfferRequiresStable verifies server-initiated offers are only

@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -16,12 +17,19 @@ import (
 // wave-6a tables/columns exist.
 func testDBStore(t *testing.T) *Store {
 	t.Helper()
+	configured := os.Getenv("VOICX_TEST_DATABASE_URL") != ""
 	s, err := New(testDBURL(), testLogger(), 2, 1, time.Minute)
 	if err != nil {
+		if configured {
+			t.Fatalf("opening configured database: %v", err)
+		}
 		t.Skipf("no database available (%v); skipping DB-backed test", err)
 	}
 	if err := s.Migrate(); err != nil {
 		_ = s.Close()
+		if configured {
+			t.Fatalf("migrating configured database: %v", err)
+		}
 		t.Skipf("migrations failed (%v); skipping DB-backed test", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
@@ -141,12 +149,27 @@ func TestGroupsDB(t *testing.T) {
 		t.Fatal("delete without force succeeded on a non-empty group")
 	}
 
-	// Timed membership: expire immediately, then reap.
-	if err := s.AssignServerGroup(ctx, gid, userID, time.Millisecond); err != nil {
-		t.Fatalf("timed assign: %v", err)
+	// Exercise the production timed upsert first, then make that same member
+	// deterministically expired without depending on a wall-clock sleep.
+	if err := s.AssignServerGroup(ctx, gid, userID, time.Hour); err != nil {
+		t.Fatalf("AssignServerGroup timed: %v", err)
 	}
-	time.Sleep(5 * time.Millisecond)
-	pairs, err := s.ExpiredGroupMembers(ctx, time.Now())
+	var timedExpiry time.Time
+	if err := s.DB().QueryRowContext(ctx, `SELECT expires_at FROM server_group_members WHERE user_id = $1 AND server_group_id = $2`, userID, gid).Scan(&timedExpiry); err != nil {
+		t.Fatalf("reading timed membership expiry: %v", err)
+	}
+	if !timedExpiry.After(time.Now()) {
+		t.Fatalf("timed membership expiry = %v, want future time", timedExpiry)
+	}
+
+	expiredAt := time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC)
+	const expireMembership = `UPDATE server_group_members
+		SET expires_at = $3
+		WHERE user_id = $1 AND server_group_id = $2`
+	if _, err := s.DB().ExecContext(ctx, expireMembership, userID, gid, expiredAt); err != nil {
+		t.Fatalf("expiring membership: %v", err)
+	}
+	pairs, err := s.ExpiredGroupMembers(ctx, expiredAt.Add(time.Second))
 	if err != nil {
 		t.Fatalf("ExpiredGroupMembers: %v", err)
 	}
@@ -384,7 +407,10 @@ func TestBansDB(t *testing.T) {
 	if err := s.DeleteBan(ctx, found.ID); err != nil {
 		t.Fatalf("DeleteBan: %v", err)
 	}
-	bans, _ = s.ListBans(ctx)
+	bans, err = s.ListBans(ctx)
+	if err != nil {
+		t.Fatalf("ListBans after DeleteBan: %v", err)
+	}
 	for _, b := range bans {
 		if b.Value == value {
 			t.Fatal("ban still listed after delete")

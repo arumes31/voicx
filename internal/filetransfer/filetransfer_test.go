@@ -5,8 +5,10 @@ package filetransfer
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -28,6 +30,109 @@ func TestServerCloseBeforeStart(t *testing.T) {
 	}
 	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("Start after Close: %v", err)
+	}
+}
+
+func TestServerStartRejectsMalformedAddress(t *testing.T) {
+	s := New(Config{Addr: "not-a-listen-address", RootDir: t.TempDir()}, newFakeFileStore(), nil)
+	if err := s.Start(context.Background()); err == nil {
+		t.Fatal("Start accepted a malformed listen address")
+	}
+}
+
+func TestServerAddressValidationAndLifecycleRetry(t *testing.T) {
+	for _, address := range []string{":0", "127.0.0.1:0", "[::1]:0"} {
+		if server := New(Config{Addr: address, RootDir: t.TempDir()}, newFakeFileStore(), nil); server.addrErr != nil {
+			t.Fatalf("valid address %q parsed as %v", address, server.addrErr)
+		}
+	}
+	for _, address := range []string{"127.0.0.1", "127.0.0.1:http", "127.0.0.1:-1", "127.0.0.1:65536", "::1:12336"} {
+		if server := New(Config{Addr: address, RootDir: t.TempDir()}, newFakeFileStore(), nil); server.addrErr == nil {
+			t.Fatalf("invalid address %q was accepted", address)
+		}
+	}
+
+	invalidHost := New(Config{Addr: "256.256.256.256:0", RootDir: t.TempDir()}, newFakeFileStore(), nil)
+	if invalidHost.addrErr != nil {
+		t.Fatalf("parse-valid host rejected before Listen: %v", invalidHost.addrErr)
+	}
+	if err := invalidHost.Start(context.Background()); err == nil || strings.Contains(err.Error(), "already started") {
+		t.Fatalf("invalid-host Start = %v, want listen failure", err)
+	}
+
+	holder, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	address := holder.Addr().String()
+	server := New(Config{Addr: address, RootDir: t.TempDir()}, newFakeFileStore(), nil)
+	if err := server.Start(context.Background()); err == nil {
+		_ = holder.Close()
+		t.Fatal("Start accepted an occupied port")
+	}
+	if err := holder.Close(); err != nil {
+		t.Fatalf("release reserved port: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan error, 1)
+	go func() { started <- server.Start(ctx) }()
+	deadline := time.Now().Add(2 * time.Second)
+	ready := false
+	for time.Now().Before(deadline) {
+		conn, dialErr := (&net.Dialer{Timeout: 50 * time.Millisecond}).DialContext(t.Context(), "tcp", address)
+		if dialErr == nil {
+			_ = conn.Close()
+			ready = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !ready {
+		cancel()
+		t.Fatalf("Start retry did not listen on %s", address)
+	}
+	cancel()
+	if err := <-started; err != nil {
+		t.Fatalf("Start retry after releasing port: %v", err)
+	}
+}
+
+func TestServerInvalidAddressCloseBeforeStartIsNoop(t *testing.T) {
+	server := New(Config{Addr: "not-a-listen-address", RootDir: t.TempDir()}, newFakeFileStore(), nil)
+	if err := server.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := server.Start(context.Background()); err != nil {
+		t.Fatalf("Start after Close: %v, want nil closed no-op", err)
+	}
+}
+
+func TestServerListenFailureCloseConcurrent(t *testing.T) {
+	for i := 0; i < 25; i++ {
+		server := New(Config{Addr: "256.256.256.256:0", RootDir: t.TempDir()}, newFakeFileStore(), nil)
+		startErr := make(chan error, 1)
+		closeErr := make(chan error, 1)
+		go func() { startErr <- server.Start(context.Background()) }()
+		go func() { closeErr <- server.Close() }()
+		select {
+		case err := <-startErr:
+			if err != nil && strings.Contains(err.Error(), "already started") {
+				t.Fatalf("iteration %d Start = %v", i, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("iteration %d Start blocked", i)
+		}
+		select {
+		case err := <-closeErr:
+			if err != nil {
+				t.Fatalf("iteration %d Close = %v", i, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("iteration %d Close blocked", i)
+		}
+		if err := server.Start(context.Background()); err != nil {
+			t.Fatalf("iteration %d terminal Start = %v, want closed no-op", i, err)
+		}
 	}
 }
 
@@ -260,7 +365,7 @@ func TestTokenLifecycle(t *testing.T) {
 
 // TestSanitizeName verifies name validation.
 func TestSanitizeName(t *testing.T) {
-	valid := []string{"a.txt", "report 2024.pdf", ".hidden", "a-b_c.d"}
+	valid := []string{"a.txt", "report 2024.pdf", ".hidden", "a-b_c.d", "console.txt", "com10.txt", "auxiliary"}
 	for _, name := range valid {
 		if _, err := sanitizeName(name); err != nil {
 			t.Errorf("sanitizeName(%q) = %v, want nil", name, err)
@@ -269,6 +374,8 @@ func TestSanitizeName(t *testing.T) {
 	invalid := []string{
 		"", ".", "..", "../etc/passwd", `..\etc\passwd`, "a/b", `a\b`,
 		"a..b", "/abs/path", `C:\Windows\win.ini`, `\\server\share\file`,
+		"trailing.", "trailing ", "CON", "prn.txt", "AUX.log", "nul ",
+		"COM1", "com9.cfg", "LPT1", "lpt³.txt", "CONIN$", "conout$.log", "CON .txt",
 	}
 	for _, name := range invalid {
 		if _, err := sanitizeName(name); !errors.Is(err, ErrInvalidName) {

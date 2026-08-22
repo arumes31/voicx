@@ -72,42 +72,66 @@ func testDBURL() string {
 // testScratchStore creates an EMPTY throwaway database and returns a Store
 // bound to it. The shared dev database is already migrated, so it cannot
 // answer the only question these tests ask — did this file run exactly once,
-// starting from nothing. Skips (never fails) when the database is missing or
-// the test role may not create one.
+// starting from nothing. Without VOICX_TEST_DATABASE_URL it skips when the
+// local database is unavailable; an explicitly configured CI database must
+// instead surface connection, setup, and permission failures.
 func testScratchStore(t *testing.T) *Store {
 	t.Helper()
+	configured := os.Getenv("VOICX_TEST_DATABASE_URL") != ""
 	base := testDBURL()
 	admin, err := sql.Open("postgres", base)
 	if err != nil {
+		if configured {
+			t.Fatalf("opening configured migration database: %v", err)
+		}
 		t.Skipf("no database available (%v); skipping migration test", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := admin.PingContext(ctx); err != nil {
 		_ = admin.Close()
+		if configured {
+			t.Fatalf("pinging configured migration database: %v", err)
+		}
 		t.Skipf("no database available (%v); skipping migration test", err)
 	}
 	name := fmt.Sprintf("voicx_scratch_%d", time.Now().UnixNano())
-	if _, err := admin.Exec("CREATE DATABASE " + name); err != nil {
+	if _, err := admin.ExecContext(t.Context(), "CREATE DATABASE "+name); err != nil {
 		_ = admin.Close()
+		if configured {
+			t.Fatalf("creating configured scratch database: %v", err)
+		}
 		t.Skipf("cannot create a scratch database (%v); skipping migration test", err)
+	}
+	dropScratch := func() error {
+		dropCtx, dropCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer dropCancel()
+		_, err := admin.ExecContext(dropCtx, "DROP DATABASE IF EXISTS "+name)
+		return err
 	}
 	u, err := url.Parse(base)
 	if err != nil {
-		_, _ = admin.Exec("DROP DATABASE IF EXISTS " + name)
+		if dropErr := dropScratch(); dropErr != nil {
+			t.Errorf("dropping scratch database after URL parse failure: %v", dropErr)
+		}
 		_ = admin.Close()
+		if configured {
+			t.Fatalf("parsing configured database URL: %v", err)
+		}
 		t.Skipf("database URL is not parseable (%v); skipping migration test", err)
 	}
 	u.Path = "/" + name
 	s, err := New(u.String(), zap.NewNop(), 2, 1, time.Minute)
 	if err != nil {
-		_, _ = admin.Exec("DROP DATABASE IF EXISTS " + name)
+		if dropErr := dropScratch(); dropErr != nil {
+			t.Errorf("dropping scratch database after open failure: %v", dropErr)
+		}
 		_ = admin.Close()
 		t.Fatalf("opening scratch database %s: %v", name, err)
 	}
 	t.Cleanup(func() {
 		_ = s.Close()
-		if _, err := admin.Exec("DROP DATABASE IF EXISTS " + name); err != nil {
+		if err := dropScratch(); err != nil {
 			t.Logf("dropping scratch database %s: %v", name, err)
 		}
 		_ = admin.Close()
@@ -120,7 +144,7 @@ func testScratchStore(t *testing.T) *Store {
 func testAdditionalStore(t *testing.T, existing *Store) *Store {
 	t.Helper()
 	var databaseName string
-	if err := existing.DB().QueryRow(`SELECT current_database()`).Scan(&databaseName); err != nil {
+	if err := existing.DB().QueryRowContext(t.Context(), `SELECT current_database()`).Scan(&databaseName); err != nil {
 		t.Fatalf("reading scratch database name: %v", err)
 	}
 	u, err := url.Parse(testDBURL())
@@ -181,7 +205,7 @@ func applyPreLedgerMigrations(t *testing.T, s *Store, stopBefore string) {
 		if noTransactionMigration(content) {
 			err = applyNonTransactionalMigration(context.Background(), s.DB(), string(content))
 		} else {
-			_, err = s.DB().Exec(string(content))
+			_, err = s.DB().ExecContext(t.Context(), string(content))
 		}
 		if err != nil {
 			t.Fatalf("applying migration %s: %v", name, err)
@@ -192,7 +216,7 @@ func applyPreLedgerMigrations(t *testing.T, s *Store, stopBefore string) {
 // ledgerRows returns the recorded migration filenames, sorted.
 func ledgerRows(t *testing.T, s *Store) []string {
 	t.Helper()
-	rows, err := s.DB().Query(`SELECT filename FROM schema_migrations ORDER BY filename`)
+	rows, err := s.DB().QueryContext(t.Context(), `SELECT filename FROM schema_migrations ORDER BY filename`)
 	if err != nil {
 		t.Fatalf("reading schema_migrations: %v", err)
 	}
@@ -213,7 +237,7 @@ func ledgerRows(t *testing.T, s *Store) []string {
 
 func assertLedgerChecksums(t *testing.T, s *Store, names []string) {
 	t.Helper()
-	rows, err := s.DB().Query(
+	rows, err := s.DB().QueryContext(t.Context(),
 		`SELECT filename, COALESCE(checksum, '') FROM schema_migrations ORDER BY filename`)
 	if err != nil {
 		t.Fatalf("reading migration checksums: %v", err)
@@ -244,7 +268,7 @@ func assertLedgerChecksums(t *testing.T, s *Store, names []string) {
 func assertLedgerChecksumInvariant(t *testing.T, s *Store) {
 	t.Helper()
 	var nullable string
-	if err := s.DB().QueryRow(`SELECT is_nullable
+	if err := s.DB().QueryRowContext(t.Context(), `SELECT is_nullable
 		FROM information_schema.columns
 		WHERE table_schema = current_schema()
 		  AND table_name = 'schema_migrations'
@@ -256,7 +280,7 @@ func assertLedgerChecksumInvariant(t *testing.T, s *Store) {
 	}
 
 	var validated bool
-	if err := s.DB().QueryRow(`SELECT convalidated
+	if err := s.DB().QueryRowContext(t.Context(), `SELECT convalidated
 		FROM pg_constraint
 		WHERE conrelid = 'schema_migrations'::regclass
 		  AND conname = $1
@@ -272,7 +296,7 @@ func assertLedgerChecksumInvariant(t *testing.T, s *Store) {
 func seedScratchUser(t *testing.T, s *Store, suffix string) int64 {
 	t.Helper()
 	var id int64
-	err := s.DB().QueryRow(
+	err := s.DB().QueryRowContext(t.Context(),
 		`INSERT INTO users (unique_id, nickname, password_hash, created_at)
 		 VALUES ($1, $2, 'x', NOW()) RETURNING id`,
 		"ledger_"+suffix, "ledger-"+suffix).Scan(&id)
@@ -289,7 +313,7 @@ func seedScratchUser(t *testing.T, s *Store, suffix string) int64 {
 func spoolSentinel(t *testing.T, s *Store, userID int64) int64 {
 	t.Helper()
 	var id int64
-	err := s.DB().QueryRow(
+	err := s.DB().QueryRowContext(t.Context(),
 		`INSERT INTO offline_messages (from_user_id, to_user_id, from_unique_id, message)
 		 VALUES ($1, $1, '', '') RETURNING id`, userID).Scan(&id)
 	if err != nil {
@@ -302,7 +326,7 @@ func spoolSentinel(t *testing.T, s *Store, userID int64) int64 {
 func rowExists(t *testing.T, s *Store, table string, id int64) bool {
 	t.Helper()
 	var n int
-	if err := s.DB().QueryRow(`SELECT count(*) FROM `+table+` WHERE id = $1`, id).Scan(&n); err != nil {
+	if err := s.DB().QueryRowContext(t.Context(), `SELECT count(*) FROM `+table+` WHERE id = $1`, id).Scan(&n); err != nil {
 		t.Fatalf("counting %s: %v", table, err)
 	}
 	return n > 0
@@ -329,7 +353,7 @@ func TestMigrationLedgerRunsEachFileOnce(t *testing.T) {
 	assertLedgerChecksums(t, s, files)
 
 	var appliedAt time.Time
-	if err := s.DB().QueryRow(
+	if err := s.DB().QueryRowContext(t.Context(),
 		`SELECT applied_at FROM schema_migrations WHERE filename = '012_chat_encryption.sql'`).Scan(&appliedAt); err != nil {
 		t.Fatalf("reading 012 ledger row: %v", err)
 	}
@@ -347,7 +371,7 @@ func TestMigrationLedgerRunsEachFileOnce(t *testing.T) {
 		t.Fatalf("ledger after second Migrate = %v, want %v", got, files)
 	}
 	var again time.Time
-	if err := s.DB().QueryRow(
+	if err := s.DB().QueryRowContext(t.Context(),
 		`SELECT applied_at FROM schema_migrations WHERE filename = '012_chat_encryption.sql'`).Scan(&again); err != nil {
 		t.Fatalf("re-reading 012 ledger row: %v", err)
 	}
@@ -405,7 +429,7 @@ func TestMigrationBackfillsLegacyChecksums(t *testing.T) {
 	// split. Materialize those historical effects so the compatibility path can
 	// verify them before baselining its filename-only row.
 	applyPreLedgerMigrations(t, s, "017")
-	if _, err := s.DB().Exec(`CREATE TABLE schema_migrations (
+	if _, err := s.DB().ExecContext(t.Context(), `CREATE TABLE schema_migrations (
 		filename TEXT PRIMARY KEY,
 		applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	)`); err != nil {
@@ -414,7 +438,7 @@ func TestMigrationBackfillsLegacyChecksums(t *testing.T) {
 
 	names := migrationNames(t)
 	for _, name := range names {
-		if _, err := s.DB().Exec(
+		if _, err := s.DB().ExecContext(t.Context(),
 			`INSERT INTO schema_migrations (filename) VALUES ($1)`, name); err != nil {
 			t.Fatalf("recording legacy migration %s: %v", name, err)
 		}
@@ -433,19 +457,19 @@ func TestMigrationBackfillsLegacyChecksums(t *testing.T) {
 		strings.Repeat("a", 63),
 		strings.Repeat("g", 64),
 	} {
-		if _, err := s.DB().Exec(
+		if _, err := s.DB().ExecContext(t.Context(),
 			`UPDATE schema_migrations SET checksum = $2 WHERE filename = $1`,
 			names[0], invalid); err == nil {
 			t.Fatalf("post-upgrade checksum update to %#v was accepted", invalid)
 		}
 	}
-	if _, err := s.DB().Exec(
+	if _, err := s.DB().ExecContext(t.Context(),
 		`INSERT INTO schema_migrations (filename) VALUES ('old_migrator.sql')`); err == nil {
 		t.Fatal("old migrator insert without a checksum was accepted")
 	}
 
 	// Once populated, a later startup must validate without rewriting rows.
-	if _, err := s.DB().Exec(`CREATE FUNCTION reject_schema_migration_update()
+	if _, err := s.DB().ExecContext(t.Context(), `CREATE FUNCTION reject_schema_migration_update()
 		RETURNS trigger LANGUAGE plpgsql AS $$
 		BEGIN
 			RAISE EXCEPTION 'schema_migrations row was rewritten';
@@ -463,7 +487,7 @@ func TestMigrationBackfillsLegacyChecksums(t *testing.T) {
 
 func TestMigrationRejectsChecksumDriftBeforeLegacyBackfill(t *testing.T) {
 	s := testScratchStore(t)
-	if _, err := s.DB().Exec(`CREATE TABLE schema_migrations (
+	if _, err := s.DB().ExecContext(t.Context(), `CREATE TABLE schema_migrations (
 		filename TEXT PRIMARY KEY,
 		checksum TEXT,
 		applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -486,7 +510,7 @@ func TestMigrationRejectsChecksumDriftBeforeLegacyBackfill(t *testing.T) {
 		case driftName:
 			checksum = corruptChecksum
 		}
-		if _, err := s.DB().Exec(
+		if _, err := s.DB().ExecContext(t.Context(),
 			`INSERT INTO schema_migrations (filename, checksum) VALUES ($1, $2)`,
 			name, checksum); err != nil {
 			t.Fatalf("recording legacy migration %s: %v", name, err)
@@ -501,7 +525,7 @@ func TestMigrationRejectsChecksumDriftBeforeLegacyBackfill(t *testing.T) {
 		t.Fatalf("checksum drift error = %q, want filename and drift diagnosis", err)
 	}
 	var nullChecksum sql.NullString
-	if err := s.DB().QueryRow(
+	if err := s.DB().QueryRowContext(t.Context(),
 		`SELECT checksum FROM schema_migrations WHERE filename = $1`, nullName).Scan(&nullChecksum); err != nil {
 		t.Fatalf("reading NULL legacy checksum: %v", err)
 	}
@@ -509,7 +533,7 @@ func TestMigrationRejectsChecksumDriftBeforeLegacyBackfill(t *testing.T) {
 		t.Fatalf("NULL checksum was mutated before drift rejection: %q", nullChecksum.String)
 	}
 	var emptyChecksum string
-	if err := s.DB().QueryRow(
+	if err := s.DB().QueryRowContext(t.Context(),
 		`SELECT checksum FROM schema_migrations WHERE filename = $1`, emptyName).Scan(&emptyChecksum); err != nil {
 		t.Fatalf("reading empty legacy checksum: %v", err)
 	}
@@ -517,12 +541,12 @@ func TestMigrationRejectsChecksumDriftBeforeLegacyBackfill(t *testing.T) {
 		t.Fatalf("empty checksum was mutated before drift rejection: %q", emptyChecksum)
 	}
 
-	if _, err := s.DB().Exec(
+	if _, err := s.DB().ExecContext(t.Context(),
 		`UPDATE schema_migrations SET checksum = $2 WHERE filename = $1`,
 		driftName, migrationChecksum(t, driftName)); err != nil {
 		t.Fatalf("repairing migration checksum: %v", err)
 	}
-	if _, err := s.DB().Exec(`CREATE FUNCTION reject_second_checksum_backfill()
+	if _, err := s.DB().ExecContext(t.Context(), `CREATE FUNCTION reject_second_checksum_backfill()
 		RETURNS trigger LANGUAGE plpgsql AS $$
 		BEGIN
 			IF OLD.filename = '002_channel_security.sql' THEN
@@ -539,14 +563,14 @@ func TestMigrationRejectsChecksumDriftBeforeLegacyBackfill(t *testing.T) {
 	if err := s.Migrate(); err == nil {
 		t.Fatal("migration checksum backfill succeeded despite injected second-row failure")
 	}
-	if err := s.DB().QueryRow(
+	if err := s.DB().QueryRowContext(t.Context(),
 		`SELECT checksum FROM schema_migrations WHERE filename = $1`, nullName).Scan(&nullChecksum); err != nil {
 		t.Fatalf("re-reading NULL legacy checksum after rollback: %v", err)
 	}
 	if nullChecksum.Valid {
 		t.Fatalf("checksum backfill was not atomic; first row retained %q", nullChecksum.String)
 	}
-	if _, err := s.DB().Exec(`DROP TRIGGER reject_second_checksum_backfill ON schema_migrations;
+	if _, err := s.DB().ExecContext(t.Context(), `DROP TRIGGER reject_second_checksum_backfill ON schema_migrations;
 		DROP FUNCTION reject_second_checksum_backfill()`); err != nil {
 		t.Fatalf("removing checksum backfill failure fixture: %v", err)
 	}
@@ -562,7 +586,7 @@ func TestMigrationRejectsChecksumDriftBeforeLegacyBackfill(t *testing.T) {
 
 func TestMigrationRejectsUnknownAppliedFilename(t *testing.T) {
 	s := testScratchStore(t)
-	if _, err := s.DB().Exec(`CREATE TABLE schema_migrations (
+	if _, err := s.DB().ExecContext(t.Context(), `CREATE TABLE schema_migrations (
 		filename TEXT PRIMARY KEY,
 		applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	)`); err != nil {
@@ -570,7 +594,7 @@ func TestMigrationRejectsUnknownAppliedFilename(t *testing.T) {
 	}
 	const unknown = "999_future_binary.sql"
 	known := migrationNames(t)[0]
-	if _, err := s.DB().Exec(
+	if _, err := s.DB().ExecContext(t.Context(),
 		`INSERT INTO schema_migrations (filename) VALUES ($1), ($2)`, known, unknown); err != nil {
 		t.Fatalf("recording unknown migration: %v", err)
 	}
@@ -583,14 +607,14 @@ func TestMigrationRejectsUnknownAppliedFilename(t *testing.T) {
 		t.Fatalf("unknown migration error = %q, want filename and compatibility diagnosis", err)
 	}
 	var usersTable sql.NullString
-	if err := s.DB().QueryRow(`SELECT to_regclass('users')::text`).Scan(&usersTable); err != nil {
+	if err := s.DB().QueryRowContext(t.Context(), `SELECT to_regclass('users')::text`).Scan(&usersTable); err != nil {
 		t.Fatalf("checking whether migrations ran: %v", err)
 	}
 	if usersTable.Valid {
 		t.Fatalf("migration files ran before the unknown ledger row was rejected: users table = %q", usersTable.String)
 	}
 	var knownChecksum sql.NullString
-	if err := s.DB().QueryRow(
+	if err := s.DB().QueryRowContext(t.Context(),
 		`SELECT checksum FROM schema_migrations WHERE filename = $1`, known).Scan(&knownChecksum); err != nil {
 		t.Fatalf("reading known legacy checksum: %v", err)
 	}
@@ -598,7 +622,7 @@ func TestMigrationRejectsUnknownAppliedFilename(t *testing.T) {
 		t.Fatalf("known checksum was backfilled before unknown migration rejection: %q", knownChecksum.String)
 	}
 
-	if _, err := s.DB().Exec(`DELETE FROM schema_migrations`); err != nil {
+	if _, err := s.DB().ExecContext(t.Context(), `DELETE FROM schema_migrations`); err != nil {
 		t.Fatalf("removing migration ledger fixtures: %v", err)
 	}
 	other := testAdditionalStore(t, s)
@@ -1011,7 +1035,7 @@ func TestMigrationIgnoresShadowSchemaIndex(t *testing.T) {
 func TestMigrationWidensKEKID(t *testing.T) {
 	s := testScratchStore(t)
 	applyPreLedgerMigrations(t, s, "024")
-	if _, err := s.DB().Exec(`CREATE TABLE schema_migrations (
+	if _, err := s.DB().ExecContext(t.Context(), `CREATE TABLE schema_migrations (
 		filename TEXT PRIMARY KEY,
 		applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	)`); err != nil {
@@ -1021,18 +1045,18 @@ func TestMigrationWidensKEKID(t *testing.T) {
 		if name >= "024" {
 			break
 		}
-		if _, err := s.DB().Exec(`INSERT INTO schema_migrations (filename) VALUES ($1)`, name); err != nil {
+		if _, err := s.DB().ExecContext(t.Context(), `INSERT INTO schema_migrations (filename) VALUES ($1)`, name); err != nil {
 			t.Fatalf("recording legacy migration %s: %v", name, err)
 		}
 	}
 
 	// Recreate the exact pre-024 type. The current 012 migration uses INTEGER
 	// for fresh databases, while existing deployments still arrive as SMALLINT.
-	if _, err := s.DB().Exec(`ALTER TABLE chat_scope_keys
+	if _, err := s.DB().ExecContext(t.Context(), `ALTER TABLE chat_scope_keys
 		ALTER COLUMN kek_id TYPE SMALLINT USING kek_id::SMALLINT`); err != nil {
 		t.Fatalf("restoring legacy kek_id type: %v", err)
 	}
-	if _, err := s.DB().Exec(`INSERT INTO chat_scope_keys
+	if _, err := s.DB().ExecContext(t.Context(), `INSERT INTO chat_scope_keys
 		(scope_id, key_id, wrapped_key, kek_id) VALUES (9001, 1, '\x01', -1)`); err != nil {
 		t.Fatalf("seeding signed legacy kek id: %v", err)
 	}
@@ -1044,24 +1068,24 @@ func TestMigrationWidensKEKID(t *testing.T) {
 		dataType string
 		kekID    int64
 	)
-	if err := s.DB().QueryRow(`SELECT data_type FROM information_schema.columns
+	if err := s.DB().QueryRowContext(t.Context(), `SELECT data_type FROM information_schema.columns
 		WHERE table_schema = current_schema() AND table_name = 'chat_scope_keys' AND column_name = 'kek_id'`).Scan(&dataType); err != nil {
 		t.Fatalf("reading kek_id type: %v", err)
 	}
 	if dataType != "integer" {
 		t.Fatalf("kek_id type = %q, want integer", dataType)
 	}
-	if err := s.DB().QueryRow(`SELECT kek_id FROM chat_scope_keys WHERE scope_id = 9001`).Scan(&kekID); err != nil {
+	if err := s.DB().QueryRowContext(t.Context(), `SELECT kek_id FROM chat_scope_keys WHERE scope_id = 9001`).Scan(&kekID); err != nil {
 		t.Fatalf("reading migrated kek id: %v", err)
 	}
 	if kekID != 65535 {
 		t.Fatalf("migrated kek id = %d, want 65535", kekID)
 	}
-	if _, err := s.DB().Exec(`INSERT INTO chat_scope_keys
+	if _, err := s.DB().ExecContext(t.Context(), `INSERT INTO chat_scope_keys
 		(scope_id, key_id, wrapped_key, kek_id) VALUES (9002, 1, '\x02', 65535)`); err != nil {
 		t.Fatalf("inserting maximum uint16 kek id: %v", err)
 	}
-	if _, err := s.DB().Exec(`INSERT INTO chat_scope_keys
+	if _, err := s.DB().ExecContext(t.Context(), `INSERT INTO chat_scope_keys
 		(scope_id, key_id, wrapped_key, kek_id) VALUES (9003, 1, '\x03', 65536)`); err == nil {
 		t.Fatal("kek id above uint16 range was accepted")
 	}

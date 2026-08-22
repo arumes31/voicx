@@ -3,19 +3,27 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
+var (
+	miscUserConfigDir = os.UserConfigDir
+	chatLogNow        = time.Now
+)
+
 // configDir returns the voicx config directory, creating it if needed.
 func configDir() (string, error) {
-	dir, err := os.UserConfigDir()
+	dir, err := miscUserConfigDir()
 	if err != nil {
 		return "", err
 	}
@@ -33,7 +41,7 @@ func (a *App) LogChat(line string) {
 	if err != nil {
 		return
 	}
-	appendDailyLog(dir, "chat.log", fmt.Sprintf("[%s] %s\n", time.Now().Format("2006-01-02 15:04:05"), line))
+	appendDailyLog(dir, "chat.log", fmt.Sprintf("[%s] %s\n", chatLogNow().Format("2006-01-02 15:04:05"), line))
 }
 
 // OpenLogFolder reveals the config folder in the OS file manager
@@ -45,7 +53,7 @@ func (a *App) OpenLogFolder() string {
 	}
 	// #nosec G204 -- explorer.exe is fixed and the application-owned config
 	// directory is passed as one argument; no command shell parses it.
-	if err := exec.Command("explorer.exe", dir).Start(); err != nil {
+	if err := exec.CommandContext(context.Background(), "explorer.exe", dir).Start(); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -73,8 +81,10 @@ type identityInfo struct {
 
 // IdentityInfo returns the current identity's unique ID and file info.
 func (a *App) IdentityInfo() identityInfo {
+	a.identityMu.Lock()
+	defer a.identityMu.Unlock()
 	out := identityInfo{}
-	path, err := identityPath()
+	id, path, err := a.activeIdentityLocked()
 	if err != nil {
 		return out
 	}
@@ -82,25 +92,27 @@ func (a *App) IdentityInfo() identityInfo {
 	if info, err := os.Stat(path); err == nil {
 		out.CreatedAt = info.ModTime().Format("2006-01-02 15:04:05")
 	}
-	out.UniqueID = a.IdentityUID()
+	out.UniqueID, _ = id.uniqueID()
 	return out
 }
 
 // RegenerateIdentity replaces the identity with a fresh key pair and returns
 // the new unique ID (or an error). A reconnect is required afterwards.
 func (a *App) RegenerateIdentity() string {
-	path, err := identityPath()
+	a.identityMu.Lock()
+	defer a.identityMu.Unlock()
+	_, path, err := a.resolveActive()
 	if err != nil {
 		return err.Error()
 	}
-	_ = os.Remove(path)
-	id, err := loadOrCreateIdentityAt(path)
+	id, err := newIdentity(strings.TrimSuffix(filepath.Base(path), ".json"))
 	if err != nil {
 		return err.Error()
 	}
-	if a.cmLoad() != nil {
-		a.cmLoad().id = id
+	if err := saveIdentityAt(path, id); err != nil {
+		return err.Error()
 	}
+	a.forgetCachedIdentity(id)
 	uid, err := id.uniqueID()
 	if err != nil {
 		return err.Error()
@@ -114,20 +126,27 @@ func (a *App) RegenerateIdentity() string {
 // The copy carries the private key in the clear so it still opens on a new
 // machine even when the stored file is OS-protected (354).
 func (a *App) ExportIdentity(id string) string {
+	// Prepare a detached snapshot under identityMu, but never hold that lock
+	// across the native dialog or destination write.
+	a.identityMu.Lock()
 	if id == "" {
 		var err error
 		if id, _, err = a.resolveActive(); err != nil {
+			a.identityMu.Unlock()
 			return err.Error()
 		}
 	}
 	src, err := identityPathFor(id)
 	if err != nil {
+		a.identityMu.Unlock()
 		return err.Error()
 	}
-	loaded, err := loadOrCreateIdentityAt(src)
+	loaded, err := loadIdentityAtStrict(src)
 	if err != nil {
+		a.identityMu.Unlock()
 		return err.Error()
 	}
+	a.identityMu.Unlock()
 	dest, err := wailsRuntime.SaveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
 		Title:           "Export identity",
 		DefaultFilename: "voicx-identity-" + id + ".json",
@@ -135,7 +154,24 @@ func (a *App) ExportIdentity(id string) string {
 	if err != nil || dest == "" {
 		return "" // cancelled
 	}
-	if err := exportIdentityTo(dest, src, loaded); err != nil {
+	out := *loaded
+	out.Protection = ""
+	out.ExportedAt = time.Now().Unix()
+	// #nosec G117 -- portable identity backup intentionally contains its private key and is written owner-only.
+	raw, err := json.MarshalIndent(&out, "", "  ")
+	if err != nil {
+		return err.Error()
+	}
+	if err := writePrivateFileAtomic(dest, raw); err != nil {
+		return err.Error()
+	}
+	// Commit the backup marker only after re-reading the live source while
+	// serialized with regenerate/import/delete. stampIdentityExported compares
+	// UIDs, so a stale exported snapshot can never overwrite a new key.
+	a.identityMu.Lock()
+	err = stampIdentityExported(src, loaded, out.ExportedAt)
+	a.identityMu.Unlock()
+	if err != nil {
 		return err.Error()
 	}
 	return ""
@@ -166,7 +202,10 @@ func (a *App) ImportIdentity() string {
 	if err != nil {
 		return err.Error()
 	}
-	if msg := a.adoptImportedIdentity(loaded, filepath.Base(src)); msg != "" {
+	a.identityMu.Lock()
+	msg := a.adoptImportedIdentityLocked(loaded, filepath.Base(src))
+	a.identityMu.Unlock()
+	if msg != "" {
 		return msg
 	}
 	log.Printf("identity imported from %s", src)

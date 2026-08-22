@@ -86,7 +86,7 @@ func (c *ringCore) Check(ent zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.C
 func (c *ringCore) Write(ent zapcore.Entry, fields []zapcore.Field) error {
 	if buf, err := c.enc.EncodeEntry(ent, fields); err == nil {
 		defer buf.Free()
-		line := strings.TrimRight(buf.String(), "\n")
+		line := sanitizeRingLine(buf.String())
 		c.buf.mu.Lock()
 		c.buf.lines = append(c.buf.lines, line)
 		if len(c.buf.lines) > ringCapacity {
@@ -102,6 +102,12 @@ func (c *ringCore) Write(ent zapcore.Entry, fields []zapcore.Field) error {
 		c.buf.mu.Unlock()
 	}
 	return nil
+}
+
+func sanitizeRingLine(line string) string {
+	line = strings.TrimSuffix(line, zapcore.DefaultLineEnding)
+	line = strings.ReplaceAll(line, "\r", `\r`)
+	return strings.ReplaceAll(line, "\n", `\n`)
 }
 
 // Sync implements zapcore.Core. The in-memory ring has nothing to flush.

@@ -29,9 +29,22 @@ type Complaint struct {
 // MaxOpenComplaints open complaints; beyond that ErrComplaintLimit is
 // returned.
 func (s *Store) AddComplaint(ctx context.Context, reporter, target, reason string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("starting complaint transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// complaints has no parent row to lock by reporter, so serialize the
+	// count-and-insert sequence with a transaction-scoped advisory lock. A hash
+	// collision can only make two reporters wait for one another; it cannot
+	// weaken the per-reporter cap.
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, reporter); err != nil {
+		return fmt.Errorf("locking complaint reporter: %w", err)
+	}
 	var open int
 	const cq = `SELECT COUNT(*) FROM complaints WHERE reporter = $1`
-	if err := s.db.QueryRowContext(ctx, cq, reporter).Scan(&open); err != nil {
+	if err := tx.QueryRowContext(ctx, cq, reporter).Scan(&open); err != nil {
 		return fmt.Errorf("counting open complaints: %w", err)
 	}
 	if open >= MaxOpenComplaints {
@@ -39,8 +52,11 @@ func (s *Store) AddComplaint(ctx context.Context, reporter, target, reason strin
 	}
 
 	const q = `INSERT INTO complaints (reporter, target, reason) VALUES ($1, $2, $3)`
-	if _, err := s.db.ExecContext(ctx, q, reporter, target, reason); err != nil {
+	if _, err := tx.ExecContext(ctx, q, reporter, target, reason); err != nil {
 		return fmt.Errorf("inserting complaint: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing complaint: %w", err)
 	}
 	return nil
 }

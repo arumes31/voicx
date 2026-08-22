@@ -238,7 +238,7 @@ function pageApplication() {
     awayMsg.placeholder = "auto-away";
     awayMsg.value = s.auto_away_message ?? "";
     awayMsg.onchange = () => { s.auto_away_message = awayMsg.value; };
-    el.appendChild(row("Auto-away status message (390)", awayMsg));
+    el.appendChild(row("Auto-away status message", awayMsg));
     el.appendChild(hint("Other clients see this text next to your 🕐 away icon while you are idle."));
 
     // Window / system integration (wave 8a).
@@ -255,7 +255,7 @@ function pageApplication() {
     }
     themeSel.value = s.theme || "dark";
     themeSel.onchange = () => { s.theme = themeSel.value; };
-    el.appendChild(row("Theme (294/295)", themeSel));
+    el.appendChild(row("Theme", themeSel));
     // (336) language selector: system default, English, Deutsch.
     const langSel = document.createElement("select");
     for (const [v, label] of [["system", "System default"], ["en", "English"], ["de", "Deutsch"]]) {
@@ -271,7 +271,7 @@ function pageApplication() {
     accent.type = "color";
     accent.value = s.accent_color || "#2ee6a8";
     accent.onchange = () => { s.accent_color = accent.value; };
-    el.appendChild(row("Accent color (296)", accent));
+    el.appendChild(row("Accent color", accent));
     const fontSel = document.createElement("select");
     for (const [v, label] of [["outfit", "Outfit"], ["sora", "Sora"], ["jetbrains", "JetBrains Mono"]]) {
         const o = document.createElement("option");
@@ -281,25 +281,25 @@ function pageApplication() {
     }
     fontSel.value = s.ui_font || "outfit";
     fontSel.onchange = () => { s.ui_font = fontSel.value; };
-    el.appendChild(row("UI font (297)", fontSel));
+    el.appendChild(row("UI font", fontSel));
     el.appendChild(row("UI font size", slider(s.ui_font_size || 14, 10, 20, (v) => { s.ui_font_size = v; })));
-    el.appendChild(row("Always on top (291)", checkbox(s.always_on_top, (v) => { s.always_on_top = v; })));
-    el.appendChild(row("Compact mode (293)", checkbox(s.compact_mode, (v) => { s.compact_mode = v; })));
-    el.appendChild(row("Reduce motion (344)", checkbox(s.reduce_motion, (v) => { s.reduce_motion = v; })));
-    el.appendChild(row("Pause video when unfocused (342)", checkbox(s.idle_video_pause !== false, (v) => { s.idle_video_pause = v; })));
-    el.appendChild(row("Close to tray (287)", checkbox(s.close_to_tray, (v) => { s.close_to_tray = v; })));
-    el.appendChild(row("Minimize to tray (288)", checkbox(s.minimize_to_tray, (v) => { s.minimize_to_tray = v; })));
+    el.appendChild(row("Always on top", checkbox(s.always_on_top, (v) => { s.always_on_top = v; })));
+    el.appendChild(row("Compact mode", checkbox(s.compact_mode, (v) => { s.compact_mode = v; })));
+    el.appendChild(row("Reduce motion", checkbox(s.reduce_motion, (v) => { s.reduce_motion = v; })));
+    el.appendChild(row("Pause video when unfocused", checkbox(s.idle_video_pause !== false, (v) => { s.idle_video_pause = v; })));
+    el.appendChild(row("Close to tray", checkbox(s.close_to_tray, (v) => { s.close_to_tray = v; })));
+    el.appendChild(row("Minimize to tray", checkbox(s.minimize_to_tray, (v) => { s.minimize_to_tray = v; })));
     // (292) the floor keeps the window clickable. Applied on release, not per
     // drag frame: the binding persists the settings file on every call.
     const opacity = slider(s.window_opacity || 100, 20, 100, (v) => { s.window_opacity = v; });
     opacity.querySelector("input").addEventListener("change",
         () => window.go.main.App.SetWindowOpacity(s.window_opacity || 100));
-    el.appendChild(row("Window opacity (292)", opacity));
+    el.appendChild(row("Window opacity", opacity));
     el.appendChild(themeEditor(s)); // (295)
     const css = document.createElement("textarea");
     css.className = "dlg-input user-css";
     css.rows = 4;
-    css.placeholder = "custom CSS overrides (296), e.g. .channel { letter-spacing: 0.5px }";
+    css.placeholder = "custom CSS overrides, e.g. .channel { letter-spacing: 0.5px }";
     css.value = s.user_css || "";
     css.onchange = () => { s.user_css = css.value; };
     el.appendChild(row("User CSS", css));
@@ -443,7 +443,7 @@ function themeEditor(s) {
     const wrap = document.createElement("div");
     const head = document.createElement("div");
     head.className = "set-subhead";
-    head.textContent = "Theme colors (295)";
+    head.textContent = "Theme colors";
     wrap.appendChild(head);
     const grid = document.createElement("div");
     grid.className = "theme-grid";
@@ -809,7 +809,7 @@ function pageHotkeys() {
         renderPage("hotkeys");
     };
     el.appendChild(reset);
-    el.appendChild(hint("Hotkeys are applied when you Apply or OK. On Windows they do not reserve or consume the configured keys. Profiles apply on connect via the bookmark's profile field (300)."));
+    el.appendChild(hint("Hotkeys are applied when you Apply or OK. On Windows they do not reserve or consume the configured keys. Profiles apply on connect via the bookmark's profile field."));
     return el;
 }
 
@@ -924,7 +924,7 @@ function pageChat() {
         s.keywords = s.keywords || {};
         s.keywords[kwAddr] = kw.value.split("\n").map((x) => x.trim()).filter(Boolean);
     };
-    el.appendChild(row("Keywords (388)", kw));
+    el.appendChild(row("Keywords", kw));
 
     el.appendChild(hint("Chat log: <config>/voicx/chat.log (Help → Open log folder)."));
     // (4b) encryption note.
@@ -1022,7 +1022,7 @@ async function refreshIdentities(tbody) {
             else V().toast("identity exported — keep the file safe");
             refreshIdentities(tbody);
         });
-        mk("Level…", "raise the proof-of-work security level (352)", async () => {
+        mk("Level…", "raise the proof-of-work security level", async () => {
             const target = parseInt(prompt("Target security level (leading zero bits, 1-40):", String((e.security_level || 0) + 4)), 10);
             if (!target) return;
             V().toast("computing security level (up to 30s)…");
@@ -1053,7 +1053,7 @@ function pageSecurity() {
     // is the primary control here.
     const sub = document.createElement("div");
     sub.className = "set-subhead";
-    sub.textContent = "Identities (351)";
+    sub.textContent = "Identities";
     el.appendChild(sub);
 
     const table = document.createElement("table");
@@ -1097,7 +1097,7 @@ function pageSecurity() {
     bar.append(newBtn, importBtn, regen);
     el.appendChild(bar);
     el.appendChild(hint("The active identity (●) is used on the next connect. Click a unique ID to copy it. "
-        + "An export is a portable plaintext copy — it is the only way to recover an identity if this machine dies (353)."));
+        + "An export is a portable plaintext copy — it is the only way to recover an identity if this machine dies."));
 
     // (354) key storage at rest, with its fallback stated plainly.
     const protSel = document.createElement("select");
@@ -1109,7 +1109,7 @@ function pageSecurity() {
     }
     protSel.value = s.identity_key_protection === "off" ? "off" : "auto";
     protSel.onchange = () => { s.identity_key_protection = protSel.value; };
-    el.appendChild(row("Private key storage (354)", protSel));
+    el.appendChild(row("Private key storage", protSel));
     el.appendChild(hint("On Windows the private key is sealed with DPAPI to your user account, so a stolen copy of the file "
         + "is useless elsewhere. Where DPAPI is unavailable the client falls back to the plaintext file instead of refusing to "
         + "start. Applies the next time an identity file is written (switch, rename, level, regenerate)."));
@@ -1151,7 +1151,7 @@ function pageNotifications() {
     const EVENTS = MATRIX_EVENTS;
     const matrix = document.createElement("table");
     matrix.className = "perm-grid notify-matrix";
-    matrix.innerHTML = `<thead><tr><th>event</th><th>toast</th><th>sound</th><th>flash</th><th>native</th><th>custom beep (384)</th></tr></thead><tbody></tbody>`;
+    matrix.innerHTML = `<thead><tr><th>event</th><th>toast</th><th>sound</th><th>flash</th><th>native</th><th>custom beep</th></tr></thead><tbody></tbody>`;
     const tbody = matrix.querySelector("tbody");
     s.notify_matrix = s.notify_matrix || {};
     s.custom_sounds = s.custom_sounds || {};
@@ -1197,7 +1197,7 @@ function pageNotifications() {
     el.appendChild(matrix);
     el.appendChild(hint("Empty freq = sound-pack default. DND overrides everything (mentions still badge)."));
     // (347/348) do-not-disturb: toggle + quiet hours schedule.
-    el.appendChild(row("Do not disturb (347)", checkbox(s.dnd_enabled, (v) => { s.dnd_enabled = v; })));
+    el.appendChild(row("Do not disturb", checkbox(s.dnd_enabled, (v) => { s.dnd_enabled = v; })));
     const from = document.createElement("input");
     from.type = "time";
     from.value = s.dnd_from || "";
@@ -1209,7 +1209,7 @@ function pageNotifications() {
     const hours = document.createElement("div");
     hours.className = "dnd-hours";
     hours.append(from, document.createTextNode(" – "), to);
-    el.appendChild(row("Quiet hours (348, empty = off)", hours));
+    el.appendChild(row("Quiet hours (empty = off)", hours));
     el.appendChild(hint("DND suppresses toasts, sounds, and taskbar flashes; mentions still badge silently."));
     el.appendChild(row("Toasts for join/leave", checkbox(s.notify_join_leave, (v) => { s.notify_join_leave = v; })));
     el.appendChild(row("Toasts for connection events", checkbox(s.notify_connection, (v) => { s.notify_connection = v; })));

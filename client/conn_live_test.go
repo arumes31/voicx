@@ -135,7 +135,7 @@ func queryCmd(t *testing.T, conn net.Conn, r *bufio.Reader, cmd string) []string
 // its ID.
 func ensureLiveChannel(t *testing.T) int64 {
 	t.Helper()
-	conn, err := net.DialTimeout("tcp", liveQueryAddr(t), 5*time.Second)
+	conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(t.Context(), "tcp", liveQueryAddr(t))
 	if err != nil {
 		t.Fatalf("dial query: %v", err)
 	}
@@ -642,7 +642,11 @@ func TestLiveFileManagement(t *testing.T) {
 		t.Fatalf("split addr: %v", err)
 	}
 	linkURL := fmt.Sprintf("http://%s:%d%s", host, link.HealthPort, link.Path)
-	resp, err := http.Get(linkURL)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, linkURL, nil)
+	if err != nil {
+		t.Fatalf("build GET link request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET link: %v", err)
 	}

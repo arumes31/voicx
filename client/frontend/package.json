@@ -11,7 +11,9 @@
     "quality": "npm run lint && npm run test:unit && npm run test:a11y && npm run build",
     "test": "npm run test:unit && npm run test:e2e",
     "test:a11y": "playwright test tests/workflows.spec.js --grep @a11y",
-    "test:unit": "node --test --experimental-test-coverage --test-coverage-include=src/markdown.js --test-coverage-include=src/i18n.js --test-coverage-include=src/security.js --test-coverage-include=src/a11y.js --test-coverage-include=src/live-announcer.js --test-coverage-include=src/modal.js --test-coverage-include=src/safe-media.js --test-coverage-include=src/media-devices.js --test-coverage-lines=90 --test-coverage-functions=90 --test-coverage-branches=80 unit/markdown.test.mjs unit/i18n.test.mjs unit/security.test.mjs unit/a11y.test.mjs unit/live-announcer.test.mjs unit/modal.test.mjs unit/safe-media.test.mjs unit/media-devices.test.mjs",
+    "test:unit": "npm run test:unit:core && npm run test:unit:ui",
+    "test:unit:core": "node --test --experimental-test-coverage --test-coverage-include=src/markdown.js --test-coverage-include=src/i18n.js --test-coverage-include=src/security.js --test-coverage-include=src/a11y.js --test-coverage-include=src/live-announcer.js --test-coverage-include=src/modal.js --test-coverage-include=src/safe-media.js --test-coverage-include=src/media-devices.js --test-coverage-include=src/runtime-json.js --test-coverage-include=src/chat-parsers.js --test-coverage-include=src/scoped-actions.js --test-coverage-include=src/file-links.js --test-coverage-lines=90 --test-coverage-functions=90 --test-coverage-branches=80 unit/markdown.test.mjs unit/i18n.test.mjs unit/security.test.mjs unit/a11y.test.mjs unit/live-announcer.test.mjs unit/modal.test.mjs unit/safe-media.test.mjs unit/media-devices.test.mjs unit/runtime-json.test.mjs unit/chat-parsers.test.mjs unit/file-links.test.mjs unit/lint.test.mjs unit/native-dialogs.test.mjs unit/scoped-actions.test.mjs unit/batch7c-hardening.test.mjs unit/playwright-config.test.mjs",
+    "test:unit:ui": "node --test --experimental-test-module-mocks --experimental-test-coverage --test-coverage-include=src/audio.js --test-coverage-include=src/chat-ui.js --test-coverage-include=src/files-ui.js --test-coverage-include=src/grid-compositor.js --test-coverage-include=src/image-tools.js --test-coverage-include=src/clientinfo.js --test-coverage-lines=25 --test-coverage-functions=25 --test-coverage-branches=70 unit/ui-modules.test.mjs",
     "test:e2e": "playwright test"
   },
   "dependencies": {
@@ -21,6 +23,8 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.62.1",
+    "acorn": "8.15.0",
+    "eslint-scope": "8.4.0",
     "vite": "^8.2.0"
   }
 }

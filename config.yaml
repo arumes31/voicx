@@ -4,18 +4,24 @@
 # (e.g. VOICX_TCP_ADDR=:12333). See .env.example for the full list of supported
 # environment variables.
 
+# SECURITY: this sample is a development starting point, not a production
+# profile. Before production set dev_mode: false, choose a strong non-empty
+# server_password, replace the development database credentials, and keep TLS
+# enabled for both control and file-transfer listeners.
 server_name: voicx
-server_password: ""  # global server password; empty = open server (hashed at startup)
+server_password: ""  # DEVELOPMENT ONLY: production action: set a strong non-empty password
 log_level: info        # debug | info | warn | error
-dev_mode: true        # true = development logger (console), false = production (JSON)
+dev_mode: true        # DEVELOPMENT ONLY: production action: set false (JSON logging and production validation)
 
 tcp_addr: ":12333"    # TLS control channel
 udp_addr: ":12334"    # UDP keepalive/media support
 udp_rate_limit_pps: 200   # per-source-IP UDP rate limit (pkt/s); 0 = disabled
 udp_rate_burst: 400       # per-source-IP UDP burst allowance
 grpc_addr: "127.0.0.1:12338"   # plaintext gRPC is restricted to loopback
-health_addr: ":12337"  # /healthz and /readyz; /metrics is loopback-only by default
+health_addr: ":12337"  # /healthz and /readyz; /dl bearer links are plaintext HTTP: bind loopback or proxy HTTPS
 metrics_allow_remote: false  # explicit opt-in; exposes operational metrics
+pprof_enabled: false         # explicit opt-in; exposes profiling only to direct loopback callers
+shutdown_timeout: 30s        # total grace period shared by every service during orderly shutdown
 query_addr: "127.0.0.1:12335"  # raw ServerQuery is plaintext and loopback-only by default
 query_allow_remote: false       # explicit opt-in; prefer query_ssh_enabled for remote use
 # ServerQuery over SSH (224): same commands and credentials as query_addr.
@@ -27,16 +33,25 @@ query_ssh_host_key: "./data/keys/query_ssh_host.key"  # generated once; keep it,
 file_addr: ":12336"
 file_root: "./data/files"     # on-disk layout: <channel_id>/<name>
 file_max_kbps: 0              # per-connection bandwidth cap in KiB/s; 0 = unlimited
+file_max_connections: 128     # concurrent accepted file-port connections; 1..10000
 file_channel_quota_mb: 0      # per-channel total file quota in MiB; 0 = unlimited
 file_max_size_mb: 100         # per-transfer size cap in MiB; 0 = unlimited
 file_quiet_hours_start: 0      # local hour 0..23; equal start/end disables
 file_quiet_hours_end: 0
 
+# DEVELOPMENT ONLY: production action: use unique credentials and sslmode=require,
+# verify-ca, or verify-full. Never deploy the voicx:voicx default credentials.
 database_url: "postgres://voicx:voicx@localhost:5432/voicx?sslmode=disable"
 pii_key_file: "./data/keys/pii.key"  # generated once, outside PostgreSQL
 redis_addr: "localhost:6379"
 redis_password: ""
 redis_enabled: true   # false = skip Redis entirely (server runs without it)
+redis_dial_timeout: 5s
+redis_read_timeout: 3s
+redis_write_timeout: 3s
+redis_tls_enabled: false       # enable for remote Redis; certificate verification remains mandatory
+redis_tls_server_name: ""      # optional; defaults to the host in redis_addr when TLS is enabled
+redis_tls_ca_file: ""          # optional PEM CA bundle; uses system roots when empty
 
 max_clients: 1024
 client_timeout_seconds: 90
@@ -61,15 +76,15 @@ channel_temp_lifetime_seconds: 60
 # server name) is generated into tls_dir on first start and reused after —
 # clients pin its SHA-256 fingerprint (TOFU), which is logged at startup and
 # sent in the auth response. tls_enabled: false is a dev/e2e escape hatch.
-tls_enabled: true
+tls_enabled: true  # DEVELOPMENT ONLY false: production action: leave true
 tls_dir: "./data/tls"
 tls_cert_file: ""
 tls_key_file: ""
-file_tls_enabled: true  # false is accepted only with dev_mode: true
+file_tls_enabled: true  # DEVELOPMENT ONLY false: production action: leave true
 
 # Chat payload encryption (wave 4b). Plaintext chat is rejected by default;
 # allow_plaintext is a dev escape hatch for old clients.
-chat_allow_plaintext: false
+chat_allow_plaintext: false  # DEVELOPMENT ONLY true: production action: leave false
 chat_master_key_file: "./data/keys/chat_master.key"
 chat_legacy_history: encrypt       # encrypt | purge
 chat_key_rotate_min_seconds: 60

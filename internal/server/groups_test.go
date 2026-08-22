@@ -57,6 +57,7 @@ type fakeGroups struct {
 	getGroupErr      error
 	deleteGroupHook  func(groupType string, groupID int64, force bool) error
 	setGroupIconHook func(groupID int64, icon string) error
+	listGroupsFn     func(context.Context, string) ([]store.Group, error)
 }
 
 func newFakeGroups() *fakeGroups {
@@ -83,7 +84,13 @@ func (f *fakeGroups) memberCount(groupType string, id int64) int {
 	return len(f.serverMembers[id])
 }
 
-func (f *fakeGroups) ListGroups(_ context.Context, groupType string) ([]store.Group, error) {
+func (f *fakeGroups) ListGroups(ctx context.Context, groupType string) ([]store.Group, error) {
+	f.mu.Lock()
+	listGroupsFn := f.listGroupsFn
+	f.mu.Unlock()
+	if listGroupsFn != nil {
+		return listGroupsFn(ctx, groupType)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []store.Group
@@ -99,6 +106,20 @@ func (f *fakeGroups) ListGroups(_ context.Context, groupType string) ([]store.Gr
 		return out[i].Name < out[j].Name
 	})
 	return out, nil
+}
+
+func TestGroupListResponseUsesRequestContext(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	env.groups.listGroupsFn = func(ctx context.Context, _ string) ([]store.Group, error) {
+		return nil, ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := env.srv.groupListResponse(ctx, "server")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("groupListResponse error = %v, want context cancellation", err)
+	}
 }
 
 func (f *fakeGroups) GetGroup(_ context.Context, groupType string, id int64) (*store.Group, error) {

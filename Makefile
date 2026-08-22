@@ -3,7 +3,9 @@
 
 GO          ?= go
 DOCKER      ?= docker
-IMAGE       ?= voicx:dev
+VOICX_IMAGE ?= voicx:dev
+VOICX_BACKUP_IMAGE ?= voicx-backup:dev
+export VOICX_IMAGE VOICX_BACKUP_IMAGE
 BINARY       = bin/voicx
 PKG          = ./cmd/server
 
@@ -57,15 +59,25 @@ proto:
 
 ## tidy: run go mod tidy
 tidy:
-	$(GO) mod tidy
+	@set -e; \
+	$(GO) mod tidy; \
+	cd client && $(GO) mod tidy
 
 ## test: run the full test suite
 test:
-	$(GO) test ./...
+	@set -e; \
+	mkdir -p client/frontend/dist; \
+	touch client/frontend/dist/.test-placeholder; \
+	$(GO) test ./...; \
+	cd client && $(GO) test ./...
 
 ## cover: run the full test suite with coverage report
 cover:
-	$(GO) test -cover ./...
+	@set -e; \
+	mkdir -p client/frontend/dist; \
+	touch client/frontend/dist/.test-placeholder; \
+	$(GO) test -cover ./...; \
+	cd client && $(GO) test -cover ./...
 
 ## fmt: format all Go sources
 fmt:
@@ -75,17 +87,17 @@ fmt:
 vet:
 	$(GO) vet ./...
 
-## docker-build: build the voicx:dev image from the Dockerfile
+## docker-build: build the $(VOICX_IMAGE) image from the Dockerfile
 docker-build:
 	@set -e; \
 	version_args="$$($(VERSION_TOOL) -format docker)"; \
 	$(DOCKER) build $$version_args \
 		--build-arg VOICX_UPDATE_REPO=$(VOICX_UPDATE_REPO) \
-		-t $(IMAGE) .
+		-t $(VOICX_IMAGE) .
 
-## docker-run: run the voicx:dev image with default ports published
+## docker-run: run the $(VOICX_IMAGE) image with default ports published
 docker-run:
-	$(DOCKER) run --rm -p 12333:12333 -p 12334:12334/udp -p 12335:12335 -p 12336:12336 -p 12337:12337 $(IMAGE)
+	$(DOCKER) run --rm -p 12333:12333 -p 12334:12334/udp -p 12335:12335 -p 12336:12336 -p 12337:12337 $(VOICX_IMAGE)
 
 ## docker-stop: stop and remove any running voicx containers
 docker-stop:
@@ -133,6 +145,7 @@ canary:
 ## clean: remove local build artifacts
 clean:
 	rm -rf bin out dist
+	rm -f adduser.exe e2e.exe
 
 ## help: print this help
 help:

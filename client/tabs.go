@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
@@ -51,10 +53,7 @@ type tabState struct {
 	journal []journalEntry // events since the last snapshot
 }
 
-// tabsMu guards tabs/activeID. cmMu (app.go) guards the active cm pointer.
-var (
-	nextTabSeq = 0
-)
+// tabsMu guards tabs/activeID and every mutable tabState field.
 
 // journalCap bounds the per-tab replay buffer (chatty channels could
 // otherwise grow it without limit).
@@ -76,44 +75,75 @@ func (s tabSink) Emit(name string, payload any) {
 // tab's state-carrying events. Active events must be journaled too: they are
 // the state that has to be replayed after switching away and back.
 func (a *App) relayTabEvent(tabID, name string, payload any) {
+	// Snapshot the nickname before taking tabsMu: tab state is protected by
+	// tabsMu, while connection state belongs to the manager. They must not be
+	// nested in that order.
+	a.tabsMu.Lock()
+	cm := (*connManager)(nil)
+	if ts := a.tabs[tabID]; ts != nil {
+		cm = ts.cm
+	}
+	a.tabsMu.Unlock()
+	nickname := ""
+	if cm != nil {
+		cm.mu.Lock()
+		nickname = cm.nickname
+		cm.mu.Unlock()
+	}
+
 	a.tabsMu.Lock()
 	active := a.activeID == tabID
+	generation := a.activationGeneration
 	ts := a.tabs[tabID]
+	if ts == nil {
+		a.tabsMu.Unlock()
+		// A manager may finish an async transfer/decrypt after its tab has
+		// closed. It is never safe to route that event to the current tab.
+		return
+	}
 	mention := false
-	if name == "disconnected" && ts != nil {
+	if name == "disconnected" {
 		ts.info.Connected = false
 	}
-	if ts != nil {
-		text, _ := payload.(string)
-		switch name {
-		case "snapshot":
-			ts.journal = ts.journal[:0]
-			ts.journal = append(ts.journal, journalEntry{name, text})
-		case "channellist", "subscriptions", "server_rules", "event":
-			ts.journal = append(ts.journal, journalEntry{name, text})
-			if len(ts.journal) > journalCap {
-				ts.journal = ts.journal[len(ts.journal)-journalCap:]
-			}
-			if !active && name == "event" {
-				mention = a.countBadge(ts, text)
-			}
+	text, _ := payload.(string)
+	switch name {
+	case "snapshot":
+		ts.journal = ts.journal[:0]
+		ts.journal = append(ts.journal, journalEntry{name, text})
+	case "channellist", "subscriptions", "server_rules", "event":
+		ts.journal = append(ts.journal, journalEntry{name, text})
+		if len(ts.journal) > journalCap {
+			ts.journal = ts.journal[len(ts.journal)-journalCap:]
+		}
+		if !active && name == "event" {
+			mention = a.countBadge(ts, text, nickname)
 		}
 	}
 	a.tabsMu.Unlock()
 
-	if active && name == "disconnected" {
-		traySetConnected(false)
-	}
 	if mention {
 		// (290) mention in a background tab: flash the taskbar + badge.
 		a.FlashWindow()
 		trayAddMention()
 	}
-	if active || ts == nil {
-		a.emitPlain(name, payload)
-		if name == "disconnected" {
-			a.emitTabsUpdate()
+	if active {
+		// Publication shares the activation sequencer. Revalidate after
+		// acquiring it: an old active relay cannot escape after a newer reset,
+		// and a new relay cannot precede its reset batch.
+		a.activationPublishMu.Lock()
+		a.tabsMu.Lock()
+		stillActive := a.activeID == tabID && a.activationGeneration == generation && a.tabs[tabID] == ts
+		a.tabsMu.Unlock()
+		if stillActive {
+			if name == "disconnected" {
+				traySetConnected(false)
+			}
+			a.emitPlain(name, payload)
+			if name == "disconnected" {
+				a.emitTabsUpdate()
+			}
 		}
+		a.activationPublishMu.Unlock()
 		return
 	}
 	if name != "snapshot" && name != "channellist" && name != "subscriptions" &&
@@ -126,7 +156,7 @@ func (a *App) relayTabEvent(tabID, name string, payload any) {
 }
 
 // countBadge increments unread/mention counters for background chat events.
-func (a *App) countBadge(ts *tabState, eventJSON string) bool {
+func (a *App) countBadge(ts *tabState, eventJSON, nickname string) bool {
 	var env struct {
 		Type string          `json:"type"`
 		Data json.RawMessage `json:"data"`
@@ -142,18 +172,54 @@ func (a *App) countBadge(ts *tabState, eventJSON string) bool {
 		return false
 	}
 	ts.info.Unread++
-	ts.cm.mu.Lock()
-	nick := ts.cm.nickname
-	ts.cm.mu.Unlock()
-	if nick != "" && strings.Contains(chat.Text, "@"+nick) {
+	if nickname != "" && containsMention(chat.Text, nickname) {
 		ts.info.Mentions++
 		return true
 	}
 	return false
 }
 
+// containsMention recognizes an exact Unicode case-insensitive @nickname.
+// A word-like suffix would address somebody else (@annex is not @ann), while
+// punctuation, whitespace, or end-of-text cleanly terminates the mention.
+func containsMention(text, nickname string) bool {
+	if nickname == "" {
+		return false
+	}
+	nicknameRunes := utf8.RuneCountInString(nickname)
+	for offset, r := range text {
+		if r != '@' {
+			continue
+		}
+		start := offset + utf8.RuneLen(r)
+		end := start
+		for range nicknameRunes {
+			if end == len(text) {
+				break
+			}
+			_, size := utf8.DecodeRuneInString(text[end:])
+			end += size
+		}
+		if utf8.RuneCountInString(text[start:end]) != nicknameRunes || !strings.EqualFold(text[start:end], nickname) {
+			continue
+		}
+		if end == len(text) {
+			return true
+		}
+		next, _ := utf8.DecodeRuneInString(text[end:])
+		if !unicode.IsLetter(next) && !unicode.IsDigit(next) && next != '_' && next != '-' {
+			return true
+		}
+	}
+	return false
+}
+
 // emitPlain forwards an event to the Wails runtime under its plain name.
 func (a *App) emitPlain(name string, payload any) {
+	if a.eventEmit != nil {
+		a.eventEmit(name, payload)
+		return
+	}
 	if a.ctx != nil {
 		wailsRuntime.EventsEmit(a.ctx, name, payload)
 	}
@@ -161,43 +227,70 @@ func (a *App) emitPlain(name string, payload any) {
 
 // emitTabsUpdate sends the tab bar model to the frontend.
 func (a *App) emitTabsUpdate() {
-	if a.ctx != nil {
-		wailsRuntime.EventsEmit(a.ctx, "tab_update", a.ListTabs())
-	}
+	a.emitPlain("tab_update", a.ListTabs())
 }
 
 // tabs/accessors ---------------------------------------------------------
 
-// tabsRegistry returns the tab map (for tests).
+// tabsRegistry returns a detached snapshot of the tab registry.
 func (a *App) tabsRegistry() map[string]*tabState {
 	a.tabsMu.Lock()
 	defer a.tabsMu.Unlock()
-	return a.tabs
+	copy := make(map[string]*tabState, len(a.tabs))
+	for id, ts := range a.tabs {
+		copy[id] = ts
+	}
+	return copy
 }
 
 // newTab creates a tab with a fresh connManager and registers it.
 func (a *App) newTab() (string, *tabState) {
-	a.tabsMu.Lock()
-	defer a.tabsMu.Unlock()
-	nextTabSeq++
-	id := fmt.Sprintf("tab-%d", nextTabSeq)
+	a.settingsMu.Lock()
+	allowPlaintext := a.settings.AllowPlaintext
+	a.settingsMu.Unlock()
+	id := fmt.Sprintf("tab-%d", a.tabSeq.Add(1))
 	cm := newConnManager(a.ctx)
 	cm.tabID = id
 	cm.sink = tabSink{app: a, tabID: id}
-	cm.allowPlaintext = a.settings.AllowPlaintext
+	cm.allowPlaintext = allowPlaintext
 	if a.knownServers != nil {
 		cm.knownServers = a.knownServers
 	}
 	ts := &tabState{cm: cm, info: TabInfo{ID: id}}
+	a.tabsMu.Lock()
+	if a.tabs == nil {
+		a.tabs = make(map[string]*tabState)
+	}
 	a.tabs[id] = ts
+	a.tabOrder = append(a.tabOrder, id)
+	a.tabsMu.Unlock()
 	return id, ts
 }
 
-// activateLocked switches the active tab (caller holds no locks): swaps the
-// binding target, tells the frontend to reset, then replays the journal.
+// activate switches the active tab. Its state commit is atomic under tabsMu;
+// UI side effects run only after the committed snapshot has been released.
 func (a *App) activate(tabID string) {
+	// Take the publication sequencer before committing activeID. That makes a
+	// reset/replay batch indivisible with respect to relayed active events.
+	a.activationPublishMu.Lock()
+	defer a.activationPublishMu.Unlock()
 	a.tabsMu.Lock()
+	activeCM, journal, generation, ok := a.activateLocked(tabID)
+	a.tabsMu.Unlock()
+	if !ok {
+		return
+	}
+	a.finishActivateSerialized(tabID, activeCM, journal, generation)
+}
+
+// activateLocked commits the active binding. The caller holds tabsMu.
+func (a *App) activateLocked(tabID string) (*connManager, []journalEntry, uint64, bool) {
 	ts := a.tabs[tabID]
+	if tabID != "" && ts == nil {
+		return nil, nil, 0, false
+	}
+	a.activationGeneration++
+	generation := a.activationGeneration
 	a.activeID = tabID
 	var activeCM *connManager
 	var journal []journalEntry
@@ -210,19 +303,37 @@ func (a *App) activate(tabID string) {
 	} else {
 		a.cmStore(nil)
 	}
-	a.tabsMu.Unlock()
+	return activeCM, journal, generation, true
+}
+
+// finishActivateSerialized publishes a committed activation while
+// activationPublishMu is held.
+func (a *App) finishActivateSerialized(tabID string, activeCM *connManager, journal []journalEntry, generation uint64) {
+	if !a.isCurrentActivation(generation) {
+		return
+	}
 	traySetConnected(activeCM != nil && activeCM.connected())
 
 	// The frontend clears chat/tree on tab_reset; the replay below rebuilds
 	// state from the journaled frames in order.
 	trayClearMentions()
 	a.emitPlain("tab_reset", tabID)
-	if ts != nil {
-		for _, e := range journal {
-			a.emitPlain(e.name, e.payload)
+	for _, e := range journal {
+		if !a.isCurrentActivation(generation) {
+			return
 		}
+		a.emitPlain(e.name, e.payload)
+	}
+	if !a.isCurrentActivation(generation) {
+		return
 	}
 	a.emitTabsUpdate()
+}
+
+func (a *App) isCurrentActivation(generation uint64) bool {
+	a.tabsMu.Lock()
+	defer a.tabsMu.Unlock()
+	return a.activationGeneration == generation
 }
 
 // --- bound API ---------------------------------------------------------------
@@ -230,19 +341,31 @@ func (a *App) activate(tabID string) {
 // ListTabs returns the tab bar model.
 func (a *App) ListTabs() []TabInfo {
 	a.tabsMu.Lock()
-	defer a.tabsMu.Unlock()
-	out := make([]TabInfo, 0, len(a.tabs))
-	for id, ts := range a.tabs {
+	tabs := make([]*tabState, 0, len(a.tabOrder))
+	activeID := a.activeID
+	for _, id := range a.tabOrder {
+		if ts := a.tabs[id]; ts != nil {
+			tabs = append(tabs, ts)
+		}
+	}
+	a.tabsMu.Unlock()
+
+	out := make([]TabInfo, 0, len(tabs))
+	for _, ts := range tabs {
+		a.tabsMu.Lock()
 		info := ts.info
-		info.ID = id
-		info.Active = id == a.activeID
+		a.tabsMu.Unlock()
+		info.Active = info.ID == activeID
 		if ts.cm != nil {
 			info.Connected = ts.cm.connected()
+			ts.cm.mu.Lock()
+			addr, nickname := ts.cm.addr, ts.cm.nickname
+			ts.cm.mu.Unlock()
 			if info.Addr == "" {
-				info.Addr = ts.cm.addr
+				info.Addr = addr
 			}
 			if info.Nickname == "" {
-				info.Nickname = ts.cm.nickname
+				info.Nickname = nickname
 			}
 		}
 		out = append(out, info)
@@ -279,8 +402,10 @@ func (a *App) ConnectBookmarkTabWithID(bookmark, addr, nickname, password, serve
 		}
 		return ConnectTabResult{Error: err}
 	}
+	a.tabsMu.Lock()
 	ts.info.Addr = addr
 	ts.info.Nickname = nickname
+	a.tabsMu.Unlock()
 	a.onTabConnected(ts.cm, bookmark, addr, nickname)
 	a.activate(id)
 	return ConnectTabResult{TabID: id}
@@ -310,8 +435,10 @@ func (a *App) ConnectGuestBookmarkTabWithID(bookmark, addr, nickname string) Con
 		}
 		return ConnectTabResult{Error: err}
 	}
+	a.tabsMu.Lock()
 	ts.info.Addr = addr
 	ts.info.Nickname = nickname
+	a.tabsMu.Unlock()
 	a.onTabConnected(ts.cm, bookmark, addr, nickname)
 	a.activate(id)
 	return ConnectTabResult{TabID: id}
@@ -332,9 +459,11 @@ func fingerprintMismatchMessage(cm *connManager) string {
 // applies a foreign hotkey profile (300) and uploads a foreign avatar
 // override (335) to the server.
 func (a *App) lookupBookmark(name, addr, nickname string) *Bookmark {
+	a.settingsMu.Lock()
+	defer a.settingsMu.Unlock()
 	var match *Bookmark
 	for i := range a.settings.Bookmarks {
-		b := &a.settings.Bookmarks[i]
+		b := a.settings.Bookmarks[i]
 		if b.Addr != addr {
 			continue
 		}
@@ -348,7 +477,8 @@ func (a *App) lookupBookmark(name, addr, nickname string) *Bookmark {
 		if match != nil {
 			return nil // ambiguous: treat as a plain login
 		}
-		match = b
+		copy := b
+		match = &copy
 	}
 	return match
 }
@@ -379,36 +509,55 @@ func (a *App) onTabConnected(cm *connManager, bookmark, addr, nickname string) {
 
 // SetActiveTab switches the active tab (replays its journaled state).
 func (a *App) SetActiveTab(tabID string) {
-	a.tabsMu.Lock()
-	_, ok := a.tabs[tabID]
-	a.tabsMu.Unlock()
-	if !ok {
-		return
-	}
 	a.activate(tabID)
 }
 
 // CloseTab disconnects and removes a tab; when it was active, the next tab
 // (if any) becomes active.
 func (a *App) CloseTab(tabID string) {
+	// Lock publication before mutating the active binding so relays cannot
+	// publish between the new active commit and its reset marker.
+	a.activationPublishMu.Lock()
+	defer a.activationPublishMu.Unlock()
 	a.tabsMu.Lock()
 	ts := a.tabs[tabID]
 	wasActive := a.activeID == tabID
-	a.tabsMu.Unlock()
 	if ts == nil {
+		a.tabsMu.Unlock()
 		return
 	}
-	ts.cm.disconnect()
-	a.removeTab(tabID)
-	if wasActive {
-		a.tabsMu.Lock()
-		var next string
-		for id := range a.tabs {
-			next = id
+	idx := -1
+	for i, id := range a.tabOrder {
+		if id == tabID {
+			idx = i
 			break
 		}
-		a.tabsMu.Unlock()
-		a.activate(next) // empty next = no tabs left (frontend shows login)
+	}
+	delete(a.tabs, tabID)
+	if idx >= 0 {
+		a.tabOrder = append(a.tabOrder[:idx], a.tabOrder[idx+1:]...)
+	}
+	var next string
+	var activeCM *connManager
+	var journal []journalEntry
+	var generation uint64
+	if wasActive {
+		if idx >= 0 && idx < len(a.tabOrder) {
+			next = a.tabOrder[idx] // right neighbour now occupies this slot.
+		} else if len(a.tabOrder) > 0 {
+			next = a.tabOrder[len(a.tabOrder)-1]
+		}
+		// Remove + replacement selection + active binding are one tabsMu
+		// transaction, so a concurrent SetActiveTab cannot be overwritten.
+		activeCM, journal, generation, _ = a.activateLocked(next)
+	}
+	a.tabsMu.Unlock()
+
+	// Teardown can emit callbacks; the registry already has no entry so a
+	// late callback is dropped by relayTabEvent.
+	ts.cm.disconnect()
+	if wasActive {
+		a.finishActivateSerialized(next, activeCM, journal, generation)
 	} else {
 		a.emitTabsUpdate()
 	}
@@ -425,5 +574,11 @@ func appWithCM(cm *connManager) *App {
 func (a *App) removeTab(tabID string) {
 	a.tabsMu.Lock()
 	delete(a.tabs, tabID)
+	for i, id := range a.tabOrder {
+		if id == tabID {
+			a.tabOrder = append(a.tabOrder[:i], a.tabOrder[i+1:]...)
+			break
+		}
+	}
 	a.tabsMu.Unlock()
 }

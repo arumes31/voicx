@@ -78,6 +78,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 			if _, err = fmt.Fprintln(stdout, argument); err != nil {
 				break
 			}
+		}
 	default:
 		return fmt.Errorf("unknown format %q", *format)
 	}
@@ -261,7 +262,7 @@ func decodeJSON(path string, destination any) error {
 	if err != nil {
 		return fmt.Errorf("opening %s: %w", path, err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(destination); err != nil {
 		return fmt.Errorf("decoding %s: %w", path, err)

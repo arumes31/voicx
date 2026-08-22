@@ -13,8 +13,11 @@
 import { renderMarkdown, escapeHTML, EMOJI } from "./markdown.js";
 import { playEvent } from "./sounds.js";
 import { pickIcon } from "./image-tools.js";
-import { closeDialog, isCurrentServerDialog, mountServerDialog } from "./modal.js";
+import { closeDialog, confirmDialog, isCurrentServerDialog, mountServerDialog, promptDialog } from "./modal.js";
 import { imageDataURL } from "./safe-media.js";
+import { parseRuntimeObject } from "./runtime-json.js";
+import { parseFileRef, transformCustomEmoji } from "./chat-parsers.js";
+import { captureScope, scopeIsCurrent } from "./scoped-actions.js";
 
 const V = () => window.__voicx;
 const $ = (id) => document.getElementById(id);
@@ -129,12 +132,53 @@ function activeChannelID() {
     return null;
 }
 
+// Export may open two dialogs before it talks to the backend. Preserve the
+// exact scope selected at the first click so a channel move cannot export a
+// different conversation than the one the user confirmed.
+function readExportScope() {
+    const exportView = view;
+    return {
+        generation: V().state.serverGeneration,
+        kind: exportView.kind,
+        channelID: exportView.kind === "global" ? 0 : (activeChannelID() || 0),
+        uid: exportView.kind === "dm" ? exportView.uid : "",
+    };
+}
+
+function exportScopeIsCurrent(scope) {
+    return scopeIsCurrent(scope, readExportScope);
+}
+
+function readAttachmentSaveScope(channelID) {
+    return {
+        generation: V().state.serverGeneration,
+        channelID,
+        viewKey: activeKey(),
+    };
+}
+
+function attachmentSaveScopeIsCurrent(scope) {
+    return scopeIsCurrent(scope, () => readAttachmentSaveScope(scope.channelID));
+}
+
+// Inline attachment previews are scoped to the same immutable chat identity
+// as native saves. A delayed encrypted download must never populate a view the
+// user has since left (or a freshly connected server using the same channel).
+function readInlineAttachmentScope(channelID) {
+    return readAttachmentSaveScope(channelID);
+}
+
+function inlineAttachmentScopeIsCurrent(scope, wrap) {
+    return wrap.isConnected && scopeIsCurrent(scope, () => readInlineAttachmentScope(scope.channelID));
+}
+
 function chatSurfaceVisible(key) {
     const workspace = document.getElementById("app");
     const chatTab = document.getElementById("tab-chat");
+    const chatPane = document.getElementById("chat-pane");
     return key === activeKey() && document.visibilityState === "visible" && document.hasFocus() &&
         workspace && !workspace.classList.contains("hidden") && workspace.getAttribute("aria-hidden") !== "true" &&
-        chatTab?.getAttribute("aria-pressed") === "true";
+        chatTab?.getAttribute("aria-selected") === "true" && !chatPane?.hidden;
 }
 
 function chatAnnouncementAllowed(event, ctx, key) {
@@ -394,21 +438,9 @@ function applyCustomEmoji(html) {
     if (customDirty) ensureCustomEmoji();
     for (const e of customEmoji) {
         const url = emojiURLs.get(e.name);
-        if (url) {
-            const img = `<img class="md-emoji" src="${escapeHTML(url)}" alt=":${escapeHTML(e.name)}:">`;
-            const parts = html.split(/(<[^>]+>)/g);
-            const target = ":" + e.name + ":";
-            for (let i = 0; i < parts.length; i++) {
-                if (!parts[i].startsWith("<")) {
-                    parts[i] = parts[i].split(target).join(img);
-                }
-            }
-            html = parts.join("");
-        } else if (url === undefined) {
-            emojiURL(e.name);
-        }
+        if (url === undefined) emojiURL(e.name);
     }
-    return html;
+    return transformCustomEmoji(html, customEmoji, emojiURLs);
 }
 
 // ---------------------------------------------------------------------------
@@ -556,18 +588,6 @@ const VIDEO_MIME = { mp4: "video/mp4", webm: "video/webm", ogv: "video/ogg" };
 const ATTACH_MAX_BYTES = 25 * 1024 * 1024;
 const INLINE_MAX_B64 = 8 * 1024 * 1024; // ~6 MB of media rendered inline
 
-// parseFileRef splits a [file:<capture>] token into its three parts. It is
-// total and never throws: zero or one separators is a legacy plain reference,
-// which is what keeps pre-encryption messages rendering. Mirrors
-// parseFileRef in client/chat.go.
-export function parseFileRef(cap) {
-    const i = cap.indexOf("#");
-    if (i < 0) return { storage: cap, key: "", name: cap, valid: true, legacy: true };       // legacy plain [file:photo.png]
-    const j = cap.indexOf("#", i + 1);
-    if (j < 0) return { storage: cap, key: "", name: cap, valid: false, legacy: false };      // malformed (1 separator)
-    return { storage: cap.slice(0, i), key: cap.slice(i + 1, j), name: cap.slice(j + 1), valid: true, legacy: false };
-}
-
 // attachFileRef takes the RAW capture and parses it here rather than in
 // renderBody, so the file key never crosses the split boundary. The key goes
 // straight into the Go call: never into textContent, an attribute or a src.
@@ -583,11 +603,16 @@ function attachFileRef(container, m, cap) {
     const ext = (name.split(".").pop() || "").toLowerCase();
     const wrap = document.createElement("span");
     wrap.className = "msg-file";
+    const previewScope = captureScope(() => readInlineAttachmentScope(chID));
+    const previewIsCurrent = () => inlineAttachmentScopeIsCurrent(previewScope, wrap);
     const inlineImage = IMAGE_EXTS.includes(ext);
     const inlineVideo = VIDEO_EXTS.includes(ext);
     if (inlineImage || inlineVideo) {
         wrap.textContent = `loading ${inlineVideo ? "video" : "image"} ${name} …`;
         app().DownloadChatAttachment(chID, ref.storage, ref.key).then((b64) => {
+            // Check before touching the wrapper or constructing a renderer data
+            // URL: a completed request belongs to the scope that launched it.
+            if (!previewIsCurrent()) return;
             wrap.textContent = "";
             if (!b64) {
                 wrap.textContent = "📎 " + name + " (unavailable)";
@@ -606,13 +631,16 @@ function attachFileRef(container, m, cap) {
             if (inlineVideo) {
                 el.className = "msg-video";
                 el.controls = true;
-                el.preload = "metadata";
+                el.preload = "none";
                 el.src = `data:${VIDEO_MIME[ext]};base64,${b64}`;
             } else {
                 el.className = "msg-img";
                 el.alt = name;
+                el.loading = "lazy";
+                el.decoding = "async";
                 el.src = `data:image/${ext === "jpg" ? "jpeg" : ext};base64,${b64}`;
             }
+            if (!previewIsCurrent()) return;
             el.title = inlineVideo ? name : name + " — click to zoom";
             wrap.appendChild(el);
             const zoom = document.createElement("button");
@@ -622,8 +650,14 @@ function attachFileRef(container, m, cap) {
             zoom.onclick = () => openLightbox(el);
             wrap.appendChild(zoom);
             if (!inlineVideo) el.onclick = () => openLightbox(el); // controls own the click on a video
-        }).catch(() => {
-            wrap.textContent = "📎 " + name + " (download failed)";
+        }).catch((err) => {
+            if (!previewIsCurrent()) return;
+            wrap.textContent = "";
+            if (String(err).includes("too large to preview")) {
+                wrap.appendChild(downloadChip(chID, ref, name, " (too large to preview)"));
+            } else {
+                wrap.textContent = "📎 " + name + " (download failed)";
+            }
         });
     } else {
         wrap.appendChild(downloadChip(chID, ref, name, ""));
@@ -632,21 +666,25 @@ function attachFileRef(container, m, cap) {
 }
 
 // downloadChip builds the "📎 name" button. ref carries the attachment key,
-// which is read straight into the Go call and never written to the DOM.
+// which is read straight into the Go call and never written to the DOM. Native
+// Go saves the decrypted bytes, so an attachment never becomes a base64 data
+// URL or plaintext buffer in the JavaScript download path.
 function downloadChip(chID, ref, name, suffix) {
     const b = document.createElement("button");
     b.className = "file-chip";
     b.textContent = "📎 " + name + suffix;
     b.title = "download " + name;
     b.onclick = async () => {
+        const scope = captureScope(() => readAttachmentSaveScope(chID));
+        b.disabled = true;
         try {
-            const b64 = await app().DownloadChatAttachment(chID, ref.storage, ref.key);
-            const a = document.createElement("a");
-            a.href = "data:application/octet-stream;base64," + b64;
-            a.download = name;
-            a.click();
+            const path = await app().SaveChatAttachment(chID, ref.storage, ref.key, name);
+            if (!attachmentSaveScopeIsCurrent(scope)) return;
+            if (path) V().toast("saved " + name);
         } catch (e) {
-            V().toast("download failed: " + e, "warn");
+            if (attachmentSaveScopeIsCurrent(scope)) V().toast("save failed: " + e, "warn");
+        } finally {
+            if (attachmentSaveScopeIsCurrent(scope) && b.isConnected) b.disabled = false;
         }
     };
     return b;
@@ -835,8 +873,17 @@ function startEdit(m) {
 }
 
 async function deleteMsg(m) {
-    if (!confirm("Delete this message?")) return;
+    const generation = V().state.serverGeneration;
+    const confirmed = await confirmDialog({
+        title: "Delete message?",
+        message: "This removes the message for everyone. This cannot be undone.",
+        confirmLabel: "Delete message",
+        danger: true,
+        serverScoped: true,
+    });
+    if (!confirmed || generation !== V().state.serverGeneration) return;
     const err = await app().ChatDeleteMessage(m.id);
+    if (generation !== V().state.serverGeneration) return;
     if (err) V().toast("delete failed: " + err, "warn");
     // The chat_deleted broadcast renders the tombstone.
 }
@@ -1191,18 +1238,22 @@ function closeChannelTab(channelID) {
     setChannelSubscription(id, false);
 }
 
+// Normalize the full authoritative subscription payload before replacing the
+// local model. Keeping this boundary pure makes malformed bridge events a
+// no-op and lets every caller use the same sorted, deduplicated IDs.
+export function normalizeSubscriptionState(json) {
+    const state = parseRuntimeObject(json);
+    if (!state) return null;
+    return [...new Set((state.channel_ids || []).map(Number).filter((id) => id > 0))]
+        .sort((a, b) => a - b);
+}
+
 // SubscriptionState is a full authoritative set. Replacing the local model
 // makes rejection, revocation, deletion and missed events self-healing.
 export function onSubscriptions(json) {
-    let state;
-    try {
-        state = typeof json === "string" ? JSON.parse(json) : json;
-    } catch {
-        V().toast("server sent malformed subscriptions", "warn");
-        return;
-    }
-    subscriptions = [...new Set((state?.channel_ids || []).map(Number).filter((id) => id > 0))]
-        .sort((a, b) => a - b);
+    const next = normalizeSubscriptionState(json);
+    if (!next) return;
+    subscriptions = next;
     chanTabs.clear();
     for (const id of subscriptions) chanTabs.set(id, { id });
 
@@ -1289,7 +1340,7 @@ function renderTabs() {
             const b = document.createElement("span");
             b.className = "pm-badge offline";
             b.textContent = "offline";
-            b.title = "offline messages received (123)";
+            b.title = "offline messages received";
             el.appendChild(b);
         }
         if (tab.unread > 0) {
@@ -1391,9 +1442,17 @@ function dmRecord(peer, nick, m) {
 // clearPMHistory is the ONLY path that destroys a conversation, and it says so
 // before it does: the server never had a copy to fall back on (122).
 async function clearPMHistory(uid, nick) {
-    if (!confirm(`Delete the stored history of the conversation with ${nick}?\n\n` +
-        "This cannot be undone — these messages are end-to-end encrypted and the server never had a copy.")) return;
+    const generation = V().state.serverGeneration;
+    const confirmed = await confirmDialog({
+        title: "Delete stored conversation?",
+        message: `This permanently deletes the stored history with ${nick}. This cannot be undone: these messages are end-to-end encrypted and the server has no copy.`,
+        confirmLabel: "Delete history",
+        danger: true,
+        serverScoped: true,
+    });
+    if (!confirmed || generation !== V().state.serverGeneration) return;
     const err = await app().DMHistoryClear(uid);
+    if (generation !== V().state.serverGeneration) return;
     if (err) {
         V().toast("could not clear DM history: " + err, "warn");
         return;
@@ -2019,29 +2078,52 @@ export async function sendMessage() {
     // name; the returned token carries that key inside the encrypted message
     // body, so the attachment is as private as the message (91-135).
     const chID = scope === "channel" ? (activeChannelID() || 0) : 0;
+    const retryFiles = [];
     for (const f of files) {
         let token;
         try {
             token = await app().UploadChatAttachment(chID, f.name, f.dataBase64);
         } catch (e) {
             V().sysMsg("upload failed: " + e);
+            retryFiles.push(f);
             continue;
         }
-        const err = await app().SendChat(scope, target, token);
-        if (err) V().sysMsg("chat failed: " + err);
+        try {
+            const err = await app().SendChat(scope, target, token);
+            if (err) {
+                V().sysMsg("chat failed: " + err);
+                retryFiles.push(f);
+            }
+        } catch (e) {
+            V().sysMsg("chat failed: " + e);
+            retryFiles.push(f);
+        }
+    }
+    if (retryFiles.length) {
+        pendingFiles = [...retryFiles, ...pendingFiles];
+        renderFilePreview();
     }
 
     if (text) {
         const parentID = scope === "direct" ? 0 : (replyTo?.id || 0);
-        const err = parentID
-            ? await app().SendChatReply(scope, target, text, parentID)
-            : await app().SendChat(scope, target, text);
+        let err = "";
+        try {
+            err = parentID
+                ? await app().SendChatReply(scope, target, text, parentID)
+                : await app().SendChat(scope, target, text);
+        } catch (e) {
+            V().sysMsg("chat failed: " + e);
+            return;
+        }
+        if (err) {
+            V().sysMsg("chat failed: " + err);
+            return;
+        }
         rememberSent(text);
         if (replyTo) clearReply();
-        if (err) V().sysMsg("chat failed: " + err);
+        input.value = "";
+        resetTypingOut(); // (120) the message landed; stop claiming to be composing
     }
-    input.value = "";
-    resetTypingOut(); // (120) the message landed; stop claiming to be composing
 }
 
 function rememberSent(text) {
@@ -2193,7 +2275,12 @@ function toggleEmojiPanel() {
         const generation = V().state.serverGeneration;
         const img = await pickIcon(128, 0.9);
         if (!img?.dataBase64 || generation !== V().state.serverGeneration) return;
-        const name = (prompt("Emoji shortcode (letters, digits, _ and -):") || "").trim();
+        const name = (await promptDialog({
+            title: "Upload custom emoji",
+            label: "Emoji shortcode (letters, digits, _ and -)",
+            confirmLabel: "Upload",
+            serverScoped: true,
+        }) || "").trim();
         if (!name || generation !== V().state.serverGeneration) return;
         const err = await app().EmojiUpload(name, img.dataBase64);
         if (generation !== V().state.serverGeneration) return;
@@ -2746,21 +2833,20 @@ function exportProgressDialog() {
 // export is the one place this client can undo the storage guarantee: it takes
 // an explicit confirm, and the encrypted container is offered first.
 async function exportChat() {
-    const generation = V().state.serverGeneration;
-    const exportView = { ...view };
+    const exportScope = captureScope(readExportScope);
     // Without a joined channel the channel view has no scope of its own, and
     // channel id 0 is GLOBAL: exporting it here would hand over a different
     // conversation than the one on screen.
-    if (view.kind === "channel" && !V().state.myChannelID) {
+    if (exportScope.kind === "channel" && !exportScope.channelID) {
         V().toast("join a channel to export its history — or switch to global", "info", "alert");
         return;
     }
-    const name = exportView.kind === "dm" ? "dm-" + exportView.uid.slice(0, 8)
-        : exportView.kind === "global" ? "global"
-        : (V().state.channels.find((c) => c.ChannelID === activeChannelID())?.Name || "channel");
+    const name = exportScope.kind === "dm" ? "dm-" + exportScope.uid.slice(0, 8)
+        : exportScope.kind === "global" ? "global"
+        : (V().state.channels.find((c) => c.ChannelID === exportScope.channelID)?.Name || "channel");
 
     const pass = await askExportPassphrase();
-    if (pass === null || generation !== V().state.serverGeneration) return; // cancelled or switched
+    if (pass === null || !exportScopeIsCurrent(exportScope)) return; // cancelled or switched
 
     const prog = exportProgressDialog();
     let unsub = window.runtime.EventsOn("chatexport:progress", (n) => prog.update(n));
@@ -2771,25 +2857,28 @@ async function exportChat() {
     });
     let res = null;
     try {
-        res = exportView.kind === "dm"
-            ? await app().DMExportHistory(exportView.uid)
-            : await app().ChatExportHistory(exportView.kind === "global" ? 0 : (activeChannelID() || 0), 0);
+        res = exportScope.kind === "dm"
+            ? await app().DMExportHistory(exportScope.uid)
+            : await app().ChatExportHistory(exportScope.channelID, 0);
     } catch (e) {
-        if (generation === V().state.serverGeneration) V().toast("export failed: " + e, "warn");
+        if (exportScopeIsCurrent(exportScope)) V().toast("export failed: " + e, "warn");
     }
     prog.close();
-    if (!res || generation !== V().state.serverGeneration) return;
+    if (!res || !exportScopeIsCurrent(exportScope)) return;
 
     const contents = res.text || "";
     if (pass !== "") {
         try {
             await app().ExportChatEncrypted(`voicx-${name}.voicxchat`, contents, pass);
+            if (!exportScopeIsCurrent(exportScope)) return;
         } catch (e) {
+            if (!exportScopeIsCurrent(exportScope)) return;
             V().toast("export failed: " + e, "warn");
             return;
         }
     } else {
         const err = await app().ExportChat(`voicx-${name}.txt`, contents);
+        if (!exportScopeIsCurrent(exportScope)) return;
         if (err) {
             V().toast("export failed: " + err, "warn");
             return;
@@ -2810,6 +2899,7 @@ function askExportPassphrase() {
     return new Promise((resolve) => {
         let result = null;
         let settled = false;
+        let confirmingPlainExport = false;
         const overlay = document.createElement("div");
         overlay.className = "dlg-overlay";
         const dlg = document.createElement("div");
@@ -2838,9 +2928,21 @@ function askExportPassphrase() {
         const ok = document.createElement("button");
         ok.className = "dlg-ok";
         ok.textContent = "Export";
-        ok.onclick = () => {
+        ok.onclick = async () => {
             const p = inp.value;
-            if (p === "" && !confirm("Write an UNENCRYPTED copy of this chat to disk?")) return;
+            if (p === "") {
+                if (confirmingPlainExport) return;
+                confirmingPlainExport = true;
+                const confirmed = await confirmDialog({
+                    title: "Export unencrypted chat?",
+                    message: "This writes decrypted messages to a file on your disk. Anyone who can read that file can read this chat.",
+                    confirmLabel: "Export unencrypted",
+                    danger: true,
+                    serverScoped: true,
+                });
+                confirmingPlainExport = false;
+                if (!confirmed || !isCurrentServerDialog(overlay)) return;
+            }
             done(p);
         };
         btns.appendChild(cancel);
@@ -3059,6 +3161,10 @@ function qsScore(q, s) {
     for (const ch of s) if (ch === q[qi]) qi++;
     return qi === q.length ? 50 - s.length * 0.05 : -1;
 }
+
+// Export the pure message and switcher boundaries for compatibility coverage;
+// UI event handlers continue to use these same implementations above.
+export { fmtSlowMode, mentionsMe, normalize, qsScore, resolveParent };
 
 function closeQS() {
     if (qsOverlay) {

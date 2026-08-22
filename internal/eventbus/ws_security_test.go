@@ -16,6 +16,8 @@ import (
 
 	"go.uber.org/zap"
 	"golang.org/x/net/websocket"
+
+	"voicx/internal/auth"
 )
 
 func testWSHandlerConfig(now func() time.Time) wsHandlerConfig {
@@ -45,13 +47,13 @@ func TestWSHandlerRejectsUnsafeRequestsBeforeAuthentication(t *testing.T) {
 	}{
 		{
 			name:       "wrong method",
-			request:    httptest.NewRequest(http.MethodPost, "http://localhost/events", nil),
+			request:    httptest.NewRequestWithContext(t.Context(), http.MethodPost, "http://localhost/events", nil),
 			wantStatus: http.StatusMethodNotAllowed,
 		},
 		{
 			name: "oversized authorization",
 			request: func() *http.Request {
-				r := httptest.NewRequest(http.MethodGet, "http://localhost/events", nil)
+				r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://localhost/events", nil)
 				r.Header.Set("Authorization", strings.Repeat("x", maxBasicHeaderSize+1))
 				return r
 			}(),
@@ -59,7 +61,7 @@ func TestWSHandlerRejectsUnsafeRequestsBeforeAuthentication(t *testing.T) {
 		},
 		{
 			name: "oversized query",
-			request: httptest.NewRequest(
+			request: httptest.NewRequestWithContext(t.Context(),
 				http.MethodGet,
 				"http://localhost/events?types="+strings.Repeat("x", maxRawQuerySize+1),
 				nil,
@@ -85,7 +87,7 @@ func TestWSHandlerRejectsUnsafeRequestsBeforeAuthentication(t *testing.T) {
 }
 
 func TestWSHandlerFailsClosedWithoutDependencies(t *testing.T) {
-	request := httptest.NewRequest(http.MethodGet, "http://localhost/events", nil)
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://localhost/events", nil)
 	request.SetBasicAuth("admin-uid", "pw")
 	bus := New(zap.NewNop())
 	defer bus.Close()
@@ -140,7 +142,7 @@ func TestRequestTypesRejectsAmbiguousAndMalformedQueries(t *testing.T) {
 func TestWSAuthenticatedPlainHTTPRequestDoesNotPanic(t *testing.T) {
 	bus := New(zap.NewNop())
 	defer bus.Close()
-	request := httptest.NewRequest(http.MethodGet, "http://localhost/events", nil)
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://localhost/events", nil)
 	request.SetBasicAuth("admin-uid", "pw")
 	recorder := httptest.NewRecorder()
 	Handler(bus, testAuth, zap.NewNop()).ServeHTTP(recorder, request)
@@ -183,7 +185,7 @@ func TestWSHandlerRateLimitsAuthentication(t *testing.T) {
 	handler := newWSHandler(bus, testAuth, zap.NewNop(), cfg)
 
 	for attempt := 1; attempt <= 3; attempt++ {
-		request := httptest.NewRequest(http.MethodGet, "http://localhost/events", nil)
+		request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://localhost/events", nil)
 		request.RemoteAddr = "192.0.2.15:4321"
 		request.SetBasicAuth("admin-uid", "wrong")
 		recorder := httptest.NewRecorder()
@@ -198,6 +200,63 @@ func TestWSHandlerRateLimitsAuthentication(t *testing.T) {
 		if attempt == 3 && recorder.Header().Get("Retry-After") == "" {
 			t.Fatal("rate-limited response has no Retry-After")
 		}
+	}
+}
+
+func TestWSHandlerReservesSharedLoginKDF(t *testing.T) {
+	bus := New(zap.NewNop())
+	defer bus.Close()
+	limiter := auth.NewLoginFailureLimiter(auth.LoginFailureLimiterConfig{
+		MaxFailures:      5,
+		LockoutDuration:  time.Minute,
+		FailureTTL:       time.Minute,
+		MaxEntries:       16,
+		MaxConcurrentKDF: 1,
+	})
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var calls atomic.Int32
+	authenticate := func(context.Context, string, string) (bool, bool, error) {
+		calls.Add(1)
+		entered <- struct{}{}
+		<-release
+		return false, false, nil
+	}
+	cfg := testWSHandlerConfig(time.Now)
+	cfg.maxAuthAttempts = 10
+	cfg.loginLimiter = limiter
+	handler := newWSHandler(bus, authenticate, zap.NewNop(), cfg)
+
+	first := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://localhost/events", nil)
+	first.RemoteAddr = "192.0.2.10:1000"
+	first.SetBasicAuth("first", "wrong")
+	firstResult := make(chan int, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, first)
+		firstResult <- recorder.Code
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("first websocket verifier did not enter")
+	}
+
+	second := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://localhost/events", nil)
+	second.RemoteAddr = "192.0.2.11:1000"
+	second.SetBasicAuth("second", "wrong")
+	secondRecorder := httptest.NewRecorder()
+	handler.ServeHTTP(secondRecorder, second)
+	if secondRecorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("second websocket login status = %d, want %d", secondRecorder.Code, http.StatusTooManyRequests)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("websocket verifier calls = %d, want 1", calls.Load())
+	}
+
+	close(release)
+	if status := <-firstResult; status != http.StatusUnauthorized {
+		t.Fatalf("first websocket login status = %d, want %d", status, http.StatusUnauthorized)
 	}
 }
 
@@ -225,7 +284,7 @@ func TestWSAllowsBotWithoutOrigin(t *testing.T) {
 	server := httptest.NewServer(Handler(bus, testAuth, zap.NewNop()))
 	defer server.Close()
 
-	conn, err := net.Dial("tcp", server.Listener.Addr().String())
+	conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", server.Listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}

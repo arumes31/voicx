@@ -497,7 +497,7 @@ is disabled; the app keeps working. Change the bindings in `hotkeys.go`.
 ## Run
 
 Prereqs: Go 1.25+, Node 24+, Wails CLI v2 (`go install
-github.com/wailsapp/wails/v2/cmd/wails@latest`).
+github.com/wailsapp/wails/v2/cmd/wails@v2.13.0`).
 
 ```bash
 # Start a local server first (repo root): postgres required
@@ -598,6 +598,9 @@ join + `user_moved`, channel chat, `GetPermissions`) against a **live**
 server — no Wails runtime needed (the backend's events go through an
 `eventSink` seam; tests install a recorder). It skips unless
 `VOICX_LIVE_ADDR` is set:
+
+This live-server test is manual-only: CI intentionally does not run it because
+it requires an explicitly selected live server.
 
 ```bash
 # server must be running (e.g. docker compose up)

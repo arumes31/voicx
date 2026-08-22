@@ -51,6 +51,57 @@ Use an isolated network and new database, file roots, credentials, and ports.
    drill result. Keep only the timestamp, recovery-point identifier, versions,
    duration, checks performed, and remediation owners.
 
+## Compose backup container
+
+The optional `backup` Compose profile runs the dedicated `voicx-backup` image.
+It connects with `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`, and `PGSSLMODE`;
+the password is supplied through `POSTGRES_PASSWORD` or
+`POSTGRES_PASSWORD_FILE`, never a connection URL or `pg_dump` argument. The
+entrypoint writes a mode-600 `.pgpass` file, drops to the PostgreSQL user, and
+the scheduler handles `TERM` cleanly. For a one-shot job, do not set
+`BACKUP_RUN_ONCE=1` on the long-running service (its normal restart policy
+would restart it). Use:
+
+```sh
+docker compose --profile backup run --rm --no-deps -e BACKUP_RUN_ONCE=1 postgres-backup
+```
+
+`BACKUP_RUN_ONCE` remains a harness/test seam. `BACKUP_RESTART_POLICY` defaults
+to `unless-stopped` for the scheduled service and can be set to `no` for a
+manually managed job.
+
+`*_FILE` values are bind-mounted read-only. On Linux, keep the host secret
+directory root-owned mode `0700` and individual files root-owned mode `0444`.
+Compose mounts only the selected file, never its parent, so non-root containers
+can read the bound file without host users being able to traverse the source
+directory. Keep sources outside the repository where possible; only
+`docker/secrets/.empty` is tracked.
+
+For a rootless Docker daemon, make the `0700` source directory owned by the
+daemon/operator account instead of root; retain the same direct-file mounts and
+keep the directory inaccessible to unrelated host users.
+
+If VoicX uses `VOICX_COMPOSE_DATABASE_URL` or its `_FILE` form for an external
+database, the profile fails closed until `BACKUP_PGHOST`, `BACKUP_PGPORT`,
+`BACKUP_PGUSER`, `BACKUP_PGDATABASE`, `BACKUP_PGSSLMODE`, and exactly one of
+`BACKUP_POSTGRES_PASSWORD` / `BACKUP_POSTGRES_PASSWORD_FILE` are provided.
+These discrete settings intentionally prevent a password-bearing URL from
+being passed to `pg_dump`. The profile does not depend on the internal
+PostgreSQL service in this mode. External backups require `require`,
+`verify-ca`, or `verify-full`; mount `BACKUP_PGSSLROOTCERT_FILE`,
+`BACKUP_PGSSLCERT_FILE`, and `BACKUP_PGSSLKEY_FILE` when libpq needs custom CA
+or client credentials. For an object remote, set `RCLONE_CONFIG_FILE`; it is
+mounted as `RCLONE_CONFIG` only in the backup container.
+
+Use the separate external topology whenever the application URL is external:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.external-db.yml --profile backup up -d
+```
+
+It removes VoicX's internal PostgreSQL health dependency and leaves the bundled
+database inactive, while retaining Redis and the optional backup profile.
+
 ## Recovery objectives
 
 Set deployment-specific RPO and RTO values beside the service SLOs. Measure RPO

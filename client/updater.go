@@ -5,9 +5,7 @@ package main
 
 import (
 	"context"
-	"crypto/ed25519"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -23,6 +21,7 @@ import (
 	"github.com/minio/selfupdate"
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
+	"voicx/internal/updatemanifest"
 	"voicx/internal/version"
 )
 
@@ -53,11 +52,10 @@ const (
 	clientAssetName        = "voicx-client-windows-amd64.exe"
 	checksumsName          = "checksums.txt"
 	checksumsSignatureName = "checksums.txt.sig"
-	manifestVersionPrefix  = "# voicx-version: "
 	metadataTimeout        = 10 * time.Second
 	updateTimeout          = 10 * time.Minute
 	maxReleaseMetadata     = 1 << 20
-	maxManifestSize        = 1 << 20
+	maxManifestSize        = updatemanifest.MaxSize
 	maxSignatureSize       = 16 << 10
 	maxClientAssetSize     = 512 << 20
 )
@@ -294,57 +292,7 @@ func downloadTo(
 }
 
 func verifySignedManifest(manifest, signature []byte, expectedVersion string) error {
-	keys, err := updatePublicKeys()
-	if err != nil {
-		return err
-	}
-	sig, err := base64.StdEncoding.Strict().DecodeString(strings.TrimSpace(string(signature)))
-	if err != nil {
-		return fmt.Errorf("decode update signature: %w", err)
-	}
-	if len(sig) != ed25519.SignatureSize {
-		return fmt.Errorf("invalid update signature length")
-	}
-	authenticated := false
-	for _, key := range keys {
-		if ed25519.Verify(key, manifest, sig) {
-			authenticated = true
-			break
-		}
-	}
-	if !authenticated {
-		return fmt.Errorf("update manifest signature is not trusted")
-	}
-
-	for _, line := range strings.Split(string(manifest), "\n") {
-		line = strings.TrimSuffix(line, "\r")
-		if strings.HasPrefix(line, manifestVersionPrefix) {
-			if got := strings.TrimSpace(strings.TrimPrefix(line, manifestVersionPrefix)); got != expectedVersion {
-				return fmt.Errorf("signed manifest version %q does not match release %q", got, expectedVersion)
-			}
-			return nil
-		}
-	}
-	return fmt.Errorf("signed manifest has no release version")
-}
-
-func updatePublicKeys() ([]ed25519.PublicKey, error) {
-	if strings.TrimSpace(version.UpdatePublicKeys) == "" {
-		return nil, fmt.Errorf("no trusted update signing key is configured")
-	}
-	encodedKeys := strings.Split(version.UpdatePublicKeys, ",")
-	keys := make([]ed25519.PublicKey, 0, len(encodedKeys))
-	for _, encoded := range encodedKeys {
-		decoded, err := base64.StdEncoding.Strict().DecodeString(strings.TrimSpace(encoded))
-		if err != nil {
-			return nil, fmt.Errorf("decode trusted update signing key: %w", err)
-		}
-		if len(decoded) != ed25519.PublicKeySize {
-			return nil, fmt.Errorf("invalid trusted update signing key length")
-		}
-		keys = append(keys, ed25519.PublicKey(decoded))
-	}
-	return keys, nil
+	return updatemanifest.Verify(manifest, signature, version.UpdatePublicKeys, expectedVersion)
 }
 
 // verifyChecksum checks that the file at filePath matches the SHA-256 line
@@ -458,21 +406,27 @@ func (a *App) emitUpdateProgress(percent int) {
 // ApplyAndRestart relaunches the (just-updated) executable and quits the
 // current process. Only call after user confirmation.
 func (a *App) ApplyAndRestart() string {
+	if a.ctx == nil {
+		return "application window is not available"
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return err.Error()
 	}
 	// #nosec G204 -- exe is the current executable path returned by the OS, not user input.
+	if err := restartLaunch(exe); err != nil {
+		return err.Error()
+	}
+	wailsQuit(a.ctx)
+	return ""
+}
+
+var restartLaunch = func(exe string) error {
+	// #nosec G204 -- exe is the current executable path returned by the OS.
 	cmd := exec.Command(exe)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		return err.Error()
-	}
-	// recover is per-goroutine: the restart worker needs its own guard (331).
-	go guardCrash("updater", func() {
-		time.Sleep(500 * time.Millisecond)
-		os.Exit(0)
-	})
-	return ""
+	return cmd.Start()
 }
+
+var wailsQuit = wailsRuntime.Quit

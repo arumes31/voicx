@@ -139,7 +139,7 @@ func (s *Store) GetChatMessage(ctx context.Context, id int64) (*ChatMessage, err
 		&m.ChannelID, &m.FromUniqueID, &m.FromNickname, &replyToID, &m.Version,
 		&m.ClientMsgID, &m.BodyEnc, &keyID, &m.SentAt, &m.EditedAt, &m.DeletedAt)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("querying chat message: %w", err)
@@ -490,7 +490,7 @@ func (s *Store) GetServerSetting(ctx context.Context, key string) (string, uint3
 	)
 	err := s.db.QueryRowContext(ctx, q, key).Scan(&v, &keyID)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return "", 0, nil
 		}
 		return "", 0, fmt.Errorf("loading server setting: %w", err)

@@ -192,9 +192,14 @@ func (s *Store) UseTokenForIdentity(ctx context.Context, key string, userID int6
 	}
 
 	if groupID.Valid && groupID.Int64 != 0 {
+		cutoff := time.Now().UTC()
 		const ins = `INSERT INTO server_group_members (user_id, server_group_id)
-		            VALUES ($1, $2) ON CONFLICT DO NOTHING`
-		if _, err := tx.ExecContext(ctx, ins, grant.UserID, groupID.Int64); err != nil {
+		            VALUES ($1, $2)
+		            ON CONFLICT (user_id, server_group_id) DO UPDATE
+		            SET expires_at = NULL
+		            WHERE server_group_members.expires_at IS NOT NULL
+		              AND server_group_members.expires_at <= $3`
+		if _, err := tx.ExecContext(ctx, ins, grant.UserID, groupID.Int64, cutoff); err != nil {
 			return TokenGrant{}, fmt.Errorf("assigning server group: %w", err)
 		}
 		grant.GroupID = groupID.Int64

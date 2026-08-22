@@ -63,7 +63,7 @@ func (s *Server) serve(ctx context.Context, conn net.Conn) {
 	if tr.Direction == "upload" {
 		err = s.receiveUpload(ctx, conn, tr)
 	} else {
-		err = s.sendDownload(conn, tr, init.Offset)
+		err = s.sendDownload(ctx, conn, tr, init.Offset)
 	}
 	if s.OnTransferComplete != nil {
 		result := "ok"
@@ -283,7 +283,7 @@ func (s *Server) rotateVersions(ctx context.Context, tr *transfer, root *os.Root
 // (259): the prefix the client already holds is folded into the hash but not
 // re-sent, so the digest still covers the whole file and a resumed download
 // is verified exactly as strictly as a fresh one.
-func (s *Server) sendDownload(conn net.Conn, tr *transfer, offset int64) (retErr error) {
+func (s *Server) sendDownload(ctx context.Context, conn net.Conn, tr *transfer, offset int64) (retErr error) {
 	root, err := s.openBlobRoot()
 	if err != nil {
 		return err
@@ -319,7 +319,7 @@ func (s *Server) sendDownload(conn net.Conn, tr *transfer, offset int64) (retErr
 				return fmt.Errorf("writing chunk: %w", err)
 			}
 			_, _ = h.Write(chunk)
-			if err := limiter.wait(context.Background(), n); err != nil {
+			if err := limiter.wait(ctx, n); err != nil {
 				return err
 			}
 		}

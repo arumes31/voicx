@@ -49,6 +49,16 @@ func TestNewProd(t *testing.T) {
 	_ = logger.Sync()
 }
 
+func TestLoggerConfigUsesExplicitProductionSampling(t *testing.T) {
+	production := loggerConfig(false)
+	if production.Sampling == nil || production.Sampling.Initial != 100 || production.Sampling.Thereafter != 10 {
+		t.Fatalf("production sampling = %#v, want Initial=100 Thereafter=10", production.Sampling)
+	}
+	if development := loggerConfig(true); development.Sampling != nil {
+		t.Fatalf("development sampling = %#v, want nil", development.Sampling)
+	}
+}
+
 // TestNewProdInvalidLevel verifies that New(false, "invalid-level") returns
 // an error.
 func TestNewProdInvalidLevel(t *testing.T) {
@@ -76,7 +86,6 @@ func TestNewDevInvalidLevel(t *testing.T) {
 func TestNewProdLevels(t *testing.T) {
 	levels := []string{"debug", "info", "warn", "error", "dpanic", "panic", "fatal"}
 	for _, lvl := range levels {
-		lvl := lvl
 		t.Run(lvl, func(t *testing.T) {
 			logger, err := New(false, lvl)
 			if err != nil {

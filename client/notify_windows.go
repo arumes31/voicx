@@ -7,6 +7,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"os"
 	"os/exec"
@@ -26,7 +27,7 @@ func (a *App) Notify(title, text string) string {
 	if len(text) > 240 {
 		text = text[:240]
 	}
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", notifyPowerShell)
+	cmd := exec.CommandContext(context.Background(), "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", notifyPowerShell)
 	cmd.Env = append(os.Environ(),
 		"VOICX_NOTIFY_TITLE_B64="+base64.StdEncoding.EncodeToString([]byte(title)),
 		"VOICX_NOTIFY_TEXT_B64="+base64.StdEncoding.EncodeToString([]byte(text)),

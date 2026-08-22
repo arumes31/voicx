@@ -23,6 +23,7 @@ test.beforeEach(async ({ page }) => {
         window.__events = {};
         window.__calls = {};
         window.__callArgs = {};
+        window.__browserURLs = [];
         window.__savedSettings = null;
         window.__tabs = [];
         window.runtime = {
@@ -36,6 +37,11 @@ test.beforeEach(async ({ page }) => {
             },
             EventsEmit() {},
             WindowIsFullscreen: async () => false,
+            BrowserOpenURL(url) {
+                window.__browserURLs.push(url);
+                if (window.__browserOpenThrow) throw new Error("browser unavailable");
+                return window.__browserOpenReject ? Promise.reject(new Error("browser unavailable")) : Promise.resolve();
+            },
         };
         const app = new Proxy({}, {
             get(_target, method) {
@@ -64,9 +70,62 @@ test.beforeEach(async ({ page }) => {
                     if (method === "IsGuest") return false;
                     if (method === "IdentityUID") return "playwright-identity";
                     if (method === "ClientVersionShort") return "test";
+                    if (method === "ClientVersion") {
+                        if (window.__clientVersionGate) await window.__clientVersionGate;
+                        if (window.__clientVersionReject) throw new Error("version unavailable");
+                        return window.__clientVersion || "test";
+                    }
+                    if (method === "Disconnect") {
+                        if (window.__disconnectReject) throw new Error("disconnect unavailable");
+                        return "";
+                    }
+                    if (method === "SendICECandidate") {
+                        if (window.__sendICECandidateReject) throw new Error("signal closed");
+                        return "";
+                    }
+                    if (method === "UploadChatAttachment") {
+                        if (typeof window.__uploadAttachmentHandler === "function") {
+                            return await window.__uploadAttachmentHandler(...args);
+                        }
+                        if (window.__uploadAttachmentReject) throw new Error("upload unavailable");
+                        return window.__uploadAttachmentResult || "[file:blob.vcx#dGVzdA==#file.bin]";
+                    }
+                    if (method === "DownloadChatAttachment") {
+                        if (typeof window.__downloadAttachmentHandler === "function") {
+                            return await window.__downloadAttachmentHandler(...args);
+                        }
+                        if (window.__attachmentGate) await window.__attachmentGate;
+                        if (window.__attachmentReject) throw new Error(window.__attachmentReject);
+                        return window.__attachmentData || "";
+                    }
+                    if (method === "SendChat") {
+                        if (typeof window.__sendChatHandler === "function") {
+                            return await window.__sendChatHandler(...args);
+                        }
+                        if (window.__sendChatReject) throw new Error("send unavailable");
+                        return window.__sendChatResult || "";
+                    }
+                    if (method === "SendChatReply") {
+                        if (window.__sendChatReplyReject) throw new Error("reply unavailable");
+                        return window.__sendChatReplyResult || "";
+                    }
+                    if (method === "VerifyFile") {
+                        if (window.__verifyFileGate) await window.__verifyFileGate;
+                        if (window.__verifyFileReject) throw new Error("verify unavailable");
+                        return window.__verifyFileResult ?? true;
+                    }
                     if (method === "FileList") {
                         if (window.__fileListGate) await window.__fileListGate;
-                        return { entries: [], folders: [], used_bytes: 0, quota_bytes: 0 };
+                        return structuredClone(window.__fileListResponse || {
+                            entries: [], folders: [], used_bytes: 0, quota_bytes: 0,
+                        });
+                    }
+                    if (method === "SaveChatAttachment") {
+                        if (window.__saveAttachmentGate) await window.__saveAttachmentGate;
+                        return window.__saveAttachmentResult || "";
+                    }
+                    if (method === "WebRTCAnswer" && window.__webRTCAnswerReject) {
+                        throw new Error("answer rejected");
                     }
                     if (method === "GetPermissions") return structuredClone(window.__permissions || []);
                     if (method === "GroupList") return structuredClone(window.__groups || { groups: [] });
@@ -927,6 +986,434 @@ test("shows the files toolbar and opens the upload picker", async ({ page }) => 
     await expect.poll(() => page.evaluate(() => window.__calls.PickUploadPaths || 0)).toBe(1);
 });
 
+test("saves chat attachments through the native bridge without a DOM data URL", async ({ page }) => {
+    await page.evaluate(() => {
+        window.__voicx.showWorkspace(false);
+        const state = window.__voicx.state;
+        state.myChannelID = 42;
+        state.channels = [{ ChannelID: 42, Name: "Uploads" }];
+        window.__saveAttachmentResult = "C:\\Downloads\\report.txt";
+        let release;
+        window.__saveAttachmentGate = new Promise((resolve) => { release = resolve; });
+        window.__releaseSaveAttachment = release;
+        for (const callback of window.__events.event || []) callback(JSON.stringify({
+            type: "chat",
+            data: {
+                id: 99, channel_id: 42, from: "Alice", from_unique_id: "user-a",
+                text: "[file:blob.vcx#dGVzdC1rZXk=#report.txt]",
+            },
+        }));
+    });
+
+    const chip = page.getByRole("button", { name: "📎 report.txt" });
+    await expect(chip).toBeVisible();
+    await chip.click();
+    await expect(chip).toBeDisabled();
+    await expect.poll(() => page.evaluate(() => window.__callArgs.SaveChatAttachment)).toEqual([
+        [42, "blob.vcx", "dGVzdC1rZXk=", "report.txt"],
+    ]);
+    await expect(page.locator('a[href^="data:application/octet-stream;base64,"]')).toHaveCount(0);
+
+    await page.evaluate(() => {
+        window.__releaseSaveAttachment();
+        window.__saveAttachmentGate = null;
+    });
+    await expect(chip).toBeEnabled();
+});
+
+test("opens About links externally once and ignores a late rejected version lookup", async ({ page }) => {
+    await page.evaluate(() => {
+        window.__voicx.showWorkspace(false);
+        let release;
+        window.__clientVersionGate = new Promise((resolve) => { release = resolve; });
+        window.__releaseClientVersion = release;
+        window.__clientVersionReject = true;
+        window.__browserOpenThrow = true;
+        window.__unhandled = [];
+        window.addEventListener("unhandledrejection", (event) => window.__unhandled.push(String(event.reason)));
+    });
+    const help = page.locator("#menubar > .menu-item").filter({ hasText: /^Help/ });
+    await help.click();
+    await page.getByRole("menuitem", { name: /About voicx/ }).click();
+    const about = page.locator(".dlg-overlay", { hasText: "About voicx" });
+    const project = about.getByRole("link", { name: "project" });
+    await expect(project).toHaveAttribute("href", "https://github.com/arumes31/voicx");
+    await expect(project).toHaveAttribute("rel", "noopener noreferrer");
+    await expect(about.getByRole("link", { name: "issues" })).toHaveAttribute("href", "https://github.com/arumes31/voicx/issues");
+
+    const before = page.url();
+    await page.evaluate(() => {
+        const overlay = [...document.querySelectorAll(".dlg-overlay")]
+            .find((el) => el.textContent.includes("About voicx"));
+        overlay.querySelector(".about-links a").click();
+        overlay.querySelector(".dlg-ok").click();
+        window.__releaseClientVersion();
+    });
+    await expect.poll(() => page.evaluate(() => window.__browserURLs)).toEqual(["https://github.com/arumes31/voicx"]);
+    expect(page.url()).toBe(before);
+    await expect(about).toHaveCount(0);
+    await page.waitForTimeout(0);
+    expect(await page.evaluate(() => window.__unhandled)).toEqual([]);
+});
+
+test("retains failed chat drafts and only retries attachments that were not sent", async ({ page }) => {
+    await page.evaluate(() => {
+        window.__voicx.showWorkspace(false);
+        window.__voicx.state.myChannelID = 42;
+        window.__voicx.state.channels = [{ ChannelID: 42, Name: "Uploads" }];
+    });
+    await page.evaluate(() => {
+        window.__voicxChat.addChat({
+            id: 701, channel_id: 42, from: "Bob", from_unique_id: "user-b", text: "reply parent",
+        });
+    });
+    await page.locator("#chat-log .msg").hover();
+    await expect(page.locator("button[title=reply]")).toBeVisible();
+    await page.locator("button[title=reply]").click();
+    await page.locator("#chat-file").setInputFiles({ name: "once.txt", mimeType: "text/plain", buffer: Buffer.from("once") });
+    await expect(page.locator("#file-preview-row")).not.toHaveClass(/hidden/);
+    await page.locator("#chat-text").fill("draft reply");
+
+    await page.evaluate(() => { window.__sendChatReplyResult = "slow mode"; });
+    await page.locator("#chat-send").click();
+    await expect(page.locator("#chat-text")).toHaveValue("draft reply");
+    await expect(page.locator("#reply-bar")).not.toHaveClass(/hidden/);
+    await expect(page.locator("#file-preview-row")).toHaveClass(/hidden/);
+    expect(await page.evaluate(() => ({ upload: window.__calls.UploadChatAttachment, send: window.__calls.SendChat }))).toEqual({ upload: 1, send: 1 });
+
+    await page.evaluate(() => {
+        window.__sendChatReplyResult = "";
+        window.__sendChatReplyReject = true;
+    });
+    await page.locator("#chat-send").click();
+    await expect(page.locator("#chat-text")).toHaveValue("draft reply");
+    await expect(page.locator("#reply-bar")).not.toHaveClass(/hidden/);
+
+    await page.evaluate(() => { window.__sendChatReplyReject = false; });
+    await page.locator("#chat-send").click();
+    await expect(page.locator("#chat-text")).toHaveValue("");
+    await expect(page.locator("#reply-bar")).toHaveClass(/hidden/);
+    expect(await page.evaluate(() => ({
+        upload: window.__calls.UploadChatAttachment,
+        send: window.__calls.SendChat,
+        reply: window.__calls.SendChatReply,
+    }))).toEqual({ upload: 1, send: 1, reply: 3 });
+});
+
+test("requeues only upload and attachment-token failures without resending successful attachments", async ({ page }) => {
+    await page.evaluate(() => {
+        window.__voicx.showWorkspace(false);
+        const state = window.__voicx.state;
+        state.myChannelID = 42;
+        state.channels = [{ ChannelID: 42, Name: "Uploads" }];
+        window.__voicxChat.addChat({ id: 704, channel_id: 42, from: "Bob", text: "reply parent" });
+        window.__uploadAttempts = {};
+        window.__attachmentSendAttempts = {};
+        window.__uploadAttachmentHandler = (_channelID, name) => {
+            const count = (window.__uploadAttempts[name] || 0) + 1;
+            window.__uploadAttempts[name] = count;
+            if (name.startsWith("upload-once_") && count === 1) throw new Error("upload unavailable");
+            return `[file:${name}.vcx#dGVzdA==#${name}]`;
+        };
+        window.__sendChatHandler = (_scope, _target, token) => {
+            const name = token.match(/#([^#]+)\]$/)?.[1] || token;
+            const count = (window.__attachmentSendAttempts[name] || 0) + 1;
+            window.__attachmentSendAttempts[name] = count;
+            return name.startsWith("token-once_") && count === 1 ? "token send failed" : "";
+        };
+        window.__sendChatReplyResult = "reply unavailable";
+    });
+    await page.locator("#chat-log .msg").hover();
+    await page.locator("button[title=reply]").click();
+    await page.locator("#chat-file").setInputFiles([
+        { name: "upload-once.txt", mimeType: "text/plain", buffer: Buffer.from("upload") },
+        { name: "token-once.txt", mimeType: "text/plain", buffer: Buffer.from("token") },
+        { name: "successful.txt", mimeType: "text/plain", buffer: Buffer.from("success") },
+    ]);
+    await expect(page.locator("#file-preview-row .file-preview")).toHaveCount(3);
+    await page.locator("#chat-text").fill("keep this reply draft");
+
+    await page.locator("#chat-send").click();
+    await expect(page.locator("#chat-text")).toHaveValue("keep this reply draft");
+    await expect(page.locator("#reply-bar")).not.toHaveClass(/hidden/);
+    await expect(page.locator("#file-preview-row .file-preview")).toHaveCount(2);
+    await expect(page.locator("#file-preview-row")).toContainText(/upload-once_/);
+    await expect(page.locator("#file-preview-row")).toContainText(/token-once_/);
+    await expect(page.locator("#file-preview-row")).not.toContainText(/successful_/);
+
+    await page.locator("#chat-send").click();
+    await expect(page.locator("#chat-text")).toHaveValue("keep this reply draft");
+    await expect(page.locator("#reply-bar")).not.toHaveClass(/hidden/);
+    await expect(page.locator("#file-preview-row")).toHaveClass(/hidden/);
+
+    expect(await page.evaluate(() => ({
+        uploads: Object.entries(window.__uploadAttempts).map(([name, count]) => [name.replace(/_[^_]+_[^.]+(?=\.txt$)/, ""), count]).sort(),
+        sends: Object.entries(window.__attachmentSendAttempts).map(([name, count]) => [name.replace(/_[^_]+_[^.]+(?=\.txt$)/, ""), count]).sort(),
+    }))).toEqual({
+        uploads: [["successful.txt", 1], ["token-once.txt", 2], ["upload-once.txt", 2]],
+        sends: [["successful.txt", 1], ["token-once.txt", 2], ["upload-once.txt", 1]],
+    });
+
+    await page.evaluate(() => { window.__sendChatReplyResult = ""; });
+    await page.locator("#chat-send").click();
+    await expect(page.locator("#chat-text")).toHaveValue("");
+    await expect(page.locator("#reply-bar")).toHaveClass(/hidden/);
+    expect(await page.evaluate(() => Object.entries(window.__uploadAttempts)
+        .map(([name, count]) => [name.replace(/_[^_]+_[^.]+(?=\.txt$)/, ""), count]).sort()))
+        .toEqual([["successful.txt", 1], ["token-once.txt", 2], ["upload-once.txt", 2]]);
+});
+
+test("discards stale inline attachment previews and configures lazy image and video media", async ({ page }) => {
+    await page.evaluate(() => {
+        window.__voicx.showWorkspace(false);
+        const state = window.__voicx.state;
+        state.myChannelID = 42;
+        state.channels = [{ ChannelID: 42, Name: "Uploads" }];
+        window.__voicxChat.onMyChannelChanged();
+        let release;
+        window.__attachmentGate = new Promise((resolve) => { release = resolve; });
+        window.__releaseAttachment = release;
+        window.__attachmentData = "aGVsbG8=";
+        window.__voicxChat.addChat({ id: 702, channel_id: 42, from: "Bob", text: "[file:stale.vcx#dGVzdA==#stale.png]" });
+    });
+    await page.evaluate(() => {
+        window.__voicx.state.serverGeneration++;
+        window.__releaseAttachment();
+    });
+    await page.waitForTimeout(0);
+    await expect(page.locator(".msg-file img, .msg-file video")).toHaveCount(0);
+    await expect(page.locator("[src^='data:image/'], [src^='data:video/']")).toHaveCount(0);
+
+    await page.evaluate(() => {
+        window.__attachmentGate = null;
+        window.__voicxChat.addChat({ id: 703, channel_id: 42, from: "Bob", text: "[file:photo.vcx#dGVzdA==#photo.png] [file:clip.vcx#dGVzdA==#clip.webm]" });
+    });
+    const image = page.locator(".msg-file img.msg-img");
+    const video = page.locator(".msg-file video.msg-video");
+    await expect(image).toHaveAttribute("loading", "lazy");
+    await expect(image).toHaveAttribute("decoding", "async");
+    await expect(video).toHaveAttribute("preload", "none");
+    await expect(video).not.toHaveAttribute("loading");
+    await image.click();
+    const imageLightbox = page.locator(".lightbox img");
+    await expect(imageLightbox).toBeVisible();
+    await expect(imageLightbox).toHaveAttribute("loading", "lazy");
+    await expect(imageLightbox).toHaveAttribute("decoding", "async");
+    await page.locator(".lightbox").click({ position: { x: 1, y: 1 } });
+    await expect(page.locator(".lightbox")).toHaveCount(0);
+    await page.locator(".msg-file:has(video) .media-zoom").click();
+    await expect(page.locator(".lightbox video[controls][autoplay]")).toBeVisible();
+});
+
+test("does not construct stale attachment data URLs after channel or view changes", async ({ page }) => {
+    await page.evaluate(() => {
+        window.__voicx.showWorkspace(false);
+        const state = window.__voicx.state;
+        state.myChannelID = 42;
+        state.channels = [
+            { ChannelID: 42, Name: "Original" },
+            { ChannelID: 43, Name: "Moved" },
+        ];
+        window.__attachmentDataURLWrites = [];
+        window.__attachmentRequests = {};
+        const instrument = (prototype) => {
+            const descriptor = Object.getOwnPropertyDescriptor(prototype, "src");
+            Object.defineProperty(prototype, "src", {
+                configurable: true,
+                enumerable: descriptor.enumerable,
+                get: descriptor.get,
+                set(value) {
+                    if (String(value).startsWith("data:")) window.__attachmentDataURLWrites.push(String(value));
+                    return descriptor.set.call(this, value);
+                },
+            });
+            return descriptor;
+        };
+        const imageSrc = instrument(HTMLImageElement.prototype);
+        const videoSrc = instrument(HTMLMediaElement.prototype);
+        window.__restoreAttachmentSrc = () => {
+            Object.defineProperty(HTMLImageElement.prototype, "src", imageSrc);
+            Object.defineProperty(HTMLMediaElement.prototype, "src", videoSrc);
+        };
+        window.__downloadAttachmentHandler = (_channelID, storage) => new Promise((resolve, reject) => {
+            window.__attachmentRequests[storage] = { resolve, reject };
+        });
+        window.__voicxChat.addChat({
+            id: 705, channel_id: 42, from: "Bob", text: "[file:stale-resolve.vcx#dGVzdA==#photo.png]",
+        });
+    });
+    await expect.poll(() => page.evaluate(() => Object.keys(window.__attachmentRequests))).toEqual(["stale-resolve.vcx"]);
+    await page.evaluate(() => {
+        window.__voicx.state.myChannelID = 43;
+        window.__attachmentRequests["stale-resolve.vcx"].resolve("aGVsbG8=");
+    });
+    await page.waitForTimeout(0);
+    expect(await page.evaluate(() => window.__attachmentDataURLWrites)).toEqual([]);
+
+    await page.evaluate(() => {
+        window.__voicxChat.addChat({
+            id: 706, channel_id: 43, from: "Bob", text: "[file:stale-reject.vcx#dGVzdA==#photo.png]",
+        });
+    });
+    await expect.poll(() => page.evaluate(() => Object.keys(window.__attachmentRequests).sort())).toEqual([
+        "stale-reject.vcx", "stale-resolve.vcx",
+    ]);
+    await page.evaluate(() => {
+        window.__voicxChat.openPM("user-b", "Bob");
+        window.__attachmentRequests["stale-reject.vcx"].reject(new Error("download rejected"));
+    });
+    await page.waitForTimeout(0);
+    expect(await page.evaluate(() => window.__attachmentDataURLWrites)).toEqual([]);
+    expect(await page.evaluate(() => document.querySelectorAll(".msg-file img, .msg-file video").length)).toBe(0);
+    await page.evaluate(() => {
+        window.__restoreAttachmentSrc();
+        delete window.__downloadAttachmentHandler;
+    });
+});
+
+test("contains disconnect and ICE-candidate rejections and reports ICE exhaustion once per outage", async ({ page }) => {
+    await page.evaluate(async () => {
+        window.__unhandled = [];
+        window.addEventListener("unhandledrejection", (event) => window.__unhandled.push(String(event.reason)));
+        window.__voicx.state.settings.notify_connection = true;
+        window.__disconnectReject = true;
+        await window.__voicx.disconnect();
+
+        const originalSetTimeout = window.setTimeout;
+        const originalClearTimeout = window.clearTimeout;
+        const iceTimers = [];
+        const delays = [];
+        window.setTimeout = (callback, delay, ...args) => {
+            if ([1000, 2000, 5000, 15000].includes(delay)) {
+                const timer = { delay, ran: false, cancelled: false, callback: () => callback(...args) };
+                delays.push(delay);
+                iceTimers.push(timer);
+                return timer;
+            }
+            return originalSetTimeout(callback, delay, ...args);
+        };
+        window.clearTimeout = (timer) => {
+            if (timer && iceTimers.includes(timer)) {
+                timer.cancelled = true;
+                return;
+            }
+            return originalClearTimeout(timer);
+        };
+        window.__restoreTimeout = () => {
+            window.setTimeout = originalSetTimeout;
+            window.clearTimeout = originalClearTimeout;
+        };
+        const runNextICETimer = async () => {
+            const timer = iceTimers.find((entry) => !entry.ran && !entry.cancelled);
+            if (!timer) throw new Error("expected an ICE retry timer");
+            timer.ran = true;
+            await timer.callback();
+        };
+        const audio = new AudioContext();
+        window.__iceAudio = audio;
+        const stream = audio.createMediaStreamDestination().stream;
+        navigator.mediaDevices.getUserMedia = async () => stream;
+        class FakePeerConnection {
+            constructor() {
+                this.senders = [];
+                this.transceivers = [];
+                this.iceConnectionState = "connected";
+            }
+            addTransceiver(track, options = {}) {
+                const sender = {
+                    track,
+                    getParameters: () => ({ encodings: [{}] }),
+                    setParameters: async () => {},
+                    replaceTrack: async (next) => { sender.track = next; },
+                };
+                const transceiver = { sender, receiver: { track: null }, direction: options.direction || "sendrecv" };
+                this.senders.push(sender);
+                this.transceivers.push(transceiver);
+                return transceiver;
+            }
+            getSenders() { return this.senders; }
+            getTransceivers() { return this.transceivers; }
+            async createOffer() { return { type: "offer", sdp: "ice-test" }; }
+            async setLocalDescription() {}
+            async setRemoteDescription() {}
+            close() { this.iceConnectionState = "closed"; }
+        }
+        window.RTCPeerConnection = FakePeerConnection;
+        const state = window.__voicx.state;
+        state.myClientID = "client-a";
+        state.myChannelID = 42;
+        state.channels = [{ ChannelID: 42, Name: "Lobby" }];
+        await window.__voicx.ensureVoiceForChannel();
+        const oldPC = state.pc;
+        window.__voicx.resetVoiceSession();
+        await window.__voicx.ensureVoiceForChannel();
+        const pc = state.pc;
+        window.__iceSysMessagesBeforeRetries = document.querySelectorAll("#chat-log .msg.sys").length;
+        window.__sendICECandidateReject = true;
+        pc.onicecandidate({ candidate: { candidate: "candidate", sdpMid: "0", sdpMLineIndex: 0 } });
+        pc.iceConnectionState = "failed";
+        pc.oniceconnectionstatechange();
+        const pendingBeforeOldEvents = iceTimers.filter((entry) => !entry.ran && !entry.cancelled).length;
+        oldPC.iceConnectionState = "connected";
+        oldPC.oniceconnectionstatechange();
+        oldPC.iceConnectionState = "completed";
+        oldPC.oniceconnectionstatechange();
+        window.__oldPeerIsolation = {
+            pendingBeforeOldEvents,
+            pendingAfterOldEvents: iceTimers.filter((entry) => !entry.ran && !entry.cancelled).length,
+        };
+        for (let i = 0; i < 4; i++) await runNextICETimer();
+        window.__terminalToastsBeforeRecovery = [...document.querySelectorAll("#toasts .toast")]
+            .filter((toast) => toast.textContent.includes("Voice connection unstable")).length;
+        pc.iceConnectionState = "connected";
+        pc.oniceconnectionstatechange();
+        pc.iceConnectionState = "failed";
+        pc.oniceconnectionstatechange();
+        for (let i = 0; i < 4; i++) await runNextICETimer();
+        window.__iceRetryDelays = delays;
+    });
+    expect(await page.evaluate(() => window.__calls.Disconnect)).toBe(1);
+    expect(await page.evaluate(() => window.__calls.SendICECandidate)).toBe(1);
+    expect(await page.evaluate(() => window.__oldPeerIsolation)).toEqual({ pendingBeforeOldEvents: 1, pendingAfterOldEvents: 1 });
+    expect(await page.evaluate(() => window.__iceRetryDelays)).toEqual([1000, 2000, 5000, 15000, 1000, 2000, 5000, 15000]);
+    expect(await page.evaluate(() => window.__terminalToastsBeforeRecovery)).toBe(1);
+    expect(await page.locator("#toasts .toast", { hasText: "Voice connection unstable" }).count()).toBe(2);
+    expect(await page.locator("#toasts .toast", { hasText: "disconnect failed" }).count()).toBe(1);
+    expect(await page.locator("#chat-log .msg.sys").count()).toBe(
+        await page.evaluate(() => window.__iceSysMessagesBeforeRetries),
+    );
+    expect(await page.evaluate(() => window.__unhandled)).toEqual([]);
+    await page.evaluate(() => {
+        window.__restoreTimeout();
+        window.__iceAudio?.close();
+    });
+});
+
+test("does not let an old checksum restoration timer mutate a reset file view", async ({ page }) => {
+    await page.evaluate(() => {
+        window.__voicx.showWorkspace(false);
+        window.__voicx.state.myChannelID = 42;
+        window.__voicx.state.channels = [{ ChannelID: 42, Name: "Uploads" }];
+        window.__fileListResponse = {
+            entries: [{ name: "report.txt", size: 4, uploader: "user-a", uploaded_at: 1, sha256: "0123456789abcdef" }],
+            folders: [], used_bytes: 4, quota_bytes: 100,
+        };
+    });
+    await page.locator("#tab-files").click();
+    const verify = page.locator(".fb-actions button[title='verify checksum (re-downloads and compares)']");
+    await expect(verify).toBeVisible();
+    await verify.click();
+    const oldSHA = await page.evaluate(() => {
+        const sha = document.querySelector(".fb-sha");
+        window.__oldChecksumCell = sha;
+        return sha.textContent;
+    });
+    expect(oldSHA).toBe("✓ ok");
+    await page.evaluate(() => window.__voicxFiles.resetServerView());
+    await page.waitForTimeout(4100);
+    expect(await page.evaluate(() => window.__oldChecksumCell.textContent)).toBe("✓ ok");
+});
+
 test("keeps details contextual and opens it when a user is selected", async ({ page }) => {
     await page.evaluate(() => {
         window.__voicx.showWorkspace(false);
@@ -1121,6 +1608,150 @@ test("@a11y audits primary login, workspace, settings, and permission-dialog sta
     await page.locator(".pm-target", { hasText: "Operators" }).click();
     await expect(page.locator(".pm-edit-grid")).toBeVisible();
     await auditAccessibility(page, "permission manager dialog");
+});
+
+test("does not delete a same-named file in a new channel after user_moved during confirmation", async ({ page }) => {
+    await page.evaluate(() => {
+        const state = window.__voicx.state;
+        window.__voicx.showWorkspace(false);
+        state.myClientID = "client-a";
+        state.myChannelID = 1;
+        state.channels = [
+            { ChannelID: 1, ParentID: 0, Name: "Original" },
+            { ChannelID: 2, ParentID: 0, Name: "New channel" },
+        ];
+        state.clients = [{ client_id: "client-a", unique_id: "user-a", nickname: "Alice", channel_id: 1 }];
+        // Both channels deliberately contain this name. A stale confirmation
+        // must not turn the old row into a delete for the new channel.
+        window.__fileListResponse = {
+            entries: [{ name: "same-name.txt", size: 1, uploaded_at: 0, uploader: "user-a", sha256: "abc" }],
+            folders: [], used_bytes: 1, quota_bytes: 0,
+        };
+    });
+    await page.locator("#tab-files").click();
+    await expect(page.locator("#files-pane .fb-name")).toHaveText("same-name.txt");
+    await page.locator('#files-pane .fb-actions button[title="delete"]').click();
+    await expect(page.getByRole("dialog", { name: "Delete file?" })).toBeVisible();
+
+    await page.evaluate(() => {
+        const moved = JSON.stringify({ type: "user_moved", data: { client_id: "client-a", channel_id: 2 } });
+        for (const callback of window.__events.event || []) callback(moved);
+    });
+    await page.getByRole("button", { name: "Delete file" }).click();
+    await expect.poll(() => page.evaluate(() => window.__calls.FileDelete || 0)).toBe(0);
+});
+
+test("does not export a different channel after its passphrase dialog is left open", async ({ page }) => {
+    await page.evaluate(() => {
+        const state = window.__voicx.state;
+        window.__voicx.showWorkspace(false);
+        state.myClientID = "client-a";
+        state.myChannelID = 1;
+        state.channels = [
+            { ChannelID: 1, ParentID: 0, Name: "Original" },
+            { ChannelID: 2, ParentID: 0, Name: "New channel" },
+        ];
+        state.clients = [{ client_id: "client-a", unique_id: "user-a", nickname: "Alice", channel_id: 1 }];
+    });
+    await page.getByRole("button", { name: "Export chat history" }).click();
+    await expect(page.getByRole("dialog", { name: "Export chat" })).toBeVisible();
+    await page.locator('input[placeholder^="passphrase"]').fill("encrypted-export");
+    await page.evaluate(() => {
+        const moved = JSON.stringify({ type: "user_moved", data: { client_id: "client-a", channel_id: 2 } });
+        for (const callback of window.__events.event || []) callback(moved);
+    });
+    await page.getByRole("button", { name: "Export", exact: true }).click();
+    await expect.poll(() => page.evaluate(() => window.__calls.ChatExportHistory || 0)).toBe(0);
+});
+
+test("runtime boundaries ignore malformed payloads and never answer a stale offer", async ({ page }) => {
+    const result = await page.evaluate(async () => {
+        const errors = [];
+        const onUnhandled = (event) => {
+            errors.push(String(event.reason));
+            event.preventDefault();
+        };
+        window.addEventListener("unhandledrejection", onUnhandled);
+        const state = window.__voicx.state;
+        state.myClientID = "client-a";
+        state.clients = [];
+        state.channels = [];
+        state.serverGeneration = 40;
+        let releaseOffer;
+        const oldPeer = {
+            ice: 0, remote: 0, answers: 0, local: 0,
+            addIceCandidate: async () => { oldPeer.ice++; },
+            setRemoteDescription: async () => {
+                oldPeer.remote++;
+                await new Promise((resolve) => { releaseOffer = resolve; });
+            },
+            createAnswer: async () => { oldPeer.answers++; return { type: "answer", sdp: "old-answer" }; },
+            setLocalDescription: async () => { oldPeer.local++; },
+        };
+        state.pc = oldPeer;
+        const emit = (name, payload) => {
+            for (const callback of window.__events[name] || []) callback(payload);
+        };
+        for (const name of ["snapshot", "channellist", "event", "ice", "offer"]) {
+            emit(name, "{");
+            emit(name, "null");
+            emit(name, "[]");
+        }
+        emit("snapshot", JSON.stringify({ root_channels: [] }));
+        emit("channellist", JSON.stringify({ channels: [{ id: 7, name: "Valid channel" }] }));
+        emit("event", JSON.stringify({ type: "user_joined", data: {
+            client_id: "client-b", unique_id: "user-b", nickname: "Bob", channel_id: 7,
+        } }));
+        emit("ice", JSON.stringify({ candidate: "candidate", sdp_mid: "0", sdp_mline_index: 0 }));
+        emit("offer", JSON.stringify({ sdp: "old-offer" }));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        state.serverGeneration++;
+        state.pc = { replacement: true };
+        releaseOffer();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const staleAnswers = window.__calls.WebRTCAnswer || 0;
+        for (const stage of ["remote", "answer", "local", "bridge"]) {
+            state.serverGeneration++;
+            window.__webRTCAnswerReject = stage === "bridge";
+            state.pc = {
+                addIceCandidate: async () => {},
+                setRemoteDescription: async () => {
+                    if (stage === "remote") throw new Error("remote rejected");
+                },
+                createAnswer: async () => {
+                    if (stage === "answer") throw new Error("answer rejected");
+                    return { type: "answer", sdp: "answer" };
+                },
+                setLocalDescription: async () => {
+                    if (stage === "local") throw new Error("local rejected");
+                },
+            };
+            emit("offer", JSON.stringify({ sdp: `${stage}-offer` }));
+            await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+        window.__webRTCAnswerReject = false;
+        window.removeEventListener("unhandledrejection", onUnhandled);
+        return {
+            hasValidChannel: state.channels.some((channel) => channel.ChannelID === 7),
+            hasValidEvent: state.clients.some((client) => client.client_id === "client-b"),
+            ice: oldPeer.ice,
+            remote: oldPeer.remote,
+            local: oldPeer.local,
+            staleAnswers,
+            answers: window.__calls.WebRTCAnswer || 0,
+            errors,
+        };
+    });
+    expect(result).toEqual({
+        hasValidChannel: true,
+        hasValidEvent: true,
+        ice: 1,
+        remote: 1,
+        local: 1,
+        staleAnswers: 0,
+        answers: 1,
+        errors: [],
+    });
 });
 
 test("serializes live-region bursts without coalescing identical messages", async ({ page }) => {
@@ -1748,6 +2379,21 @@ test("activates tree rows and workspace views from the keyboard with loading fee
     await expect(client).toHaveAttribute("aria-selected", "true");
     await expect(client).toBeFocused();
 
+    const tablist = page.getByRole("tablist", { name: "Workspace views" });
+    await expect(tablist).toBeVisible();
+    expect(await tablist.locator("#tab-transfers").count()).toBe(0);
+    await expect(page.locator("#tab-transfers")).toHaveAttribute("aria-haspopup", "dialog");
+    await expect(page.locator("#tab-chat")).toHaveAttribute("aria-controls", "chat-pane");
+    await expect(page.locator("#tab-chat")).toHaveAttribute("aria-selected", "true");
+    await expect(page.locator("#tab-chat")).toHaveAttribute("tabindex", "0");
+    await expect(page.locator("#tab-files")).toHaveAttribute("aria-controls", "files-pane");
+    await expect(page.locator("#tab-files")).toHaveAttribute("aria-selected", "false");
+    await expect(page.locator("#tab-files")).toHaveAttribute("tabindex", "-1");
+    await expect(page.locator("#chat-pane")).toHaveAttribute("role", "tabpanel");
+    await expect(page.locator("#chat-pane")).toHaveAttribute("aria-labelledby", "tab-chat");
+    await expect(page.locator("#files-pane")).toHaveAttribute("role", "tabpanel");
+    await expect(page.locator("#files-pane")).toHaveAttribute("aria-labelledby", "tab-files");
+
     await page.evaluate(() => {
         let release;
         window.__fileListGate = new Promise((resolve) => { release = resolve; });
@@ -1755,8 +2401,15 @@ test("activates tree rows and workspace views from the keyboard with loading fee
     });
     await page.locator("#tab-chat").focus();
     await page.keyboard.press("ArrowRight");
-    await expect(page.locator("#tab-files")).toHaveAttribute("aria-pressed", "true");
-    await expect(page.locator("#files-pane")).toHaveAttribute("aria-hidden", "false");
+    await expect(page.locator("#tab-files")).toHaveAttribute("aria-selected", "true");
+    await expect(page.locator("#tab-files")).toHaveAttribute("tabindex", "0");
+    await expect(page.locator("#tab-chat")).toHaveAttribute("tabindex", "-1");
+    expect(await page.evaluate(() => ({
+        chatSelected: document.getElementById("tab-chat").getAttribute("aria-selected"),
+        filesSelected: document.getElementById("tab-files").getAttribute("aria-selected"),
+        chatHidden: document.getElementById("chat-pane").hidden,
+        filesHidden: document.getElementById("files-pane").hidden,
+    }))).toEqual({ chatSelected: "false", filesSelected: "true", chatHidden: true, filesHidden: false });
     await expect(page.locator("#files-pane .fb-list")).toHaveAttribute("aria-busy", "true");
     await expect(page.locator('#files-pane .fb-list [role="status"]')).toContainText("Loading channel files");
 
@@ -1767,7 +2420,112 @@ test("activates tree rows and workspace views from the keyboard with loading fee
     await expect(page.locator("#files-pane .fb-list")).not.toHaveAttribute("aria-busy", "true");
     await expect(page.locator("#files-pane .empty-state")).toContainText("Empty folder");
     await page.keyboard.press("ArrowLeft");
-    await expect(page.locator("#tab-chat")).toHaveAttribute("aria-pressed", "true");
+    await expect(page.locator("#tab-chat")).toHaveAttribute("aria-selected", "true");
+    await expect(page.locator("#chat-pane")).toBeVisible();
+    await expect(page.locator("#files-pane")).toBeHidden();
+    await page.keyboard.press("End");
+    await expect(page.locator("#tab-files")).toHaveAttribute("aria-selected", "true");
+    await page.keyboard.press("Home");
+    await expect(page.locator("#tab-chat")).toHaveAttribute("aria-selected", "true");
+});
+
+test("keeps unread notification labels exact while the visual badge is capped", async ({ page }) => {
+    await page.evaluate(() => window.__voicx.showWorkspace(false));
+    const bell = page.locator("#notif-bell");
+    const badge = page.locator("#notif-badge");
+    await expect(bell).toHaveAttribute("aria-label", "Notifications, 0 unread");
+    await expect(badge).toHaveClass(/hidden/);
+
+    await page.evaluate(() => window.__voicxPolish.recordNotification("message", "one"));
+    await expect(bell).toHaveAttribute("aria-label", "Notifications, 1 unread");
+    await expect(badge).toHaveText("1");
+
+    await page.evaluate(() => {
+        for (let i = 2; i <= 12; i++) window.__voicxPolish.recordNotification("message", String(i));
+    });
+    await expect(bell).toHaveAttribute("aria-label", "Notifications, 12 unread");
+    await expect(badge).toHaveText("9+");
+
+    await bell.click();
+    await expect(page.locator(".notif-center")).toBeVisible();
+    await expect(bell).toHaveAttribute("aria-label", "Notifications, 0 unread");
+    await expect(badge).toHaveClass(/hidden/);
+    await page.getByRole("button", { name: "Clear all notifications" }).click();
+    await expect(bell).toHaveAttribute("aria-label", "Notifications, 0 unread");
+    await expect(badge).toHaveText("");
+});
+
+test("keeps global announcements available in Files and restores chat for compact and zen modes", async ({ page }) => {
+    await page.evaluate(() => window.__voicx.showWorkspace(false));
+    const workspaceState = () => page.evaluate(() => ({
+        chatSelected: document.getElementById("tab-chat").getAttribute("aria-selected"),
+        filesSelected: document.getElementById("tab-files").getAttribute("aria-selected"),
+        chatTabIndex: document.getElementById("tab-chat").tabIndex,
+        filesTabIndex: document.getElementById("tab-files").tabIndex,
+        chatHidden: document.getElementById("chat-pane").hidden,
+        filesHidden: document.getElementById("files-pane").hidden,
+    }));
+    const chatActive = {
+        chatSelected: "true", filesSelected: "false",
+        chatTabIndex: 0, filesTabIndex: -1,
+        chatHidden: false, filesHidden: true,
+    };
+    const activeElement = () => page.evaluate(() => {
+        const active = document.activeElement;
+        const style = active ? getComputedStyle(active) : null;
+        return {
+            id: active?.id || "",
+            visible: Boolean(active && active !== document.body && active.isConnected && !active.hidden && !active.closest("[hidden]") &&
+                style?.display !== "none" && style?.visibility !== "hidden" && active.getClientRects().length),
+            unselectedFilesTab: active?.id === "tab-files" && active.tabIndex === -1,
+        };
+    });
+    const expectRecoveredFocus = async () => {
+        expect(await activeElement()).toEqual({ id: "voice-mute", visible: true, unselectedFilesTab: false });
+    };
+
+    await page.locator("#tab-files").click();
+    await expect(page.locator("#files-pane")).toBeVisible();
+    await expect(page.locator("#tab-files")).toBeFocused();
+    await page.evaluate(() => {
+        window.__voicx.announceLive("Connection warning while browsing files", "assertive");
+        window.__voicx.announceLive("Status while browsing files", "polite");
+    });
+    await expect(page.locator("#alert-announcer")).toHaveText("Connection warning while browsing files");
+    await expect(page.locator("#chat-announcer")).toHaveText("Status while browsing files");
+    await expect(page.locator("#alert-announcer")).toBeVisible();
+    expect(await page.evaluate(() => {
+        const chatPane = document.getElementById("chat-pane");
+        const filesPane = document.getElementById("files-pane");
+        return ["chat-announcer", "alert-announcer"].every((id) => {
+            const region = document.getElementById(id);
+            return !chatPane.contains(region) && !filesPane.contains(region) && !region.hidden;
+        });
+    })).toBe(true);
+
+    await page.evaluate(() => window.__voicx.toggleCompact());
+    await expect(page.locator("body")).toHaveClass(/compact/);
+    await expect(page.locator("#voice-bar")).toBeVisible();
+    expect(await workspaceState()).toEqual(chatActive);
+    await expectRecoveredFocus();
+    await page.evaluate(() => window.__voicx.toggleCompact());
+    await expect(page.locator("body")).not.toHaveClass(/compact/);
+    expect(await workspaceState()).toEqual(chatActive);
+    await expectRecoveredFocus();
+
+    await page.locator("#tab-files").click();
+    await expect(page.locator("#files-pane .fb-upload")).toBeVisible();
+    await page.locator("#files-pane .fb-upload").focus();
+    await expect(page.locator("#files-pane .fb-upload")).toBeFocused();
+    await page.evaluate(() => window.__voicxPolish.toggleZen());
+    await expect(page.locator("body")).toHaveClass(/zen/);
+    await expect(page.locator("#voice-bar")).toBeVisible();
+    expect(await workspaceState()).toEqual(chatActive);
+    await expectRecoveredFocus();
+    await page.evaluate(() => window.__voicxPolish.toggleZen());
+    await expect(page.locator("body")).not.toHaveClass(/zen/);
+    expect(await workspaceState()).toEqual(chatActive);
+    await expectRecoveredFocus();
 });
 
 test("moves focus explicitly between login and the connected workspace", async ({ page }) => {
@@ -1800,7 +2558,7 @@ test("moves focus explicitly between login and the connected workspace", async (
 test("computes names for settings and generated dialog controls", async ({ page }) => {
     await page.evaluate(() => window.__voicx.openSettings("application"));
     await expect(page.locator('#settings-content input[type="number"]').first()).toHaveAccessibleName("Chat max lines");
-    await expect(page.locator("#settings-content select").first()).toHaveAccessibleName("Theme (294/295)");
+    await expect(page.locator("#settings-content select").first()).toHaveAccessibleName("Theme");
     await expect(page.locator('#settings-content input[type="range"]').first()).toHaveAccessibleName("UI font size");
     await page.keyboard.press("Escape");
 

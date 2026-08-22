@@ -19,10 +19,36 @@ var ErrNoPeer = errors.New("webrtc: no peer connection for client")
 // renegState tracks per-peer renegotiation scheduling (debounce + rate limit
 // + unanswered-offer tolerance).
 type renegState struct {
-	timer      *time.Timer
+	timer      renegTimer
+	generation uint64
+	pending    bool
 	lastSent   time.Time
 	unanswered int
 }
+
+type renegTimer interface {
+	Stop() bool
+}
+
+type renegClock interface {
+	Now() time.Time
+	AfterFunc(time.Duration, func()) renegTimer
+}
+
+type realtimeRenegClock struct{}
+
+func (realtimeRenegClock) Now() time.Time {
+	return time.Now()
+}
+
+func (realtimeRenegClock) AfterFunc(delay time.Duration, callback func()) renegTimer {
+	return time.AfterFunc(delay, callback)
+}
+
+const (
+	defaultRenegDebounce  = 200 * time.Millisecond
+	defaultRenegRateLimit = 2 * time.Second
+)
 
 // Voice is the signaling and routing facade for the voicx voice pipeline.
 type Voice struct {
@@ -30,24 +56,28 @@ type Voice struct {
 	router *Router
 	logger *zap.Logger
 
-	renegMu     sync.Mutex
-	reneg       map[string]*renegState
-	offerSender func(clientID, offerSDP string) error
+	renegMu        sync.Mutex
+	reneg          map[string]*renegState
+	offerSender    func(clientID, offerSDP string) error
+	renegClock     renegClock
+	renegDebounce  time.Duration
+	renegRateLimit time.Duration
 }
-
-// renegDebounce coalesces bursts of track changes into one offer per peer.
-var renegDebounce = 200 * time.Millisecond
-
-// renegRateLimit caps server-initiated renegotiation to one offer per this
-// interval per peer (ICE restart storm protection).
-var renegRateLimit = 2 * time.Second
 
 // NewVoice constructs a Voice facade over the given engine and router.
 func NewVoice(engine *Engine, router *Router, logger *zap.Logger) *Voice {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	v := &Voice{engine: engine, router: router, logger: logger, reneg: make(map[string]*renegState)}
+	v := &Voice{
+		engine:         engine,
+		router:         router,
+		logger:         logger,
+		reneg:          make(map[string]*renegState),
+		renegClock:     realtimeRenegClock{},
+		renegDebounce:  defaultRenegDebounce,
+		renegRateLimit: defaultRenegRateLimit,
+	}
 	router.SetRenegotiateHook(v.scheduleRenegotiate)
 	return v
 }
@@ -120,7 +150,6 @@ func (v *Voice) channelAudioFor(clientID string) ChannelAudio {
 // renegotiation offer, capped at one offer per renegRateLimit.
 func (v *Voice) scheduleRenegotiate(clientID string) {
 	v.renegMu.Lock()
-	defer v.renegMu.Unlock()
 	st, ok := v.reneg[clientID]
 	if !ok {
 		st = &renegState{}
@@ -128,12 +157,46 @@ func (v *Voice) scheduleRenegotiate(clientID string) {
 	}
 	if st.timer != nil {
 		st.timer.Stop()
+		st.timer = nil
 	}
-	delay := renegDebounce
-	if elapsed := time.Since(st.lastSent); !st.lastSent.IsZero() && elapsed < renegRateLimit {
-		delay = renegRateLimit - elapsed
+	clock, debounce, rateLimit := v.renegScheduleConfigLocked()
+	delay := debounce
+	if elapsed := clock.Now().Sub(st.lastSent); !st.lastSent.IsZero() && elapsed < rateLimit {
+		delay = rateLimit - elapsed
 	}
-	st.timer = time.AfterFunc(delay, func() { v.sendRenegotiation(clientID) })
+	st.generation++
+	generation := st.generation
+	st.pending = true
+	v.renegMu.Unlock()
+
+	// Schedule outside the renegotiation mutex: production timers run
+	// asynchronously, but test schedulers may invoke callbacks immediately.
+	timer := clock.AfterFunc(delay, func() { v.sendRenegotiation(clientID, generation) })
+	v.renegMu.Lock()
+	if active, ok := v.reneg[clientID]; ok && active == st &&
+		active.generation == generation && active.pending {
+		active.timer = timer
+		v.renegMu.Unlock()
+		return
+	}
+	v.renegMu.Unlock()
+	timer.Stop()
+}
+
+func (v *Voice) renegScheduleConfigLocked() (renegClock, time.Duration, time.Duration) {
+	clock := v.renegClock
+	if clock == nil {
+		clock = realtimeRenegClock{}
+	}
+	debounce := v.renegDebounce
+	if debounce <= 0 {
+		debounce = defaultRenegDebounce
+	}
+	rateLimit := v.renegRateLimit
+	if rateLimit <= 0 {
+		rateLimit = defaultRenegRateLimit
+	}
+	return clock, debounce, rateLimit
 }
 
 // sendRenegotiation creates and delivers a renegotiation offer for a peer.
@@ -142,18 +205,23 @@ func (v *Voice) scheduleRenegotiate(clientID string) {
 // can only be created once the client answers (HandleAnswer) or re-offers
 // (HandleOffer recreates the connection) — until then renegotiation offers
 // for that peer are refused by CreateOffer and skipped.
-func (v *Voice) sendRenegotiation(clientID string) {
+func (v *Voice) sendRenegotiation(clientID string, generation uint64) {
 	v.renegMu.Lock()
 	st, ok := v.reneg[clientID]
-	if !ok {
+	if !ok || st.generation != generation || !st.pending {
 		v.renegMu.Unlock()
 		return
 	}
 	st.timer = nil
+	st.pending = false
 	sender := v.offerSender
 	unanswered := st.unanswered
+	clock, _, _ := v.renegScheduleConfigLocked()
 	v.renegMu.Unlock()
 
+	if v.engine == nil {
+		return
+	}
 	wrapper := v.engine.PeerConnection(clientID)
 	if wrapper == nil {
 		return
@@ -182,8 +250,10 @@ func (v *Voice) sendRenegotiation(clientID string) {
 	}
 
 	v.renegMu.Lock()
-	st.lastSent = time.Now()
-	st.unanswered++
+	if current, ok := v.reneg[clientID]; ok {
+		current.lastSent = clock.Now()
+		current.unanswered++
+	}
 	v.renegMu.Unlock()
 
 	if sender != nil {

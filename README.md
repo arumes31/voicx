@@ -73,7 +73,7 @@ graph TD
 | **`UDP Dynamic`** | WebRTC SFU Engine | DTLS-SRTP (Opus audio, H.264/VP8 video) | ICE candidate negotiation & SRTP encryption |
 | **`TCP 127.0.0.1:12335`** | ServerQuery Protocol | Line-based ASCII / UTF-8 plaintext stream | Loopback by default; remote binding requires explicit opt-in, and SSH is preferred |
 | **`TCP :12336`** | File Transfer Engine | Binary frames over TLS 1.3 | TOFU-pinned certificate plus an ephemeral single-use token |
-| **`TCP :12337`** | Health & Prometheus | HTTP GET (`/healthz`, `/readyz`, `/metrics`) | Liveness/readiness follow the listener bind; metrics are loopback-only unless explicitly enabled |
+| **`TCP :12337`** | Health & Prometheus | HTTP GET (`/healthz`, `/readyz`, `/metrics`) | Liveness/readiness follow the listener bind; metrics are loopback-only unless explicitly enabled; pprof is disabled by default and loopback-only |
 
 ---
 
@@ -134,9 +134,17 @@ flowchart TD
 
    The sample environment is for host-local development. Before exposing a
    deployment, set `VOICX_DEV_MODE=false`, replace the sample PostgreSQL
-   credential, and set `VOICX_COMPOSE_DATABASE_URL` with `sslmode=require`,
-   `verify-ca`, or `verify-full`. Production startup rejects the sample
-   credential and plaintext database transport.
+   credential, and set `POSTGRES_SSLMODE` to `require`, `verify-ca`, or
+   `verify-full` (or supply `VOICX_COMPOSE_DATABASE_URL` with that sslmode).
+   Each Compose secret also supports an `_FILE` counterpart; configure exactly
+   one non-empty source. Set an `_FILE` value to a readable host path; Compose
+   mounts it read-only at `/run/secrets/...`. Prefer a path outside the
+   repository—`docker/secrets/.empty` is only the checked-in empty fallback.
+   On Linux, keep the source directory root-owned `0700` and each source file
+   root-owned `0444`; Compose mounts individual files, never the directory.
+   This permits the non-root service reader without exposing host traversal.
+   Production startup rejects the sample credential and plaintext database
+   transport.
 
 3. View initial startup log (includes the generated **Admin Privilege Token**):
    ```bash
@@ -148,7 +156,7 @@ flowchart TD
 #### Prerequisites
 * **Go**: `>= 1.25`
 * **Node.js**: `>= 24`
-* **Wails CLI**: `go install github.com/wailsapp/wails/v2/cmd/wails@latest`
+* **Wails CLI**: `go install github.com/wailsapp/wails/v2/cmd/wails@v2.13.0`
 * **PostgreSQL**: `>= 16`
 
 #### Build Backend Server
@@ -202,8 +210,10 @@ VoicX can be configured via environment variables or a YAML configuration file (
 | `VOICX_QUERY_SSH_ENABLED` | `false` | Enable the SSH-wrapped ServerQuery listener |
 | `VOICX_QUERY_SSH_ADDR` | `:12339` | SSH ServerQuery listener address |
 | `VOICX_FILE_ADDR` | `:12336` | File transfer upload/download listener address |
-| `VOICX_HEALTH_ADDR` | `:12337` | Health/readiness and metrics HTTP listener |
+| `VOICX_HEALTH_ADDR` | `:12337` | Health/readiness HTTP listener; `/dl` bearer links on this listener are plaintext HTTP, so bind loopback or proxy it behind HTTPS |
 | `VOICX_METRICS_ALLOW_REMOTE` | `false` | Permit remote `/metrics` requests; without this opt-in, only IPv4/IPv6 loopback is accepted |
+| `VOICX_PPROF_ENABLED` | `false` | Enable runtime `/debug/pprof/` diagnostics; every pprof endpoint remains GET-only and direct-loopback-only |
+| `VOICX_SHUTDOWN_TIMEOUT` | `30s` | Positive total grace period shared by all services during orderly shutdown |
 | `VOICX_DATABASE_URL` | `postgres://...` | PostgreSQL connection URL |
 | `VOICX_REDIS_ADDR` | `localhost:6379` | Optional Redis address for pub/sub fanout |
 | `VOICX_TLS_ENABLED` | `true` | Enable TLS 1.3 encryption on control port |
@@ -211,15 +221,29 @@ VoicX can be configured via environment variables or a YAML configuration file (
 | `VOICX_TLS_CERT_FILE` / `VOICX_TLS_KEY_FILE` | empty | Custom certificate and key; both must be configured together |
 | `VOICX_FILE_TLS_ENABLED` | `true` | Enable TLS 1.3 on file transfers; disabling is development-only |
 | `VOICX_FILE_ROOT` | `./data/files` | Root storage path for uploaded channel files & avatars |
+| `VOICX_FILE_MAX_CONNECTIONS` | `128` | Concurrent accepted file-transfer connections (1–10000) |
 | `VOICX_PII_KEY_FILE` | `./data/keys/pii.key` | AES-256-GCM master key file path for PII encryption |
 | `VOICX_CHANNEL_TEMP_LIFETIME_SECONDS` | `60` | Grace period before an empty temporary channel is removed |
 | `VOICX_CHAT_MASTER_KEY_FILE` | `./data/keys/chat_master.key` | KEK file used to wrap persisted chat scope keys; back it up with PostgreSQL |
+| `VOICX_CHAT_MASTER_KEY` | empty | Secret-injection override for the key file: one base64 32-byte key or a newline-separated `id:base64` key ring; never commit it |
 | `VOICX_CHAT_LEGACY_HISTORY` | `encrypt` | One-time handling for legacy plaintext rows: `encrypt` or `purge` |
 | `VOICX_CHAT_KEY_ROTATE_MIN_SECONDS` | `60` | Minimum interval used to coalesce scope-key rotations |
 | `VOICX_CHAT_SEARCH_MAX_MESSAGES` | `2000` | Maximum history messages scanned by client-side search |
 | `VOICX_CHAT_MAX_LENGTH` | `4096` | Maximum decrypted chat payload size in UTF-8 bytes |
 | `VOICX_DEFAULT_GROUPS_ENABLED` | `true` | Auto-create and assign the built-in Guest and Member groups |
 | `VOICX_TURN_CREDENTIALS_TTL` | `24h` | TURN credential lifetime; must be positive and at most 30 days |
+| `VOICX_REDIS_DIAL_TIMEOUT` / `READ_TIMEOUT` / `WRITE_TIMEOUT` | `5s` / `3s` / `3s` | Redis client timeouts when Redis is enabled |
+| `VOICX_REDIS_TLS_ENABLED` | `false` | Enable verified Redis TLS (TLS 1.2+); optional server name and CA file use `VOICX_REDIS_TLS_SERVER_NAME` / `VOICX_REDIS_TLS_CA_FILE` |
+
+`VOICX_CHAT_MASTER_KEY` takes precedence over `VOICX_CHAT_MASTER_KEY_FILE`.
+Use secret injection for the override; it accepts either a single base64 32-byte
+key or a newline-separated `id:base64` key ring for key rotation.
+
+### Logging
+
+Production logging uses Zap sampling: for each repeated message in a sampling
+tick, it writes the first 100 entries and then every 10th entry thereafter.
+Development logging keeps Zap's unsampled development configuration.
 
 ### Certificate trust and rotation
 

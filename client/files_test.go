@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -81,5 +82,61 @@ func TestDownloadPath(t *testing.T) {
 	a.settings.DownloadFolder = filepath.Join(dir, "gone")
 	if got := a.DownloadPath("a.txt"); got != "" {
 		t.Errorf("missing folder = %q, want \"\" (fall back to the dialog)", got)
+	}
+}
+
+func TestFinalizeDownloadedPartReplacesDestination(t *testing.T) {
+	dir := t.TempDir()
+	partPath := filepath.Join(dir, "download.bin"+partSuffix)
+	destPath := filepath.Join(dir, "download.bin")
+	if err := os.WriteFile(partPath, []byte("verified"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(destPath, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := finalizeDownloadedPart(partPath, destPath); err != nil {
+		t.Fatalf("finalizeDownloadedPart: %v", err)
+	}
+	got, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "verified" {
+		t.Fatalf("destination = %q, want verified content", got)
+	}
+	if _, err := os.Stat(partPath); !os.IsNotExist(err) {
+		t.Fatalf("partial file still exists: %v", err)
+	}
+}
+
+func TestFinalizeDownloadedPartPreservesPartialOnRemoveFailure(t *testing.T) {
+	dir := t.TempDir()
+	partPath := filepath.Join(dir, "download.bin"+partSuffix)
+	if err := os.WriteFile(partPath, []byte("verified"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A non-empty directory cannot be removed as a file on supported
+	// platforms, giving this test a deterministic replacement failure without
+	// touching anything outside its temporary directory.
+	destPath := filepath.Join(dir, "occupied")
+	if err := os.Mkdir(destPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(destPath, "keep"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := finalizeDownloadedPart(partPath, destPath)
+	if err == nil || !strings.Contains(err.Error(), "replace existing download") {
+		t.Fatalf("finalizeDownloadedPart error = %v", err)
+	}
+	got, readErr := os.ReadFile(partPath)
+	if readErr != nil {
+		t.Fatalf("partial file was not preserved: %v", readErr)
+	}
+	if string(got) != "verified" {
+		t.Fatalf("partial file = %q, want verified content", got)
 	}
 }

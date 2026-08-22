@@ -19,33 +19,46 @@ import (
 
 // fakeCommand is a fake OS process for lifecycle tests.
 type fakeCommand struct {
-	mu       sync.Mutex
-	stdin    *fakeWriteCloser
-	started  bool
-	killed   bool
-	waitDone chan struct{}
-	output   string
+	mu            sync.Mutex
+	stdin         *fakeWriteCloser
+	started       bool
+	killed        bool
+	waitDone      chan struct{}
+	quitRequested chan struct{}
+	quitOnce      sync.Once
+	output        string
 }
 
 type fakeWriteCloser struct {
-	mu   sync.Mutex
-	data []byte
+	mu      sync.Mutex
+	data    []byte
+	onWrite func([]byte)
 }
 
 func (w *fakeWriteCloser) Write(p []byte) (int, error) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	w.data = append(w.data, p...)
+	onWrite := w.onWrite
+	w.mu.Unlock()
+	if onWrite != nil {
+		onWrite(p)
+	}
 	return len(p), nil
 }
 func (w *fakeWriteCloser) Close() error { return nil }
 
 func newFakeCommand(output string) *fakeCommand {
-	return &fakeCommand{
-		stdin:    &fakeWriteCloser{},
-		waitDone: make(chan struct{}),
-		output:   output,
+	command := &fakeCommand{
+		waitDone:      make(chan struct{}),
+		quitRequested: make(chan struct{}),
+		output:        output,
 	}
+	command.stdin = &fakeWriteCloser{onWrite: func(p []byte) {
+		if string(p) == "q" {
+			command.quitOnce.Do(func() { close(command.quitRequested) })
+		}
+	}}
+	return command
 }
 
 func (c *fakeCommand) StdinPipe() (io.WriteCloser, error) { return c.stdin, nil }
@@ -71,6 +84,35 @@ func (c *fakeCommand) Wait() error {
 	return nil
 }
 
+type errorWaitCommand struct {
+	*fakeCommand
+	waitErr error
+}
+
+func (c *errorWaitCommand) Wait() error {
+	<-c.waitDone
+	return c.waitErr
+}
+
+type blockingStartErrorCommand struct {
+	stdin   *fakeWriteCloser
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c *blockingStartErrorCommand) StdinPipe() (io.WriteCloser, error) { return c.stdin, nil }
+func (*blockingStartErrorCommand) BindRecordingRoot(*os.Root, string, string, string, string) error {
+	return nil
+}
+func (*blockingStartErrorCommand) CloseBeforeStart() error { return nil }
+func (c *blockingStartErrorCommand) Start() error {
+	close(c.entered)
+	<-c.release
+	return errors.New("delayed start failure")
+}
+func (*blockingStartErrorCommand) Wait() error { return errors.New("unexpected Wait") }
+func (*blockingStartErrorCommand) Kill() error { return nil }
+
 func (c *fakeCommand) Kill() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -89,6 +131,37 @@ func (c *fakeCommand) release() {
 	case <-c.waitDone:
 	default:
 		close(c.waitDone)
+	}
+}
+
+func (c *fakeCommand) waitForQuit(t *testing.T) {
+	t.Helper()
+	select {
+	case <-c.quitRequested:
+	case <-time.After(time.Second):
+		t.Fatal("recorder did not request the ffmpeg quit command")
+	}
+}
+
+func releaseAndWaitStop(t *testing.T, recorder *Recorder, cmd *fakeCommand, channelID int64) error {
+	t.Helper()
+	result := make(chan error, 1)
+	go func() { result <- recorder.Stop(channelID) }()
+	cmd.waitForQuit(t)
+	cmd.release()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(time.Second):
+		t.Fatal("recorder Stop did not return after ffmpeg exited")
+		return nil
+	}
+}
+
+func releaseAndStop(t *testing.T, recorder *Recorder, cmd *fakeCommand, channelID int64) {
+	t.Helper()
+	if err := releaseAndWaitStop(t, recorder, cmd, channelID); err != nil {
+		t.Fatalf("Stop(%d): %v", channelID, err)
 	}
 }
 
@@ -237,14 +310,8 @@ func TestStartStopLifecycle(t *testing.T) {
 		t.Fatalf("second Start = %v, want ErrAlreadyRecording", err)
 	}
 
-	// Graceful stop: release the fake process when stdin gets the quit cmd.
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		exec.cmd.release()
-	}()
-	if err := r.Stop(7); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
+	// Graceful stop: release the fake process only after the quit command.
+	releaseAndStop(t, r, exec.cmd, 7)
 	if exec.cmd.killed {
 		t.Error("ffmpeg was killed despite graceful exit")
 	}
@@ -255,6 +322,132 @@ func TestStartStopLifecycle(t *testing.T) {
 
 	if session.FilePath == "" {
 		t.Error("session has no output path")
+	}
+}
+
+func TestRecorderCloseReportsStopFailureOnce(t *testing.T) {
+	var observed []string
+	var observedMu sync.Mutex
+	r := New(testConfig(t.TempDir()), testLogger(), Observers{
+		OnError: func(operation string) {
+			observedMu.Lock()
+			observed = append(observed, operation)
+			observedMu.Unlock()
+		},
+	})
+	command := &errorWaitCommand{
+		fakeCommand: newFakeCommand(""),
+		waitErr:     errors.New("ffmpeg exited with an error"),
+	}
+	r.Exec = func(_ context.Context, _ string, args ...string) Command {
+		command.output = args[len(args)-1]
+		return command
+	}
+	if _, err := r.Start(t.Context(), 24, &fakeTapRouter{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- r.Close() }()
+	command.waitForQuit(t)
+	command.release()
+	if err := <-closeResult; err == nil {
+		t.Fatal("Close succeeded despite process wait error")
+	}
+	observedMu.Lock()
+	defer observedMu.Unlock()
+	if len(observed) != 1 || observed[0] != "stop" {
+		t.Fatalf("observed errors = %v, want exactly [stop]", observed)
+	}
+}
+
+func TestRecorderRequestedStopDoesNotReportUnexpectedExit(t *testing.T) {
+	var observed []string
+	var observedMu sync.Mutex
+	r := New(testConfig(t.TempDir()), testLogger(), Observers{
+		OnError: func(operation string) {
+			observedMu.Lock()
+			observed = append(observed, operation)
+			observedMu.Unlock()
+		},
+	})
+	command := &errorWaitCommand{
+		fakeCommand: newFakeCommand(""),
+		waitErr:     errors.New("ffmpeg exited with an error"),
+	}
+	r.Exec = func(_ context.Context, _ string, args ...string) Command {
+		command.output = args[len(args)-1]
+		return command
+	}
+	if _, err := r.Start(t.Context(), 26, &fakeTapRouter{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	stopResult := make(chan error, 1)
+	go func() { stopResult <- r.Stop(26) }()
+	command.waitForQuit(t)
+	command.release()
+	if err := <-stopResult; err == nil {
+		t.Fatal("Stop succeeded despite process wait error")
+	}
+	observedMu.Lock()
+	defer observedMu.Unlock()
+	if len(observed) != 1 || observed[0] != "stop" {
+		t.Fatalf("observed errors = %v, want exactly [stop]", observed)
+	}
+}
+
+func TestRecorderConcurrentStartCloseReportsStartFailureOnce(t *testing.T) {
+	var observed []string
+	var observedMu sync.Mutex
+	r := New(testConfig(t.TempDir()), testLogger(), Observers{
+		OnError: func(operation string) {
+			observedMu.Lock()
+			observed = append(observed, operation)
+			observedMu.Unlock()
+		},
+	})
+	r.killWait = time.Second
+	command := &blockingStartErrorCommand{
+		stdin:   &fakeWriteCloser{},
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	r.Exec = func(context.Context, string, ...string) Command { return command }
+	startResult := make(chan error, 1)
+	go func() {
+		_, err := r.Start(t.Context(), 25, &fakeTapRouter{})
+		startResult <- err
+	}()
+	select {
+	case <-command.entered:
+	case <-time.After(time.Second):
+		t.Fatal("Start did not reach the process launcher")
+	}
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- r.Close() }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		r.mu.Lock()
+		closed := r.closed
+		r.mu.Unlock()
+		if closed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Close did not mark the recorder closed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(command.release)
+	if err := <-startResult; err == nil {
+		t.Fatal("Start succeeded despite delayed process failure")
+	}
+	if err := <-closeResult; err != nil {
+		t.Fatalf("Close = %v, want nil because Start owns the launcher failure", err)
+	}
+	observedMu.Lock()
+	defer observedMu.Unlock()
+	if len(observed) != 1 || observed[0] != "start" {
+		t.Fatalf("observed errors = %v, want exactly [start]", observed)
 	}
 }
 

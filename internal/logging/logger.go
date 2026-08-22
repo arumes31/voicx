@@ -16,10 +16,9 @@ func New(devMode bool, level string) (*zap.Logger, error) {
 		return nil, fmt.Errorf("invalid log level %q: %w", level, err)
 	}
 
-	config := zap.NewProductionConfig()
+	config := loggerConfig(devMode)
 	mode := "production"
 	if devMode {
-		config = zap.NewDevelopmentConfig()
 		mode = "development"
 	}
 	config.Level = zap.NewAtomicLevelAt(lvl)
@@ -28,4 +27,13 @@ func New(devMode bool, level string) (*zap.Logger, error) {
 		return nil, fmt.Errorf("building %s logger: %w", mode, err)
 	}
 	return logger, nil
+}
+
+func loggerConfig(devMode bool) zap.Config {
+	if devMode {
+		return zap.NewDevelopmentConfig()
+	}
+	config := zap.NewProductionConfig()
+	config.Sampling = &zap.SamplingConfig{Initial: 100, Thereafter: 10}
+	return config
 }

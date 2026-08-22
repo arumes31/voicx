@@ -45,17 +45,6 @@ func assertRecordingDirEmpty(t *testing.T, dir string) {
 	}
 }
 
-func releaseAndStop(t *testing.T, recorder *Recorder, cmd *fakeCommand, channelID int64) {
-	t.Helper()
-	go func() {
-		time.Sleep(10 * time.Millisecond)
-		cmd.release()
-	}()
-	if err := recorder.Stop(channelID); err != nil {
-		t.Fatalf("Stop(%d): %v", channelID, err)
-	}
-}
-
 func TestConcurrentStartReservesChannelAtomically(t *testing.T) {
 	recorder := New(testConfig(t.TempDir()), zap.NewNop())
 	exec := &fakeExec{}
@@ -211,7 +200,15 @@ func TestRecordingLifetimeOutlivesRequestContext(t *testing.T) {
 
 func TestUnexpectedProcessExitCleansSessionAndArtifacts(t *testing.T) {
 	dir := t.TempDir()
-	recorder := New(testConfig(dir), zap.NewNop())
+	var observed []string
+	var observedMu sync.Mutex
+	recorder := New(testConfig(dir), zap.NewNop(), Observers{
+		OnError: func(operation string) {
+			observedMu.Lock()
+			observed = append(observed, operation)
+			observedMu.Unlock()
+		},
+	})
 	exec := &fakeExec{}
 	recorder.Exec = exec.run
 	router := &fakeTapRouter{}
@@ -229,6 +226,12 @@ func TestUnexpectedProcessExitCleansSessionAndArtifacts(t *testing.T) {
 		t.Fatal("unexpected process exit was not observed")
 	}
 	waitForSessionCount(t, recorder, 0)
+	observedMu.Lock()
+	if len(observed) != 1 || observed[0] != "unexpected_exit" {
+		observedMu.Unlock()
+		t.Fatalf("observed errors = %v, want exactly [unexpected_exit]", observed)
+	}
+	observedMu.Unlock()
 	if _, err := os.Stat(session.sdpPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("SDP artifact still exists: %v", err)
 	}
@@ -249,11 +252,7 @@ func TestMissingRecordingOutputIsReported(t *testing.T) {
 	if _, err := recorder.Start(context.Background(), 15, &fakeTapRouter{}); err != nil {
 		t.Fatal(err)
 	}
-	go func() {
-		time.Sleep(10 * time.Millisecond)
-		command.release()
-	}()
-	err := recorder.Stop(15)
+	err := releaseAndWaitStop(t, recorder, command, 15)
 	if err == nil || !strings.Contains(err.Error(), "recording output is missing") {
 		t.Fatalf("Stop with missing output = %v", err)
 	}
@@ -451,7 +450,7 @@ func TestConcurrentStopIsIdempotent(t *testing.T) {
 		}()
 	}
 	close(start)
-	time.Sleep(20 * time.Millisecond)
+	exec.cmd.waitForQuit(t)
 	exec.cmd.release()
 	for range 2 {
 		if err := <-errs; err != nil {
@@ -1090,6 +1089,7 @@ func TestDelayedOldUnregisterCannotRemoveReplacementTap(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("old tap removal did not start")
 	}
+	firstCommand.waitForQuit(t)
 	firstCommand.release()
 	select {
 	case err := <-firstStop:
@@ -1128,13 +1128,7 @@ func TestDelayedOldUnregisterCannotRemoveReplacementTap(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	go func() {
-		time.Sleep(10 * time.Millisecond)
-		secondCommand.release()
-	}()
-	if err := recorder.Stop(51); err != nil {
-		t.Fatalf("stopping replacement session: %v", err)
-	}
+	releaseAndStop(t, recorder, secondCommand, 51)
 }
 
 func TestRecorderCopiesConfigArguments(t *testing.T) {

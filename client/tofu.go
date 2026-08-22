@@ -11,8 +11,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -39,6 +42,15 @@ type knownServers struct {
 	loadErr error
 }
 
+// errTrustStoreUnavailable marks a local TOFU-store failure. It is distinct
+// from errFingerprintMismatch: falling back to plaintext after losing the
+// ability to verify a pin would silently defeat the client's TLS policy.
+var errTrustStoreUnavailable = errors.New("tls trust store unavailable")
+
+func trustStoreUnavailable(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", errTrustStoreUnavailable, fmt.Sprintf(format, args...))
+}
+
 // knownServersPath returns the default TOFU store location.
 func knownServersPath() (string, error) {
 	dir, err := os.UserConfigDir()
@@ -58,34 +70,68 @@ func loadKnownServersAt(path string) *knownServers {
 		return ks
 	}
 	if err != nil {
-		ks.loadErr = fmt.Errorf("reading TLS trust store: %w", err)
+		ks.loadErr = trustStoreUnavailable("read: %v", err)
 		return ks
 	}
+	servers, err := decodeKnownServers(data)
+	if err != nil {
+		ks.loadErr = trustStoreUnavailable("%v", err)
+		return ks
+	}
+	ks.Servers = servers
+	return ks
+}
+
+// decodeKnownServers parses and canonicalizes a known-servers document
+// without performing filesystem access. Conflicting aliases are rejected so
+// every canonical server address has exactly one pin.
+func decodeKnownServers(data []byte) (map[string]string, error) {
 	var persisted struct {
 		Servers map[string]string `json:"servers"`
 	}
 	if err := json.Unmarshal(data, &persisted); err != nil {
-		ks.loadErr = fmt.Errorf("parsing TLS trust store: %w", err)
-		return ks
+		return nil, fmt.Errorf("parse: %w", err)
 	}
-	if persisted.Servers != nil {
-		ks.Servers = persisted.Servers
+
+	canonical := make(map[string]string, len(persisted.Servers))
+	addresses := make([]string, 0, len(persisted.Servers))
+	for addr := range persisted.Servers {
+		addresses = append(addresses, addr)
 	}
-	return ks
+	sort.Strings(addresses)
+	for _, addr := range addresses {
+		fingerprint := persisted.Servers[addr]
+		key, err := normalizeServerAddr(addr)
+		if err != nil {
+			return nil, fmt.Errorf("normalize address %q: %w", addr, err)
+		}
+		if prior, exists := canonical[key]; exists && !secureEqualFold(prior, fingerprint) {
+			return nil, fmt.Errorf("conflicting pins for %q", key)
+		}
+		canonical[key] = fingerprint
+	}
+	return canonical, nil
 }
 
 // verify compares fp against the pinned fingerprint for addr.
-func (k *knownServers) verify(addr, fp string) trustStatus {
+func (k *knownServers) verify(addr, fp string) (trustStatus, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	known, ok := k.Servers[addr]
+	if k.loadErr != nil {
+		return trustUnknown, k.loadErr
+	}
+	key, err := normalizeServerAddr(addr)
+	if err != nil {
+		return trustUnknown, trustStoreUnavailable("normalize address %q: %v", addr, err)
+	}
+	known, ok := k.Servers[key]
 	if !ok {
-		return trustUnknown
+		return trustUnknown, nil
 	}
 	if !secureEqualFold(known, fp) {
-		return trustMismatch
+		return trustMismatch, nil
 	}
-	return trustOK
+	return trustOK, nil
 }
 
 // secureEqualFold compares normalized fingerprints without a data-dependent
@@ -104,11 +150,15 @@ func (k *knownServers) trust(addr, fp string) error {
 	if k.loadErr != nil {
 		return k.loadErr
 	}
+	key, err := normalizeServerAddr(addr)
+	if err != nil {
+		return trustStoreUnavailable("normalize address %q: %v", addr, err)
+	}
 	next := make(map[string]string, len(k.Servers)+1)
 	for knownAddr, knownFingerprint := range k.Servers {
 		next[knownAddr] = knownFingerprint
 	}
-	next[addr] = fp
+	next[key] = fp
 	raw, err := json.MarshalIndent(struct {
 		Servers map[string]string `json:"servers"`
 	}{Servers: next}, "", "  ")
@@ -120,6 +170,33 @@ func (k *knownServers) trust(addr, fp string) error {
 	}
 	k.Servers = next
 	return nil
+}
+
+// normalizeServerAddr creates the sole TOFU key for a network endpoint. It
+// accepts only host:port input; callers keep the original text for dialing so
+// canonicalization cannot change a user-selected transport target.
+func normalizeServerAddr(addr string) (string, error) {
+	host, portText, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return "", fmt.Errorf("address must be host:port: %w", err)
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "", errors.New("address host is empty")
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return "", errors.New("address port must be 1..65535")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
+	} else {
+		host = strings.TrimSuffix(strings.ToLower(host), ".")
+		if host == "" {
+			return "", errors.New("address host is empty")
+		}
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
 }
 
 func writeKnownServers(path string, raw []byte) (retErr error) {

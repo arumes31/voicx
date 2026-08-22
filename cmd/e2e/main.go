@@ -96,18 +96,27 @@ func dialTCP(addr string) (net.Conn, error) {
 		return nil, err
 	}
 	if !useTLS {
-		return net.DialTimeout("tcp", addr, readTimeout)
+		return (&net.Dialer{Timeout: readTimeout}).DialContext(context.Background(), "tcp", addr)
 	}
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: readTimeout}, "tcp", addr, tlsConfig)
+	dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: readTimeout},
+		Config:    tlsConfig,
+	}
+	conn, err := dialer.DialContext(context.Background(), "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		_ = conn.Close()
+		return nil, errors.New("TLS dial returned a non-TLS connection")
+	}
 	loggedFP.Do(func() {
-		if pc := conn.ConnectionState().PeerCertificates; len(pc) > 0 {
+		if pc := tlsConn.ConnectionState().PeerCertificates; len(pc) > 0 {
 			fmt.Printf("e2e: server TLS fingerprint: %s\n", tlscert.FingerprintDER(pc[0].Raw))
 		}
 	})
-	return conn, nil
+	return tlsConn, nil
 }
 
 func controlTLSConfig(addr string, mode controlTLSMode) (*tls.Config, bool, error) {
@@ -542,7 +551,11 @@ type check struct {
 
 func httpGet(url string) (int, string, error) {
 	client := &http.Client{Timeout: readTimeout}
-	resp, err := client.Get(url)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+	if err != nil {
+		return 0, "", err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, "", err
 	}
@@ -892,7 +905,7 @@ func (l *lineReader) readLine(timeout time.Duration) (string, error) {
 }
 
 func dialQuery(addr, uid, password string) (*querySession, error) {
-	conn, err := net.DialTimeout("tcp", addr, readTimeout)
+	conn, err := (&net.Dialer{Timeout: readTimeout}).DialContext(context.Background(), "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -1476,7 +1489,7 @@ func dialFileTransfer(addr string, init netproto.FileTransferInitResponse) (net.
 		if strings.TrimSpace(init.TLSFingerprint) != "" {
 			return nil, errors.New("file transfer response supplied a TLS fingerprint for a plaintext port")
 		}
-		return net.DialTimeout("tcp", addr, readTimeout)
+		return (&net.Dialer{Timeout: readTimeout}).DialContext(context.Background(), "tcp", addr)
 	}
 	if strings.TrimSpace(init.TLSFingerprint) == "" {
 		return nil, errors.New("file transfer TLS response omitted its certificate fingerprint")
@@ -1485,7 +1498,11 @@ func dialFileTransfer(addr string, init netproto.FileTransferInitResponse) (net.
 	if err != nil {
 		return nil, fmt.Errorf("file transfer TLS fingerprint: %w", err)
 	}
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: readTimeout}, "tcp", addr, tlsConfig)
+	dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: readTimeout},
+		Config:    tlsConfig,
+	}
+	conn, err := dialer.DialContext(context.Background(), "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("file transfer TLS: %w", err)
 	}

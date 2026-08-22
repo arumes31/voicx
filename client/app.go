@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,25 +16,82 @@ import (
 	"voicx/internal/version"
 )
 
+// windowOpacityApply is replaceable in ordering tests. Production uses the
+// platform implementation.
+var windowOpacityApply = setWindowOpacity
+
+// alwaysOnTopApply is replaceable in effect-ordering tests. Production uses
+// Wails only when a live application context is available.
+var alwaysOnTopApply = func(ctx context.Context, on bool) {
+	if ctx != nil {
+		wailsRuntime.WindowSetAlwaysOnTop(ctx, on)
+	}
+}
+
+var (
+	lifecyclePollInterval = 400 * time.Millisecond
+	windowIsMinimized     = wailsRuntime.WindowIsMinimised
+	windowUnminimize      = wailsRuntime.WindowUnminimise
+	windowHide            = wailsRuntime.WindowHide
+	windowMarkHidden      = trayMarkHidden
+)
+
 // App is the Wails application.
 type App struct {
 	ctx context.Context
+	// Attachment seams keep the native dialog, transfer, and final replacement
+	// independently testable without putting plaintext or destination paths on
+	// the Wails/JavaScript boundary. Nil fields use production implementations.
+	chatAttachmentFetch      func(*connManager, int64, string) ([]byte, error)
+	chatAttachmentSaveDialog func(context.Context, wailsRuntime.SaveDialogOptions) (string, error)
+	chatAttachmentWrite      func(string, []byte) error
+	lifecycleMu              sync.Mutex
+	lifecycleCancel          context.CancelFunc
 	// cm is the ACTIVE tab's connManager (281 multi-server tabs): all
 	// bindings keep operating on it. Background tabs live in tabs and their
 	// events are journaled/replayed by tabs.go. Access via cmLoad/cmStore
 	// (atomic; tab switches race with bindings).
 	cm       atomic.Pointer[connManager]
 	tabs     map[string]*tabState
+	tabOrder []string
 	tabsMu   sync.Mutex
-	activeID string
-	settings Settings
+	// activationPublishMu serializes frontend reset/replay batches. The
+	// generation itself is guarded by tabsMu; publication never holds tabsMu
+	// across Wails event delivery.
+	activationPublishMu  sync.Mutex
+	activationGeneration uint64
+	activeID             string
+	tabSeq               atomic.Uint64
+	settings             Settings
 	// settingsMu guards settings fields accessed by background goroutines.
 	settingsMu sync.Mutex
+	// settingsTxMu serializes the complete durable-settings transaction. It
+	// deliberately remains separate from settingsMu: a transaction reads or
+	// publishes memory under settingsMu, but holds no settings lock while it
+	// writes the snapshot to disk.
+	settingsTxMu sync.Mutex
+	// settingsEffectMu serializes OS/Wails/hotkey effects independently of
+	// settingsMu. Commit generations are per effect family: an always-on-top
+	// update must not suppress a pending opacity application (and vice versa).
+	settingsEffectMu            sync.Mutex
+	hotkeyEffectGeneration      uint64
+	opacityEffectGeneration     uint64
+	alwaysOnTopEffectGeneration uint64
+	settingsGeneration          uint64
 	// settingsPath overrides the settings file location (tests; empty =
 	// default UserConfigDir path).
 	settingsPath string
 	// knownServers is the shared TOFU store for all tabs.
 	knownServers *knownServers
+	// eventEmit is a test seam for observing App-level Wails events. Nil uses
+	// the real runtime event emitter.
+	eventEmit func(name string, payload any)
+	// beforeSettingsEffect is a deterministic test barrier after an effect has
+	// read its first snapshot and before it can claim the serialized commit.
+	beforeSettingsEffect func(uint64, Settings)
+	// beforeSettingsTransaction is a deterministic test seam immediately
+	// before a caller queues for the durable-settings transaction.
+	beforeSettingsTransaction func()
 
 	hkMu    sync.Mutex
 	hotkeys map[string]*hotkeyReg
@@ -46,6 +104,11 @@ type App struct {
 	// dmMu serialises the local DM logs — every append rewrites a whole
 	// file, so two concurrent DMs with one peer would otherwise lose one (122).
 	dmMu sync.Mutex
+
+	// identityMu serializes identity-store reads and mutations. Identity files
+	// are account credentials, so interleaving a switch/regeneration/delete
+	// must never select one path and write another.
+	identityMu sync.Mutex
 }
 
 // NewApp creates a new App.
@@ -60,6 +123,36 @@ func NewApp() *App {
 // cmLoad returns the active tab's connManager (may be nil).
 func (a *App) cmLoad() *connManager { return a.cm.Load() }
 
+// requireCM captures the active manager exactly once for an operation. A tab
+// switch after this point must not redirect the rest of that operation.
+func (a *App) requireCM() (*connManager, error) {
+	cm := a.cmLoad()
+	if cm == nil {
+		return nil, fmt.Errorf("not connected")
+	}
+	return cm, nil
+}
+
+// request and write are the one-frame operation boundaries used by bindings
+// that do not need to retain the manager for a later local step. They still
+// capture it once through requireCM, so an active-tab switch cannot split a
+// request between managers.
+func (a *App) request(send, reply netproto.MessageType, msg any, timeout time.Duration) (*netproto.Frame, error) {
+	cm, err := a.requireCM()
+	if err != nil {
+		return nil, err
+	}
+	return cm.request(send, reply, msg, timeout)
+}
+
+func (a *App) write(mt netproto.MessageType, msg any) error {
+	cm, err := a.requireCM()
+	if err != nil {
+		return err
+	}
+	return cm.write(mt, msg)
+}
+
 // cmStore sets the active tab's connManager.
 func (a *App) cmStore(cm *connManager) { a.cm.Store(cm) }
 
@@ -68,51 +161,78 @@ func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	if path, err := knownServersPath(); err == nil {
 		a.knownServers = loadKnownServersAt(path)
+	} else {
+		a.knownServers = &knownServers{Servers: map[string]string{}, loadErr: trustStoreUnavailable("locate path: %v", err)}
 	}
 	a.registerHotkeys()
 	// (291) restore always-on-top.
-	if a.settings.AlwaysOnTop {
+	a.settingsMu.Lock()
+	alwaysOnTop := a.settings.AlwaysOnTop
+	a.settingsMu.Unlock()
+	if alwaysOnTop {
 		wailsRuntime.WindowSetAlwaysOnTop(ctx, true)
 	}
-	// recover is per-goroutine (331).
-	go guardCrash("window-watch", a.windowWatch)
+	a.lifecycleMu.Lock()
+	if a.lifecycleCancel != nil {
+		a.lifecycleCancel()
+	}
+	watchCtx, cancel := context.WithCancel(ctx)
+	a.lifecycleCancel = cancel
+	a.lifecycleMu.Unlock()
+	go guardCrash("window-opacity", func() { a.restoreWindowOpacity(watchCtx) })
+	go guardCrash("window-watch", func() { a.watchMinimized(watchCtx) })
 }
 
 // windowWatch restores the persisted opacity once the native window exists
 // (292) and polls the minimised state (288). Wails v2 emits no minimize
 // event, but WindowIsMinimised is a live query, so acting on the rising edge
 // is what puts a minimised window in the tray instead of the taskbar.
-func (a *App) windowWatch() {
-	tick := time.NewTicker(400 * time.Millisecond)
+func (a *App) restoreWindowOpacity(ctx context.Context) {
+	tick := time.NewTicker(lifecyclePollInterval)
 	defer tick.Stop()
-	applied := false
-	wasMin := false
-	for range tick.C {
-		if a.ctx == nil {
-			continue
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
 		}
 		// (292) the layered-window call needs an HWND, which only exists once
 		// the window is up; the first success ends the retry.
 		a.settingsMu.Lock()
 		opacity := a.settings.WindowOpacity
+		a.settingsMu.Unlock()
+		a.opacityMu.Lock()
+		err := windowOpacityApply(opacity)
+		a.opacityMu.Unlock()
+		if err == nil {
+			return
+		}
+	}
+}
+
+func (a *App) watchMinimized(ctx context.Context) {
+	tick := time.NewTicker(lifecyclePollInterval)
+	defer tick.Stop()
+	wasMin := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		if a.ctx == nil {
+			continue
+		}
+		a.settingsMu.Lock()
 		minimizeToTray := a.settings.MinimizeToTray
 		a.settingsMu.Unlock()
-		if !applied {
-			a.opacityMu.Lock()
-			err := setWindowOpacity(opacity)
-			a.opacityMu.Unlock()
-			if err == nil {
-				applied = true
-			}
-		}
-		min := wailsRuntime.WindowIsMinimised(a.ctx)
+		min := windowIsMinimized(a.ctx)
 		if min && !wasMin && minimizeToTray {
 			// unminimise before hiding: a window hidden while minimised comes
 			// back minimised when the tray shows it again.
-			wailsRuntime.WindowUnminimise(a.ctx)
-			wailsRuntime.WindowHide(a.ctx)
-			trayMarkHidden()
-			min = false
+			windowUnminimize(a.ctx)
+			windowHide(a.ctx)
+			windowMarkHidden()
 		}
 		wasMin = min
 	}
@@ -128,17 +248,14 @@ func (a *App) SetWindowOpacity(pct int) string {
 	if pct > 100 {
 		pct = 100
 	}
-	a.settingsMu.Lock()
-	a.settings.WindowOpacity = pct
-	if err := a.saveLocked(); err != nil {
-		a.settingsMu.Unlock()
+	generation, err := a.updateSettings(func(settings Settings) Settings {
+		settings.WindowOpacity = pct
+		return settings
+	})
+	if err != nil {
 		return err.Error()
 	}
-	a.settingsMu.Unlock()
-	a.opacityMu.Lock()
-	err := setWindowOpacity(pct)
-	a.opacityMu.Unlock()
-	if err != nil {
+	if err := a.applyOpacityEffect(generation); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -146,6 +263,12 @@ func (a *App) SetWindowOpacity(pct int) string {
 
 // shutdown is called when the app closes.
 func (a *App) shutdown(_ context.Context) {
+	a.lifecycleMu.Lock()
+	if a.lifecycleCancel != nil {
+		a.lifecycleCancel()
+		a.lifecycleCancel = nil
+	}
+	a.lifecycleMu.Unlock()
 	a.hkMu.Lock()
 	for action, reg := range a.hotkeys {
 		reg.stop()
@@ -175,8 +298,11 @@ func (a *App) ConnectGuest(addr, nickname string) string {
 
 // Disconnect closes the server connection.
 func (a *App) Disconnect() {
-	if a.activeID != "" {
-		a.CloseTab(a.activeID)
+	a.tabsMu.Lock()
+	activeID := a.activeID
+	a.tabsMu.Unlock()
+	if activeID != "" {
+		a.CloseTab(activeID)
 	}
 }
 
@@ -188,7 +314,11 @@ func (a *App) Connected() bool {
 
 // JoinChannel joins (moves into) a channel.
 func (a *App) JoinChannel(channelID int64) string {
-	if err := a.cmLoad().write(netproto.MsgJoinChannel, netproto.JoinChannel{ChannelID: channelID}); err != nil {
+	cm, err := a.requireCM()
+	if err != nil {
+		return err.Error()
+	}
+	if err := cm.write(netproto.MsgJoinChannel, netproto.JoinChannel{ChannelID: channelID}); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -197,7 +327,11 @@ func (a *App) JoinChannel(channelID int64) string {
 // MoveClient moves another client into a channel (gated server-side by
 // i_client_move_power; 305 drag & drop).
 func (a *App) MoveClient(clientID string, channelID int64) string {
-	if err := a.cmLoad().write(netproto.MsgMoveClient, netproto.MoveClient{
+	cm, err := a.requireCM()
+	if err != nil {
+		return err.Error()
+	}
+	if err := cm.write(netproto.MsgMoveClient, netproto.MoveClient{
 		ClientID: clientID, ChannelID: channelID,
 	}); err != nil {
 		return err.Error()
@@ -208,7 +342,11 @@ func (a *App) MoveClient(clientID string, channelID int64) string {
 // GetICEServers returns the ICE servers the server provided at connect
 // (STUN/TURN), or nil when the client should use its built-in defaults.
 func (a *App) GetICEServers() []netproto.ICEServer {
-	return a.cmLoad().iceServersSnapshot()
+	cm, err := a.requireCM()
+	if err != nil {
+		return nil
+	}
+	return cm.iceServersSnapshot()
 }
 
 // ServerFingerprint returns the SHA-256 fingerprint of the current (or last
@@ -296,10 +434,11 @@ func (a *App) TrustServerFingerprint(addr, fp string) string {
 // display in the UI: "TLS (fingerprint …[, first seen])", "PLAINTEXT", or
 // "offline".
 func (a *App) ConnectionSecurity() string {
-	if a.cmLoad() == nil || !a.cmLoad().connected() {
+	cm := a.cmLoad()
+	if cm == nil || !cm.connected() {
 		return "offline"
 	}
-	tlsUsed, fp, newServer := a.cmLoad().securitySnapshot()
+	tlsUsed, fp, newServer := cm.securitySnapshot()
 	if !tlsUsed {
 		return "PLAINTEXT — traffic is NOT encrypted"
 	}
@@ -312,10 +451,11 @@ func (a *App) ConnectionSecurity() string {
 // MOTD returns the server's message of the day delivered in the AuthResponse
 // ("" when unset or offline). Surfaced in chat once per connect (133).
 func (a *App) MOTD() string {
-	if a.cmLoad() == nil {
+	cm, err := a.requireCM()
+	if err != nil {
 		return ""
 	}
-	return a.cmLoad().motdSnapshot()
+	return cm.motdSnapshot()
 }
 
 // AcceptServerRules accepts exactly the rules revision displayed by the
@@ -352,7 +492,11 @@ func (a *App) ClientID() string {
 // (gated server-side by b_client_priority_speaker). It returns "" on success
 // or the failure reason.
 func (a *App) SetPrioritySpeaker(active bool) string {
-	if err := a.cmLoad().write(netproto.MsgPrioritySpeaker, netproto.PrioritySpeaker{Active: active}); err != nil {
+	cm, err := a.requireCM()
+	if err != nil {
+		return err.Error()
+	}
+	if err := cm.write(netproto.MsgPrioritySpeaker, netproto.PrioritySpeaker{Active: active}); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -362,7 +506,11 @@ func (a *App) SetPrioritySpeaker(active bool) string {
 // b_channel_modify). The dialog always sends the full form, so every field
 // is set explicitly. It returns "" on success or the failure reason.
 func (a *App) ChannelEdit(channelID int64, topic string, maxClients int, opusBitrate int, opusFEC bool, opusDTX bool, opusStereo bool, description string, slowModeSeconds int) string {
-	if err := a.cmLoad().write(netproto.MsgChannelEdit, netproto.ChannelEdit{
+	cm, err := a.requireCM()
+	if err != nil {
+		return err.Error()
+	}
+	if err := cm.write(netproto.MsgChannelEdit, netproto.ChannelEdit{
 		ChannelID:   channelID,
 		Topic:       &topic,
 		MaxClients:  &maxClients,
@@ -397,14 +545,18 @@ func (a *App) sendChat(scope, target, text string, replyToID int64) string {
 	if text == "" {
 		return "empty message"
 	}
-	msg, err := a.cmLoad().encryptChat(scope, target, text)
+	cm, err := a.requireCM()
+	if err != nil {
+		return err.Error()
+	}
+	msg, err := cm.encryptChat(scope, target, text)
 	if err != nil {
 		return "encryption failed: " + err.Error()
 	}
 	if scope != "direct" {
 		msg.ReplyToID = replyToID
 	}
-	if err := a.cmLoad().write(netproto.MsgChatSend, msg); err != nil {
+	if err := cm.write(netproto.MsgChatSend, msg); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -412,7 +564,11 @@ func (a *App) sendChat(scope, target, text string, replyToID int64) string {
 
 // WhisperSet configures the whisper list and mode.
 func (a *App) WhisperSet(uniqueIDs []string, channelIDs []int64, active bool) string {
-	if err := a.cmLoad().write(netproto.MsgWhisperSet, netproto.WhisperSet{
+	cm, err := a.requireCM()
+	if err != nil {
+		return err.Error()
+	}
+	if err := cm.write(netproto.MsgWhisperSet, netproto.WhisperSet{
 		UniqueIDs:  uniqueIDs,
 		ChannelIDs: channelIDs,
 		Active:     active,
@@ -424,7 +580,11 @@ func (a *App) WhisperSet(uniqueIDs []string, channelIDs []int64, active bool) st
 
 // GetPermissions returns the caller's resolved permission set.
 func (a *App) GetPermissions() ([]netproto.PermissionEntry, error) {
-	f, err := a.cmLoad().request(netproto.MsgPermissionsQuery, netproto.MsgPermissionsResponse,
+	cm, err := a.requireCM()
+	if err != nil {
+		return nil, err
+	}
+	f, err := cm.request(netproto.MsgPermissionsQuery, netproto.MsgPermissionsResponse,
 		netproto.PermissionsQuery{}, 5*time.Second)
 	if err != nil {
 		return nil, err
@@ -443,7 +603,11 @@ func (a *App) GetPermissions() ([]netproto.PermissionEntry, error) {
 // dropped. The declaration REPLACES the previous one, so every offer must
 // carry the complete list.
 func (a *App) WebRTCOffer(sdp string, tracks []netproto.TrackSlot) (string, error) {
-	f, err := a.cmLoad().request(netproto.MsgWebRTCOffer, netproto.MsgWebRTCAnswer,
+	cm, err := a.requireCM()
+	if err != nil {
+		return "", err
+	}
+	f, err := cm.request(netproto.MsgWebRTCOffer, netproto.MsgWebRTCAnswer,
 		netproto.WebRTCOffer{SDP: sdp, Tracks: tracks}, 10*time.Second)
 	if err != nil {
 		return "", err
@@ -457,12 +621,18 @@ func (a *App) WebRTCOffer(sdp string, tracks []netproto.TrackSlot) (string, erro
 
 // WebRTCAnswer forwards a renegotiation answer to the server.
 func (a *App) WebRTCAnswer(sdp string) {
-	_ = a.cmLoad().write(netproto.MsgWebRTCAnswer, netproto.WebRTCAnswer{SDP: sdp})
+	if cm, err := a.requireCM(); err == nil {
+		_ = cm.write(netproto.MsgWebRTCAnswer, netproto.WebRTCAnswer{SDP: sdp})
+	}
 }
 
 // SendICECandidate forwards a browser ICE candidate to the server.
 func (a *App) SendICECandidate(candidate, sdpMid string, sdpMLineIndex uint16) {
-	_ = a.cmLoad().write(netproto.MsgICECandidate, netproto.ICECandidate{
+	cm, err := a.requireCM()
+	if err != nil {
+		return
+	}
+	_ = cm.write(netproto.MsgICECandidate, netproto.ICECandidate{
 		Candidate:     candidate,
 		SDPMid:        sdpMid,
 		SDPMLineIndex: sdpMLineIndex,
@@ -522,7 +692,11 @@ func (a *App) SetPTT(active bool) {
 
 // SetAvatar uploads an avatar image (base64).
 func (a *App) SetAvatar(dataBase64 string) string {
-	if err := a.cmLoad().write(netproto.MsgAvatarSet, netproto.AvatarSet{DataBase64: dataBase64}); err != nil {
+	cm, err := a.requireCM()
+	if err != nil {
+		return err.Error()
+	}
+	if err := cm.write(netproto.MsgAvatarSet, netproto.AvatarSet{DataBase64: dataBase64}); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -530,10 +704,16 @@ func (a *App) SetAvatar(dataBase64 string) string {
 
 // SetAlwaysOnTop toggles always-on-top (291) and persists the setting.
 func (a *App) SetAlwaysOnTop(on bool) {
-	a.settings.AlwaysOnTop = on
-	_ = a.save()
-	if a.ctx != nil {
-		wailsRuntime.WindowSetAlwaysOnTop(a.ctx, on)
+	generation, err := a.updateSettings(func(settings Settings) Settings {
+		settings.AlwaysOnTop = on
+		return settings
+	})
+	if err != nil {
+		log.Printf("saving always-on-top setting failed: %v", err)
+		return
+	}
+	if err := a.applyAlwaysOnTopEffect(generation); err != nil {
+		log.Printf("applying always-on-top setting failed: %v", err)
 	}
 }
 
@@ -555,10 +735,9 @@ func (a *App) ClientVersionShort() string {
 // IdentityUID returns the unique ID derived from the client's identity key
 // (used by the login screen to show the auto-generated identity).
 func (a *App) IdentityUID() string {
-	if a.cmLoad() == nil {
-		return ""
-	}
-	id, err := a.cmLoad().identity()
+	a.identityMu.Lock()
+	defer a.identityMu.Unlock()
+	id, _, err := a.activeIdentityLocked()
 	if err != nil {
 		return ""
 	}
@@ -571,7 +750,11 @@ func (a *App) IdentityUID() string {
 
 // GetAvatar fetches a user's avatar from the server.
 func (a *App) GetAvatar(uniqueID string) (netproto.AvatarData, error) {
-	f, err := a.cmLoad().request(netproto.MsgAvatarGet, netproto.MsgAvatarData,
+	cm, err := a.requireCM()
+	if err != nil {
+		return netproto.AvatarData{}, err
+	}
+	f, err := cm.request(netproto.MsgAvatarGet, netproto.MsgAvatarData,
 		netproto.AvatarGet{UniqueID: uniqueID}, 5*time.Second)
 	if err != nil {
 		return netproto.AvatarData{}, err
@@ -586,7 +769,11 @@ func (a *App) GetAvatar(uniqueID string) (netproto.AvatarData, error) {
 // GetClientInfo fetches the connection info of an online client (TS3-style
 // Client Info dialog).
 func (a *App) GetClientInfo(clientID string) (netproto.ClientInfoResponse, error) {
-	f, err := a.cmLoad().request(netproto.MsgClientInfoQuery, netproto.MsgClientInfoResponse,
+	cm, err := a.requireCM()
+	if err != nil {
+		return netproto.ClientInfoResponse{}, err
+	}
+	f, err := cm.request(netproto.MsgClientInfoQuery, netproto.MsgClientInfoResponse,
 		netproto.ClientInfoQuery{ClientID: clientID}, 5*time.Second)
 	if err != nil {
 		return netproto.ClientInfoResponse{}, err

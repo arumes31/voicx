@@ -51,15 +51,17 @@ type connManager struct {
 	// plain names.
 	tabID string
 
-	mu       sync.Mutex
-	conn     net.Conn
-	addr     string // control address (tab info)
-	clientID string
-	uniqueID string
-	nickname string
-	isAdmin  bool
-	isGuest  bool
-	closed   bool
+	mu        sync.Mutex
+	writeMu   sync.Mutex
+	conn      net.Conn
+	connEpoch uint64
+	addr      string // control address (tab info)
+	clientID  string
+	uniqueID  string
+	nickname  string
+	isAdmin   bool
+	isGuest   bool
+	closed    bool
 	// lastSnapshot/lastChannelList cache the latest state frames so a tab
 	// switch can replay them (281).
 	lastSnapshot    string
@@ -78,8 +80,9 @@ type connManager struct {
 	id *identity
 
 	// E2EE chat (wave 4b): peer key cache + per-scope channel keys.
-	pubKeys   *pubKeyCache
-	scopeKeys *scopeKeyStore
+	pubKeys    *pubKeyCache
+	scopeKeys  *scopeKeyStore
+	decryptSem chan struct{}
 
 	// debugFrames tees frame summaries to the "debug_frame" event (327 debug
 	// console) when enabled.
@@ -101,21 +104,61 @@ type connManager struct {
 	certNotAfter        time.Time
 	certValidityTrusted bool
 
-	// pending maps message types to one-shot response waiters
-	// (PermissionsQuery, WebRTCOffer).
-	pending map[netproto.MessageType]chan *netproto.Frame
-	// reqMu serializes request/response exchanges so concurrent same-type
-	// requests (e.g. avatar fetches for several clients) cannot clobber each
-	// other's waiter.
-	reqMu sync.Mutex
+	// The wire protocol has no request ID, so same-reply-type requests remain
+	// serialized. Newer servers attach Error.OriginType, letting an error for
+	// a fire-and-forget command stay global instead of failing this request.
+	// Typed replies are still protected by closing the exact transport on a
+	// timeout, so a late reply can never satisfy the next request.
+	requestGatesMu sync.Mutex
+	requestGates   map[netproto.MessageType]*sync.Mutex
+	pending        map[netproto.MessageType]pendingRequest
+	// beforeDispatchLock is a test-only barrier used to prove that an already
+	// parsed frame cannot race a replacement connection's waiter.
+	beforeDispatchLock func()
+	transfers          transferRegistry
+	progress           transferProgressReporter
+	// transferEpoch and acceptingTransfers bind data-port workers to one
+	// authenticated control connection. A disconnect flips the gate before
+	// transfer entries are detached, so a worker that finishes dialing cannot
+	// register an orphan into a later reconnect.
+	transferEpoch      uint64
+	acceptingTransfers bool
+
+	// The defaults keep an idle connected control channel alive while making a
+	// peer that stops responding fail in bounded time. Tests may shorten them.
+	heartbeatInterval time.Duration
+	readTimeout       time.Duration
+	writeTimeout      time.Duration
 }
+
+type requestResult struct {
+	frame *netproto.Frame
+	err   error
+}
+
+type pendingRequest struct {
+	request netproto.MessageType
+	reply   netproto.MessageType
+	result  chan requestResult
+}
+
+const (
+	defaultHeartbeatInterval = 15 * time.Second
+	defaultReadTimeout       = 45 * time.Second
+	defaultWriteTimeout      = 10 * time.Second
+)
 
 func newConnManager(wailsCtx context.Context) *connManager {
 	return &connManager{
-		sink:      wailsSink{ctx: wailsCtx},
-		pending:   make(map[netproto.MessageType]chan *netproto.Frame),
-		pubKeys:   newPubKeyCache(),
-		scopeKeys: newScopeKeyStore(),
+		sink:              wailsSink{ctx: wailsCtx},
+		pending:           make(map[netproto.MessageType]pendingRequest),
+		requestGates:      make(map[netproto.MessageType]*sync.Mutex),
+		heartbeatInterval: defaultHeartbeatInterval,
+		readTimeout:       defaultReadTimeout,
+		writeTimeout:      defaultWriteTimeout,
+		pubKeys:           newPubKeyCache(),
+		scopeKeys:         newScopeKeyStore(),
+		decryptSem:        make(chan struct{}, maxAsyncDecrypts),
 	}
 }
 
@@ -151,6 +194,14 @@ func (m *connManager) dialTransport(addr string) (net.Conn, error) {
 	m.certNotAfter = time.Time{}
 	m.certValidityTrusted = false
 	m.mu.Unlock()
+	canonicalAddr := ""
+	if ks != nil {
+		var err error
+		canonicalAddr, err = normalizeServerAddr(addr)
+		if err != nil {
+			return nil, trustStoreUnavailable("normalize server address %q: %v", addr, err)
+		}
+	}
 	var fingerprint string
 	var firstSeen bool
 	var certNotBefore time.Time
@@ -170,7 +221,11 @@ func (m *connManager) dialTransport(addr string) (net.Conn, error) {
 			if ks == nil {
 				return nil
 			}
-			switch ks.verify(addr, fingerprint) {
+			status, err := ks.verify(canonicalAddr, fingerprint)
+			if err != nil {
+				return fmt.Errorf("TLS trust store unavailable: %w", err)
+			}
+			switch status {
 			case trustUnknown:
 				firstSeen = true
 				return nil
@@ -181,10 +236,14 @@ func (m *connManager) dialTransport(addr string) (net.Conn, error) {
 			}
 		},
 	}
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", addr, tlsConf)
+	dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: 5 * time.Second},
+		Config:    tlsConf,
+	}
+	conn, err := dialer.DialContext(context.Background(), "tcp", addr)
 	if err == nil {
 		if ks != nil && firstSeen {
-			if err := ks.trust(addr, fingerprint); err != nil {
+			if err := ks.trust(canonicalAddr, fingerprint); err != nil {
 				_ = conn.Close()
 				return nil, fmt.Errorf("pinning server fingerprint: %w", err)
 			}
@@ -214,6 +273,9 @@ func (m *connManager) dialTransport(addr string) (net.Conn, error) {
 		m.mu.Unlock()
 		return nil, errFingerprintMismatch
 	}
+	if errors.Is(tlsErr, errTrustStoreUnavailable) {
+		return nil, tlsErr
+	}
 
 	m.mu.Lock()
 	allowPlain := m.allowPlaintext
@@ -230,7 +292,7 @@ func (m *connManager) dialTransport(addr string) (net.Conn, error) {
 	m.certNotAfter = time.Time{}
 	m.certValidityTrusted = false
 	m.mu.Unlock()
-	return net.DialTimeout("tcp", addr, 5*time.Second)
+	return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(context.Background(), "tcp", addr)
 }
 
 // securitySnapshot reports how the current connection is secured, for
@@ -366,9 +428,20 @@ func (m *connManager) connectWith(addr string, authMsg netproto.Authenticate, si
 	// identity(), so it must run outside the state lock below.
 	m.installCurrentKeys(0, resp.ChatKeys)
 	motd := m.openMOTD(resp)
+	if m.pubKeys != nil {
+		m.pubKeys.clear()
+	}
+	// Establishment writes happen before the transport becomes externally
+	// installed. If the peer closes after auth but before KeyPublish, Connect
+	// fails cleanly with no disconnected event and no reader/heartbeat loops.
+	if err := m.publishE2EKeyConn(conn); err != nil {
+		_ = conn.Close()
+		return "e2e key publish failed: " + err.Error()
+	}
 
 	m.mu.Lock()
 	m.conn = conn
+	m.connEpoch++
 	m.addr = addr
 	m.clientID = resp.ClientID
 	m.uniqueID = resp.UniqueID
@@ -378,15 +451,11 @@ func (m *connManager) connectWith(addr string, authMsg netproto.Authenticate, si
 	m.iceServers = resp.ICEServers
 	m.motd = motd
 	m.closed = false
+	m.transferEpoch++
+	m.acceptingTransfers = true
 	m.mu.Unlock()
 
-	// Publish the E2EE public key; the server answers with sealed chat keys.
-	// Failure is non-fatal (old server) but chat encryption will not work.
-	if err := m.publishE2EKey(); err != nil {
-		m.emit("servererror", "e2e key publish failed: "+err.Error())
-	}
-
-	// Publishing the E2EE key above triggers the server to answer with sealed
+	// The KeyPublish above triggers the server to answer with sealed
 	// scope keys on the read loop below. Account reconnect and state
 	// synchronization are driven by server broadcasts upon authentication.
 
@@ -394,25 +463,13 @@ func (m *connManager) connectWith(addr string, authMsg netproto.Authenticate, si
 	go guardCrash("readLoop", func() {
 		defer func() {
 			if r := recover(); r != nil {
-				m.mu.Lock()
-				owned := (m.conn == conn)
-				intentional := m.closed
-				if owned {
-					m.disconnectLocked()
-				}
-				m.mu.Unlock()
-				if owned {
-					if !intentional {
-						m.emit("disconnected", "")
-					}
-				} else {
-					_ = conn.Close()
-				}
+				m.terminateConn(conn, true)
 				panic(r)
 			}
 		}()
 		m.readLoop(conn)
 	})
+	go guardCrash("heartbeat", func() { m.heartbeatLoop(conn) })
 	return ""
 }
 
@@ -434,8 +491,16 @@ func (m *connManager) openMOTD(resp netproto.AuthResponse) string {
 	return plain
 }
 
-// disconnectLocked closes the connection while m.mu is held.
-func (m *connManager) disconnectLocked() {
+// detachLocked clears manager-owned connection state while m.mu is held. The
+// caller owns closing the returned connection and notifying the returned
+// waiters after unlocking.
+func (m *connManager) detachLocked() (net.Conn, []chan requestResult, []net.Conn) {
+	conn := m.conn
+	waiters := make([]chan requestResult, 0, len(m.pending))
+	for _, pending := range m.pending {
+		waiters = append(waiters, pending.result)
+	}
+	clear(m.pending)
 	m.iceServers = nil
 	m.motd = ""
 	m.tlsUsed = false
@@ -448,18 +513,62 @@ func (m *connManager) disconnectLocked() {
 	// disconnect, so keeping the cached set would show tabs that no longer
 	// receive anything.
 	m.lastSubscriptions = ""
-	if m.conn != nil {
-		m.closed = true
-		_ = m.conn.Close()
-		m.conn = nil
-	}
+	m.closed = true
+	m.conn = nil
+	m.connEpoch++
+	m.acceptingTransfers = false
+	m.transferEpoch++
+	transferConns := m.detachTransfersLocked()
+	return conn, waiters, transferConns
 }
 
 // disconnect closes the connection, if any.
 func (m *connManager) disconnect() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.disconnectLocked()
+	conn, waiters, transferConns := m.detachLocked()
+	m.mu.Unlock()
+	if m.pubKeys != nil {
+		m.pubKeys.clear()
+	}
+	if conn != nil {
+		_ = conn.Close()
+	}
+	m.notifyWaiters(waiters, requestResult{err: net.ErrClosed})
+	closeTransfers(transferConns)
+}
+
+// terminateConn is the single unexpected-termination owner. It detaches only
+// the active transport, wakes waiters and emits disconnected exactly once.
+// A stale read/write loop can never clear or signal a replacement connection.
+func (m *connManager) terminateConn(conn net.Conn, emitDisconnected bool) bool {
+	m.mu.Lock()
+	if m.conn != conn {
+		m.mu.Unlock()
+		return false
+	}
+	toClose, waiters, transferConns := m.detachLocked()
+	m.mu.Unlock()
+	if m.pubKeys != nil {
+		m.pubKeys.clear()
+	}
+	if toClose != nil {
+		_ = toClose.Close()
+	}
+	m.notifyWaiters(waiters, requestResult{err: net.ErrClosed})
+	closeTransfers(transferConns)
+	if emitDisconnected {
+		m.emit("disconnected", "")
+	}
+	return true
+}
+
+func (m *connManager) notifyWaiters(waiters []chan requestResult, result requestResult) {
+	for _, waiter := range waiters {
+		select {
+		case waiter <- result:
+		default:
+		}
+	}
 }
 
 // iceServersSnapshot returns the ICE servers the server provided at connect
@@ -521,12 +630,65 @@ func (m *connManager) write(mt netproto.MessageType, msg any) error {
 }
 
 func (m *connManager) writeConn(conn net.Conn, mt netproto.MessageType, msg any) error {
+	m.mu.Lock()
+	timeout := m.writeTimeout
+	debugFrames := m.debugFrames
+	m.mu.Unlock()
+
+	m.writeMu.Lock()
 	f, err := netproto.Encode(mt, msg)
 	if err != nil {
+		m.writeMu.Unlock()
 		return err
 	}
-	m.teeFrame("out", f)
-	return netproto.WriteFrame(conn, f)
+	if timeout > 0 {
+		_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+	}
+	err = netproto.WriteFrame(conn, f)
+	if timeout > 0 {
+		_ = conn.SetWriteDeadline(time.Time{})
+	}
+	m.writeMu.Unlock()
+	if err != nil {
+		m.terminateConn(conn, true)
+		return err
+	}
+	// Event sinks may re-enter write. Emit only after releasing writeMu and
+	// only for a completed wire write.
+	m.teeFrameIfEnabled("out", f, debugFrames)
+	return err
+}
+
+func (m *connManager) readDeadline() time.Duration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.readTimeout
+}
+
+func (m *connManager) heartbeatPeriod() time.Duration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.heartbeatInterval
+}
+
+func (m *connManager) heartbeatLoop(conn net.Conn) {
+	period := m.heartbeatPeriod()
+	if period <= 0 {
+		return
+	}
+	ticker := time.NewTicker(period)
+	defer ticker.Stop()
+	for range ticker.C {
+		m.mu.Lock()
+		owned := m.conn == conn
+		m.mu.Unlock()
+		if !owned {
+			return
+		}
+		if err := m.writeConn(conn, netproto.MsgPing, netproto.Ping{}); err != nil {
+			return
+		}
+	}
 }
 
 // frameSummary is the debug console's per-frame record (327).
@@ -542,6 +704,10 @@ func (m *connManager) teeFrame(dir string, f *netproto.Frame) {
 	m.mu.Lock()
 	on := m.debugFrames
 	m.mu.Unlock()
+	m.teeFrameIfEnabled(dir, f, on)
+}
+
+func (m *connManager) teeFrameIfEnabled(dir string, f *netproto.Frame, on bool) {
 	if !on {
 		return
 	}
@@ -559,24 +725,39 @@ func (m *connManager) teeFrame(dir string, f *netproto.Frame) {
 
 // request sends a message and waits for a typed response.
 func (m *connManager) request(send, reply netproto.MessageType, msg any, timeout time.Duration) (*netproto.Frame, error) {
-	m.reqMu.Lock()
-	defer m.reqMu.Unlock()
+	gate := m.requestGate(reply)
+	gate.Lock()
+	defer gate.Unlock()
 
-	ch := make(chan *netproto.Frame, 1)
+	ch := make(chan requestResult, 1)
 	m.mu.Lock()
-	m.pending[reply] = ch
+	conn := m.conn
+	if conn == nil {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("not connected")
+	}
+	if m.pending == nil {
+		m.pending = make(map[netproto.MessageType]pendingRequest)
+	}
+	m.pending[reply] = pendingRequest{request: send, reply: reply, result: ch}
 	m.mu.Unlock()
 	defer func() {
 		m.mu.Lock()
-		delete(m.pending, reply)
+		if pending, ok := m.pending[reply]; ok && pending.result == ch {
+			delete(m.pending, reply)
+		}
 		m.mu.Unlock()
 	}()
 
-	if err := m.write(send, msg); err != nil {
+	if err := m.writeConn(conn, send, msg); err != nil {
 		return nil, err
 	}
 	select {
-	case f := <-ch:
+	case result := <-ch:
+		if result.err != nil {
+			return nil, result.err
+		}
+		f := result.frame
 		if f.Type == uint16(netproto.MsgError) {
 			var e netproto.Error
 			if err := netproto.Decode(f, &e); err == nil {
@@ -586,41 +767,110 @@ func (m *connManager) request(send, reply netproto.MessageType, msg any, timeout
 		}
 		return f, nil
 	case <-time.After(timeout):
+		// There is no typed response correlation on the legacy frame format.
+		// Closing this exact transport prevents its late response from being
+		// delivered to a later request that expects the same reply type.
+		m.terminateConn(conn, true)
 		return nil, fmt.Errorf("timeout waiting for %s", reply)
 	}
 }
 
+// requestGate serializes only requests that expect the same reply type. The
+// wire protocol has no request ID, so those requests cannot be distinguished;
+// unrelated replies may proceed concurrently.
+func (m *connManager) requestGate(reply netproto.MessageType) *sync.Mutex {
+	m.requestGatesMu.Lock()
+	defer m.requestGatesMu.Unlock()
+	if m.requestGates == nil {
+		m.requestGates = make(map[netproto.MessageType]*sync.Mutex)
+	}
+	gate := m.requestGates[reply]
+	if gate == nil {
+		gate = &sync.Mutex{}
+		m.requestGates[reply] = gate
+	}
+	return gate
+}
+
 // readLoop dispatches incoming frames until the connection fails.
 func (m *connManager) readLoop(conn net.Conn) {
+	m.mu.Lock()
+	epoch := m.connEpoch
+	m.mu.Unlock()
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
 	for {
+		if timeout := m.readDeadline(); timeout > 0 {
+			_ = conn.SetReadDeadline(time.Now().Add(timeout))
+		}
 		f, err := netproto.ReadFrame(conn)
 		if err != nil {
 			// Intentional closes (Disconnect/CloseTab) end the loop quietly;
-			// only unexpected drops are reported.
-			m.mu.Lock()
-			intentional := m.closed
-			m.mu.Unlock()
-			if !intentional {
-				m.emit("disconnected", "")
-			}
-			m.disconnect()
+			// only unexpected drops are reported. An old loop may only detach
+			// the exact transport it was started for.
+			m.terminateConn(conn, true)
 			return
 		}
-		m.dispatch(f)
+		m.dispatchFrom(conn, epoch, f)
 	}
 }
 
-// dispatch routes one frame to pending waiters or frontend events.
+// dispatch is the test/direct-call wrapper. A live read loop uses
+// dispatchFrom with its installed connection epoch.
 func (m *connManager) dispatch(f *netproto.Frame) {
+	// Unit tests and synthetic state replay intentionally inject a frame
+	// without a transport. Live readers always use dispatchFrom below.
+	m.dispatchAccepted(nil, 0, false, f)
+}
+
+// dispatchFrom drops an already-read frame unless its exact source connection
+// and generation are still installed. This check happens before pending/UI
+// effects, so an old read loop cannot complete a replacement's request.
+func (m *connManager) dispatchFrom(conn net.Conn, epoch uint64, f *netproto.Frame) {
+	m.dispatchAccepted(conn, epoch, true, f)
+}
+
+// dispatchAccepted validates a live frame's source and claims any matching
+// waiter in one mutex critical section. In particular, an old read loop can
+// never observe a valid connection, unlock, and then complete a waiter that a
+// replacement connection installed in the gap.
+func (m *connManager) dispatchAccepted(conn net.Conn, epoch uint64, checkSource bool, f *netproto.Frame) {
 	mt := netproto.MessageType(f.Type)
-	m.teeFrame("in", f)
+	var protocolErr netproto.Error
+	if mt == netproto.MsgError {
+		if err := netproto.Decode(f, &protocolErr); err != nil {
+			return
+		}
+	}
+	if hook := m.beforeDispatchLock; hook != nil {
+		hook()
+	}
 
 	m.mu.Lock()
-	waiter, ok := m.pending[mt]
+	if checkSource && (conn == nil || m.conn != conn || m.connEpoch != epoch) {
+		m.mu.Unlock()
+		return
+	}
+	var waiter chan requestResult
+	if mt != netproto.MsgError {
+		if pending, ok := m.pending[mt]; ok {
+			delete(m.pending, mt)
+			waiter = pending.result
+		}
+	} else if protocolErr.OriginType != 0 {
+		origin := netproto.MessageType(protocolErr.OriginType)
+		for reply, pending := range m.pending {
+			if pending.request == origin {
+				delete(m.pending, reply)
+				waiter = pending.result
+				break
+			}
+		}
+	}
 	m.mu.Unlock()
-	if ok {
+	m.teeFrame("in", f)
+	if waiter != nil {
 		select {
-		case waiter <- f:
+		case waiter <- requestResult{frame: f}:
 		default:
 		}
 		return
@@ -677,25 +927,20 @@ func (m *connManager) dispatch(f *netproto.Frame) {
 			m.emit("perms_invalid", pi.Reason)
 		}
 	case netproto.MsgError:
-		m.mu.Lock()
-		for _, waiter := range m.pending {
-			select {
-			case waiter <- f:
-			default:
-			}
+		// OriginType was absent from legacy Error frames. It is unsafe to
+		// continue because an eventual uncorrelated reply could satisfy a
+		// later request, so terminate this exact transport and wake all
+		// current waiters immediately. The global error remains observable.
+		if protocolErr.OriginType == 0 && checkSource {
+			m.terminateConn(conn, true)
 		}
-		m.mu.Unlock()
-
-		var e netproto.Error
-		if err := netproto.Decode(f, &e); err == nil {
-			// Capability probes (121 read state) are sent speculatively, so an
-			// older server answering "unknown message type" is an expected
-			// negative, not something to show the user.
-			if strings.Contains(e.Message, "unknown message type") {
-				return
-			}
-			m.emit("servererror", fmt.Sprintf("%d: %s", e.Code, e.Message))
+		// Capability probes (121 read state) are sent speculatively, so an
+		// older server answering "unknown message type" is an expected
+		// negative, not something to show the user.
+		if strings.Contains(protocolErr.Message, "unknown message type") {
+			return
 		}
+		m.emit("servererror", fmt.Sprintf("%d: %s", protocolErr.Code, protocolErr.Message))
 	case netproto.MsgPong, netproto.MsgChatBroadcast, netproto.MsgAuthResponse:
 		// Nothing to do.
 	case netproto.MsgPing:

@@ -87,6 +87,9 @@ RUN mkdir -p /data/files /data/recordings \
 
 # Copy the compiled binary from the builder stage.
 COPY --from=builder --chown=10001:10001 /out/voicx /out/voicx
+COPY --chown=10001:10001 scripts/secret-env.sh /usr/local/lib/voicx/secret-env.sh
+COPY --chown=10001:10001 scripts/voicx-entrypoint.sh /usr/local/bin/voicx-entrypoint.sh
+RUN chmod 0555 /usr/local/lib/voicx/secret-env.sh /usr/local/bin/voicx-entrypoint.sh
 
 # Drop privileges: run as the non-root voicx user.
 USER 10001:10001
@@ -102,9 +105,10 @@ USER 10001:10001
 EXPOSE 12333/tcp 12334/udp 12335/tcp 12336/tcp 12337/tcp 12338/tcp 12339/tcp
 
 # Liveness probe against the health endpoint.
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget -qO- http://127.0.0.1:12337/healthz || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["wget", "-qO-", "http://127.0.0.1:12337/healthz"]
 
 STOPSIGNAL SIGTERM
 
-ENTRYPOINT ["/out/voicx"]
+ENTRYPOINT ["/usr/local/bin/voicx-entrypoint.sh"]
+CMD ["/out/voicx"]
