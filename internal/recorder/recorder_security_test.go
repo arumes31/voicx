@@ -200,13 +200,10 @@ func TestRecordingLifetimeOutlivesRequestContext(t *testing.T) {
 
 func TestUnexpectedProcessExitCleansSessionAndArtifacts(t *testing.T) {
 	dir := privateTempDir(t)
-	var observed []string
-	var observedMu sync.Mutex
+	observed := make(chan string, 2)
 	recorder := New(testConfig(dir), zap.NewNop(), Observers{
 		OnError: func(operation string) {
-			observedMu.Lock()
-			observed = append(observed, operation)
-			observedMu.Unlock()
+			observed <- operation
 		},
 	})
 	exec := &fakeExec{}
@@ -226,12 +223,19 @@ func TestUnexpectedProcessExitCleansSessionAndArtifacts(t *testing.T) {
 		t.Fatal("unexpected process exit was not observed")
 	}
 	waitForSessionCount(t, recorder, 0)
-	observedMu.Lock()
-	if len(observed) != 1 || observed[0] != "unexpected_exit" {
-		observedMu.Unlock()
-		t.Fatalf("observed errors = %v, want exactly [unexpected_exit]", observed)
+	select {
+	case operation := <-observed:
+		if operation != "unexpected_exit" {
+			t.Fatalf("observed error = %q, want unexpected_exit", operation)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("unexpected_exit observer was not called")
 	}
-	observedMu.Unlock()
+	select {
+	case operation := <-observed:
+		t.Fatalf("unexpected additional observed error %q", operation)
+	default:
+	}
 	if _, err := os.Stat(session.sdpPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("SDP artifact still exists: %v", err)
 	}

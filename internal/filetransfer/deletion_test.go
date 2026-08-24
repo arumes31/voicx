@@ -78,14 +78,17 @@ func TestDeleteChannelDataStopsActiveTransferBeforeReturning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("activateTransfer: %v", err)
 	}
+	// Arm the deadline before deletion can close the peer. net.Pipe may reject
+	// SetReadDeadline after the peer has already closed, which is itself the
+	// successful condition this test is trying to observe.
+	if err := clientConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
 
 	deleteDone := make(chan error, 1)
 	go func() {
 		deleteDone <- s.DeleteChannelData(context.Background(), 7)
 	}()
-	if err := clientConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := clientConn.Read(make([]byte, 1)); err == nil {
 		t.Fatal("active transfer connection remained open")
 	}
