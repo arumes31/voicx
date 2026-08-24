@@ -3,7 +3,7 @@
 # voicx - voice/video server (Phase 1 base image)
 # =============================================================================
 # Multi-stage build:
-#   1. builder  - cross-compiles a static Go binary from Go 1.26.5/Alpine 3.24
+#   1. builder  - cross-compiles a static Go binary from Go 1.26.6/Alpine 3.24
 #   2. runtime  - minimal Alpine 3.24 image running as a non-root user
 #
 # NOTE on CGO: Phase 1 keeps CGO_ENABLED=0 to produce a fully static binary
@@ -15,7 +15,7 @@
 # -----------------------------------------------------------------------------
 # Builder stage
 # -----------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.6-alpine@sha256:3889b425f035be855a72fb4755265311293b6d414521f0a519d819df32222d83 AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
