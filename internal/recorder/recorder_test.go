@@ -234,6 +234,18 @@ func testConfig(dir string) Config {
 	return Config{Enabled: true, Dir: dir, WindowsACLReady: true}
 }
 
+// privateTempDir adapts testing.TempDir to the recorder's production
+// invariant. Go 1.26 may create the test directory with group/other execute
+// bits on Unix, while recording roots deliberately require mode 0700.
+func privateTempDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatalf("restrict test recording directory: %v", err)
+	}
+	return dir
+}
+
 // TestBuildArgsDefaults verifies the default ffmpeg command line (copy
 // codecs, SDP input, output file).
 func TestBuildArgsDefaults(t *testing.T) {
@@ -282,7 +294,7 @@ func TestBuildSDP(t *testing.T) {
 // TestStartStopLifecycle verifies a recording session starts ffmpeg with the
 // expected command, registers router taps, and stops gracefully.
 func TestStartStopLifecycle(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateTempDir(t)
 	r := New(testConfig(dir), testLogger())
 	exec := &fakeExec{}
 	r.Exec = exec.run
@@ -328,7 +340,7 @@ func TestStartStopLifecycle(t *testing.T) {
 func TestRecorderCloseReportsStopFailureOnce(t *testing.T) {
 	var observed []string
 	var observedMu sync.Mutex
-	r := New(testConfig(t.TempDir()), testLogger(), Observers{
+	r := New(testConfig(privateTempDir(t)), testLogger(), Observers{
 		OnError: func(operation string) {
 			observedMu.Lock()
 			observed = append(observed, operation)
@@ -363,7 +375,7 @@ func TestRecorderCloseReportsStopFailureOnce(t *testing.T) {
 func TestRecorderRequestedStopDoesNotReportUnexpectedExit(t *testing.T) {
 	var observed []string
 	var observedMu sync.Mutex
-	r := New(testConfig(t.TempDir()), testLogger(), Observers{
+	r := New(testConfig(privateTempDir(t)), testLogger(), Observers{
 		OnError: func(operation string) {
 			observedMu.Lock()
 			observed = append(observed, operation)
@@ -398,7 +410,7 @@ func TestRecorderRequestedStopDoesNotReportUnexpectedExit(t *testing.T) {
 func TestRecorderConcurrentStartCloseReportsStartFailureOnce(t *testing.T) {
 	var observed []string
 	var observedMu sync.Mutex
-	r := New(testConfig(t.TempDir()), testLogger(), Observers{
+	r := New(testConfig(privateTempDir(t)), testLogger(), Observers{
 		OnError: func(operation string) {
 			observedMu.Lock()
 			observed = append(observed, operation)
@@ -454,7 +466,7 @@ func TestRecorderConcurrentStartCloseReportsStartFailureOnce(t *testing.T) {
 // TestStopKillsStuckProcess verifies Stop kills ffmpeg when it does not exit
 // within the recorder's grace period.
 func TestStopKillsStuckProcess(t *testing.T) {
-	r := New(testConfig(t.TempDir()), testLogger())
+	r := New(testConfig(privateTempDir(t)), testLogger())
 	r.stopGracePeriod = 25 * time.Millisecond
 	r.killWait = time.Second
 	exec := &fakeExec{}

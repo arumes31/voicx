@@ -98,6 +98,8 @@ func samePath(a, b string) bool {
 }
 
 func readBaseVersion(root string) (string, error) {
+	// #nosec G304 -- root is the explicitly selected repository root and the
+	// filename is fixed rather than derived from repository contents.
 	raw, err := os.ReadFile(filepath.Join(root, "VERSION"))
 	if err != nil {
 		return "", fmt.Errorf("reading VERSION: %w", err)
@@ -119,6 +121,8 @@ func (r gitRunner) run(args ...string) ([]byte, error) {
 	defer cancel()
 
 	commandArgs := append([]string{"-C", r.root, "--no-optional-locks"}, args...)
+	// #nosec G204 -- the executable is fixed and arguments are passed directly
+	// to git without a shell; callers select only internal version queries.
 	command := exec.CommandContext(ctx, "git", commandArgs...)
 	command.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
 	output, err := command.Output()
@@ -266,6 +270,7 @@ func hashPath(hash io.Writer, root, name string) error {
 		_, _ = io.WriteString(hash, "\x00")
 		return nil
 	}
+	// #nosec G304 -- cleanName was proven relative to root immediately above.
 	file, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("opening %q: %w", name, err)

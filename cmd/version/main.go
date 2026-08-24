@@ -258,6 +258,7 @@ func readWailsVersion(path string) (string, error) {
 }
 
 func decodeJSON(path string, destination any) error {
+	// #nosec G304 -- callers provide paths from the fixed version-manifest set.
 	file, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("opening %s: %w", path, err)
@@ -277,6 +278,7 @@ func decodeJSON(path string, destination any) error {
 }
 
 func readLocalModuleVersion(path string) (string, error) {
+	// #nosec G304 -- path is the fixed client/go.mod entry in the manifest.
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("reading %s: %w", path, err)

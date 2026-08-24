@@ -495,7 +495,7 @@ func (s *TCPServer) Start(ctx context.Context) error {
 	go func() {
 		select {
 		case <-ctx.Done():
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout())
+			shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.shutdownTimeout())
 			_ = s.Shutdown(shutdownCtx)
 			cancel()
 		case <-s.stopCh:

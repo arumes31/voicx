@@ -1,6 +1,6 @@
 module voicx/client
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/getlantern/systray v1.2.2
@@ -57,7 +57,7 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
-	golang.org/x/text v0.40.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
 )
 
 replace voicx => ../

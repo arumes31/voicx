@@ -290,6 +290,7 @@ func executableFingerprint() string {
 	if err != nil {
 		return ""
 	}
+	// #nosec G304 -- path comes from os.Executable, not external input.
 	file, err := os.Open(path)
 	if err != nil {
 		return ""

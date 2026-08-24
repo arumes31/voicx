@@ -14,6 +14,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -891,6 +892,7 @@ const (
 type ftEndpoint struct {
 	addr        string
 	fingerprint string
+	certDER     []byte
 	tls         bool
 	epoch       uint64
 }
@@ -910,6 +912,7 @@ func (m *connManager) ftTarget(init netproto.FileTransferInitResponse) (ftEndpoi
 	conn := m.conn
 	accepting := m.acceptingTransfers
 	control := m.fingerprint
+	controlCertDER := bytes.Clone(m.peerCertificateDER)
 	epoch := m.transferEpoch
 	m.mu.Unlock()
 	if conn == nil || !accepting {
@@ -936,7 +939,16 @@ func (m *connManager) ftTarget(init netproto.FileTransferInitResponse) (ftEndpoi
 	if control != "" && !secureEqualFold(fingerprint, control) {
 		return ftEndpoint{}, errors.New("file transfer certificate does not match the server — refusing the transfer")
 	}
-	return ftEndpoint{addr: addr, fingerprint: fingerprint, tls: true, epoch: epoch}, nil
+	if len(controlCertDER) == 0 {
+		return ftEndpoint{}, errors.New("file transfer TLS certificate is unavailable — refusing the transfer")
+	}
+	return ftEndpoint{
+		addr:        addr,
+		fingerprint: fingerprint,
+		certDER:     controlCertDER,
+		tls:         true,
+		epoch:       epoch,
+	}, nil
 }
 
 // ftTarget resolves a transfer target for the manager active at call start.
@@ -1337,16 +1349,54 @@ func ftDial(ep ftEndpoint) (net.Conn, error) {
 	if ep.fingerprint == "" {
 		return nil, errors.New("file transfer TLS fingerprint is missing")
 	}
+	tlsConfig, err := pinnedTLSConfig(ep.certDER, ep.fingerprint)
+	if err != nil {
+		return nil, err
+	}
 	dialer := &tls.Dialer{
 		NetDialer: &net.Dialer{Timeout: 15 * time.Second},
-		Config: &tls.Config{
-			// #nosec G402 -- VerifyConnection enforces the established control-channel pin on every handshake.
-			InsecureSkipVerify: true,
-			MinVersion:         tls.VersionTLS13,
-			VerifyConnection:   pinFingerprint(ep.fingerprint),
-		},
+		Config:    tlsConfig,
 	}
 	return dialer.DialContext(context.Background(), "tcp", ep.addr)
+}
+
+// pinnedTLSConfig turns the exact certificate authenticated by the control
+// channel into a private trust store for the data port. Standard certificate
+// verification therefore remains enabled, while VerifyConnection keeps the
+// fingerprint pin explicit as a defense-in-depth check.
+func pinnedTLSConfig(certDER []byte, fingerprint string) (*tls.Config, error) {
+	if fingerprint == "" {
+		return nil, errors.New("file transfer TLS fingerprint is missing")
+	}
+	if len(certDER) == 0 {
+		return nil, errors.New("file transfer TLS certificate is missing")
+	}
+	leaf, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return nil, fmt.Errorf("parsing file transfer TLS certificate: %w", err)
+	}
+	if got := tlscert.FingerprintDER(leaf.Raw); !secureEqualFold(got, fingerprint) {
+		return nil, fmt.Errorf("file transfer certificate mismatch (%s, expected %s)", got, fingerprint)
+	}
+
+	serverName := ""
+	if len(leaf.DNSNames) > 0 {
+		serverName = leaf.DNSNames[0]
+	} else if len(leaf.IPAddresses) > 0 {
+		serverName = leaf.IPAddresses[0].String()
+	}
+	if serverName == "" {
+		return nil, errors.New("file transfer TLS certificate has no DNS or IP subject alternative name")
+	}
+
+	roots := x509.NewCertPool()
+	roots.AddCert(leaf)
+	return &tls.Config{
+		MinVersion:       tls.VersionTLS13,
+		RootCAs:          roots,
+		ServerName:       serverName,
+		VerifyConnection: pinFingerprint(fingerprint),
+	}, nil
 }
 
 // transferDial is injectable for deterministic disconnect-between-endpoint-

@@ -99,6 +99,7 @@ type connManager struct {
 	// clock that is too far outside it without weakening TOFU verification.
 	tlsUsed             bool
 	fingerprint         string
+	peerCertificateDER  []byte
 	newServer           bool
 	certNotBefore       time.Time
 	certNotAfter        time.Time
@@ -189,6 +190,7 @@ func (m *connManager) dialTransport(addr string) (net.Conn, error) {
 	// transport available to diagnostics.
 	m.tlsUsed = false
 	m.fingerprint = ""
+	m.peerCertificateDER = nil
 	m.newServer = false
 	m.certNotBefore = time.Time{}
 	m.certNotAfter = time.Time{}
@@ -203,6 +205,7 @@ func (m *connManager) dialTransport(addr string) (net.Conn, error) {
 		}
 	}
 	var fingerprint string
+	var peerCertificateDER []byte
 	var firstSeen bool
 	var certNotBefore time.Time
 	var certNotAfter time.Time
@@ -216,6 +219,7 @@ func (m *connManager) dialTransport(addr string) (net.Conn, error) {
 			}
 			leaf := state.PeerCertificates[0]
 			fingerprint = tlscert.FingerprintDER(leaf.Raw)
+			peerCertificateDER = append(peerCertificateDER[:0], leaf.Raw...)
 			certNotBefore = leaf.NotBefore
 			certNotAfter = leaf.NotAfter
 			if ks == nil {
@@ -251,6 +255,7 @@ func (m *connManager) dialTransport(addr string) (net.Conn, error) {
 		m.mu.Lock()
 		m.tlsUsed = true
 		m.fingerprint = fingerprint
+		m.peerCertificateDER = append([]byte(nil), peerCertificateDER...)
 		m.newServer = firstSeen
 		m.certNotBefore = certNotBefore
 		m.certNotAfter = certNotAfter
@@ -287,6 +292,7 @@ func (m *connManager) dialTransport(addr string) (net.Conn, error) {
 	m.mu.Lock()
 	m.tlsUsed = false
 	m.fingerprint = ""
+	m.peerCertificateDER = nil
 	m.newServer = false
 	m.certNotBefore = time.Time{}
 	m.certNotAfter = time.Time{}
@@ -505,6 +511,7 @@ func (m *connManager) detachLocked() (net.Conn, []chan requestResult, []net.Conn
 	m.motd = ""
 	m.tlsUsed = false
 	m.fingerprint = ""
+	m.peerCertificateDER = nil
 	m.newServer = false
 	m.certNotBefore = time.Time{}
 	m.certNotAfter = time.Time{}

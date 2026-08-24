@@ -128,9 +128,11 @@ func VerifyPassword(password, encodedHash string) error {
 }
 
 func makeDummyPasswordHash() string {
-	const password = "voicx-dummy-password"
+	// #nosec G101 -- this public fixed input is deliberately not a credential;
+	// it equalizes the missing-user password-verification path.
+	const dummyInput = "voicx-dummy-password"
 	salt := []byte("voicx-dummy-salt")
-	hash := argon2.IDKey([]byte(password), salt, argonTime, argonMemory, argonThreads, argonKeyLen)
+	hash := argon2.IDKey([]byte(dummyInput), salt, argonTime, argonMemory, argonThreads, argonKeyLen)
 	return encodeHash(salt, hash)
 }
 
