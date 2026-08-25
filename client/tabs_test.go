@@ -91,7 +91,7 @@ func TestTabOrderAndActiveCloseNeighborAreDeterministic(t *testing.T) {
 func TestIntentionalDisconnectEventPrecedesReplacementReplay(t *testing.T) {
 	a := newTabApp(t)
 	activeID, active := a.newTab()
-	_, background := a.newTab()
+	a.newTab()
 	a.activate(activeID)
 
 	client, peer := net.Pipe()
@@ -469,7 +469,7 @@ func TestTabReplayPublishesCompletionAfterJournal(t *testing.T) {
 			done = i
 		}
 	}
-	if reset < 0 || journal < 0 || done < 0 || !(reset < journal && journal < done) {
+	if reset < 0 || journal < 0 || done < 0 || reset >= journal || journal >= done {
 		t.Fatalf("replay order = %#v, want reset < journal < tab_replay_done", events)
 	}
 }

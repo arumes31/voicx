@@ -935,7 +935,7 @@ test("removes cascaded deleted channels and displaces every cached member safely
     await expect(page.locator("#voice-status")).toHaveText("voice off");
 });
 
-test("starts voice and plays the local cue when joining or switching channels", async ({ page }) => {
+test("starts voice, plays the MP3 join cue, and switches channels", async ({ page }) => {
     await page.evaluate(() => {
         window.__getUserMediaCalls = 0;
         window.__playedMedia = [];
@@ -980,7 +980,10 @@ test("starts voice and plays the local cue when joining or switching channels", 
         const moved = JSON.stringify({ type: "user_moved", data: { client_id: "client-a", channel_id: 43 } });
         for (const cb of window.__events.event || []) cb(moved);
     });
-    await expect.poll(() => page.evaluate(() => window.__playedMedia.length)).toBe(firstCueCount + 1);
+    // The bundled media cue belongs to the initial join; a channel switch has
+    // its own synthesized motif and must not replay the MP3.
+    await expect.poll(() => page.evaluate(() => window.__voicx.state.myChannelID)).toBe(43);
+    await expect.poll(() => page.evaluate(() => window.__playedMedia.length)).toBe(firstCueCount);
     await page.evaluate(() => {
         const moved = JSON.stringify({ type: "user_moved", data: { client_id: "client-a", channel_id: 0 } });
         for (const cb of window.__events.event || []) cb(moved);
@@ -1292,6 +1295,7 @@ test("contains disconnect and ICE-candidate rejections and reports ICE exhaustio
         window.__unhandled = [];
         window.addEventListener("unhandledrejection", (event) => window.__unhandled.push(String(event.reason)));
         window.__voicx.state.settings.notify_connection = true;
+        document.getElementById("conn-pill").classList.add("up");
         window.__disconnectReject = true;
         await window.__voicx.disconnect();
 
