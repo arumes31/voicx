@@ -643,16 +643,52 @@ func TestActiveIdentityIsGoOwned(t *testing.T) {
 }
 
 // TestEventSoundsCoverMatrix pins the sound presets against the notification
-// matrix rows (385): a matrix event with no sound entry is how the two lists
-// drifted apart before.
+// matrix rows and action cues: a missing default turns a new control silent.
 func TestEventSoundsCoverMatrix(t *testing.T) {
 	sounds := DefaultSettings().EventSounds
 	for _, event := range []string{
-		"mention", "keyword", "dm", "whisper", "poke", "join_leave",
+		"connection_connected", "connection_reconnected", "connection_disconnected",
+		"connection_lost", "connection_reconnecting", "connection_failed", "server_error",
+		"own_channel_join", "own_channel_switch", "own_channel_leave",
+		"user_join", "user_leave", "user_move_in", "user_move_out",
+		"mic_on", "mic_off", "deafen_on", "deafen_off", "ptt_on", "ptt_off",
+		"mention", "keyword", "dm", "channel_message", "whisper", "poke", "join_leave",
 		"buddy_online", "kick", "announcement", "channel_watch",
 	} {
 		if !sounds[event] {
-			t.Errorf("notification matrix event %q has no default event sound", event)
+			t.Errorf("sound event %q has no default event sound", event)
 		}
+	}
+}
+
+func TestMigrateSettingsSplitsLegacyEventSounds(t *testing.T) {
+	legacy := DefaultSettings()
+	legacy.SettingsVersion = 6
+	legacy.EventSounds["join"] = false
+	legacy.EventSounds["leave"] = false
+	legacy.EventSounds["join_leave"] = false
+	legacy.EventSounds["mic_on"] = false
+	legacy.EventSounds["mic_off"] = false
+
+	got := migrateSettings(legacy)
+	for _, event := range []string{
+		"own_channel_join", "own_channel_switch", "own_channel_leave",
+		"user_join", "user_leave", "user_move_in", "user_move_out",
+	} {
+		if got.EventSounds[event] {
+			t.Errorf("legacy disabled event did not carry to %q", event)
+		}
+	}
+	if got.EventSounds["join"] || got.EventSounds["leave"] || got.EventSounds["join_leave"] {
+		t.Fatal("legacy sound keys were not retained")
+	}
+
+	current := DefaultSettings()
+	current.EventSounds["join"] = false
+	current.EventSounds["join_leave"] = false
+	current.EventSounds["own_channel_join"] = true
+	current.EventSounds["user_move_out"] = true
+	if got := migrateSettings(current); !got.EventSounds["own_channel_join"] || !got.EventSounds["user_move_out"] {
+		t.Fatalf("version-7 explicit split choices were overwritten: %+v", got.EventSounds)
 	}
 }

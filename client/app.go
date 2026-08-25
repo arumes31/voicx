@@ -302,7 +302,7 @@ func (a *App) Disconnect() {
 	activeID := a.activeID
 	a.tabsMu.Unlock()
 	if activeID != "" {
-		a.CloseTab(activeID)
+		a.closeTab(activeID, true)
 	}
 }
 

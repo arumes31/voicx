@@ -59,9 +59,16 @@ test.beforeEach(async ({ page }) => {
                         };
                     }
                     if (method === "ConnectGuestBookmarkTabWithID") {
+                        if (typeof window.__guestConnectHandler === "function") {
+                            return await window.__guestConnectHandler(...args);
+                        }
                         return { tab_id: window.__guestConnectTabID || "", error: "" };
                     }
                     if (method === "ListTabs") return structuredClone(window.__tabs);
+                    if (method === "Connected") {
+                        if (window.__connectedGate) await window.__connectedGate;
+                        return !!window.__connected;
+                    }
                     if (method === "ClientID") {
                         if (window.__clientIDGate) await window.__clientIDGate;
                         return window.__activeClient || "client-a";
@@ -76,8 +83,17 @@ test.beforeEach(async ({ page }) => {
                         return window.__clientVersion || "test";
                     }
                     if (method === "Disconnect") {
+                        if (typeof window.__disconnectHandler === "function") {
+                            return await window.__disconnectHandler(...args);
+                        }
                         if (window.__disconnectReject) throw new Error("disconnect unavailable");
                         return "";
+                    }
+                    if (method === "CloseTab" && typeof window.__closeTabHandler === "function") {
+                        return await window.__closeTabHandler(...args);
+                    }
+                    if (method === "DisconnectTab" && typeof window.__disconnectTabHandler === "function") {
+                        return await window.__disconnectTabHandler(...args);
                     }
                     if (method === "SendICECandidate") {
                         if (window.__sendICECandidateReject) throw new Error("signal closed");
@@ -2815,4 +2831,344 @@ test("debounces keyboard pane persistence and refreshes separator values", async
     await expect.poll(() => handle.evaluate((element) =>
         Number(element.getAttribute("aria-valuenow")) - Math.round(element.parentElement.getBoundingClientRect().width),
     )).toBe(0);
+});
+
+test("uses grouped, distinct action sounds without replaying historical tab activity", async ({ page }) => {
+    const result = await page.evaluate(async () => {
+        const tones = [];
+        const media = [];
+        class FakeAudioContext {
+            get currentTime() { return 0; }
+            get destination() { return {}; }
+            createGain() {
+                return {
+                    gain: { setValueAtTime() {}, exponentialRampToValueAtTime() {} },
+                    connect(destination) { return destination; },
+                };
+            }
+            createOscillator() {
+                return {
+                    type: "sine",
+                    frequency: { value: 0 },
+                    connect(node) { return node; },
+                    start() { tones.push(this.frequency.value); },
+                    stop() {},
+                };
+            }
+        }
+        window.AudioContext = FakeAudioContext;
+        window.Audio = class {
+            addEventListener() {}
+            play() { media.push("channel_join"); return Promise.resolve(); }
+        };
+        const state = window.__voicx.state;
+        state.audioCtx = null;
+        state.settings = {
+            ...state.settings,
+            activation_mode: "ptt",
+            ptt_release_delay_ms: 0,
+            event_sounds: {},
+            notify_matrix: {},
+            custom_sounds: {},
+        };
+        state.myClientID = "client-a";
+        state.myChannelID = 1;
+        state.clients = [
+            { client_id: "client-a", unique_id: "user-a", nickname: "Alice", channel_id: 1 },
+            { client_id: "client-b", unique_id: "user-b", nickname: "Bob", channel_id: 2 },
+        ];
+        const emit = (name, payload) => {
+            for (const callback of window.__events[name] || []) callback(payload);
+        };
+        const move = (channelID) => emit("event", JSON.stringify({
+            type: "user_moved", data: { client_id: "client-b", channel_id: channelID },
+        }));
+        const collect = (fn) => {
+            tones.length = 0;
+            fn();
+            return [...tones];
+        };
+
+        const moveIn = collect(() => move(1));
+        const moveOut = collect(() => move(2));
+        state.settings.custom_sounds.join_leave = { freq: 432, duration_ms: 100 };
+        state.settings.notify_matrix.join_leave = { toast: true, sound: false, flash: false, native: false };
+        const matrixOff = collect(() => move(1));
+        state.settings.notify_matrix.join_leave.sound = true;
+        const custom = collect(() => move(2));
+        state.replayingTabID = "tab-a";
+        const replay = collect(() => move(1));
+        emit("tab_replay_done", "tab-a");
+        state.settings.event_sounds.user_move_out = false;
+        const disabledSpecific = collect(() => move(2));
+        state.settings.event_sounds.user_move_out = true;
+        delete state.settings.custom_sounds.join_leave;
+        const afterReplay = collect(() => move(1));
+        state.myUniqueID = "user-a";
+        state.lastConnect = { addr: "sound.example:12333" };
+        state.settings.chat_notification_level = "all";
+        state.settings.keywords = { "sound.example:12333": ["urgent"] };
+        const chat = (id, text) => emit("event", JSON.stringify({
+            type: "chat", data: {
+                id, from: "Bob", from_unique_id: "user-b", text, channel_id: 1,
+            },
+        }));
+        const keywordChat = collect(() => chat(901, "urgent request"));
+        const roleChat = collect(() => chat(902, "@admin urgent request"));
+        const ordinaryChat = collect(() => chat(903, "ordinary request"));
+        state.myChannelID = 0;
+        state.clients = [{ client_id: "client-a", unique_id: "user-a", nickname: "Alice", channel_id: 7 }];
+        const mediaBeforeOwnJoin = media.length;
+        const ownJoin = collect(() => window.__voicx.syncOwnChannel());
+        const ownJoinMedia = media.length - mediaBeforeOwnJoin;
+        state.clients[0].channel_id = 8;
+        const ownSwitch = collect(() => window.__voicx.syncOwnChannel());
+        state.myChannelID = 9;
+        state.clients = [{ client_id: "client-a", unique_id: "user-a", nickname: "Alice", channel_id: 9 }];
+        state.channels = [{ ChannelID: 9, ParentID: 0, Name: "Deleted" }];
+        const channelDeletion = collect(() => {
+            emit("event", JSON.stringify({ type: "channel_deleted", data: { channel_id: 9 } }));
+            emit("event", JSON.stringify({ type: "user_moved", data: { client_id: "client-a", channel_id: 0 } }));
+        });
+        state.settings.activation_mode = "vad";
+        const vadPTT = collect(() => window.__voicx.setPTT(true));
+        window.__voicx.setPTT(false);
+        state.settings.activation_mode = "ptt";
+        const ptt = collect(() => window.__voicx.setPTT(true));
+        window.__voicx.setPTT(false);
+        const deafen = collect(() => window.__voicx.setDeafened(true));
+        state.settings.bookmarks = [{ name: "Guest", addr: "guest.example:12333", nickname: "Guest" }];
+        window.__tabs = [{
+            id: "guest-tab", addr: "guest.example:12333", nickname: "Guest",
+            active: true, connected: true, unread: 0, mentions: 0,
+        }];
+        window.__guestConnectHandler = async () => {
+            // Emulate Go's connect/activate ordering: reset, replayed state,
+            // then replay completion, all before the bridge resolves.
+            emit("tab_reset", "guest-tab");
+            emit("snapshot", JSON.stringify({ root_channels: [{
+                ChannelID: 15, ParentID: 0, Name: "Guest channel", clients: [{
+                    client_id: "client-a", unique_id: "user-a", nickname: "Alice", channel_id: 15,
+                }], children: [],
+            }] }));
+            // Let ClientID resolve and record the replayed channel while cues
+            // remain suppressed, then finish the replay.
+            await Promise.resolve();
+            await Promise.resolve();
+            emit("tab_replay_done", "guest-tab");
+            return { tab_id: "guest-tab", error: "" };
+        };
+        const mediaBeforeGuest = media.length;
+        tones.length = 0;
+        await window.__voicxTabs.quickConnectLast();
+        const guestConnect = [...tones];
+        const guestInitialJoinMedia = media.length - mediaBeforeGuest;
+        const guestInitialCueCleared = state.pendingInitialChannelCueTabID === "";
+
+        // Exercise the opposite race too: replay completes before ClientID.
+        // syncOwnChannel must then play the pending initial join when identity
+        // arrives, without replay history getting its own cue.
+        let releaseReplayFirstIdentity;
+        window.__clientIDGate = new Promise((resolve) => { releaseReplayFirstIdentity = resolve; });
+        window.__tabs = [{
+            id: "replay-first-tab", addr: "replay.example:12333", nickname: "Replay",
+            active: true, connected: true, unread: 0, mentions: 0,
+        }];
+        emit("tab_reset", "replay-first-tab");
+        emit("snapshot", JSON.stringify({ root_channels: [{
+            ChannelID: 16, ParentID: 0, Name: "Replay channel", clients: [{
+                client_id: "client-a", unique_id: "user-a", nickname: "Alice", channel_id: 16,
+            }], children: [],
+        }] }));
+        emit("tab_replay_done", "replay-first-tab");
+        const mediaBeforeReplayFirstIdentity = media.length;
+        releaseReplayFirstIdentity();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        window.__clientIDGate = null;
+        const replayFirstIdentityMedia = media.length - mediaBeforeReplayFirstIdentity;
+        const replayFirstCueCleared = state.pendingInitialChannelCueTabID === "";
+
+        // A channel-0 replay leaves its initial marker armed. Its first live
+        // self-move must consume that marker, so the following equality sync
+        // cannot duplicate the MP3 cue.
+        window.__tabs = [{
+            id: "live-move-tab", addr: "live.example:12333", nickname: "Live",
+            active: true, connected: true, unread: 0, mentions: 0,
+        }];
+        emit("tab_reset", "live-move-tab");
+        emit("snapshot", JSON.stringify({ root_channels: [{
+            ChannelID: 18, ParentID: 0, Name: "No channel", clients: [{
+                client_id: "client-a", unique_id: "user-a", nickname: "Alice", channel_id: 0,
+            }], children: [],
+        }] }));
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        emit("tab_replay_done", "live-move-tab");
+        const mediaBeforeLiveMove = media.length;
+        emit("event", JSON.stringify({
+            type: "user_moved", data: { client_id: "client-a", channel_id: 17 },
+        }));
+        window.__voicx.syncOwnChannel();
+        const liveMoveInitialMedia = media.length - mediaBeforeLiveMove;
+        const liveMoveCueCleared = state.pendingInitialChannelCueTabID === "";
+        window.__voicx.openSettings("notifications");
+        const groups = [...document.querySelectorAll("#settings-content .set-subhead")].map((element) => element.textContent);
+        return { moveIn, moveOut, matrixOff, custom, replay, disabledSpecific, afterReplay,
+            keywordChat, roleChat, ordinaryChat,
+            ownJoin, ownJoinMedia, ownSwitch, channelDeletion, vadPTT, ptt, deafen, guestConnect,
+            guestInitialJoinMedia, guestInitialCueCleared, replayFirstIdentityMedia,
+            replayFirstCueCleared, liveMoveInitialMedia, liveMoveCueCleared, groups };
+    });
+
+    expect(result.moveIn).toEqual([494, 659, 784]);
+    expect(result.moveOut).toEqual([784, 659, 494]);
+    expect(result.matrixOff).toEqual([]);
+    expect(result.custom).toEqual([432]);
+    expect(result.replay).toEqual([]);
+    expect(result.disabledSpecific).toEqual([]);
+    expect(result.afterReplay).toEqual([494, 659, 784]);
+    expect(result.keywordChat).toEqual([659, 784, 988]);
+    expect(result.roleChat).toEqual([784, 1047]);
+    expect(result.ordinaryChat).toEqual([587, 659]);
+    expect(result.ownJoin).toEqual([]);
+    expect(result.ownJoinMedia).toBe(1);
+    expect(result.ownSwitch).toEqual([659, 784, 988]);
+    expect(result.channelDeletion).toEqual([587, 440, 349]);
+    expect(result.vadPTT).toEqual([]);
+    expect(result.ptt).toEqual([740, 880]);
+    expect(result.deafen).toEqual([392, 294, 196]);
+    expect(result.guestConnect).toEqual([523, 659, 784]);
+    expect(result.guestInitialJoinMedia).toBe(1);
+    expect(result.guestInitialCueCleared).toBe(true);
+    expect(result.replayFirstIdentityMedia).toBe(1);
+    expect(result.replayFirstCueCleared).toBe(true);
+    expect(result.liveMoveInitialMedia).toBe(1);
+    expect(result.liveMoveCueCleared).toBe(true);
+    expect(result.groups).toEqual(expect.arrayContaining([
+        "Connection", "Your channel", "Other users", "Voice controls", "Notifications",
+    ]));
+    await expect(page.getByText("Channel message", { exact: true })).toBeVisible();
+});
+
+test("scopes connection failures and active-tab close sounds", async ({ page }) => {
+    const result = await page.evaluate(async () => {
+        const tones = [];
+        class FakeAudioContext {
+            get currentTime() { return 0; }
+            get destination() { return {}; }
+            createGain() {
+                return {
+                    gain: { setValueAtTime() {}, exponentialRampToValueAtTime() {} },
+                    connect(destination) { return destination; },
+                };
+            }
+            createOscillator() {
+                return {
+                    type: "sine",
+                    frequency: { value: 0 },
+                    connect(node) { return node; },
+                    start() { tones.push(this.frequency.value); },
+                    stop() {},
+                };
+            }
+        }
+        window.AudioContext = FakeAudioContext;
+        const state = window.__voicx.state;
+        state.audioCtx = null;
+        state.settings = { ...state.settings, event_sounds: {}, notify_matrix: {} };
+        const emit = (name, payload) => {
+            for (const callback of window.__events[name] || []) callback(payload);
+        };
+        window.__tabs = [
+            { id: "tab-a", addr: "a.example:12333", nickname: "Alice", active: true, connected: true, unread: 0, mentions: 0 },
+            { id: "tab-b", addr: "b.example:12333", nickname: "Bob", active: false, connected: true, unread: 0, mentions: 0 },
+        ];
+        emit("tab_reset", "tab-a");
+        emit("tab_replay_done", "tab-a");
+        document.getElementById("login-addr").value = "slow.example:12333";
+        document.getElementById("login-nick").value = "Alice";
+        window.__connectBookmarkGate = new Promise((resolve) => { window.__releaseSlowConnect = resolve; });
+        const slowLogin = window.__voicx.connectFromLogin();
+        await Promise.resolve();
+        emit("tab_reset", "tab-b");
+        emit("tab_replay_done", "tab-b");
+        window.__connectBookmarkResult = "server unavailable";
+        window.__releaseSlowConnect();
+        await slowLogin;
+        const staleFailure = [...tones];
+
+        tones.length = 0;
+        window.__connectBookmarkGate = null;
+        window.__connectBookmarkResult = "still unavailable";
+        await window.__voicx.connectFromLogin();
+        const currentFailure = [...tones];
+        window.__connectBookmarkResult = "";
+
+        tones.length = 0;
+        window.__disconnectHandler = async () => {
+            // Match App.Disconnect -> closeTab(true): the Go-owned edge is
+            // emitted before replacement tab replay and bridge resolution.
+            emit("intentional_disconnect", "tab-b");
+            window.__tabs = [
+                { id: "tab-a", addr: "a.example:12333", nickname: "Alice", active: true, connected: true, unread: 0, mentions: 0 },
+                { id: "tab-b", addr: "b.example:12333", nickname: "Bob", active: false, connected: true, unread: 0, mentions: 0 },
+            ];
+            emit("tab_reset", "tab-a");
+            emit("tab_replay_done", "tab-a");
+            return "";
+        };
+        emit("tray_disconnect");
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const menuDisconnect = [...tones];
+
+        emit("tab_update", structuredClone(window.__tabs));
+        tones.length = 0;
+        document.querySelector('.srv-tab[data-tab-id="tab-b"] .srv-tab-x').click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const backgroundClose = [...tones];
+
+        window.__disconnectTabHandler = async (tabID) => {
+            if (tabID === "tab-a") {
+                emit("intentional_disconnect", "tab-a");
+                window.__tabs = [{
+                    id: "tab-b", addr: "b.example:12333", nickname: "Bob",
+                    active: true, connected: true, unread: 0, mentions: 0,
+                }];
+                emit("tab_reset", "tab-b");
+                emit("tab_replay_done", "tab-b");
+            }
+            return "";
+        };
+        tones.length = 0;
+        document.querySelector('.srv-tab[data-tab-id="tab-a"] .srv-tab-x').click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const activeClose = [...tones];
+
+        window.__tabs = [{
+            id: "tab-b", addr: "b.example:12333", nickname: "Bob",
+            active: true, connected: false, unread: 0, mentions: 0,
+        }];
+        emit("tab_update", structuredClone(window.__tabs));
+        tones.length = 0;
+        document.querySelector('.srv-tab[data-tab-id="tab-b"] .srv-tab-x').click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const activeOfflineClose = [...tones];
+
+        tones.length = 0;
+        window.__disconnectHandler = null;
+        emit("tray_disconnect");
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const offlineMenuDisconnect = [...tones];
+        return {
+            staleFailure, currentFailure, menuDisconnect, backgroundClose, activeClose,
+            activeOfflineClose, offlineMenuDisconnect,
+        };
+    });
+
+    expect(result.staleFailure).toEqual([]);
+    expect(result.currentFailure).toEqual([247, 196, 165]);
+    expect(result.menuDisconnect).toEqual([659, 523, 392]);
+    expect(result.backgroundClose).toEqual([]);
+    expect(result.activeClose).toEqual([659, 523, 392]);
+    expect(result.activeOfflineClose).toEqual([]);
+    expect(result.offlineMenuDisconnect).toEqual([]);
 });

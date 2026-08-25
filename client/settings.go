@@ -105,7 +105,7 @@ type HotkeyProfile struct {
 // serialized default changes, and add the repair to migrateSettings:
 // loading merges the file ONTO the defaults, so a field an older client always
 // wrote wins over the new default unless it is explicitly repaired.
-const settingsVersion = 6
+const settingsVersion = 7
 
 // Settings holds all user preferences.
 type Settings struct {
@@ -271,13 +271,22 @@ func DefaultSettings() Settings {
 		WarnEmptyChannel:  true,
 		SoundPack:         "soft",
 		SoundVolume:       100,
-		// (385) one entry per notification-matrix event plus the local
-		// mic/voice ones, so every matrix row has a togglable sound.
+		// (385) one entry per notification-matrix event plus the connection,
+		// channel, and voice-action cues. Legacy join/leave entries stay in the
+		// file so version-7 migration can preserve earlier choices.
 		EventSounds: map[string]bool{
-			"join": true, "leave": true, "join_leave": true, "mention": true,
-			"keyword": true, "dm": true, "whisper": true, "poke": true,
-			"buddy_online": true, "kick": true, "announcement": true,
-			"channel_watch": true, "mic_on": true, "mic_off": true,
+			"join": true, "leave": true, // legacy pre-v7 split sources
+			"connection_connected": true, "connection_reconnected": true,
+			"connection_disconnected": true, "connection_lost": true,
+			"connection_reconnecting": true, "connection_failed": true,
+			"server_error":     true,
+			"own_channel_join": true, "own_channel_switch": true, "own_channel_leave": true,
+			"user_join": true, "user_leave": true, "user_move_in": true, "user_move_out": true,
+			"mic_on": true, "mic_off": true, "deafen_on": true, "deafen_off": true,
+			"ptt_on": true, "ptt_off": true,
+			"mention": true, "keyword": true, "dm": true, "channel_message": true,
+			"whisper": true, "poke": true, "join_leave": true, "buddy_online": true,
+			"kick": true, "announcement": true, "channel_watch": true,
 		},
 		WhisperReplyHotkey: "Ctrl+R",
 		VoiceLimiter:       true,
@@ -382,8 +391,36 @@ func migrateSettings(s Settings) Settings {
 		// behavior. A current-version false remains an explicit opt-out.
 		s.ReconnectOnLoss = true
 	}
+	if s.SettingsVersion < 7 {
+		migrateEventSoundSplits(&s)
+	}
 	s.SettingsVersion = settingsVersion
 	return s
+}
+
+// migrateEventSoundSplits carries pre-v7 choices to their more precise
+// successors. loadSettingsAt unmarshals old JSON onto new defaults, so a
+// legacy false must deliberately overwrite each new default true. Current
+// version-7 settings are left entirely alone: their split choices are already
+// explicit.
+func migrateEventSoundSplits(s *Settings) {
+	if s.EventSounds == nil {
+		return
+	}
+	for _, split := range []struct {
+		legacy string
+		new    []string
+	}{
+		{legacy: "join", new: []string{"own_channel_join", "own_channel_switch"}},
+		{legacy: "leave", new: []string{"own_channel_leave"}},
+		{legacy: "join_leave", new: []string{"user_join", "user_leave", "user_move_in", "user_move_out"}},
+	} {
+		if enabled, ok := s.EventSounds[split.legacy]; ok {
+			for _, event := range split.new {
+				s.EventSounds[event] = enabled
+			}
+		}
+	}
 }
 
 // normalizeSettings clamps presentation-only preferences. Structural values

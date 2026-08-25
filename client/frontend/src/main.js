@@ -83,6 +83,8 @@ const state = {
     serverGeneration: 0, // invalidates async responses when the active server tab changes
     settings: null,
     activeTabID: "", // frontend-observed active tab; guards async finalizers against tab switches
+    replayingTabID: "", // journal replay is view restoration, not fresh activity
+    pendingInitialChannelCueTabID: "", // new tab's first own-channel cue waits for replay
     lastConnect: null,   // {addr, nick, pw, spw, bookmark} for reconnect-on-loss
     lastSuccessfulConnect: null, // in-memory only; keeps manual tray reconnect available after Disconnect
     tabConnects: new Map(), // (281) tab ID -> its own lastConnect record
@@ -269,6 +271,15 @@ async function connectFromLogin() {
     const nick = $("login-nick").value.trim();
     const pw = $("login-password").value;
     const spw = $("login-serverpw").value;
+    // A bridge call can outlive a tab switch. Only the tab/generation that
+    // initiated this login may announce its eventual failure.
+    const requestServerGeneration = state.serverGeneration;
+    const requestTabID = state.activeTabID;
+    const playCurrentConnectionFailure = () => {
+        if (requestServerGeneration === state.serverGeneration && requestTabID === state.activeTabID) {
+            playEvent("connection_failed");
+        }
+    };
     $("login-error").textContent = "";
     // (334) a nickname override replaces the login nickname, so addr+nickname
     // no longer identifies the bookmark this login came from: forward the name
@@ -281,9 +292,11 @@ async function connectFromLogin() {
             // (4a) TOFU fingerprint mismatch: prominent warning + explicit
             // trust action — never silently accepted.
             if (err.startsWith("tls fingerprint mismatch")) {
+                playCurrentConnectionFailure();
                 showFingerprintWarning(addr, err);
                 return;
             }
+            playCurrentConnectionFailure();
             $("login-error").textContent = err;
             return;
         }
@@ -337,10 +350,12 @@ async function connectFromLogin() {
         window.__voicxSocial.refreshNews(); // (313) server news pane
         startQualitySampler(); // (333) connection quality pill
         noteActivity(); // (308) auto-away timer starts at connect
+        playEvent("connection_connected");
         // (4a) surface the connection security as an info line.
         if (security) sysMsg("connected: " + security);
         warnCertificateClock(clockWarning, addr);
     } catch (e) {
+        playCurrentConnectionFailure();
         $("login-error").textContent = String(e);
     } finally {
         submit.disabled = false;
@@ -473,6 +488,8 @@ async function rememberTabConnect(c, expectedGeneration = null, tabID = "") {
 let reconnectCountdownTimer = null;
 let reconnectRequestPending = false;
 let reconnectGeneration = 0;
+let reconnectFailureSounded = false;
+let reconnectCueTimer = null;
 
 function autoReconnectEnabled() {
     // Missing settings and pre-setting-version profiles inherit the safer
@@ -488,6 +505,10 @@ function clearReconnectTimer() {
     if (reconnectCountdownTimer) {
         clearInterval(reconnectCountdownTimer);
         reconnectCountdownTimer = null;
+    }
+    if (reconnectCueTimer) {
+        clearTimeout(reconnectCueTimer);
+        reconnectCueTimer = null;
     }
 }
 
@@ -535,6 +556,7 @@ async function completeReconnect(c, generation, tabID) {
     window.__voicxSocial?.refreshNews?.();
     startQualitySampler();
     noteActivity();
+    playEvent("connection_reconnected");
     warnCertificateClock(clockWarning, c.addr);
     return generation === reconnectGeneration;
 }
@@ -576,8 +598,20 @@ async function attemptReconnect(c = state.lastConnect, { announceFailure = true 
     return completed;
 }
 
-function scheduleReconnect(target = state.lastConnect, generation = reconnectGeneration) {
+function scheduleReconnect(
+    target = state.lastConnect,
+    generation = reconnectGeneration,
+    sourceTabID = state.activeTabID,
+    sourceServerGeneration = state.serverGeneration,
+) {
+    const ownsSource = () => generation === reconnectGeneration
+        && sourceServerGeneration === state.serverGeneration
+        && sourceTabID === state.activeTabID;
     if (generation !== reconnectGeneration || !autoReconnectEnabled() || !target || state.reconnectAttempts >= 5) {
+        if (target && state.reconnectAttempts >= 5 && !reconnectFailureSounded && ownsSource()) {
+            reconnectFailureSounded = true;
+            playEvent("connection_failed");
+        }
         chatUI.cancelReconnectAnnouncementBatch();
         showLogin();
         return;
@@ -586,6 +620,17 @@ function scheduleReconnect(target = state.lastConnect, generation = reconnectGen
     // replace state.lastConnect while the five-second countdown is running.
     const reconnectTarget = { ...target };
 
+    if (state.reconnectAttempts === 0) {
+        reconnectFailureSounded = false;
+        // Let the loss contour complete before the recovery contour starts.
+        // The timer is cancelled by a manual disconnect or a newer connection.
+        reconnectCueTimer = setTimeout(() => {
+            reconnectCueTimer = null;
+            if (ownsSource() && state.lastConnect?.addr === reconnectTarget.addr) {
+                playEvent("connection_reconnecting");
+            }
+        }, 550);
+    }
     state.reconnectAttempts++;
     chatUI.beginReconnectAnnouncementBatch();
     sysMsg(`reconnecting in 5s (attempt ${state.reconnectAttempts}/5)…`);
@@ -606,7 +651,7 @@ function scheduleReconnect(target = state.lastConnect, generation = reconnectGen
         if (connected) return;
         if (generation !== reconnectGeneration) return;
         chatUI.cancelReconnectAnnouncementBatch();
-        scheduleReconnect(reconnectTarget, generation);
+        scheduleReconnect(reconnectTarget, generation, sourceTabID, sourceServerGeneration);
     }, 5000);
 }
 
@@ -646,6 +691,13 @@ window.runtime.EventsOn("tray_reconnect", () => { void reconnectLastServerNow();
 window.runtime.EventsOn("tray_disconnect", () => { void disconnect(); });
 
 async function disconnect() {
+    // Clear reconnect intent synchronously. CloseTab owns the actual
+    // intentional connection edge and publishes it before tab replacement.
+    const sourceServerGeneration = state.serverGeneration;
+    const sourceTabID = state.activeTabID;
+    const wasVisiblyConnected = $("conn-pill").classList.contains("up");
+    const ownsSource = () => sourceServerGeneration === state.serverGeneration
+        && sourceTabID === state.activeTabID;
     reconnectGeneration++;
     state.lastConnect = null; // intentional disconnect: no reconnect
     clearReconnectTimer();
@@ -656,12 +708,26 @@ async function disconnect() {
         // The local cancellation above is still intentional even when the
         // bridge is already gone. Surface one actionable connection warning
         // instead of leaking an unhandled tray-event rejection.
-        toast("disconnect failed", "warn", "conn");
+        if (wasVisiblyConnected && ownsSource()) {
+            toast("disconnect failed", "warn", "conn");
+            playEvent("connection_failed");
+        }
     }
 }
 
+// Go emits this before disconnecting an active connected tab and before a
+// replacement tab's reset/replay batch. It centralizes menu, tray and tab-X
+// teardown into one exactly-once user-facing connection edge.
+window.runtime.EventsOn("intentional_disconnect", (tabID) => {
+    if (String(tabID || "") !== state.activeTabID) return;
+    if (state.settings?.notify_connection !== false) toast("Disconnected", "info", "conn");
+    playEvent("connection_disconnected");
+});
+
 window.runtime.EventsOn("disconnected", () => {
-    if (state.settings?.notify_connection !== false) toast("Connection lost", "warn", "conn");
+    const unexpected = !!state.lastConnect;
+    if (unexpected && state.settings?.notify_connection !== false) toast("Connection lost", "warn", "conn");
+    if (unexpected) playEvent("connection_lost");
     sysMsg("disconnected from server");
     // (32/33) whisper state is per-connection: client IDs and the server-side
     // whisper list do not survive a reconnect.
@@ -686,6 +752,7 @@ window.runtime.EventsOn("disconnected", () => {
 window.runtime.EventsOn("servererror", (msg) => {
     const text = String(msg).replace(/^\d+:\s*/, "");
     toast(text || "The server rejected that action", "warn");
+    playEvent("server_error");
 });
 
 // (282) the Go side maintains settings of its own (recents on every connect),
@@ -827,6 +894,21 @@ function stopQualitySampler() {
 const lastKnownChannel = new Map();
 const LAST_CHANNEL_MAX = 200;
 
+function actionSoundsSuppressed() {
+    return !!state.replayingTabID;
+}
+
+// A tab switch replays the other tab's journal so the view can be rebuilt.
+// That history is not live join/leave activity and must never play cues.
+window.runtime.EventsOn("tab_replay_done", (tabID) => {
+    if (String(tabID || "") !== state.replayingTabID) return;
+    state.replayingTabID = "";
+    // Identity resolution may have won or lost the race with this marker.
+    // In either case, this resolves a new tab's first own-channel cue exactly
+    // once, while restored tabs have no pending cue to play.
+    syncOwnChannel({ audible: false });
+});
+
 window.runtime.EventsOn("snapshot", (json) => {
     const snap = parseRuntimeObject(json);
     if (!snap) return;
@@ -862,17 +944,38 @@ window.runtime.EventsOn("snapshot", (json) => {
 
 // syncOwnChannel makes channel ownership independent of whether the snapshot
 // / user_moved event or the active-tab ClientID lookup finishes first.
-function syncOwnChannel() {
+function syncOwnChannel({ audible = true } = {}) {
     if (!state.myClientID) return;
     const me = state.clients.find((c) => c.client_id === state.myClientID);
     if (!me) return;
     const channelID = Number(me.channel_id) || 0;
     if (state.myChannelID === channelID) {
+        // Identity can resolve while journal replay is still muted. In that
+        // ordering it has already recorded our initial channel, so replay_done
+        // must flush the pending new-tab join from this equality branch.
+        const initialCuePending = state.pendingInitialChannelCueTabID === state.activeTabID;
+        if (initialCuePending && channelID > 0 && !actionSoundsSuppressed()) {
+            playChannelJoin();
+            state.pendingInitialChannelCueTabID = "";
+        }
         ensureVoiceForChannel();
         return;
     }
+    const previousChannelID = state.myChannelID;
     state.myChannelID = channelID;
-    if (channelID > 0) playChannelJoin();
+    const initialCuePending = state.pendingInitialChannelCueTabID === state.activeTabID;
+    let playedCue = false;
+    if ((audible || initialCuePending) && !actionSoundsSuppressed()) {
+        if (channelID > 0) {
+            if (previousChannelID > 0) playEvent("own_channel_switch");
+            else playChannelJoin();
+            playedCue = true;
+        } else if (previousChannelID > 0) {
+            playEvent("own_channel_leave");
+            playedCue = true;
+        }
+    }
+    if (playedCue && initialCuePending) state.pendingInitialChannelCueTabID = "";
     expandMyBranch();
     applyChannelAudio();
     chatUI.onMyChannelChanged();
@@ -974,7 +1077,8 @@ window.runtime.EventsOn("event", (json) => {
                 if (joinedChannel === state.myChannelID && state.myChannelID !== 0) {
                     // (385) joins in my channel dispatch through the matrix.
                     window.__voicxNotify?.notify("join_leave", (d.nickname || "someone") + " joined your channel",
-                        { channelID: state.myChannelID, className: "joins", kind: "info" });
+                        { channelID: state.myChannelID, className: "joins", kind: "info",
+                            soundEvent: "user_join", noSound: actionSoundsSuppressed() });
                 }
             }
             break;
@@ -992,9 +1096,10 @@ window.runtime.EventsOn("event", (json) => {
                     }
                 }
                 chatUI.sysJoinLeave(was.nickname || was.unique_id || "someone", "left"); // (130/131)
-                if (was.channel_id === state.myChannelID && state.myChannelID !== 0) {
+                if (was.client_id !== state.myClientID && was.channel_id === state.myChannelID && state.myChannelID !== 0) {
                     window.__voicxNotify?.notify("join_leave", (was.nickname || "someone") + " left your channel",
-                        { channelID: state.myChannelID, className: "joins", kind: "info" });
+                        { channelID: state.myChannelID, className: "joins", kind: "info",
+                            soundEvent: "user_leave", noSound: actionSoundsSuppressed() });
                 }
             }
             videoTrackRemoved(d.client_id);
@@ -1003,20 +1108,46 @@ window.runtime.EventsOn("event", (json) => {
         }
         case "user_moved": {
             const c = state.clients.find((c) => c.client_id === d.client_id);
-            if (c) c.channel_id = d.channel_id;
+            const previousRemoteChannelID = Number(c?.channel_id) || 0;
+            const nextChannelID = Number(d.channel_id) || 0;
+            if (c) c.channel_id = nextChannelID;
             if (d.client_id === state.myClientID) {
                 const previousChannelID = state.myChannelID;
-                state.myChannelID = d.channel_id;
-                if (d.channel_id > 0 && d.channel_id !== previousChannelID) playChannelJoin();
+                state.myChannelID = nextChannelID;
+                let playedOwnCue = false;
+                if (!actionSoundsSuppressed()) {
+                    if (nextChannelID > 0 && nextChannelID !== previousChannelID) {
+                        if (previousChannelID > 0) playEvent("own_channel_switch");
+                        else playChannelJoin();
+                        playedOwnCue = true;
+                    } else if (nextChannelID === 0 && previousChannelID > 0) {
+                        playEvent("own_channel_leave");
+                        playedOwnCue = true;
+                    }
+                }
+                // A new tab can finish its replay in channel 0, then receive
+                // its first live self-move. That live cue fulfills the pending
+                // initial transition; leave no marker for a later equality
+                // sync to replay the same join.
+                if (playedOwnCue && state.pendingInitialChannelCueTabID === state.activeTabID) {
+                    state.pendingInitialChannelCueTabID = "";
+                }
                 expandMyBranch(); // (302)
                 applyChannelAudio();
                 chatUI.onMyChannelChanged(); // (103/111) load history + header for the new channel
                 window.__voicxFiles?.onChannelChanged?.(); // (256) file browser follows the channel
-                recordRecentChannel(d.channel_id); // (320) recent channels
+                recordRecentChannel(nextChannelID); // (320) recent channels
                 ensureVoiceForChannel();
-            } else if (d.channel_id === state.myChannelID && state.myChannelID !== 0 && c) {
-                window.__voicxNotify?.notify("join_leave", (c.nickname || "someone") + " joined your channel",
-                    { channelID: state.myChannelID, className: "joins", kind: "info" });
+            } else if (c && nextChannelID === state.myChannelID && state.myChannelID !== 0
+                && previousRemoteChannelID !== nextChannelID) {
+                window.__voicxNotify?.notify("join_leave", (c.nickname || "someone") + " moved into your channel",
+                    { channelID: state.myChannelID, className: "joins", kind: "info",
+                        soundEvent: "user_move_in", noSound: actionSoundsSuppressed() });
+            } else if (c && previousRemoteChannelID === state.myChannelID && state.myChannelID !== 0
+                && previousRemoteChannelID !== nextChannelID) {
+                window.__voicxNotify?.notify("join_leave", (c.nickname || "someone") + " moved out of your channel",
+                    { channelID: previousRemoteChannelID, className: "joins", kind: "info",
+                        soundEvent: "user_move_out", noSound: actionSoundsSuppressed() });
             }
             recomputeDucking();
             break;
@@ -1065,7 +1196,10 @@ window.runtime.EventsOn("event", (json) => {
                 state.collapsedChannels.delete(channelID);
                 state.expandedVirtual.delete(channelID);
             }
-            if (selfDisplaced) state.myChannelID = 0;
+            if (selfDisplaced) {
+                if (state.myChannelID > 0 && !actionSoundsSuppressed()) playEvent("own_channel_leave");
+                state.myChannelID = 0;
+            }
             chatUI.onChannelsDeleted([...deleted]);
             if (selfDisplaced) {
                 chatUI.onMyChannelChanged();
@@ -2834,6 +2968,11 @@ function setPTT(active) {
         $("ptt-btn").classList.toggle("live", effective);
         $("ptt-btn").setAttribute("aria-pressed", String(effective));
         window.go.main.App.SetPTT(effective);
+        // VAD continuously changes pttActive as speech starts and stops; only
+        // physical push-to-talk actions earn an audible confirmation.
+        if ((state.settings?.activation_mode || "ptt") === "ptt") {
+            playEvent(effective ? "ptt_on" : "ptt_off");
+        }
         applyVoiceState();
         updateTalkBanner();
     });
@@ -2865,9 +3004,11 @@ $("voice-mute").onclick = () => {
 syncMuteButton($("voice-mute"), state.muted);
 
 function setDeafened(on) {
+    if (state.deafened === on) return;
     state.deafened = on;
     $("remote-video").muted = on;
     if (remoteChain.master) remoteChain.master.gain.value = on ? 0 : Math.min(2, (state.settings?.volume ?? 100) / 100);
+    playEvent(on ? "deafen_on" : "deafen_off");
     renderTree();
 }
 
@@ -3094,6 +3235,7 @@ window.__voicx = {
     connectFromLogin, renderTree, setChannelExpanded, setDetailsOpen, setDirectTargetVisible,
     clientName, initials, fetchAvatar,
     applyAppearance, toggleCompact, recentChannels, syncOwnChannel,
+    playConnectionCue: (event = "connection_connected") => playEvent(event),
     startQualitySampler, stopQualitySampler,
     checkCertificateClock,
     ensureVoiceForChannel, resetVoiceSession, retryMicrophoneAccess,

@@ -5,41 +5,95 @@ import channelJoinURL from "./assets/channel_join.mp3?url";
 
 const V = () => window.__voicx;
 
-// Sound events: every row of the notification matrix plus the local
-// mic/voice events. (28) join/leave exist both split and as the combined
-// "join_leave" the matrix dispatches, so no matrix event is ever silent.
-export const SOUND_EVENTS = [
-    "join", "leave", "join_leave", "mention", "keyword", "dm", "whisper",
-    "poke", "buddy_online", "kick", "announcement", "channel_watch",
-    "mic_on", "mic_off",
+// Sound events are grouped for the settings UI as well as exported flat for
+// the player and migration tests.  The notification group deliberately keeps
+// the matrix event names: notify() controls when those sounds may fire.
+export const SOUND_EVENT_GROUPS = [
+    { label: "Connection", events: [
+        ["connection_connected", "Connected"],
+        ["connection_reconnected", "Reconnected"],
+        ["connection_disconnected", "Disconnected"],
+        ["connection_lost", "Connection lost"],
+        ["connection_reconnecting", "Reconnecting"],
+        ["connection_failed", "Connection failed"],
+        ["server_error", "Server action error"],
+    ] },
+    { label: "Your channel", events: [
+        ["own_channel_join", "Joined channel"],
+        ["own_channel_switch", "Switched channel"],
+        ["own_channel_leave", "Left channel"],
+    ] },
+    { label: "Other users", events: [
+        ["user_join", "User joined"],
+        ["user_leave", "User left"],
+        ["user_move_in", "User moved in"],
+        ["user_move_out", "User moved out"],
+    ] },
+    { label: "Voice controls", events: [
+        ["mic_on", "Microphone on"],
+        ["mic_off", "Microphone off"],
+        ["deafen_on", "Deafened"],
+        ["deafen_off", "Undeafened"],
+        ["ptt_on", "Push-to-talk on"],
+        ["ptt_off", "Push-to-talk off"],
+    ] },
+    { label: "Notifications", events: [
+        ["mention", "Mention"],
+        ["keyword", "Keyword highlight"],
+        ["dm", "Direct message"],
+        ["channel_message", "Channel message"],
+        ["whisper", "Voice whisper"],
+        ["poke", "Poke"],
+        ["join_leave", "Join/leave (your channel)"],
+        ["buddy_online", "Watched contact online"],
+        ["kick", "Kick/ban"],
+        ["announcement", "Announcement"],
+        ["channel_watch", "Channel watch"],
+    ] },
 ];
 
-// Presets: each event = [type, freqHz, durationSec]. Packs tune the timbre.
+export const SOUND_EVENTS = SOUND_EVENT_GROUPS.flatMap((group) => group.events.map(([id]) => id));
+
+// Every cue is a recognisable contour rather than a single beep:
+// [frequency Hz, duration seconds, start offset seconds]. Packs vary the
+// instrument and register while preserving each event's melodic identity.
+const CUES = {
+    connection_connected: [[523, .07, 0], [659, .08, .08], [784, .14, .18]],
+    connection_reconnected: [[392, .07, 0], [523, .08, .08], [659, .14, .18]],
+    connection_disconnected: [[659, .07, 0], [523, .08, .08], [392, .14, .18]],
+    connection_lost: [[440, .11, 0], [330, .13, .12], [220, .22, .27]],
+    connection_reconnecting: [[330, .06, 0], [392, .07, .07], [494, .10, .15]],
+    connection_failed: [[247, .10, 0], [196, .13, .12], [165, .19, .26]],
+    server_error: [[220, .11, 0], [196, .14, .13], [220, .11, .30]],
+    own_channel_switch: [[659, .07, 0], [784, .10, .08], [988, .13, .19]],
+    own_channel_leave: [[587, .08, 0], [440, .10, .09], [349, .14, .20]],
+    user_join: [[659, .06, 0], [784, .10, .07]],
+    user_leave: [[523, .07, 0], [392, .12, .08]],
+    user_move_in: [[494, .06, 0], [659, .06, .07], [784, .11, .14]],
+    user_move_out: [[784, .06, 0], [659, .06, .07], [494, .11, .14]],
+    mic_on: [[659, .06, 0], [784, .08, .07]],
+    mic_off: [[523, .06, 0], [392, .08, .07]],
+    deafen_on: [[392, .08, 0], [294, .10, .09], [196, .13, .20]],
+    deafen_off: [[262, .07, 0], [392, .08, .08], [523, .12, .18]],
+    ptt_on: [[740, .05, 0], [880, .07, .06]],
+    ptt_off: [[660, .05, 0], [494, .07, .06]],
+    mention: [[784, .07, 0], [1047, .11, .08]],
+    keyword: [[659, .06, 0], [784, .06, .07], [988, .10, .14]],
+    dm: [[523, .07, 0], [784, .11, .08]],
+    channel_message: [[587, .06, 0], [659, .08, .07]],
+    whisper: [[880, .05, 0], [1175, .07, .06], [880, .11, .14]],
+    poke: [[988, .05, 0], [1175, .05, .06], [988, .08, .12]],
+    join_leave: [[554, .06, 0], [659, .09, .07]],
+    buddy_online: [[523, .06, 0], [659, .06, .07], [784, .11, .14]],
+    kick: [[330, .09, 0], [247, .12, .10], [196, .16, .23]],
+    announcement: [[784, .07, 0], [988, .07, .08], [1175, .13, .17]],
+    channel_watch: [[494, .06, 0], [659, .06, .07], [880, .10, .14]],
+};
+
 const PACKS = {
-    soft: {
-        join: ["sine", 520, 0.12], leave: ["sine", 380, 0.12], join_leave: ["sine", 450, 0.10],
-        mention: ["sine", 740, 0.10], keyword: ["sine", 700, 0.10],
-        dm: ["sine", 660, 0.10], whisper: ["sine", 880, 0.14], poke: ["sine", 990, 0.08],
-        buddy_online: ["sine", 580, 0.14], kick: ["sine", 260, 0.20],
-        announcement: ["sine", 840, 0.18], channel_watch: ["sine", 620, 0.12],
-        mic_on: ["sine", 620, 0.07], mic_off: ["sine", 420, 0.07],
-    },
-    bright: {
-        join: ["triangle", 660, 0.10], leave: ["triangle", 440, 0.10], join_leave: ["triangle", 560, 0.09],
-        mention: ["triangle", 880, 0.09], keyword: ["triangle", 820, 0.09],
-        dm: ["triangle", 760, 0.09], whisper: ["triangle", 1040, 0.12], poke: ["triangle", 1200, 0.07],
-        buddy_online: ["triangle", 700, 0.12], kick: ["triangle", 300, 0.18],
-        announcement: ["triangle", 980, 0.16], channel_watch: ["triangle", 720, 0.11],
-        mic_on: ["triangle", 760, 0.06], mic_off: ["triangle", 500, 0.06],
-    },
-    retro: {
-        join: ["square", 440, 0.08], leave: ["square", 330, 0.08], join_leave: ["square", 390, 0.07],
-        mention: ["square", 660, 0.07], keyword: ["square", 620, 0.07],
-        dm: ["square", 550, 0.07], whisper: ["square", 770, 0.10], poke: ["square", 880, 0.06],
-        buddy_online: ["square", 500, 0.10], kick: ["square", 220, 0.16],
-        announcement: ["square", 700, 0.14], channel_watch: ["square", 580, 0.09],
-        mic_on: ["square", 550, 0.05], mic_off: ["square", 380, 0.05],
-    },
+    soft: { type: "sine", pitch: 1 },
+    bright: { type: "triangle", pitch: 1.12 },
+    retro: { type: "square", pitch: .84 },
 };
 
 function audioCtx() {
@@ -58,6 +112,9 @@ function soundsEnabled() {
 function eventEnabled(name, force = false) {
     const s = V().state.settings;
     if (!s) return false;
+    // Journal frames rebuild an inactive tab's UI after tab_reset. They are
+    // history, not a new user action; force remains available for previews.
+    if (!force && V().state.replayingTabID) return false;
     if (!force && !soundsEnabled()) return false;
     if (s.event_sounds && s.event_sounds[name] === false) return false;
     // (347/348) DND silences sounds (mentions still badge silently).
@@ -70,18 +127,21 @@ export function playEvent(name, force = false) {
     const s = V().state.settings;
     if (!eventEnabled(name, force)) return;
     const pack = PACKS[s.sound_pack] || PACKS.soft;
-    const preset = pack[name];
-    if (!preset) return;
-    play(preset[0], preset[1], preset[2], (s.sound_volume ?? 100) / 100, force);
+    const cue = CUES[name];
+    if (!cue) return;
+    const volume = (s.sound_volume ?? 100) / 100;
+    for (const [freq, dur, offset] of cue) {
+        playTone(pack.type, freq * pack.pitch, dur, volume, offset);
+    }
 }
 
-// playChannelJoin plays the bundled cue only for this client's own channel
-// transition. It shares the Join event's settings policy without replacing
-// the synthesized join notification used for other users.
+// playChannelJoin keeps the bundled cue for this client's own first join.
+// Channel switches use their separate synthesized motif, so the two actions
+// remain recognisable without replacing the shipped media asset.
 const activeMedia = new Set();
 
 export function playChannelJoin(force = false) {
-    if (!eventEnabled("join", force)) return;
+    if (!eventEnabled("own_channel_join", force)) return;
     try {
         const audio = new Audio(channelJoinURL);
         audio.volume = Math.min(1, Math.max(0, (V().state.settings?.sound_volume ?? 100) / 100));
@@ -96,6 +156,10 @@ export function playChannelJoin(force = false) {
 // play sounds an oscillator note.
 export function play(type, freq, dur, vol = 1, force = false) {
     if (!force && !soundsEnabled()) return;
+    playTone(type, freq, dur, vol);
+}
+
+function playTone(type, freq, dur, vol = 1, offset = 0) {
     try {
         const ctx = audioCtx();
         const osc = ctx.createOscillator();
@@ -103,11 +167,12 @@ export function play(type, freq, dur, vol = 1, force = false) {
         osc.type = type;
         osc.frequency.value = freq;
         const peak = 0.08 * Math.min(2, Math.max(0, vol));
-        gain.gain.setValueAtTime(peak, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + dur);
+        const start = ctx.currentTime + offset;
+        gain.gain.setValueAtTime(peak, start);
+        gain.gain.exponentialRampToValueAtTime(0.001, start + dur);
         osc.connect(gain).connect(ctx.destination);
-        osc.start();
-        osc.stop(ctx.currentTime + dur);
+        osc.start(start);
+        osc.stop(start + dur);
     } catch { /* audio unavailable */ }
 }
 
@@ -120,7 +185,8 @@ export function testAll() {
         if (s.event_sounds && s.event_sounds[name] === false) continue;
         setTimeout(() => {
             V().toast("sound: " + name);
-            playEvent(name, true);
+            if (name === "own_channel_join") playChannelJoin(true);
+            else playEvent(name, true);
         }, delay);
         delay += 450;
     }

@@ -1684,6 +1684,7 @@ export function addChat(d) {
     let announcementAllowed = false;
     let announcementEvent = "channel_message";
     let announcementContext = { channelID: m.channelID, className: "messages" };
+    let notification = null;
     if (directMention) {
         m.mentioned = true; // (106) accent highlight
     } else if (!m.self) {
@@ -1693,32 +1694,44 @@ export function addChat(d) {
         if (kw) {
             m.mentioned = true;
             if (keywordLevelAllowed) {
-                const keywordContext = { channelID: m.channelID, className: "mentions" };
-                const keywordAnnouncement = chatAnnouncementAllowed("keyword", keywordContext, key);
-                if (keywordAnnouncement) {
-                    announcementAllowed = true;
-                    announcementEvent = "keyword";
-                    announcementContext = keywordContext;
-                }
-                window.__voicxNotify?.notify("keyword", `[${kw}] ` + (m.from || "someone") + ": " + (m.text || "").slice(0, 80),
-                    { ...keywordContext, kind: "warn", announce: false });
+                notification = {
+                    event: "keyword",
+                    text: `[${kw}] ` + (m.from || "someone") + ": " + (m.text || "").slice(0, 80),
+                    context: { channelID: m.channelID, className: "mentions", kind: "warn" },
+                };
             }
         }
     }
     if (!m.self) {
         const allowed = level === "all" || (level === "channel_mentions" && directMention) || (level === "role_mentions" && roleMention);
-        if (allowed) {
+        // A direct/role mention outranks a keyword; an otherwise ordinary
+        // message is the fallback. Dispatch one notification per message so
+        // the new per-event sound cues never overlap for the same chat line.
+        if (allowed && (directMention || roleMention)) {
             const event = directMention || roleMention ? "mention" : "channel_message";
             const context = { channelID: m.channelID, className: directMention || roleMention ? "mentions" : "messages" };
-            const eventAnnouncement = chatAnnouncementAllowed(event, context, key);
-            if (eventAnnouncement) {
-                announcementAllowed = true;
-                announcementEvent = event;
-                announcementContext = context;
-            }
-            window.__voicxNotify?.notify(event, (m.from || "someone") + ": " + (m.text || "").slice(0, 80),
-                { ...context, kind: directMention || roleMention ? "warn" : "info", announce: false });
+            notification = {
+                event,
+                text: (m.from || "someone") + ": " + (m.text || "").slice(0, 80),
+                context: { ...context, kind: "warn" },
+            };
+        } else if (!notification && level === "all") {
+            notification = {
+                event: "channel_message",
+                text: (m.from || "someone") + ": " + (m.text || "").slice(0, 80),
+                context: { channelID: m.channelID, className: "messages", kind: "info" },
+            };
         }
+    }
+    if (notification) {
+        const { event, text, context } = notification;
+        const eventAnnouncement = chatAnnouncementAllowed(event, context, key);
+        if (eventAnnouncement) {
+            announcementAllowed = true;
+            announcementEvent = event;
+            announcementContext = context;
+        }
+        window.__voicxNotify?.notify(event, text, { ...context, announce: false });
     }
     if (key === activeKey()) {
         if (position === "append") appendLive(m);

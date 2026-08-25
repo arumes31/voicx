@@ -327,6 +327,9 @@ func (a *App) finishActivateSerialized(tabID string, activeCM *connManager, jour
 	if !a.isCurrentActivation(generation) {
 		return
 	}
+	// The frontend keeps historical replay visually useful but must not treat
+	// it as fresh user activity (notably, no action sounds on tab switch).
+	a.emitPlain("tab_replay_done", tabID)
 	a.emitTabsUpdate()
 }
 
@@ -512,9 +515,22 @@ func (a *App) SetActiveTab(tabID string) {
 	a.activate(tabID)
 }
 
-// CloseTab disconnects and removes a tab; when it was active, the next tab
-// (if any) becomes active.
+// CloseTab silently removes a tab. It is used for internal stale-tab cleanup;
+// user-initiated teardown must call DisconnectTab so it can publish one
+// intentional connection edge before replacing the active tab.
 func (a *App) CloseTab(tabID string) {
+	a.closeTab(tabID, false)
+}
+
+// DisconnectTab intentionally disconnects and removes a tab selected by the
+// user. Background and offline tabs remain silent.
+func (a *App) DisconnectTab(tabID string) {
+	a.closeTab(tabID, true)
+}
+
+// closeTab removes tabID; intentional controls whether an active live
+// connection publishes its user-facing teardown edge.
+func (a *App) closeTab(tabID string, intentional bool) {
 	// Lock publication before mutating the active binding so relays cannot
 	// publish between the new active commit and its reset marker.
 	a.activationPublishMu.Lock()
@@ -523,6 +539,16 @@ func (a *App) CloseTab(tabID string) {
 	ts := a.tabs[tabID]
 	wasActive := a.activeID == tabID
 	if ts == nil {
+		a.tabsMu.Unlock()
+		return
+	}
+	// connManager has its own mutex. Never acquire it while holding tabsMu:
+	// relayTabEvent snapshots the tab under tabsMu before inspecting the
+	// manager, and preserving that lock order avoids inversion.
+	a.tabsMu.Unlock()
+	wasConnected := intentional && wasActive && ts.cm.connected()
+	a.tabsMu.Lock()
+	if a.tabs[tabID] != ts || (a.activeID == tabID) != wasActive {
 		a.tabsMu.Unlock()
 		return
 	}
@@ -555,6 +581,13 @@ func (a *App) CloseTab(tabID string) {
 
 	// Teardown can emit callbacks; the registry already has no entry so a
 	// late callback is dropped by relayTabEvent.
+	// This is the sole intentional-disconnect edge. Publish it while the
+	// closing tab is still the frontend's active identity, before replacement
+	// activation replays historical state. Background and offline tabs are
+	// deliberately silent.
+	if wasConnected {
+		a.emitPlain("intentional_disconnect", tabID)
+	}
 	ts.cm.disconnect()
 	if wasActive {
 		a.finishActivateSerialized(next, activeCM, journal, generation)

@@ -88,6 +88,88 @@ func TestTabOrderAndActiveCloseNeighborAreDeterministic(t *testing.T) {
 	}
 }
 
+func TestIntentionalDisconnectEventPrecedesReplacementReplay(t *testing.T) {
+	a := newTabApp(t)
+	activeID, active := a.newTab()
+	_, background := a.newTab()
+	a.activate(activeID)
+
+	client, peer := net.Pipe()
+	t.Cleanup(func() { _ = peer.Close() })
+	active.cm.mu.Lock()
+	active.cm.conn = client
+	active.cm.closed = false
+	active.cm.mu.Unlock()
+
+	var events []journalEntry
+	a.eventEmit = func(name string, payload any) {
+		text, _ := payload.(string)
+		events = append(events, journalEntry{name: name, payload: text})
+	}
+	a.DisconnectTab(activeID)
+
+	intentionalAt, resetAt := -1, -1
+	for i, event := range events {
+		switch {
+		case event.name == "intentional_disconnect" && event.payload == activeID:
+			intentionalAt = i
+		case event.name == "tab_reset":
+			resetAt = i
+		}
+	}
+	if intentionalAt < 0 || resetAt < 0 || intentionalAt >= resetAt {
+		t.Fatalf("event order = %#v, want intentional_disconnect before tab_reset", events)
+	}
+	if got := len(events); got == 0 {
+		t.Fatal("DisconnectTab emitted no events")
+	}
+
+	// A normal internal close is deliberately silent, even while connected.
+	silentID, silent := a.newTab()
+	client, peer = net.Pipe()
+	t.Cleanup(func() { _ = peer.Close() })
+	silent.cm.mu.Lock()
+	silent.cm.conn = client
+	silent.cm.closed = false
+	silent.cm.mu.Unlock()
+	a.activate(silentID)
+	events = nil
+	a.CloseTab(silentID)
+	for _, event := range events {
+		if event.name == "intentional_disconnect" {
+			t.Fatalf("silent CloseTab emitted intentional disconnect: %#v", events)
+		}
+	}
+
+	// A connected background tab has no connection edge: only the active live
+	// tab can earn the cue.
+	foregroundID, _ := a.newTab()
+	backgroundID, background := a.newTab()
+	a.activate(foregroundID)
+	client, peer = net.Pipe()
+	t.Cleanup(func() { _ = peer.Close() })
+	background.cm.mu.Lock()
+	background.cm.conn = client
+	background.cm.closed = false
+	background.cm.mu.Unlock()
+	events = nil
+	a.DisconnectTab(backgroundID)
+	for _, event := range events {
+		if event.name == "intentional_disconnect" {
+			t.Fatalf("background DisconnectTab emitted intentional disconnect: %#v", events)
+		}
+	}
+	_, offline := a.newTab()
+	a.activate(offline.info.ID)
+	events = nil
+	a.DisconnectTab(offline.info.ID)
+	for _, event := range events {
+		if event.name == "intentional_disconnect" {
+			t.Fatalf("offline DisconnectTab emitted intentional disconnect: %#v", events)
+		}
+	}
+}
+
 func TestContainsMentionUsesUnicodeCaseFoldAndExactBoundary(t *testing.T) {
 	for _, test := range []struct {
 		text, nickname string
@@ -362,6 +444,33 @@ func TestTabReplayUsesCachedFrames(t *testing.T) {
 	ts.cm.dispatch(&netproto.Frame{Type: uint16(netproto.MsgChannelList), Payload: []byte(`{"channels":[]}`)})
 	if ts.cm.lastSnapshot == "" || ts.cm.lastChannelList == "" {
 		t.Fatal("frames not cached on the connManager")
+	}
+}
+
+func TestTabReplayPublishesCompletionAfterJournal(t *testing.T) {
+	a := newTabApp(t)
+	id, ts := a.newTab()
+	ts.journal = []journalEntry{{name: "event", payload: "journal-entry"}}
+	var events []journalEntry
+	a.eventEmit = func(name string, payload any) {
+		text, _ := payload.(string)
+		events = append(events, journalEntry{name: name, payload: text})
+	}
+
+	a.activate(id)
+	reset, journal, done := -1, -1, -1
+	for i, event := range events {
+		switch {
+		case event.name == "tab_reset":
+			reset = i
+		case event.name == "event" && event.payload == "journal-entry":
+			journal = i
+		case event.name == "tab_replay_done" && event.payload == id:
+			done = i
+		}
+	}
+	if reset < 0 || journal < 0 || done < 0 || !(reset < journal && journal < done) {
+		t.Fatalf("replay order = %#v, want reset < journal < tab_replay_done", events)
 	}
 }
 

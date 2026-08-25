@@ -110,6 +110,10 @@ export function CloseTab(arg1) {
   return window['go']['main']['App']['CloseTab'](arg1);
 }
 
+export function DisconnectTab(arg1) {
+  return window['go']['main']['App']['DisconnectTab'](arg1);
+}
+
 export function ComplaintClear(arg1, arg2) {
   return window['go']['main']['App']['ComplaintClear'](arg1, arg2);
 }

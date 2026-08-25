@@ -57,6 +57,8 @@ export function ClientVersionShort():Promise<string>;
 
 export function CloseTab(arg1:string):Promise<void>;
 
+export function DisconnectTab(arg1:string):Promise<void>;
+
 export function ComplaintClear(arg1:string,arg2:string):Promise<netproto.Complaints>;
 
 export function ComplaintList():Promise<netproto.Complaints>;

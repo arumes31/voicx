@@ -88,7 +88,9 @@ export function notificationOutputAllowed(event, ctx = {}, output = "toast") {
 
 // notify is the single dispatch point for user-facing notifications:
 // DND → record-only; muted/overridden channels → filtered; matrix → which
-// outputs fire. ctx: {channelID, uid, className ("messages"|"mentions"|"joins"), noSound, announce}.
+// outputs fire. ctx: {channelID, uid, className ("messages"|"mentions"|"joins"),
+// noSound, soundEvent, announce}. soundEvent chooses a more specific cue but
+// never bypasses this event's matrix row, channel override, or custom beep.
 export function notify(event, text, ctx = {}) {
     // (346) always record in the notification center (even under DND).
     window.__voicxPolish?.recordNotification(event, text, ctx);
@@ -100,21 +102,30 @@ export function notify(event, text, ctx = {}) {
         V().toast(text, kind, ctx.category || TOAST_CATEGORY[event] || "alert", { announce: false, record: false });
         if (ctx.announce !== false) V().announceLive(text, kind === "warn" ? "assertive" : "polite");
     }
-    if (row.sound && !ctx.noSound) playEventSound(event);
+    if (row.sound && !ctx.noSound) playEventSound(event, ctx.soundEvent);
     if (row.flash) App().FlashWindow();
     if (row.native && !document.hasFocus()) App().Notify("voicx " + event, text.slice(0, 200));
 }
 
-// playEventSound plays an event's sound: custom beep (384) when configured,
-// else the sound pack preset.
-function playEventSound(event) {
+// playEventSound plays an event's sound: custom beep (384) for the matrix
+// event when configured, else its specific sound-pack cue. This lets all
+// remote join/leave/move sounds share the join_leave policy without making a
+// user's existing join/leave custom beep silently stop working.
+function playEventSound(event, soundEvent = event) {
     if (window.__voicxPolish?.dndActive?.()) return;
-    const spec = V().state.settings?.custom_sounds?.[event];
+    const settings = V().state.settings;
+    // Matrix sound permission is checked by notify() before this point. These
+    // two checks additionally make a replay silent and let a precise action
+    // toggle (for example user_move_out) suppress its legacy join_leave beep.
+    if (V().state.replayingTabID
+        || settings?.event_sounds?.[event] === false
+        || settings?.event_sounds?.[soundEvent] === false) return;
+    const spec = settings?.custom_sounds?.[event];
     if (spec && spec.freq > 0) {
         play("sine", spec.freq, (spec.duration_ms || 200) / 1000, (V().state.settings?.sound_volume ?? 100) / 100);
         return;
     }
-    playEvent(event);
+    playEvent(soundEvent);
 }
 
 // ---------------------------------------------------------------------------

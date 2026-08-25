@@ -1,7 +1,7 @@
 // settings-ui.js — TS3-style settings dialog with left icon nav.
 import { t } from "./i18n.js";
 import { calibrateMic, startLoopback } from "./audio.js";
-import { play, SOUND_EVENTS, testAll } from "./sounds.js";
+import { play, SOUND_EVENT_GROUPS, testAll } from "./sounds.js";
 import { MATRIX_EVENTS, defaultMatrixRow } from "./notifications.js";
 import { associateControlLabel, wrappedIndex } from "./a11y.js";
 import { createMediaDeviceInventory } from "./media-devices.js";
@@ -1237,13 +1237,20 @@ function pageNotifications() {
     sub.className = "set-subhead";
     sub.textContent = "Event sounds";
     el.appendChild(sub);
-    // (28) driven by the pack's event list so every matrix event is togglable.
-    for (const ev of SOUND_EVENTS) {
-        const enabled = !s.event_sounds || s.event_sounds[ev] !== false;
-        el.appendChild(row(ev.replace(/_/g, " "), checkbox(enabled, (v) => {
-            s.event_sounds = s.event_sounds || {};
-            s.event_sounds[ev] = v;
-        })));
+    // The player owns this grouped metadata. The settings dialog therefore
+    // stays legible as cues grow without ever drifting from playable events.
+    for (const group of SOUND_EVENT_GROUPS) {
+        const heading = document.createElement("div");
+        heading.className = "set-subhead";
+        heading.textContent = group.label;
+        el.appendChild(heading);
+        for (const [event, label] of group.events) {
+            const enabled = !s.event_sounds || s.event_sounds[event] !== false;
+            el.appendChild(row(label, checkbox(enabled, (v) => {
+                s.event_sounds = s.event_sounds || {};
+                s.event_sounds[event] = v;
+            })));
+        }
     }
 
     const testBtn = document.createElement("button");
