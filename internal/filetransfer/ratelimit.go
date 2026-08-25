@@ -60,11 +60,20 @@ func newRateLimiter(kbps int) *rateLimiter {
 // cancelled. Bytes are consumed in installments, so n may exceed the burst
 // size.
 func (r *rateLimiter) wait(ctx context.Context, n int) error {
-	if r.bytesPerSec <= 0 {
+	if r.bytesPerSec <= 0 || n <= 0 {
 		return nil
 	}
 	remaining := float64(n)
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+
 	for remaining > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		r.mu.Lock()
 		now := time.Now()
 		r.tokens += now.Sub(r.last).Seconds() * r.bytesPerSec
@@ -80,21 +89,30 @@ func (r *rateLimiter) wait(ctx context.Context, n int) error {
 			}
 			r.tokens -= take
 			remaining -= take
-			r.mu.Unlock()
-			continue
 		}
 		r.mu.Unlock()
+		if remaining <= 0 {
+			return nil
+		}
 
-		// Bucket empty: sleep for a fraction of the refill time (capped to
-		// stay responsive to cancellation).
+		// Wait for a bounded refill interval even when the clock advanced just
+		// enough to yield a fractional token. Immediately looping on that tiny
+		// refill would busy-spin and could starve the cancellation select.
 		delay := time.Duration(remaining/r.bytesPerSec*float64(time.Second)) + time.Millisecond
 		if delay > 100*time.Millisecond {
 			delay = 100 * time.Millisecond
 		}
+		timer.Reset(delay)
 		select {
 		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			return ctx.Err()
-		case <-time.After(delay):
+		case <-timer.C:
 		}
 	}
 	return nil

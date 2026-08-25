@@ -64,7 +64,7 @@ func TestDeleteChannelDataRevokesCapabilitiesAndRemovesDirectory(t *testing.T) {
 	}
 
 	recorder := httptest.NewRecorder()
-	s.Links().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dl/"+linkToken, nil))
+	s.Links().ServeHTTP(recorder, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/dl/"+linkToken, nil))
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("revoked link status = %d, want 404", recorder.Code)
 	}
@@ -78,14 +78,17 @@ func TestDeleteChannelDataStopsActiveTransferBeforeReturning(t *testing.T) {
 	if err != nil {
 		t.Fatalf("activateTransfer: %v", err)
 	}
+	// Arm the deadline before deletion can close the peer. net.Pipe may reject
+	// SetReadDeadline after the peer has already closed, which is itself the
+	// successful condition this test is trying to observe.
+	if err := clientConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
 
 	deleteDone := make(chan error, 1)
 	go func() {
 		deleteDone <- s.DeleteChannelData(context.Background(), 7)
 	}()
-	if err := clientConn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := clientConn.Read(make([]byte, 1)); err == nil {
 		t.Fatal("active transfer connection remained open")
 	}
@@ -147,7 +150,7 @@ func TestLinkRegistryRevokeWaitsForOpenRegistration(t *testing.T) {
 	serveDone := make(chan struct{})
 	go func() {
 		recorder := httptest.NewRecorder()
-		registry.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dl/"+token, nil))
+		registry.ServeHTTP(recorder, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/dl/"+token, nil))
 		close(serveDone)
 	}()
 	<-openEntered
@@ -290,7 +293,7 @@ func TestDeleteChannelDataRevokesBeforeContextBoundedDrain(t *testing.T) {
 		t.Fatalf("InitUpload during deferred drain = %v, want ErrChannelDeleted", err)
 	}
 	recorder := httptest.NewRecorder()
-	s.Links().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dl/"+linkToken, nil))
+	s.Links().ServeHTTP(recorder, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/dl/"+linkToken, nil))
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("link during deferred drain status = %d, want 404", recorder.Code)
 	}

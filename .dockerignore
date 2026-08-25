@@ -10,6 +10,7 @@
 # Environment / secrets
 .env
 .env.*
+docker/secrets/*
 *.pem
 *.key
 *.crt

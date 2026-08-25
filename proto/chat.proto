@@ -4,9 +4,12 @@ package voicx.v1;
 
 option go_package = "voicx/v1;voicxv1";
 
-// Chat service handles channel chat, global server chat, direct messages,
-// and offline message spool requests.
+// Deprecated: Chat is intentionally unserved. End-to-end and scope-key
+// encrypted chat stays on the control channel; the message types remain for
+// descriptor and source compatibility while clients migrate away from this RPC
+// service.
 service Chat {
+  option deprecated = true;
   // SendChannelChat sends a message to a channel.
   rpc SendChannelChat(SendChannelChatRequest) returns (SendChatResponse);
   // SendGlobalChat sends a message to the entire server.

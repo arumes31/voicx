@@ -20,12 +20,18 @@ import (
 
 	"go.uber.org/zap"
 	"golang.org/x/net/websocket"
+
+	"voicx/internal/auth"
 )
 
 // Authenticator verifies bot credentials. It has the same shape as the
 // ServerQuery login check: ok reports valid credentials, admin reports whether
 // the account may administer the server.
 type Authenticator func(ctx context.Context, uniqueID, password string) (ok, admin bool, err error)
+
+type authFailureRecorder interface {
+	IncAuthFailure(transport, reason string)
+}
 
 const (
 	// wsWriteTimeout bounds a single frame write. A consumer whose TCP window
@@ -65,12 +71,28 @@ type wsEvent struct {
 // Subscribers authenticate with HTTP Basic auth and may narrow the stream with
 // a comma-separated ?types= query parameter.
 func Handler(bus *Bus, auth Authenticator, logger *zap.Logger) http.Handler {
-	return newWSHandler(bus, auth, logger, wsHandlerConfig{
+	return HandlerWithLoginProtection(bus, auth, logger, nil, nil)
+}
+
+// HandlerWithLoginProtection serves the WebSocket event stream with the
+// process-wide password-verification limiter. The cheap per-IP limiter remains
+// in place as an earlier rejection layer; this limiter protects the expensive
+// credential verification itself.
+func HandlerWithLoginProtection(
+	bus *Bus,
+	authenticate Authenticator,
+	logger *zap.Logger,
+	loginLimiter *auth.LoginFailureLimiter,
+	failures authFailureRecorder,
+) http.Handler {
+	return newWSHandler(bus, authenticate, logger, wsHandlerConfig{
 		maxConnections:  maxWSConnections,
 		maxAuthAttempts: maxWSAuthAttempts,
 		authWindow:      wsAuthWindow,
 		maxAuthBuckets:  maxWSAuthBuckets,
 		now:             time.Now,
+		loginLimiter:    loginLimiter,
+		failures:        failures,
 	})
 }
 
@@ -80,9 +102,11 @@ type wsHandlerConfig struct {
 	authWindow      time.Duration
 	maxAuthBuckets  int
 	now             func() time.Time
+	loginLimiter    *auth.LoginFailureLimiter
+	failures        authFailureRecorder
 }
 
-func newWSHandler(bus *Bus, auth Authenticator, logger *zap.Logger, cfg wsHandlerConfig) http.Handler {
+func newWSHandler(bus *Bus, authenticate Authenticator, logger *zap.Logger, cfg wsHandlerConfig) http.Handler {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -99,11 +123,12 @@ func newWSHandler(bus *Bus, auth Authenticator, logger *zap.Logger, cfg wsHandle
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if bus == nil || auth == nil {
+		if bus == nil || authenticate == nil {
 			http.Error(w, "event stream unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		if len(r.Header.Get("Authorization")) > maxBasicHeaderSize {
+			recordWSAuthFailure(cfg.failures, "malformed_metadata")
 			http.Error(w, "request header too large", http.StatusRequestHeaderFieldsTooLarge)
 			return
 		}
@@ -113,6 +138,7 @@ func newWSHandler(bus *Bus, auth Authenticator, logger *zap.Logger, cfg wsHandle
 		}
 		allowed, retryAfter := limiter.allow(r.RemoteAddr)
 		if !allowed {
+			recordWSAuthFailure(cfg.failures, "locked_out")
 			w.Header().Set("Retry-After", retryAfterSeconds(retryAfter))
 			http.Error(w, "too many authentication attempts", http.StatusTooManyRequests)
 			return
@@ -120,20 +146,43 @@ func newWSHandler(bus *Bus, auth Authenticator, logger *zap.Logger, cfg wsHandle
 
 		user, password, ok := r.BasicAuth()
 		if !ok || user == "" || len(user) > maxUniqueIDSize || len(password) > maxPasswordSize {
+			recordWSAuthFailure(cfg.failures, "malformed_metadata")
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
 		}
-		valid, admin, err := auth(r.Context(), user, password)
+
+		var attempt *auth.LoginAttempt
+		principalScope := auth.LoginFailureScope("", user)
+		if cfg.loginLimiter != nil {
+			sourceScope := auth.LoginFailureScope("ws:"+remoteIPKey(r.RemoteAddr), "")
+			var allowed bool
+			attempt, allowed = cfg.loginLimiter.Reserve(sourceScope, principalScope)
+			if !allowed {
+				recordWSAuthFailure(cfg.failures, "locked_out")
+				http.Error(w, "too many authentication attempts", http.StatusTooManyRequests)
+				return
+			}
+			defer attempt.Cancel()
+		}
+
+		valid, admin, err := authenticate(r.Context(), user, password)
 		if err != nil {
 			logger.Warn("event stream auth error", zap.Error(err))
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
 		if !valid || !admin {
+			if attempt != nil {
+				attempt.Fail()
+			}
+			recordWSAuthFailure(cfg.failures, "invalid_credentials")
 			logger.Warn("event stream login refused",
 				zap.String("unique_id", user), zap.String("remote", r.RemoteAddr))
 			http.Error(w, "invalid credentials", http.StatusUnauthorized)
 			return
+		}
+		if attempt != nil {
+			attempt.Succeed(principalScope)
 		}
 
 		types, err := requestTypes(r.URL.RawQuery)
@@ -172,6 +221,12 @@ func newWSHandler(bus *Bus, auth Authenticator, logger *zap.Logger, cfg wsHandle
 		}
 		wsServer.ServeHTTP(w, r)
 	})
+}
+
+func recordWSAuthFailure(recorder authFailureRecorder, reason string) {
+	if recorder != nil {
+		recorder.IncAuthFailure("ws", reason)
+	}
 }
 
 func requestTypes(rawQuery string) ([]string, error) {

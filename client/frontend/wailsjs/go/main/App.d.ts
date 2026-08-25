@@ -17,6 +17,8 @@ export function BanRemove(arg1:number):Promise<string>;
 
 export function CancelTransfer(arg1:string):Promise<void>;
 
+export function CertificateClockWarning():Promise<string>;
+
 export function ChannelEdit(arg1:number,arg2:string,arg3:number,arg4:number,arg5:boolean,arg6:boolean,arg7:boolean,arg8:string,arg9:number):Promise<string>;
 
 export function ChannelEditTree(arg1:number,arg2:string,arg3:number,arg4:number,arg5:number,arg6:boolean):Promise<string>;
@@ -55,6 +57,8 @@ export function ClientVersionShort():Promise<string>;
 
 export function CloseTab(arg1:string):Promise<void>;
 
+export function DisconnectTab(arg1:string):Promise<void>;
+
 export function ComplaintClear(arg1:string,arg2:string):Promise<netproto.Complaints>;
 
 export function ComplaintList():Promise<netproto.Complaints>;
@@ -63,9 +67,13 @@ export function Connect(arg1:string,arg2:string,arg3:string,arg4:string):Promise
 
 export function ConnectBookmarkTab(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string):Promise<string>;
 
+export function ConnectBookmarkTabWithID(arg1:string,arg2:string,arg3:string,arg4:string,arg5:string):Promise<main.ConnectTabResult>;
+
 export function ConnectGuest(arg1:string,arg2:string):Promise<string>;
 
 export function ConnectGuestBookmarkTab(arg1:string,arg2:string,arg3:string):Promise<string>;
+
+export function ConnectGuestBookmarkTabWithID(arg1:string,arg2:string,arg3:string):Promise<main.ConnectTabResult>;
 
 export function ConnectGuestTab(arg1:string,arg2:string):Promise<string>;
 
@@ -232,6 +240,8 @@ export function RecordRecent(arg1:string,arg2:string):Promise<void>;
 export function RegenerateIdentity():Promise<string>;
 
 export function RenameIdentity(arg1:string,arg2:string):Promise<string>;
+
+export function SaveChatAttachment(arg1:number,arg2:string,arg3:string,arg4:string):Promise<string>;
 
 export function SaveSettings(arg1:main.Settings):Promise<string>;
 

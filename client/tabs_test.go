@@ -3,10 +3,15 @@
 package main
 
 import (
+	"crypto/tls"
+	"net"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"voicx/internal/netproto"
+	"voicx/internal/tlscert"
 )
 
 // newTabApp returns an App with a fresh tab registry (no Wails context).
@@ -59,6 +64,316 @@ func TestTabLifecycle(t *testing.T) {
 	if a.cmLoad() != nil {
 		t.Fatal("cm set with no tabs")
 	}
+}
+
+func TestTabOrderAndActiveCloseNeighborAreDeterministic(t *testing.T) {
+	a := newTabApp(t)
+	first, _ := a.newTab()
+	middle, _ := a.newTab()
+	last, _ := a.newTab()
+	a.activate(middle)
+	a.CloseTab(middle)
+	if got := a.cmLoad(); got == nil {
+		t.Fatal("closing the middle active tab left no active tab")
+	}
+	tabs := a.ListTabs()
+	if len(tabs) != 2 || tabs[0].ID != first || tabs[1].ID != last || !tabs[1].Active {
+		t.Fatalf("tab order/active after middle close = %+v", tabs)
+	}
+
+	a.CloseTab(last)
+	tabs = a.ListTabs()
+	if len(tabs) != 1 || tabs[0].ID != first || !tabs[0].Active {
+		t.Fatalf("last active tab did not select its left neighbor: %+v", tabs)
+	}
+}
+
+func TestIntentionalDisconnectEventPrecedesReplacementReplay(t *testing.T) {
+	a := newTabApp(t)
+	activeID, active := a.newTab()
+	a.newTab()
+	a.activate(activeID)
+
+	client, peer := net.Pipe()
+	t.Cleanup(func() { _ = peer.Close() })
+	active.cm.mu.Lock()
+	active.cm.conn = client
+	active.cm.closed = false
+	active.cm.mu.Unlock()
+
+	var events []journalEntry
+	a.eventEmit = func(name string, payload any) {
+		text, _ := payload.(string)
+		events = append(events, journalEntry{name: name, payload: text})
+	}
+	a.DisconnectTab(activeID)
+
+	intentionalAt, resetAt := -1, -1
+	for i, event := range events {
+		switch {
+		case event.name == "intentional_disconnect" && event.payload == activeID:
+			intentionalAt = i
+		case event.name == "tab_reset":
+			resetAt = i
+		}
+	}
+	if intentionalAt < 0 || resetAt < 0 || intentionalAt >= resetAt {
+		t.Fatalf("event order = %#v, want intentional_disconnect before tab_reset", events)
+	}
+	if got := len(events); got == 0 {
+		t.Fatal("DisconnectTab emitted no events")
+	}
+
+	// A normal internal close is deliberately silent, even while connected.
+	silentID, silent := a.newTab()
+	client, peer = net.Pipe()
+	t.Cleanup(func() { _ = peer.Close() })
+	silent.cm.mu.Lock()
+	silent.cm.conn = client
+	silent.cm.closed = false
+	silent.cm.mu.Unlock()
+	a.activate(silentID)
+	events = nil
+	a.CloseTab(silentID)
+	for _, event := range events {
+		if event.name == "intentional_disconnect" {
+			t.Fatalf("silent CloseTab emitted intentional disconnect: %#v", events)
+		}
+	}
+
+	// A connected background tab has no connection edge: only the active live
+	// tab can earn the cue.
+	foregroundID, _ := a.newTab()
+	backgroundID, background := a.newTab()
+	a.activate(foregroundID)
+	client, peer = net.Pipe()
+	t.Cleanup(func() { _ = peer.Close() })
+	background.cm.mu.Lock()
+	background.cm.conn = client
+	background.cm.closed = false
+	background.cm.mu.Unlock()
+	events = nil
+	a.DisconnectTab(backgroundID)
+	for _, event := range events {
+		if event.name == "intentional_disconnect" {
+			t.Fatalf("background DisconnectTab emitted intentional disconnect: %#v", events)
+		}
+	}
+	_, offline := a.newTab()
+	a.activate(offline.info.ID)
+	events = nil
+	a.DisconnectTab(offline.info.ID)
+	for _, event := range events {
+		if event.name == "intentional_disconnect" {
+			t.Fatalf("offline DisconnectTab emitted intentional disconnect: %#v", events)
+		}
+	}
+}
+
+func TestContainsMentionUsesUnicodeCaseFoldAndExactBoundary(t *testing.T) {
+	for _, test := range []struct {
+		text, nickname string
+		want           bool
+	}{
+		{"hello @ÄLICE!", "älice", true},
+		{"hello @K!", "k", true},
+		{"hello @k!", "K", true},
+		{"hello @ſ!", "s", true},
+		{"hello @s!", "ſ", true},
+		{"hello @ann", "ann", true},
+		{"hello @annex", "ann", false},
+		{"hello @ann_2", "ann", false},
+		{"hello @ann-2", "ann", false},
+		{"hello @Kx", "k", false},
+		{"hello @K-2", "k", false},
+		{"hello @ann.", "ann", true},
+		{"hello @foo.bar!", "foo.bar", true},
+		{"hello @foo.bar2", "foo.bar", false},
+		{"hello @fox🙂!", "fox🙂", true},
+		{"hello @fox🙂x", "fox🙂", false},
+		{"hello @🙂", "🙂", true},
+	} {
+		if got := containsMention(test.text, test.nickname); got != test.want {
+			t.Errorf("containsMention(%q, %q) = %v, want %v", test.text, test.nickname, got, test.want)
+		}
+	}
+}
+
+func TestCloseTabCommitCannotReinstateClosedActiveOrRouteLateEvent(t *testing.T) {
+	a := newTabApp(t)
+	closedID, closed := a.newTab()
+	remainingID, remaining := a.newTab()
+	a.activate(closedID)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); <-start; a.CloseTab(closedID) }()
+	go func() { defer wg.Done(); <-start; a.SetActiveTab(remainingID) }()
+	close(start)
+	wg.Wait()
+
+	a.tabsMu.Lock()
+	_, removed := a.tabs[closedID]
+	activeID := a.activeID
+	a.tabsMu.Unlock()
+	if removed || activeID == closedID || a.cmLoad() == closed.cm {
+		t.Fatalf("closed tab remained active: active=%q removed=%v", activeID, removed)
+	}
+	if activeID != remainingID || a.cmLoad() != remaining.cm {
+		t.Fatalf("remaining tab not active: active=%q", activeID)
+	}
+	before := len(remaining.journal)
+	var emitted atomic.Int32
+	a.eventEmit = func(string, any) { emitted.Add(1) }
+	a.relayTabEvent(closedID, "event", `{"type":"chat","data":{"text":"late"}}`)
+	if len(remaining.journal) != before {
+		t.Fatal("late removed-tab event was delivered to remaining tab")
+	}
+	if emitted.Load() != 0 {
+		t.Fatal("late removed-tab event was emitted to the webview")
+	}
+}
+
+func TestActivationPublicationDropsSupersededReplayBatch(t *testing.T) {
+	a := newTabApp(t)
+	firstID, first := a.newTab()
+	secondID, second := a.newTab()
+	first.journal = []journalEntry{{name: "event", payload: "first-journal"}}
+	second.journal = []journalEntry{{name: "event", payload: "second-journal"}}
+
+	firstReset := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var mu sync.Mutex
+	var events []journalEntry
+	a.eventEmit = func(name string, payload any) {
+		if name == "tab_reset" && payload == firstID {
+			select {
+			case <-firstReset:
+			default:
+				close(firstReset)
+				<-releaseFirst
+			}
+		}
+		text, _ := payload.(string)
+		mu.Lock()
+		events = append(events, journalEntry{name: name, payload: text})
+		mu.Unlock()
+	}
+
+	firstDone := make(chan struct{})
+	go func() { a.activate(firstID); close(firstDone) }()
+	<-firstReset
+	secondDone := make(chan struct{})
+	go func() { a.activate(secondID); close(secondDone) }()
+	close(releaseFirst)
+	<-firstDone
+	<-secondDone
+
+	mu.Lock()
+	defer mu.Unlock()
+	lastReset := -1
+	for i, event := range events {
+		if event.name == "tab_reset" {
+			lastReset = i
+		}
+	}
+	if lastReset < 0 || events[lastReset].payload != secondID {
+		t.Fatalf("last reset = %#v, want second tab %q", events, secondID)
+	}
+	for _, event := range events[lastReset+1:] {
+		if event.name == "event" && event.payload == "first-journal" {
+			t.Fatalf("superseded first replay published after second reset: %#v", events)
+		}
+	}
+}
+
+func TestRelayAndActivationSharePublicationSequencer(t *testing.T) {
+	t.Run("old relay cannot follow new reset", func(t *testing.T) {
+		a := newTabApp(t)
+		oldID, _ := a.newTab()
+		newID, _ := a.newTab()
+		a.activate(oldID)
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		var mu sync.Mutex
+		var events []journalEntry
+		a.eventEmit = func(name string, payload any) {
+			text, _ := payload.(string)
+			if name == "event" && text == "old" {
+				close(entered)
+				<-release
+			}
+			mu.Lock()
+			events = append(events, journalEntry{name: name, payload: text})
+			mu.Unlock()
+		}
+		relayDone := make(chan struct{})
+		go func() { a.relayTabEvent(oldID, "event", "old"); close(relayDone) }()
+		<-entered
+		activateDone := make(chan struct{})
+		go func() { a.activate(newID); close(activateDone) }()
+		close(release)
+		<-relayDone
+		<-activateDone
+		mu.Lock()
+		defer mu.Unlock()
+		oldAt, resetAt := -1, -1
+		for i, event := range events {
+			if event.name == "event" && event.payload == "old" {
+				oldAt = i
+			}
+			if event.name == "tab_reset" && event.payload == newID {
+				resetAt = i
+			}
+		}
+		if oldAt < 0 || resetAt < 0 || oldAt > resetAt {
+			t.Fatalf("old relay/reset order = %#v", events)
+		}
+	})
+
+	t.Run("new relay cannot precede its reset", func(t *testing.T) {
+		a := newTabApp(t)
+		oldID, _ := a.newTab()
+		newID, _ := a.newTab()
+		a.activate(oldID)
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		var mu sync.Mutex
+		var events []journalEntry
+		a.eventEmit = func(name string, payload any) {
+			text, _ := payload.(string)
+			if name == "tab_reset" && text == newID {
+				close(entered)
+				<-release
+			}
+			mu.Lock()
+			events = append(events, journalEntry{name: name, payload: text})
+			mu.Unlock()
+		}
+		activateDone := make(chan struct{})
+		go func() { a.activate(newID); close(activateDone) }()
+		<-entered
+		relayDone := make(chan struct{})
+		go func() { a.relayTabEvent(newID, "event", "new"); close(relayDone) }()
+		close(release)
+		<-activateDone
+		<-relayDone
+		mu.Lock()
+		defer mu.Unlock()
+		resetAt, newAt := -1, -1
+		for i, event := range events {
+			if event.name == "tab_reset" && event.payload == newID {
+				resetAt = i
+			}
+			if event.name == "event" && event.payload == "new" {
+				newAt = i
+			}
+		}
+		if resetAt < 0 || newAt < 0 || newAt < resetAt {
+			t.Fatalf("new reset/relay order = %#v", events)
+		}
+	})
 }
 
 // TestTabJournalAndBadges covers background-event journaling, badge
@@ -129,6 +444,177 @@ func TestTabReplayUsesCachedFrames(t *testing.T) {
 	ts.cm.dispatch(&netproto.Frame{Type: uint16(netproto.MsgChannelList), Payload: []byte(`{"channels":[]}`)})
 	if ts.cm.lastSnapshot == "" || ts.cm.lastChannelList == "" {
 		t.Fatal("frames not cached on the connManager")
+	}
+}
+
+func TestTabReplayPublishesCompletionAfterJournal(t *testing.T) {
+	a := newTabApp(t)
+	id, ts := a.newTab()
+	ts.journal = []journalEntry{{name: "event", payload: "journal-entry"}}
+	var events []journalEntry
+	a.eventEmit = func(name string, payload any) {
+		text, _ := payload.(string)
+		events = append(events, journalEntry{name: name, payload: text})
+	}
+
+	a.activate(id)
+	reset, journal, done := -1, -1, -1
+	for i, event := range events {
+		switch {
+		case event.name == "tab_reset":
+			reset = i
+		case event.name == "event" && event.payload == "journal-entry":
+			journal = i
+		case event.name == "tab_replay_done" && event.payload == id:
+			done = i
+		}
+	}
+	if reset < 0 || journal < 0 || done < 0 || reset >= journal || journal >= done {
+		t.Fatalf("replay order = %#v, want reset < journal < tab_replay_done", events)
+	}
+}
+
+// TestConnectBookmarkTabWithID verifies successful connections return the
+// exact tab they created and the compatibility wrappers connect only once.
+func TestConnectBookmarkTabWithID(t *testing.T) {
+	oldRoot, oldProtection := identityRootOverride, keyProtectionSetting
+	identityRootOverride = t.TempDir()
+	keyProtectionSetting = func() string { return "off" }
+	t.Cleanup(func() {
+		identityRootOverride = oldRoot
+		keyProtectionSetting = oldProtection
+	})
+
+	addr := startTabAuthServer(t, 3)
+	a := newTabApp(t)
+	t.Cleanup(func() {
+		for _, tab := range a.ListTabs() {
+			a.CloseTab(tab.ID)
+		}
+	})
+
+	account := a.ConnectBookmarkTabWithID("work", addr, "alice", "password", "")
+	if account.Error != "" || account.TabID == "" {
+		t.Fatalf("account result = %+v, want a tab ID without an error", account)
+	}
+	if tabs := a.ListTabs(); len(tabs) != 1 || tabs[0].ID != account.TabID || !tabs[0].Active {
+		t.Fatalf("tabs after account connect = %+v, want active tab %q", tabs, account.TabID)
+	}
+
+	guest := a.ConnectGuestBookmarkTabWithID("guest", addr, "visitor")
+	if guest.Error != "" || guest.TabID == "" {
+		t.Fatalf("guest result = %+v, want a tab ID without an error", guest)
+	}
+	if guest.TabID == account.TabID {
+		t.Fatalf("guest tab ID = account tab ID = %q", guest.TabID)
+	}
+	if a.activeID != guest.TabID {
+		t.Fatalf("active tab = %q, want guest tab %q", a.activeID, guest.TabID)
+	}
+
+	if err := a.ConnectBookmarkTab("legacy", addr, "bob", "password", ""); err != "" {
+		t.Fatalf("compatibility wrapper connect: %s", err)
+	}
+	if tabs := a.ListTabs(); len(tabs) != 3 {
+		t.Fatalf("tabs after three connect calls = %d, want 3", len(tabs))
+	}
+}
+
+func TestConnectTabResultValidation(t *testing.T) {
+	const expected = "server address and nickname are required"
+	a := newTabApp(t)
+
+	account := a.ConnectBookmarkTabWithID("", "", "alice", "password", "")
+	if account.TabID != "" || account.Error != expected {
+		t.Fatalf("account validation result = %+v", account)
+	}
+	guest := a.ConnectGuestBookmarkTabWithID("", "server", "")
+	if guest.TabID != "" || guest.Error != expected {
+		t.Fatalf("guest validation result = %+v", guest)
+	}
+	if got := a.ConnectBookmarkTab("", "", "alice", "password", ""); got != expected {
+		t.Fatalf("account compatibility error = %q, want %q", got, expected)
+	}
+	if got := a.ConnectGuestBookmarkTab("", "server", ""); got != expected {
+		t.Fatalf("guest compatibility error = %q, want %q", got, expected)
+	}
+	if tabs := a.ListTabs(); len(tabs) != 0 {
+		t.Fatalf("validation failures created tabs: %+v", tabs)
+	}
+}
+
+func startTabAuthServer(t *testing.T, connectionCount int) string {
+	t.Helper()
+	cert, _, err := tlscert.Ensure(t.TempDir(), "", "", nil)
+	if err != nil {
+		t.Fatalf("create TLS certificate: %v", err)
+	}
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS13,
+	})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	var (
+		connections  []net.Conn
+		acceptDone   = make(chan struct{})
+		connectionWG sync.WaitGroup
+	)
+	go func() {
+		defer close(acceptDone)
+		for range connectionCount {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			connections = append(connections, conn)
+			connectionWG.Add(1)
+			go func() {
+				defer connectionWG.Done()
+				serveTabAuthConnection(conn)
+			}()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = listener.Close()
+		<-acceptDone
+		for _, conn := range connections {
+			_ = conn.Close()
+		}
+		connectionWG.Wait()
+	})
+	return listener.Addr().String()
+}
+
+func serveTabAuthConnection(conn net.Conn) {
+	defer func() { _ = conn.Close() }()
+	frame, err := netproto.ReadFrame(conn)
+	if err != nil {
+		return
+	}
+	var authenticate netproto.Authenticate
+	if err := netproto.Decode(frame, &authenticate); err != nil {
+		return
+	}
+	nickname := authenticate.Nickname
+	if nickname == "" {
+		nickname = authenticate.Username
+	}
+	response, err := netproto.Encode(netproto.MsgAuthResponse, netproto.AuthResponse{
+		OK:       true,
+		ClientID: "client",
+		UniqueID: "user",
+		Nickname: nickname,
+	})
+	if err != nil || netproto.WriteFrame(conn, response) != nil {
+		return
+	}
+	for {
+		if _, err := netproto.ReadFrame(conn); err != nil {
+			return
+		}
 	}
 }
 

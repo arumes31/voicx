@@ -7,8 +7,8 @@ server. All files use `syntax = "proto3";` and the package `voicx.v1`.
 
 | File | Service(s) | Purpose |
 |------|------------|---------|
-| [`signaling.proto`](signaling.proto) | `Signaling` | WebRTC signaling: SDP offer/answer, ICE candidates, channel join/leave, subscribe/unsubscribe. |
-| [`chat.proto`](chat.proto) | `Chat` | Channel chat, global server chat, direct messages, offline message spool. |
+| [`signaling.proto`](signaling.proto) | `Signaling` (deprecated) | Compatibility descriptors for the intentionally unserved WebRTC signaling RPCs. |
+| [`chat.proto`](chat.proto) | `Chat` (deprecated) | Compatibility descriptors for the intentionally unserved chat RPCs. |
 | [`events.proto`](events.proto) | `Events` | Server events broadcast to clients (user joined/left, speaking, channel created/deleted, user moved/kicked/banned). |
 | [`control.proto`](control.proto) | `Control` | Authentication, channel create/delete/list, permission queries, file transfer control. |
 
@@ -28,28 +28,27 @@ The Go stubs are generated and committed under [`v1/`](../v1) (package
 each `.proto` file. Regenerate them after every schema change and commit the
 result — the server (232) compiles against them.
 
-Prerequisites (install once):
+Prerequisite (install once):
 
 ```sh
-go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
-go install github.com/bufbuild/buf/cmd/buf@latest
+go install github.com/bufbuild/buf/cmd/buf@v1.72.0
 ```
 
 Regenerate from the project root ([`buf.gen.yaml`](../buf.gen.yaml) configures
-the plugins and the output layout):
+the pinned remote plugins and output layout):
 
 ```sh
 buf generate
 ```
 
-buf compiles the schema itself, so `protoc` is not needed.
+buf compiles the schema itself and downloads the pinned remote Go plugins, so
+neither `protoc` nor local `protoc-gen-*` binaries are needed.
 
 ## Implementation status
 
 | Service | Status |
 |---------|--------|
 | `Events` | Served: `Subscribe` streams from the server-side event bus. |
-| `Control` | Served: auth, channel create/delete/list, permission query. The file-transfer RPCs return `Unimplemented` on purpose — transfer tokens are minted by the control channel after a per-client permission check. |
-| `Chat` | Not served: chat is end-to-end/scope-key encrypted on the control channel. |
-| `Signaling` | Not served: WebRTC signaling stays on the control channel. |
+| `Control` | Served: auth, channel create/delete/list, permission query. Authentication returns only `user_id`; it does not mint a session token. The file-transfer RPCs intentionally return `Unimplemented` — transfer tokens are minted by the control channel after a per-client permission check. |
+| `Chat` | Deprecated and intentionally unserved: chat is end-to-end/scope-key encrypted on the control channel. |
+| `Signaling` | Deprecated and intentionally unserved: WebRTC signaling stays on the control channel. |

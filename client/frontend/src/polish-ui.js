@@ -169,6 +169,7 @@ function toggleChatPopout() {
 
 function toggleZen() {
     const on = !document.body.classList.contains("zen");
+    if (on) window.__voicxFiles?.activateWorkspaceTab?.("chat", { focus: false });
     document.body.classList.toggle("zen", on);
     let ind = document.getElementById("zen-indicator");
     if (on && !ind) {
@@ -180,6 +181,7 @@ function toggleZen() {
     } else if (!on && ind) {
         ind.remove();
     }
+    window.__voicxFiles?.restoreVisibleWorkspaceFocus?.();
 }
 
 // ---------------------------------------------------------------------------
@@ -257,7 +259,7 @@ function updateBellBadge() {
     badge.textContent = n > 0 ? (n > 9 ? "9+" : n) : "";
     badge.classList.toggle("hidden", n === 0);
     document.getElementById("notif-bell")?.setAttribute(
-        "aria-label", n > 0 ? `Notifications, ${n} unread` : "Notifications");
+        "aria-label", `Notifications, ${n} unread`);
 }
 
 // dndActive reports whether DND is on (toggle or quiet hours, 347/348).
@@ -395,7 +397,6 @@ function injectFakeTree(n) {
     const domRows = document.querySelectorAll("#channel-tree .channel, #channel-tree .client").length;
     const total = state.channels.length + state.clients.length;
     if (import.meta.env.DEV) {
-        console.log(`[virtualization] ${total} logical rows, ${domRows} DOM rows, rendered in ${ms.toFixed(1)}ms (windowed=${virtualizeEnabled()})`);
     }
     return { ms, domRows, total, windowed: virtualizeEnabled() };
 }

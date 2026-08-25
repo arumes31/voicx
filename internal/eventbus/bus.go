@@ -49,6 +49,22 @@ type Stats struct {
 	Evicted     uint64
 }
 
+// CloseReason is the immutable terminal state of a Subscription. It lets a
+// consumer distinguish its own cancellation from a slow-consumer eviction or
+// a bus shutdown without inferring semantics from the lossy drop counter.
+type CloseReason uint8
+
+const (
+	// CloseReasonOpen means the subscription is still accepting events.
+	CloseReasonOpen CloseReason = iota
+	// CloseReasonUnsubscribed means the consumer explicitly unsubscribed.
+	CloseReasonUnsubscribed
+	// CloseReasonSlowConsumer means the drop policy evicted the consumer.
+	CloseReasonSlowConsumer
+	// CloseReasonBusClosed means the event bus shut down.
+	CloseReasonBusClosed
+)
+
 // Bus is the subscriber registry and fan-out.
 type Bus struct {
 	logger *zap.Logger
@@ -108,6 +124,7 @@ type Subscription struct {
 
 	closeMu sync.Mutex
 	closed  bool
+	reason  CloseReason
 }
 
 // Subscribe registers a consumer. name identifies it in logs, types filters by
@@ -143,28 +160,47 @@ func (b *Bus) Subscribe(name string, types []string, buffer int) *Subscription {
 }
 
 // Unsubscribe removes the subscription and closes its channel. It is
-// idempotent.
+// idempotent. If shutdown already began, the terminal reason remains
+// CloseReasonBusClosed rather than being overwritten by cleanup.
 func (s *Subscription) Unsubscribe() {
 	if s == nil {
 		return
 	}
 	s.bus.mu.Lock()
+	if s.bus.closed {
+		s.close(CloseReasonBusClosed)
+		s.bus.mu.Unlock()
+		return
+	}
 	delete(s.bus.subs, s.id)
+	s.close(CloseReasonUnsubscribed)
 	s.bus.mu.Unlock()
-	s.close()
 }
 
 // Dropped reports how many events this subscriber missed.
 func (s *Subscription) Dropped() uint64 { return s.dropped.Load() }
 
-// close closes the delivery channel exactly once.
-func (s *Subscription) close() {
+// CloseReason reports the subscription's current terminal state. Once a
+// subscription closes, the reason is immutable.
+func (s *Subscription) CloseReason() CloseReason {
+	if s == nil {
+		return CloseReasonOpen
+	}
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	return s.reason
+}
+
+// close closes the delivery channel exactly once and records its immutable
+// terminal reason.
+func (s *Subscription) close(reason CloseReason) {
 	s.closeMu.Lock()
 	defer s.closeMu.Unlock()
 	if s.closed {
 		return
 	}
 	s.closed = true
+	s.reason = reason
 	close(s.ch)
 }
 
@@ -222,6 +258,7 @@ func (b *Bus) evict(sub *Subscription) {
 	b.mu.Lock()
 	current, exists := b.subs[sub.id]
 	if exists && current == sub {
+		sub.close(CloseReasonSlowConsumer)
 		delete(b.subs, sub.id)
 	}
 	b.mu.Unlock()
@@ -232,7 +269,6 @@ func (b *Bus) evict(sub *Subscription) {
 	b.logger.Warn("eventbus subscriber evicted: not draining its buffer",
 		zap.String("name", sub.name), zap.Uint64("id", sub.id),
 		zap.Uint64("dropped", sub.Dropped()))
-	sub.close()
 }
 
 func cloneEvent(event Event) Event {
@@ -262,13 +298,9 @@ func (b *Bus) Close() {
 		return
 	}
 	b.closed = true
-	subs := make([]*Subscription, 0, len(b.subs))
 	for id, sub := range b.subs {
-		subs = append(subs, sub)
+		sub.close(CloseReasonBusClosed)
 		delete(b.subs, id)
 	}
 	b.mu.Unlock()
-	for _, sub := range subs {
-		sub.close()
-	}
 }

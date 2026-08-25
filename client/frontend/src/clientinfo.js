@@ -601,11 +601,11 @@ function openChannelNotify(channel) {
     overlay.innerHTML = `
         <div class="dlg">
             <h3>Notifications: #${window.__voicxSocial.esc(channel.Name)}</h3>
-            <label class="dlg-label">Messages (386)</label>${sel("cn-messages", ov.messages)}
+            <label class="dlg-label">Messages</label>${sel("cn-messages", ov.messages)}
             <label class="dlg-label">Mentions & keywords</label>${sel("cn-mentions", ov.mentions)}
             <label class="dlg-label">Joins & leaves</label>${sel("cn-joins", ov.joins)}
-            <label class="dlg-label"><input type="checkbox" class="cn-muted" ${ov.muted ? "checked" : ""} /> Mute channel entirely (387)</label>
-            <label class="dlg-label">Watch: toast when user count reaches (0 = off) (389)</label>
+            <label class="dlg-label"><input type="checkbox" class="cn-muted" ${ov.muted ? "checked" : ""} /> Mute channel entirely</label>
+            <label class="dlg-label">Watch: toast when user count reaches (0 = off)</label>
             <input type="number" class="dlg-input cn-watch" min="0" value="${ov.watch_threshold || 0}" />
             <div class="dlg-buttons">
                 <button class="dlg-ok">Save</button>
@@ -766,6 +766,10 @@ function subtreeOf(channelID) {
     return out;
 }
 
+// These helpers only transform stats/channel snapshots and are shared by the
+// dialog paths above; exporting them permits focused behavior coverage.
+export { countSubtree, humanDuration, inboundAudioByPublisher, matchPreset, subtreeOf };
+
 function openChannelEdit(channel) {
     const overlay = document.createElement("div");
     overlay.className = "dlg-overlay";
@@ -803,14 +807,14 @@ function openChannelEdit(channel) {
                 <label><input type="checkbox" class="ce-stereo" /> Stereo</label>
             </div>
             <label class="dlg-label">Needed join power (0 = open to everyone)</label>
-            <input type="number" class="dlg-input ce-joinpower" min="0" title="a client needs i_channel_join_power at or above this to join; you cannot raise it above your own join power (160)" />
-            <label class="dlg-label">Parent channel (168)</label>
+            <input type="number" class="dlg-input ce-joinpower" min="0" title="a client needs i_channel_join_power at or above this to join; you cannot raise it above your own join power" />
+            <label class="dlg-label">Parent channel</label>
             <select class="dlg-input ce-parent">
                 <option value="0">— top level —</option>
             </select>
             <label class="dlg-label">Sort index (163; lower sorts first among siblings)</label>
             <input type="number" class="dlg-input ce-order" />
-            <label class="dlg-label"><input type="checkbox" class="ce-inherit" /> inherit the parent's channel permissions and join power (157)</label>
+            <label class="dlg-label"><input type="checkbox" class="ce-inherit" /> inherit the parent's channel permissions and join power</label>
             <label class="dlg-label">Channel icon</label>
             <div class="ce-icon-row">
                 <button class="icon-btn ce-icon-upload" title="Upload icon (compressed, max 1024px)">⬆ Upload…</button>

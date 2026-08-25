@@ -265,6 +265,8 @@ function toggleFocus(clid) {
 
 export function initVideo() {
     syncCameraButton(); // (85) disabled until a voice session captures a camera
+    syncShareButton();
+    syncLowBandwidthButton();
     document.addEventListener("keydown", (e) => {
         if (e.key === "Escape" && focusedID) {
             focusedID = null;
@@ -519,15 +521,37 @@ let lowBandwidth = false;
 // LOW_BW_BITRATE is the send ceiling of the mode; a screen share must not lift
 // it (88), so the share preset caps are clamped to it while the mode is on.
 const LOW_BW_BITRATE = 150000;
+const LOW_BW_HOURLY_MB = Math.ceil(LOW_BW_BITRATE * 60 * 60 / 8 / 1000000);
+const LOW_BW_ESTIMATE_ID = "voice-lowbw-estimate";
+
+function syncLowBandwidthButton() {
+    const btn = V().$("voice-lowbw");
+    if (!btn) return;
+    const description = `Estimated outgoing video: up to ${LOW_BW_HOURLY_MB} MB/hour at the 150 kbps camera or screen-share cap. Voice, protocol overhead, and incoming data are additional.`;
+    btn.title = `Low bandwidth — ${description}`;
+    btn.setAttribute("aria-description", description);
+    btn.classList.toggle("active", lowBandwidth);
+    btn.setAttribute("aria-pressed", String(lowBandwidth));
+    let badge = document.getElementById(LOW_BW_ESTIMATE_ID);
+    if (!badge) {
+        badge = document.createElement("span");
+        badge.id = LOW_BW_ESTIMATE_ID;
+        badge.className = "lowbw-estimate";
+        btn.insertAdjacentElement("afterend", badge);
+    }
+    badge.textContent = `≤${LOW_BW_HOURLY_MB} MB/h video send`;
+    badge.title = description;
+    badge.setAttribute("aria-label", description);
+    badge.classList.toggle("active", lowBandwidth);
+    btn.setAttribute("aria-describedby", LOW_BW_ESTIMATE_ID);
+}
 
 export function isLowBandwidth() { return lowBandwidth; }
 
 // setLowBandwidth toggles the mode; persist=true saves it into settings.
 export async function setLowBandwidth(on, persist) {
     lowBandwidth = on;
-    const { $ } = V();
-    $("voice-lowbw").classList.toggle("active", on);
-    $("voice-lowbw").setAttribute("aria-pressed", String(on));
+    syncLowBandwidthButton();
     gridEl().classList.toggle("lowbw", on);
     lastSentQuality = ""; // force re-push with the new effective quality
     pushQuality();
@@ -613,6 +637,19 @@ const regionSupported = typeof CropTarget !== "undefined" && (
         "cropTo" in BrowserCaptureMediaStreamTrack.prototype) ||
     (typeof MediaStreamTrack !== "undefined" && "cropTo" in MediaStreamTrack.prototype));
 
+let shareDialogID = 0;
+
+function syncShareButton() {
+    const btn = V().$("voice-screen");
+    if (!btn) return;
+    const sharing = !!V().state.screenSharing;
+    const label = sharing ? "Stop sharing" : "Start sharing";
+    btn.classList.toggle("active", sharing);
+    btn.setAttribute("aria-pressed", String(sharing));
+    btn.setAttribute("aria-label", label);
+    btn.title = label;
+}
+
 // shareToggle is the voice-screen button handler: stop when sharing
 // (confirming first, 85), otherwise open the share dialog.
 export async function shareToggle() {
@@ -625,27 +662,30 @@ export async function shareToggle() {
 }
 
 function openShareDialog() {
-    const { $ } = V();
+    const dialogID = ++shareDialogID;
+    const sourceName = `shsrc-${dialogID}`;
+    const qualityID = `share-quality-${dialogID}`;
+    const audioID = `share-audio-${dialogID}`;
     const overlay = document.createElement("div");
     overlay.className = "dlg-overlay";
     overlay.innerHTML = `
         <div class="dlg share-dlg">
             <h3>Share screen</h3>
-            <label class="dlg-label">Source</label>
-            <div class="share-sources">
-                <label><input type="radio" name="shsrc" value="monitor" checked /> Screen</label>
-                <label><input type="radio" name="shsrc" value="window" /> Window</label>
+            <fieldset class="share-sources">
+                <legend class="dlg-label">Source</legend>
+                <label><input type="radio" name="${sourceName}" value="monitor" checked /> Screen</label>
+                <label><input type="radio" name="${sourceName}" value="window" /> Window</label>
                 <label title="${regionSupported ? "Crop the share to a region of this app" : "Region Capture not available in this WebView2"}">
-                    <input type="radio" name="shsrc" value="region" ${regionSupported ? "" : "disabled"} /> Region of this app
+                    <input type="radio" name="${sourceName}" value="region" ${regionSupported ? "" : "disabled"} /> Region of this app
                 </label>
-            </div>
-            <label class="dlg-label">Quality preset</label>
-            <select class="dlg-input sh-preset">
+            </fieldset>
+            <label class="dlg-label" for="${qualityID}">Quality preset</label>
+            <select class="dlg-input sh-preset" id="${qualityID}">
                 <option value="balanced">${SHARE_PRESETS.balanced.label}</option>
                 <option value="text">${SHARE_PRESETS.text.label}</option>
                 <option value="motion">${SHARE_PRESETS.motion.label}</option>
             </select>
-            <label class="share-audio"><input type="checkbox" class="sh-audio" /> Include system audio</label>
+            <label class="share-audio" for="${audioID}"><input type="checkbox" class="sh-audio" id="${audioID}" /> Include system audio</label>
             <div class="dlg-buttons">
                 <button class="dlg-ok">Start sharing</button>
                 <button class="dlg-cancel">Cancel</button>
@@ -655,7 +695,7 @@ function openShareDialog() {
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
     overlay.querySelector(".dlg-ok").onclick = async () => {
         if (!isCurrentServerDialog(overlay)) return;
-        const surface = overlay.querySelector('input[name="shsrc"]:checked').value;
+        const surface = overlay.querySelector(`input[name="${sourceName}"]:checked`).value;
         const preset = overlay.querySelector(".sh-preset").value;
         const withAudio = overlay.querySelector(".sh-audio").checked;
         overlay.remove();
@@ -731,6 +771,17 @@ async function startShare({ surface, preset, withAudio }) {
         return;
     }
     screenTrack.contentHint = preset === "text" ? "detail" : "motion";
+    let shareEnded = false;
+    screenTrack.onended = () => {
+        shareEnded = true;
+        if (state.screenSharing) {
+            doStopShare();
+            return;
+        }
+        if (state.shareStream === display) state.shareStream = null;
+        discardDisplay(display);
+        clearRegionBox();
+    };
 
     if (surface === "region") {
         const ok = await pickRegionAndCrop(screenTrack, current);
@@ -807,8 +858,6 @@ async function startShare({ surface, preset, withAudio }) {
             vs.setParameters(params).catch(() => {});
         }
     }
-    screenTrack.onended = () => doStopShare(); // browser "stop sharing" UI
-
     // (70) merge display audio as a second published audio track (the server
     // fans out every publisher audio track) + renegotiate.
     const displayAudio = withAudio ? display.getAudioTracks()[0] : null;
@@ -859,8 +908,10 @@ async function startShare({ surface, preset, withAudio }) {
         }
     }
 
-    if (!current()) {
+    if (!current() || shareEnded || screenTrack.readyState === "ended") {
+        if (state.shareStream === display) state.shareStream = null;
         discardDisplay(display);
+        clearRegionBox();
         return;
     }
     state.screenSharing = true;
@@ -874,8 +925,7 @@ async function startShare({ surface, preset, withAudio }) {
         await doStopShare();
         return;
     }
-    document.getElementById("voice-screen").classList.add("active");
-    document.getElementById("voice-screen").setAttribute("aria-pressed", "true");
+    syncShareButton();
 }
 
 // pickRegionAndCrop shows a draggable/resizable box over the app; on confirm
@@ -1049,8 +1099,7 @@ async function doStopShare() {
     const { state } = V();
     if (!state.screenSharing) return;
     state.screenSharing = false;
-    document.getElementById("voice-screen").classList.remove("active");
-    document.getElementById("voice-screen").setAttribute("aria-pressed", "false");
+    syncShareButton();
     await window.go.main.App.SetScreenShare(false);
 
     if (state.shareAudioSender && state.pc) {
@@ -1105,6 +1154,7 @@ export function resetCameraState() {
     cameraOff = false;
     sharePresetBitrate = 0;
     syncCameraButton();
+    syncShareButton();
 }
 
 // cameraToggle is the voice-video button handler.
@@ -1176,7 +1226,7 @@ export function trackSlots() {
 // share track); the server treats re-offers idempotently. A failed round is
 // rolled back to "stable": without that the pc stays in have-local-offer and
 // every later renegotiation dies with InvalidStateError.
-async function renegotiate(peerConnection = V().state.pc, generation = V().state.serverGeneration) {
+export async function renegotiate(peerConnection = V().state.pc, generation = V().state.serverGeneration) {
     const current = () => V().state.pc === peerConnection && V().state.serverGeneration === generation;
     const ensureCurrent = () => {
         if (!current()) throw new DOMException("server session changed", "AbortError");

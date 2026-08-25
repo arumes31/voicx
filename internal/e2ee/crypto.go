@@ -6,7 +6,7 @@ import (
 	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/ed25519"
-	"crypto/hmac"
+	stdhkdf "crypto/hkdf"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -18,6 +18,24 @@ import (
 )
 
 const MaxSkippedKeys = 2000
+
+// FileChunkCiphertextOverhead is the per-chunk overhead emitted by
+// EncryptFileChunk: the random AES-GCM nonce followed by the authentication
+// tag. Derive it from the AEAD used by sealAES so callers that bound framed
+// file transfers cannot drift from the ciphertext format.
+var fileChunkCiphertextOverhead = func() int {
+	block, err := aes.NewCipher(make([]byte, 32))
+	if err != nil {
+		panic(err)
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		panic(err)
+	}
+	return aead.NonceSize() + aead.Overhead()
+}()
+
+func FileChunkCiphertextOverhead() int { return fileChunkCiphertextOverhead }
 
 var (
 	ErrInvalidSignature = errors.New("invalid signed prekey signature")
@@ -160,23 +178,17 @@ func RespondX3DH(identityPrivate, signedPreKeyPrivate, oneTimePreKeyPrivate, ini
 }
 
 func hkdf(secret, salt, info []byte, size int) []byte {
-	if salt == nil {
-		salt = make([]byte, sha256.Size)
+	// crypto/hkdf.Key implements the same RFC 5869 extract-and-expand
+	// construction formerly implemented locally. It keeps a nil salt and
+	// arbitrary binary info semantically intact.
+	out, err := stdhkdf.Key(sha256.New, secret, salt, string(info), size)
+	if err != nil {
+		// Every caller requests a fixed 32-byte key, well within HKDF's
+		// maximum. Keeping this private helper's long-standing no-error
+		// contract avoids public API churn.
+		panic(fmt.Sprintf("deriving HKDF key: %v", err))
 	}
-	extract := hmac.New(sha256.New, salt)
-	_, _ = extract.Write(secret)
-	prk := extract.Sum(nil)
-	out := make([]byte, 0, size)
-	var previous []byte
-	for counter := byte(1); len(out) < size; counter++ {
-		expand := hmac.New(sha256.New, prk)
-		_, _ = expand.Write(previous)
-		_, _ = expand.Write(info)
-		_, _ = expand.Write([]byte{counter})
-		previous = expand.Sum(nil)
-		out = append(out, previous...)
-	}
-	return out[:size]
+	return out
 }
 
 func chainStep(chain []byte) (next, message []byte) {

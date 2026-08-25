@@ -35,34 +35,49 @@ type Config struct {
 	// credentials as QueryAddr, wrapped in an SSH transport. Off by default.
 	// QuerySSHHostKey is generated on first start and must persist, or every
 	// client reports a changed host identity after a restart.
-	QuerySSHEnabled    bool   `mapstructure:"query_ssh_enabled"`
-	QuerySSHAddr       string `mapstructure:"query_ssh_addr"`
-	QuerySSHHostKey    string `mapstructure:"query_ssh_host_key"`
-	FileAddr           string `mapstructure:"file_addr"`
-	FileRoot           string `mapstructure:"file_root"`
-	FileMaxKBps        int    `mapstructure:"file_max_kbps"`
-	FileChannelQuotaMB int64  `mapstructure:"file_channel_quota_mb"`
-	FileMaxSizeMB      int64  `mapstructure:"file_max_size_mb"`
+	QuerySSHEnabled bool   `mapstructure:"query_ssh_enabled"`
+	QuerySSHAddr    string `mapstructure:"query_ssh_addr"`
+	QuerySSHHostKey string `mapstructure:"query_ssh_host_key"`
+	FileAddr        string `mapstructure:"file_addr"`
+	FileRoot        string `mapstructure:"file_root"`
+	FileMaxKBps     int    `mapstructure:"file_max_kbps"`
+	// FileMaxConnections bounds simultaneous accepted file-port connections.
+	// It prevents idle or stalled clients from exhausting descriptors.
+	FileMaxConnections int   `mapstructure:"file_max_connections"`
+	FileChannelQuotaMB int64 `mapstructure:"file_channel_quota_mb"`
+	FileMaxSizeMB      int64 `mapstructure:"file_max_size_mb"`
 	// Quiet hours lift file_max_kbps between these local hours (276), so
 	// backups and big uploads run at full speed when nobody is listening.
 	// Both are 0-23; equal values disable the window. A start after the end
 	// wraps past midnight (22 -> 6).
-	FileQuietHoursStart int    `mapstructure:"file_quiet_hours_start"`
-	FileQuietHoursEnd   int    `mapstructure:"file_quiet_hours_end"`
-	DatabaseURL         string `mapstructure:"database_url"`
-	PIIKeyFile          string `mapstructure:"pii_key_file"`
-	RedisAddr           string `mapstructure:"redis_addr"`
-	RedisPassword       string `mapstructure:"redis_password"`
-	RedisEnabled        bool   `mapstructure:"redis_enabled"`
+	FileQuietHoursStart int           `mapstructure:"file_quiet_hours_start"`
+	FileQuietHoursEnd   int           `mapstructure:"file_quiet_hours_end"`
+	DatabaseURL         string        `mapstructure:"database_url"`
+	PIIKeyFile          string        `mapstructure:"pii_key_file"`
+	RedisAddr           string        `mapstructure:"redis_addr"`
+	RedisPassword       string        `mapstructure:"redis_password"`
+	RedisEnabled        bool          `mapstructure:"redis_enabled"`
+	RedisDialTimeout    time.Duration `mapstructure:"redis_dial_timeout"`
+	RedisReadTimeout    time.Duration `mapstructure:"redis_read_timeout"`
+	RedisWriteTimeout   time.Duration `mapstructure:"redis_write_timeout"`
+	RedisTLSEnabled     bool          `mapstructure:"redis_tls_enabled"`
+	RedisTLSServerName  string        `mapstructure:"redis_tls_server_name"`
+	RedisTLSCAFile      string        `mapstructure:"redis_tls_ca_file"`
 	// MetricsAllowRemote exposes /metrics beyond loopback on HealthAddr.
 	// Liveness and readiness remain reachable wherever HealthAddr is bound.
-	MetricsAllowRemote   bool `mapstructure:"metrics_allow_remote"`
-	MaxClients           int  `mapstructure:"max_clients"`
-	ClientTimeoutSeconds int  `mapstructure:"client_timeout_seconds"`
-	DefaultOpusBitrate   int  `mapstructure:"default_opus_bitrate"`
-	DefaultOpusFEC       bool `mapstructure:"default_opus_fec"`
-	DefaultOpusDTX       bool `mapstructure:"default_opus_dtx"`
-	DefaultOpusStereo    bool `mapstructure:"default_opus_stereo"`
+	MetricsAllowRemote bool `mapstructure:"metrics_allow_remote"`
+	// PprofEnabled exposes loopback-only runtime profiling endpoints on
+	// HealthAddr. It is disabled unless explicitly enabled for diagnostics.
+	PprofEnabled bool `mapstructure:"pprof_enabled"`
+	// ShutdownTimeout is the total grace period shared by every server
+	// component during an orderly shutdown.
+	ShutdownTimeout      time.Duration `mapstructure:"shutdown_timeout"`
+	MaxClients           int           `mapstructure:"max_clients"`
+	ClientTimeoutSeconds int           `mapstructure:"client_timeout_seconds"`
+	DefaultOpusBitrate   int           `mapstructure:"default_opus_bitrate"`
+	DefaultOpusFEC       bool          `mapstructure:"default_opus_fec"`
+	DefaultOpusDTX       bool          `mapstructure:"default_opus_dtx"`
+	DefaultOpusStereo    bool          `mapstructure:"default_opus_stereo"`
 	// EchoChannelName is the name of the loopback test channel: the server
 	// ensures it exists at startup, and publishers in it hear their own audio
 	// routed back (the echo channel is the only channel with self-fan-out).
@@ -207,11 +222,10 @@ type WebRTCConfig struct {
 	EnableAV1 bool `mapstructure:"enable_av1"`
 }
 
-// Load reads configuration from environment variables (VOICX_ prefix),
-// an optional config.yaml (searched in the working directory first, then
-// /etc/voicx), and built-in defaults. It returns a typed *Config or an error
-// if configuration could not be unmarshalled.
-func Load() (*Config, error) {
+// newConfigViper returns a fresh Viper instance populated with the runtime
+// defaults. Keeping construction separate from loading makes decoding
+// deterministic for callers that provide an explicit configuration source.
+func newConfigViper() *viper.Viper {
 	v := viper.New()
 
 	// Defaults -----------------------------------------------------------------
@@ -231,6 +245,7 @@ func Load() (*Config, error) {
 	v.SetDefault("file_addr", DefaultFileAddr)
 	v.SetDefault("file_root", "./data/files")
 	v.SetDefault("file_max_kbps", 0)
+	v.SetDefault("file_max_connections", 128)
 	v.SetDefault("file_channel_quota_mb", 0)
 	v.SetDefault("file_max_size_mb", 100)
 	v.SetDefault("file_quiet_hours_start", 0)
@@ -239,7 +254,15 @@ func Load() (*Config, error) {
 	v.SetDefault("redis_addr", "localhost:6379")
 	v.SetDefault("redis_password", "")
 	v.SetDefault("redis_enabled", true)
+	v.SetDefault("redis_dial_timeout", 5*time.Second)
+	v.SetDefault("redis_read_timeout", 3*time.Second)
+	v.SetDefault("redis_write_timeout", 3*time.Second)
+	v.SetDefault("redis_tls_enabled", false)
+	v.SetDefault("redis_tls_server_name", "")
+	v.SetDefault("redis_tls_ca_file", "")
 	v.SetDefault("metrics_allow_remote", false)
+	v.SetDefault("pprof_enabled", false)
+	v.SetDefault("shutdown_timeout", 30*time.Second)
 	v.SetDefault("max_clients", 1024)
 	v.SetDefault("echo_channel_name", "Echo Test")
 	// 60s matches channels.DefaultCleanupDelay (165).
@@ -301,6 +324,16 @@ func Load() (*Config, error) {
 	v.SetDefault("recording.max_concurrent", 4)
 	v.SetDefault("recording.windows_acl_ready", false)
 
+	return v
+}
+
+// Load reads configuration from environment variables (VOICX_ prefix),
+// an optional config.yaml (searched in the working directory first, then
+// /etc/voicx), and built-in defaults. It returns a typed *Config or an error
+// if configuration could not be unmarshalled.
+func Load() (*Config, error) {
+	v := newConfigViper()
+
 	// config.yaml: the working directory wins; /etc/voicx is the system
 	// location used by the Docker image. The first file found is used.
 	v.SetConfigName("config")
@@ -319,6 +352,12 @@ func Load() (*Config, error) {
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
 
+	return decodeConfig(v)
+}
+
+// decodeConfig converts a populated Viper instance into a validated runtime
+// configuration without reading files or consulting the process environment.
+func decodeConfig(v *viper.Viper) (*Config, error) {
 	cfg := &Config{}
 	if err := v.Unmarshal(cfg); err != nil {
 		return nil, fmt.Errorf("unmarshalling config: %w", err)
@@ -398,6 +437,27 @@ func (c *Config) Validate() error {
 		if err := validateAddress("redis_addr", c.RedisAddr); err != nil {
 			errs = append(errs, err)
 		}
+		for _, timeout := range []struct {
+			name  string
+			value time.Duration
+		}{
+			{name: "redis_dial_timeout", value: c.RedisDialTimeout},
+			{name: "redis_read_timeout", value: c.RedisReadTimeout},
+			{name: "redis_write_timeout", value: c.RedisWriteTimeout},
+		} {
+			if timeout.value <= 0 {
+				errs = append(errs, fmt.Errorf("%s %s must be positive when redis_enabled=true", timeout.name, timeout.value))
+			}
+		}
+	}
+	if !c.RedisTLSEnabled && (strings.TrimSpace(c.RedisTLSServerName) != "" || strings.TrimSpace(c.RedisTLSCAFile) != "") {
+		errs = append(errs, errors.New("redis_tls_server_name and redis_tls_ca_file require redis_tls_enabled=true"))
+	}
+	if c.RedisEnabled && c.RedisTLSEnabled && strings.TrimSpace(c.RedisTLSServerName) == "" {
+		host, _, err := net.SplitHostPort(c.RedisAddr)
+		if err == nil && host == "" {
+			errs = append(errs, errors.New("redis_tls_server_name must be set when redis_tls_enabled=true and redis_addr has no host"))
+		}
 	}
 
 	if c.MaxClients <= 0 || c.MaxClients > 100_000 {
@@ -406,12 +466,18 @@ func (c *Config) Validate() error {
 	if c.ClientTimeoutSeconds <= 0 {
 		errs = append(errs, fmt.Errorf("client_timeout_seconds %d must be positive", c.ClientTimeoutSeconds))
 	}
+	if c.ShutdownTimeout <= 0 {
+		errs = append(errs, fmt.Errorf("shutdown_timeout %s must be positive", c.ShutdownTimeout))
+	}
 	if c.DefaultOpusBitrate < 6_000 || c.DefaultOpusBitrate > 512_000 {
 		errs = append(errs, fmt.Errorf("default_opus_bitrate %d must be between 6000 and 512000", c.DefaultOpusBitrate))
 	}
 
 	if c.FileMaxKBps < 0 {
 		errs = append(errs, fmt.Errorf("file_max_kbps %d must not be negative", c.FileMaxKBps))
+	}
+	if c.FileMaxConnections < 1 || c.FileMaxConnections > 10_000 {
+		errs = append(errs, fmt.Errorf("file_max_connections %d must be between 1 and 10000", c.FileMaxConnections))
 	}
 	if c.FileChannelQuotaMB < 0 {
 		errs = append(errs, fmt.Errorf("file_channel_quota_mb %d must not be negative", c.FileChannelQuotaMB))
@@ -552,8 +618,8 @@ func (c *Config) Validate() error {
 	return errors.Join(errs...)
 }
 
-// Warnings returns security-relevant choices that are valid only because the
-// operator explicitly opted in or selected development mode.
+// Warnings returns security-relevant configuration choices that need operator
+// attention, including deliberate development-mode escape hatches.
 func (c *Config) Warnings() []string {
 	if c == nil {
 		return []string{"configuration is nil"}
@@ -564,6 +630,9 @@ func (c *Config) Warnings() []string {
 	}
 	if c.MetricsAllowRemote {
 		warnings = append(warnings, "metrics_allow_remote exposes operational metrics beyond loopback")
+	}
+	if !c.DevMode && strings.TrimSpace(c.ServerPassword) == "" {
+		warnings = append(warnings, "server_password is empty in production; any client may join unless another access control is configured")
 	}
 	if !c.TLSEnabled {
 		warnings = append(warnings, "tls_enabled=false exposes the control protocol in plaintext")
@@ -579,6 +648,15 @@ func (c *Config) Warnings() []string {
 	}
 	if c.TURN.Secret == "" && len(c.TURN.URIs) > 0 {
 		warnings = append(warnings, "turn.uris is configured but turn.secret is empty; TURN is disabled")
+	}
+	if c.TURN.Secret != "" && len(c.TURN.Secret) < 16 {
+		warnings = append(warnings, "turn.secret is shorter than 16 bytes; use a high-entropy coturn static-auth-secret")
+	}
+	if c.RedisEnabled && !isLoopbackAddress(c.RedisAddr) && strings.TrimSpace(c.RedisPassword) == "" {
+		warnings = append(warnings, "redis is enabled on a non-loopback address without redis_password; require Redis ACL/password authentication")
+	}
+	if !isLoopbackAddress(c.HealthAddr) {
+		warnings = append(warnings, "health_addr is reachable beyond loopback; /dl bearer download links are served over plaintext HTTP, bind it to loopback or place it behind HTTPS")
 	}
 	return warnings
 }
@@ -736,11 +814,11 @@ func sensitiveQueryKey(key string) bool {
 // suitable for logging at startup.
 func (c *Config) Summary() string {
 	const format = "name=%q dev=%t level=%s tcp=%q udp=%q grpc=%q health=%q " +
-		"query=%q db=%q redis=%q redis_enabled=%t max_clients=%d av1=%t ice_servers=%d"
+		"query=%q db=%q redis=%q redis_enabled=%t redis_tls=%t shutdown_timeout=%s max_clients=%d av1=%t ice_servers=%d"
 	return fmt.Sprintf(
 		format,
 		c.ServerName, c.DevMode, c.LogLevel, c.TCPAddr, c.UDPAddr, c.GRPCAddr,
 		c.HealthAddr, c.QueryAddr, c.RedactedDatabaseURL(), c.RedactedRedisAddr(),
-		c.RedisEnabled, c.MaxClients, c.WebRTC.EnableAV1, len(c.WebRTC.ICEServers),
+		c.RedisEnabled, c.RedisTLSEnabled, c.ShutdownTimeout, c.MaxClients, c.WebRTC.EnableAV1, len(c.WebRTC.ICEServers),
 	)
 }

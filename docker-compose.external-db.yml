@@ -1,0 +1,13 @@
+# External PostgreSQL topology. Use together with docker-compose.yml whenever
+# VOICX_COMPOSE_DATABASE_URL or VOICX_COMPOSE_DATABASE_URL_FILE is configured.
+# It removes the internal readiness gate and keeps the bundled database behind
+# an inactive profile so an external deployment does not start an unused DB.
+services:
+  voicx:
+    depends_on: !override
+      redis:
+        condition: service_healthy
+  postgres:
+    profiles: ["internal-db"]
+  postgres-backup:
+    depends_on: !reset []

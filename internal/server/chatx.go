@@ -261,7 +261,7 @@ func (s *TCPServer) routeScopedChat(ctx context.Context, client *Client, msg net
 			if !privileged {
 				if wait := s.chatSlow.check(uid, channelID, ch.SlowModeSeconds, time.Now()); wait > 0 {
 					s.metricsSink().IncChatMessage("rejected")
-					return s.sendError(client, errCodeMalformed,
+					return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed,
 						fmt.Sprintf("slow mode: wait %ds before your next message in this channel", int(wait.Seconds())+1))
 				}
 			}
@@ -275,7 +275,7 @@ func (s *TCPServer) routeScopedChat(ctx context.Context, client *Client, msg net
 	if msg.Enc {
 		p, err := s.chatKeys.open(ctx, channelID, msg.KeyID, msg.Text)
 		if err != nil {
-			return s.sendError(client, errCodeMalformed, "message decryption failed (stale key?)")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "message decryption failed (stale key?)")
 		}
 		plain = p
 	}
@@ -283,7 +283,7 @@ func (s *TCPServer) routeScopedChat(ctx context.Context, client *Client, msg net
 	// (640) cap UTF-8 bytes, not runes, so wire/storage cost is predictable.
 	if s.cfg != nil && s.cfg.ChatMaxLength > 0 && len([]byte(plain)) > s.cfg.ChatMaxLength {
 		s.metricsSink().IncChatMessage("rejected")
-		return s.sendError(client, errCodeMalformed, fmt.Sprintf("message too long (max %d bytes)", s.cfg.ChatMaxLength))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, fmt.Sprintf("message too long (max %d bytes)", s.cfg.ChatMaxLength))
 	}
 
 	// Attachment tokens carry a fresh random key per upload; the filters and
@@ -293,13 +293,13 @@ func (s *TCPServer) routeScopedChat(ctx context.Context, client *Client, msg net
 	// (117/118) word + link filters.
 	if err := s.moderateBody(ctx, moderated); err != nil {
 		s.metricsSink().IncChatMessage("rejected")
-		return s.sendError(client, errCodeMalformed, err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, err.Error())
 	}
 
 	// (116) anti-spam: identical message x3 in 30s.
 	if s.chatSpam != nil && s.chatSpam.record(uid, bodyDigest(moderated), time.Now()) {
 		s.metricsSink().IncChatMessage("rejected")
-		return s.sendError(client, errCodeMalformed, "possible spam detected — please vary your messages")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "possible spam detected — please vary your messages")
 	}
 	// (105) mention parsing.
 	mentions := s.parseMentions(ctx, client, channelID, plain)
@@ -315,11 +315,11 @@ func (s *TCPServer) routeScopedChat(ctx context.Context, client *Client, msg net
 		// membership, and everyone is in the global scope), so ensuring the
 		// scope's first generation here is authorised.
 		if _, _, err := s.chatKeys.EnsureScope(ctx, channelID); err != nil {
-			return s.sendError(client, errCodeUnavailable, "chat key unavailable")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "chat key unavailable")
 		}
 		id, ct, err := s.chatKeys.seal(ctx, channelID, plain)
 		if err != nil {
-			return s.sendError(client, errCodeUnavailable, "chat key unavailable")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "chat key unavailable")
 		}
 		bodyEnc, keyID = ct, id
 	}
@@ -329,10 +329,10 @@ func (s *TCPServer) routeScopedChat(ctx context.Context, client *Client, msg net
 		if msg.ReplyToID != 0 {
 			parent, err := s.deps.Chat.GetChatMessage(ctx, msg.ReplyToID)
 			if err != nil {
-				return s.sendError(client, errCodeUnavailable, "reply target lookup failed")
+				return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "reply target lookup failed")
 			}
 			if parent == nil || parent.DeletedAt != nil || parent.ChannelID != channelID {
-				return s.sendError(client, errCodeMalformed, "reply target is not in this chat")
+				return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "reply target is not in this chat")
 			}
 		}
 		id, inserted, err := s.deps.Chat.StoreChatMessage(ctx, channelID, uid, client.Username, bodyEnc, keyID, msg.ReplyToID, msg.ClientMsgID)
@@ -341,7 +341,7 @@ func (s *TCPServer) routeScopedChat(ctx context.Context, client *Client, msg net
 			// invisible, indefinite history loss; fail the send instead.
 			s.logger.Warn("storing chat message failed", zap.Error(err))
 			s.metricsSink().IncChatMessage("rejected")
-			return s.sendError(client, errCodeUnavailable, "message not stored — not delivered")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "message not stored — not delivered")
 		}
 		messageID = id
 		if !inserted {
@@ -607,10 +607,10 @@ func (s *TCPServer) moderateBody(ctx context.Context, body string) error {
 func (s *TCPServer) handleChatFilterGet(ctx context.Context, client *Client, _ *netproto.Frame) error {
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	if !pc.granted(permissionKeyChatFilterManage) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissionKeyChatFilterManage))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissionKeyChatFilterManage))
 	}
 	f, fromConfig := s.effectiveFilters(ctx)
 	return s.writeMessage(client, netproto.MsgChatFilterResponse, netproto.ChatFilterResponse{
@@ -626,17 +626,17 @@ func (s *TCPServer) handleChatFilterGet(ctx context.Context, client *Client, _ *
 func (s *TCPServer) handleChatFilterSet(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.ChatFilterSet
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed chat_filter_set: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed chat_filter_set: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Chat == nil {
-		return s.sendError(client, errCodeUnavailable, "chat store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "chat store unavailable")
 	}
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	if !pc.granted(permissionKeyChatFilterManage) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissionKeyChatFilterManage))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissionKeyChatFilterManage))
 	}
 
 	if s.chatFilters != nil {
@@ -659,7 +659,7 @@ func (s *TCPServer) handleChatFilterSet(ctx context.Context, client *Client, f *
 			continue
 		}
 		if len(*upd.in) > maxFilterListBytes {
-			return s.sendError(client, errCodeMalformed,
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed,
 				fmt.Sprintf("filter list too long (max %d bytes)", maxFilterListBytes))
 		}
 		*upd.out = normalizeList(*upd.in)
@@ -667,11 +667,11 @@ func (s *TCPServer) handleChatFilterSet(ctx context.Context, client *Client, f *
 
 	raw, err := json.Marshal(next)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "encoding chat filters failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "encoding chat filters failed")
 	}
 	if err := s.deps.Chat.SetServerSetting(ctx, chatFiltersKey, string(raw), 0); err != nil {
 		s.logger.Warn("storing chat filters failed", zap.Error(err))
-		return s.sendError(client, errCodeUnavailable, "storing chat filters failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "storing chat filters failed")
 	}
 	s.invalidateFilters()
 	s.audit(ctx, client.UniqueID, "chat_filter_set", chatFiltersKey,
@@ -799,13 +799,13 @@ func (s *TCPServer) scopeKeyBundle(ctx context.Context, scope int64, memberPub s
 func (s *TCPServer) handleChatHistory(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.ChatHistory
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed chat_history: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed chat_history: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Chat == nil || s.deps.State == nil {
-		return s.sendError(client, errCodeUnavailable, "chat store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "chat store unavailable")
 	}
 	if !s.scopeReadable(ctx, client, msg.ChannelID) {
-		return s.sendError(client, errCodePermissionDenied, "not a member of this channel")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "not a member of this channel")
 	}
 	// Anonymous users may still join and inspect public channel membership,
 	// but one request cannot bulk-export more than a normal page of history.
@@ -814,12 +814,12 @@ func (s *TCPServer) handleChatHistory(ctx context.Context, client *Client, f *ne
 	}
 	memberPub := s.publishedKey(client)
 	if memberPub == "" {
-		return s.sendError(client, errCodePermissionDenied, "publish an encryption key before reading history")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "publish an encryption key before reading history")
 	}
 
 	msgs, err := s.deps.Chat.ChatHistory(ctx, msg.ChannelID, msg.BeforeID, msg.Limit)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "history query failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "history query failed")
 	}
 	ids := make([]int64, 0, len(msgs))
 	for _, m := range msgs {
@@ -878,26 +878,26 @@ func chatHistoryEntry(m store.ChatMessage, reactions map[string]int) netproto.Ch
 func (s *TCPServer) handleChatEdit(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.ChatEdit
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed chat_edit: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed chat_edit: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Chat == nil {
-		return s.sendError(client, errCodeUnavailable, "chat store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "chat store unavailable")
 	}
 	if !msg.Enc && (s.cfg == nil || !s.cfg.ChatAllowPlaintext) {
-		return s.sendError(client, errCodePermissionDenied, "plaintext chat is disabled on this server — update your client (chat encryption is mandatory)")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "plaintext chat is disabled on this server — update your client (chat encryption is mandatory)")
 	}
 	stored, err := s.deps.Chat.GetChatMessage(ctx, msg.MessageID)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "message lookup failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "message lookup failed")
 	}
 	if stored == nil || stored.DeletedAt != nil {
-		return s.sendError(client, errCodeNotFound, "message not found")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "message not found")
 	}
 	if stored.FromUniqueID != client.UniqueID {
-		return s.sendError(client, errCodePermissionDenied, "you can only edit your own messages")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "you can only edit your own messages")
 	}
 	if s.chatKeys == nil {
-		return s.sendError(client, errCodeUnavailable, "chat key manager unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "chat key manager unavailable")
 	}
 
 	plain := msg.NewText
@@ -906,14 +906,14 @@ func (s *TCPServer) handleChatEdit(ctx context.Context, client *Client, f *netpr
 		// otherwise fail deep in the pipeline with a confusing error.
 		currentID, _, err := s.chatKeys.current(ctx, stored.ChannelID)
 		if err != nil {
-			return s.sendError(client, errCodeUnavailable, "no chat key for this channel yet — rejoin the channel")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "no chat key for this channel yet — rejoin the channel")
 		}
 		if msg.KeyID != currentID {
-			return s.sendError(client, errCodeMalformed, "stale chat key for channel (key rotated; wait for re-key)")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "stale chat key for channel (key rotated; wait for re-key)")
 		}
 		p, err := s.chatKeys.open(ctx, stored.ChannelID, msg.KeyID, msg.NewText)
 		if err != nil {
-			return s.sendError(client, errCodeMalformed, "message decryption failed (stale key?)")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "message decryption failed (stale key?)")
 		}
 		plain = p
 	}
@@ -921,10 +921,10 @@ func (s *TCPServer) handleChatEdit(ctx context.Context, client *Client, f *netpr
 	// already treats s.cfg as possibly nil above, so testing ChatMaxLength
 	// first would panic on exactly the path that guard exists for.
 	if s.cfg != nil && s.cfg.ChatMaxLength > 0 && len([]byte(plain)) > s.cfg.ChatMaxLength {
-		return s.sendError(client, errCodeMalformed, fmt.Sprintf("message too long (max %d bytes)", s.cfg.ChatMaxLength))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, fmt.Sprintf("message too long (max %d bytes)", s.cfg.ChatMaxLength))
 	}
 	if err := s.moderateBody(ctx, stripAttachmentRefs(plain)); err != nil {
-		return s.sendError(client, errCodeMalformed, err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, err.Error())
 	}
 
 	// The plaintext escape hatch never reaches storage or the relay: the
@@ -933,17 +933,17 @@ func (s *TCPServer) handleChatEdit(ctx context.Context, client *Client, f *netpr
 	if !msg.Enc {
 		id, ct, err := s.chatKeys.seal(ctx, stored.ChannelID, plain)
 		if err != nil {
-			return s.sendError(client, errCodeUnavailable, "chat key unavailable")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "chat key unavailable")
 		}
 		bodyEnc, keyID = ct, id
 	}
 
 	version, err := s.deps.Chat.EditChatMessage(ctx, msg.MessageID, bodyEnc, keyID, msg.ExpectedVersion)
 	if errors.Is(err, store.ErrChatEditConflict) {
-		return s.sendError(client, errCodeConflict, "message changed on another client; reload before editing")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeConflict, "message changed on another client; reload before editing")
 	}
 	if err != nil {
-		return s.sendError(client, errCodeNotFound, "edit failed: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "edit failed: "+err.Error())
 	}
 
 	// Uniform wire format: the edit event carries ciphertext like any other
@@ -965,29 +965,29 @@ func (s *TCPServer) handleChatEdit(ctx context.Context, client *Client, f *netpr
 func (s *TCPServer) handleChatDelete(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.ChatDelete
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed chat_delete: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed chat_delete: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Chat == nil {
-		return s.sendError(client, errCodeUnavailable, "chat store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "chat store unavailable")
 	}
 	stored, err := s.deps.Chat.GetChatMessage(ctx, msg.MessageID)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "message lookup failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "message lookup failed")
 	}
 	if stored == nil || stored.DeletedAt != nil {
-		return s.sendError(client, errCodeNotFound, "message not found")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "message not found")
 	}
 	if stored.FromUniqueID != client.UniqueID {
 		pc, err := s.permCheckerFor(ctx, client)
 		if err != nil {
-			return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 		}
 		if !pc.granted(permissions.PermissionKeyChatDeleteAny) {
-			return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyChatDeleteAny))
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyChatDeleteAny))
 		}
 	}
 	if err := s.deps.Chat.DeleteChatMessage(ctx, msg.MessageID); err != nil {
-		return s.sendError(client, errCodeNotFound, "delete failed: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "delete failed: "+err.Error())
 	}
 	s.broadcastScope(ctx, stored.ChannelID, eventChatDeleted, map[string]any{
 		"message_id": msg.MessageID,
@@ -1026,33 +1026,33 @@ func (s *TCPServer) broadcastScope(ctx context.Context, channelID int64, eventTy
 func (s *TCPServer) handleChatPin(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.ChatPin
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed chat_pin: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed chat_pin: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Chat == nil {
-		return s.sendError(client, errCodeUnavailable, "chat store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "chat store unavailable")
 	}
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	if !pc.granted(permissions.PermissionKeyChannelModify) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyChannelModify))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyChannelModify))
 	}
 
 	if msg.Pinned {
 		stored, err := s.deps.Chat.GetChatMessage(ctx, msg.MessageID)
 		if err != nil || stored == nil || stored.DeletedAt != nil {
-			return s.sendError(client, errCodeNotFound, "message not found")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "message not found")
 		}
 		if stored.ChannelID != msg.ChannelID {
-			return s.sendError(client, errCodeMalformed, "message is not in this channel")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "message is not in this channel")
 		}
 		if err := s.deps.Chat.PinChatMessage(ctx, msg.ChannelID, msg.MessageID, client.UniqueID); err != nil {
-			return s.sendError(client, errCodeUnavailable, "pin failed")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "pin failed")
 		}
 	} else {
 		if err := s.deps.Chat.UnpinChatMessage(ctx, msg.ChannelID, msg.MessageID); err != nil {
-			return s.sendError(client, errCodeUnavailable, "unpin failed")
+			return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "unpin failed")
 		}
 	}
 
@@ -1076,21 +1076,21 @@ func (s *TCPServer) handleChatPin(ctx context.Context, client *Client, f *netpro
 func (s *TCPServer) handleChatPins(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.ChatPins
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed chat_pins: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed chat_pins: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Chat == nil {
-		return s.sendError(client, errCodeUnavailable, "chat store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "chat store unavailable")
 	}
 	if !s.scopeReadable(ctx, client, msg.ChannelID) {
-		return s.sendError(client, errCodePermissionDenied, "not a member of this channel")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "not a member of this channel")
 	}
 	memberPub := s.publishedKey(client)
 	if memberPub == "" {
-		return s.sendError(client, errCodePermissionDenied, "publish an encryption key before reading history")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "publish an encryption key before reading history")
 	}
 	pins, err := s.deps.Chat.ChatPins(ctx, msg.ChannelID)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "pins query failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "pins query failed")
 	}
 	resp := netproto.ChatPinsResponse{ChannelID: msg.ChannelID, Pins: []netproto.ChatPinEntry{}}
 	gens := map[uint32]bool{}
@@ -1118,21 +1118,21 @@ func (s *TCPServer) handleChatPins(ctx context.Context, client *Client, f *netpr
 func (s *TCPServer) handleChatReact(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.ChatReact
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed chat_react: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed chat_react: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Chat == nil {
-		return s.sendError(client, errCodeUnavailable, "chat store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "chat store unavailable")
 	}
 	if msg.Emoji == "" || utf8.RuneCountInString(msg.Emoji) > 32 {
-		return s.sendError(client, errCodeMalformed, "invalid emoji")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "invalid emoji")
 	}
 	stored, err := s.deps.Chat.GetChatMessage(ctx, msg.MessageID)
 	if err != nil || stored == nil || stored.DeletedAt != nil {
-		return s.sendError(client, errCodeNotFound, "message not found")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "message not found")
 	}
 	counts, added, err := s.deps.Chat.ToggleReaction(ctx, msg.MessageID, client.UniqueID, msg.Emoji)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "reaction failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "reaction failed")
 	}
 	s.broadcastScope(ctx, stored.ChannelID, eventChatReaction, map[string]any{
 		"message_id": msg.MessageID,
@@ -1169,10 +1169,10 @@ type typingEvent struct {
 func (s *TCPServer) handleTyping(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.Typing
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed typing: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed typing: "+err.Error())
 	}
 	if s.deps == nil || s.deps.Broadcast == nil {
-		return s.sendError(client, errCodeUnavailable, "broadcast backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "broadcast backend unavailable")
 	}
 	typingScope := "global"
 	if msg.ToUniqueID != "" {
@@ -1221,30 +1221,30 @@ func (s *TCPServer) handleTyping(ctx context.Context, client *Client, f *netprot
 }
 
 // handleChatDelivered relays a DM delivery ack to the original sender (124).
-func (s *TCPServer) handleChatDelivered(_ context.Context, client *Client, f *netproto.Frame) error {
+func (s *TCPServer) handleChatDelivered(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.ChatDelivered
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed chat_delivered: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed chat_delivered: "+err.Error())
 	}
-	return s.relayReceipt(client, msg.ToUniqueID, eventDMDelivered, msg.ClientMsgID)
+	return s.relayReceipt(ctx, client, msg.ToUniqueID, eventDMDelivered, msg.ClientMsgID)
 }
 
 // handleChatRead relays a DM read receipt to the original sender (124).
-func (s *TCPServer) handleChatRead(_ context.Context, client *Client, f *netproto.Frame) error {
+func (s *TCPServer) handleChatRead(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.ChatRead
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed chat_read: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed chat_read: "+err.Error())
 	}
-	return s.relayReceipt(client, msg.ToUniqueID, eventDMRead, msg.ClientMsgID)
+	return s.relayReceipt(ctx, client, msg.ToUniqueID, eventDMRead, msg.ClientMsgID)
 }
 
 // relayReceipt forwards a receipt event to the (online) original DM sender.
-func (s *TCPServer) relayReceipt(client *Client, toUniqueID, eventType, clientMsgID string) error {
+func (s *TCPServer) relayReceipt(ctx context.Context, client *Client, toUniqueID, eventType, clientMsgID string) error {
 	if s.deps == nil || s.deps.Broadcast == nil {
-		return s.sendError(client, errCodeUnavailable, "broadcast backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "broadcast backend unavailable")
 	}
 	if clientMsgID == "" {
-		return s.sendError(client, errCodeMalformed, "client_msg_id is required")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "client_msg_id is required")
 	}
 	payload, err := eventEnvelope(eventType, map[string]any{
 		"from_unique_id": client.UniqueID,
@@ -1271,25 +1271,25 @@ var emojiNameRe = regexp.MustCompile(`^[a-z0-9_\-]{1,32}$`)
 func (s *TCPServer) handleEmojiUpload(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.EmojiUpload
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed emoji_upload: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed emoji_upload: "+err.Error())
 	}
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	if !pc.granted(permissions.PermissionKeyEmojiManage) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyEmojiManage))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyEmojiManage))
 	}
 	if !emojiNameRe.MatchString(msg.Name) {
-		return s.sendError(client, errCodeMalformed, "invalid emoji name (1-32 of a-z 0-9 _ -)")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "invalid emoji name (1-32 of a-z 0-9 _ -)")
 	}
 	raw, ext, err := decodeImage(msg.DataBase64)
 	if err != nil {
-		return s.sendError(client, errCodeMalformed, err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, err.Error())
 	}
 	fileName, err := s.assets().writeImage("emojis", msg.Name, ext, raw)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "emoji write failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "emoji write failed")
 	}
 	s.broadcastEvent(eventEmojiAdded, map[string]any{"name": msg.Name, "file_name": fileName, "by": client.UniqueID})
 	return nil
@@ -1299,10 +1299,10 @@ func (s *TCPServer) handleEmojiUpload(ctx context.Context, client *Client, f *ne
 func (s *TCPServer) emojiManageAllowed(ctx context.Context, client *Client) error {
 	pc, err := s.permCheckerFor(ctx, client)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "permission backend unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "permission backend unavailable")
 	}
 	if !pc.granted(permissions.PermissionKeyEmojiManage) {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyEmojiManage))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyEmojiManage))
 	}
 	return nil
 }
@@ -1311,20 +1311,20 @@ func (s *TCPServer) emojiManageAllowed(ctx context.Context, client *Client) erro
 func (s *TCPServer) handleEmojiDelete(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.EmojiDelete
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed emoji_delete: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed emoji_delete: "+err.Error())
 	}
 	if err := s.emojiManageAllowed(ctx, client); err != nil {
 		return err
 	}
 	if !emojiNameRe.MatchString(msg.Name) {
-		return s.sendError(client, errCodeMalformed, "invalid emoji name")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "invalid emoji name")
 	}
 	_, err := s.assets().removeImage("emojis", msg.Name)
 	if errors.Is(err, fs.ErrNotExist) {
-		return s.sendError(client, errCodeNotFound, "emoji not found")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "emoji not found")
 	}
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "emoji delete failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "emoji delete failed")
 	}
 	s.audit(ctx, client.UniqueID, "emoji_delete", msg.Name, "")
 	s.broadcastEvent(eventEmojiRemoved, map[string]any{"name": msg.Name, "by": client.UniqueID})
@@ -1337,26 +1337,26 @@ func (s *TCPServer) handleEmojiDelete(ctx context.Context, client *Client, f *ne
 func (s *TCPServer) handleEmojiRename(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.EmojiRename
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed emoji_rename: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed emoji_rename: "+err.Error())
 	}
 	if err := s.emojiManageAllowed(ctx, client); err != nil {
 		return err
 	}
 	if !emojiNameRe.MatchString(msg.Name) || !emojiNameRe.MatchString(msg.NewName) {
-		return s.sendError(client, errCodeMalformed, "invalid emoji name (1-32 of a-z 0-9 _ -)")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "invalid emoji name (1-32 of a-z 0-9 _ -)")
 	}
 	if msg.Name == msg.NewName {
-		return s.sendError(client, errCodeMalformed, "new name is the same")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "new name is the same")
 	}
 	fileName, err := s.assets().renameImage("emojis", msg.Name, msg.NewName)
 	if errors.Is(err, fs.ErrNotExist) {
-		return s.sendError(client, errCodeNotFound, "emoji not found")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "emoji not found")
 	}
 	if errors.Is(err, fs.ErrExist) {
-		return s.sendError(client, errCodeMalformed, "an emoji with that name already exists")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "an emoji with that name already exists")
 	}
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "emoji rename failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "emoji rename failed")
 	}
 	s.audit(ctx, client.UniqueID, "emoji_rename", msg.Name, "to "+msg.NewName)
 	s.broadcastEvent(eventEmojiRenamed, map[string]any{
@@ -1366,7 +1366,7 @@ func (s *TCPServer) handleEmojiRename(ctx context.Context, client *Client, f *ne
 }
 
 // handleEmojiList lists the uploaded custom emojis.
-func (s *TCPServer) handleEmojiList(_ context.Context, client *Client, f *netproto.Frame) error {
+func (s *TCPServer) handleEmojiList(ctx context.Context, client *Client, f *netproto.Frame) error {
 	images, err := s.assets().listImages("emojis")
 	if err != nil {
 		// No emoji directory yet is an empty list, not an error.
@@ -1387,13 +1387,13 @@ func (s *TCPServer) handleEmojiList(_ context.Context, client *Client, f *netpro
 
 // handleEmojiGet serves one emoji image over the control channel (the files
 // live on the server; clients cache them by name).
-func (s *TCPServer) handleEmojiGet(_ context.Context, client *Client, f *netproto.Frame) error {
+func (s *TCPServer) handleEmojiGet(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.EmojiGet
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed emoji_get: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed emoji_get: "+err.Error())
 	}
 	if !emojiNameRe.MatchString(msg.Name) {
-		return s.sendError(client, errCodeMalformed, "invalid emoji name")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "invalid emoji name")
 	}
 	raw, image, err := s.assets().readImage("emojis", msg.Name)
 	if err == nil {
@@ -1403,7 +1403,7 @@ func (s *TCPServer) handleEmojiGet(_ context.Context, client *Client, f *netprot
 			ContentType: image.contentType,
 		})
 	}
-	return s.sendError(client, errCodeNotFound, "emoji not found")
+	return s.sendErrorFor(client, requestOrigin(ctx), errCodeNotFound, "emoji not found")
 }
 
 // ---------------------------------------------------------------------------

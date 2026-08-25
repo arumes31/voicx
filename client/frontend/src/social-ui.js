@@ -106,8 +106,8 @@ function openContacts() {
             row.innerHTML = `
                 <span class="ct-dot ${online ? "on" : ""}" title="${online ? "online" : "offline"}"></span>
                 <span class="ct-name"></span>
-                <span class="ct-hist mono" title="nickname history (318)"></span>
-                <button class="ct-block" title="block/unblock (317)"></button>
+                <span class="ct-hist mono" title="nickname history"></span>
+                <button class="ct-block" title="block/unblock"></button>
                 <button class="ct-del" title="remove">✕</button>`;
             row.querySelector(".ct-name").textContent = (c.label || online?.nickname || c.unique_id.slice(0, 12)) + (online ? " — " + online.nickname : "");
             row.querySelector(".ct-hist").textContent = (c.nick_history || []).slice(-3).join(", ");

@@ -10,6 +10,44 @@ const V = () => window.__voicx;
 const App = () => window.go.main.App;
 let activeTabID = "";
 
+function playActiveConnectionCue(tabID, connectedGeneration) {
+    // A successful connect activates its new tab. Retain an empty-ID fallback
+    // for older bridges that do not publish tab_reset with the result.
+    if (connectedGeneration !== V().state.serverGeneration) return;
+    if (tabID && activeTabID && activeTabID !== tabID) return;
+    V().playConnectionCue?.("connection_connected");
+}
+
+function playSourceConnectionFailure(sourceTabID, sourceGeneration) {
+    if (sourceGeneration !== V().state.serverGeneration || sourceTabID !== activeTabID) return;
+    V().playConnectionCue?.("connection_failed");
+}
+
+async function closeTab(tabID) {
+    // DisconnectTab owns the intentional edge and publishes it before
+    // replacement activation. Keep CloseTab only as a compatibility fallback
+    // for an older backend that lacks the dedicated user-intent binding.
+    try {
+        const disconnect = App().DisconnectTab;
+        if (typeof disconnect === "function") await disconnect(tabID);
+        else await App().CloseTab(tabID);
+    } catch {
+        // The backend owns the close operation; leave its error surface alone.
+    }
+}
+
+async function connectGuestBookmarkWithID(bookmark, addr, nick) {
+    const method = App().ConnectGuestBookmarkTabWithID;
+    const result = typeof method === "function"
+        ? await method(bookmark, addr, nick)
+        : await App().ConnectGuestBookmarkTab(bookmark, addr, nick);
+    if (typeof result === "string") return { tabID: "", error: result };
+    return {
+        tabID: String(result?.tab_id || ""),
+        error: String(result?.error || ""),
+    };
+}
+
 // bookmarkFor resolves the bookmark a tab was opened from (284), so the tab
 // can carry its colour. The nickname actually sent is either the bookmark's
 // own or its per-server override (334), and neither key is unique, so a tie
@@ -78,7 +116,7 @@ function renderTabs(tabs) {
         x.setAttribute("aria-label", "Disconnect and close " + label.textContent);
         x.onclick = (e) => {
             e.stopPropagation();
-            App().CloseTab(t.id);
+            void closeTab(t.id);
         };
         el.appendChild(x);
         const activate = () => {
@@ -126,7 +164,7 @@ async function refreshTabIdentity(tabID) {
     // The tab's replayed snapshot (and even an immediate join event) may have
     // arrived while ClientID was pending. Resolve our channel from that state
     // now so the move cannot be mistaken for another user's.
-    V().syncOwnChannel();
+    V().syncOwnChannel({ audible: false });
     let isAdmin = false;
     try { isAdmin = await App().IsAdmin(); } catch { /* disconnected */ }
     if (activeTabID !== activatedTabID) return;
@@ -154,6 +192,7 @@ async function refreshTabIdentity(tabID) {
         if (info) state.tabConnects.set(tabID, state.lastConnect);
     }
     state.myNickname = state.lastConnect ? state.lastConnect.nick : "";
+    if (state.lastConnect) state.lastSuccessfulConnect = { ...state.lastConnect };
     V().renderTree();
 }
 
@@ -162,8 +201,23 @@ async function refreshTabIdentity(tabID) {
 function onTabReset(tabID) {
     const { state, $ } = V();
     activeTabID = tabID || "";
+    state.activeTabID = activeTabID;
+    const restoringKnownTab = state.tabConnects.has(tabID);
+    // Go publishes tab_replay_done after the journal frames. main.js uses the
+    // marker to keep historic channel/user transitions silent.
+    state.replayingTabID = activeTabID;
+    state.pendingInitialChannelCueTabID = !restoringKnownTab && activeTabID ? activeTabID : "";
     const preserveReconnectAnnouncements = !!state.reconnectInFlight;
     state.serverGeneration = (state.serverGeneration || 0) + 1;
+    // RTT belongs to one server identity. Clear the old sample before replay
+    // and restart only after the new tab's identity has been resolved.
+    V().stopQualitySampler?.();
+    const connectionPill = $("conn-pill");
+    connectionPill.classList.remove("up");
+    connectionPill.textContent = tabID ? "switching…" : "offline";
+    connectionPill.title = tabID
+        ? "Connection status is refreshing"
+        : "Offline — no current RTT sample";
     closeServerDialogs();
     // Voice is active-tab only: fully tear down capture and WebRTC before the
     // replayed channel state automatically starts the new tab's session.
@@ -200,8 +254,25 @@ function onTabReset(tabID) {
     window.__voicxPerms?.refreshGroups?.().then(() => {
         if (activeTabID === tabID) V().renderTree();
     });
-    refreshTabIdentity(tabID).then(() => {
+    refreshTabIdentity(tabID).then(async () => {
         if (activeTabID !== tabID) return;
+        let connected = false;
+        try { connected = !!(await App().Connected()); } catch { /* disconnected */ }
+        if (activeTabID !== tabID) return;
+        if (connected && state.myClientID) {
+            connectionPill.textContent = state.lastConnect?.addr || "connected";
+            connectionPill.classList.add("up");
+            connectionPill.title = "";
+            V().startQualitySampler?.();
+            await V().checkCertificateClock?.(state.lastConnect?.addr || "", tabID);
+            if (activeTabID !== tabID) return;
+        } else {
+            connectionPill.textContent = state.lastConnect?.addr
+                ? `${state.lastConnect.addr} (offline)`
+                : "offline";
+            connectionPill.classList.remove("up");
+            V().stopQualitySampler?.();
+        }
         window.__voicxFiles?.loadServerIcon?.();
         window.__voicxSocial?.refreshNews?.();
     });
@@ -216,14 +287,24 @@ async function autoConnectBookmarks() {
         // (334) the per-server nickname override is what gets sent, so the
         // bookmark must be named explicitly for the backend to find it.
         const nick = b.nickname_override || b.nickname;
-        const err = await App().ConnectGuestBookmarkTab(b.name, b.addr, nick);
+        const requestServerGeneration = V().state.serverGeneration;
+        const requestTabID = activeTabID;
+        const { error: err, tabID } = await connectGuestBookmarkWithID(b.name, b.addr, nick);
         if (err !== "") {
+            playSourceConnectionFailure(requestTabID, requestServerGeneration);
             // Account login needed: prefill for the user.
             const { $ } = V();
             $("login-addr").value = b.addr;
             $("login-nick").value = nick;
             V().state.pendingBookmark = { name: b.name, addr: b.addr };
             V().sysMsg?.("auto-connect needs your password for " + b.addr);
+        } else {
+            // The successful call activates its tab and emits tab_reset before
+            // resolving. Capture that generation now, then make the delayed
+            // certificate check conditional on the same active tab.
+            const connectedGeneration = V().state.serverGeneration;
+            await V().checkCertificateClock?.(b.addr, tabID);
+            playActiveConnectionCue(tabID, connectedGeneration);
         }
     }
 }
@@ -242,8 +323,12 @@ async function quickConnectLast() {
     // bookmarks prefill the login dialog. (334) the override is the nickname
     // actually sent, so the bookmark name goes along; recents have neither.
     const nick = target.nickname_override || target.nickname;
-    const err = await App().ConnectGuestBookmarkTab(target.name || "", target.addr, nick);
+    const requestServerGeneration = V().state.serverGeneration;
+    const requestTabID = activeTabID;
+    const { error: err, tabID } = await connectGuestBookmarkWithID(
+        target.name || "", target.addr, nick);
     if (err !== "") {
+        playSourceConnectionFailure(requestTabID, requestServerGeneration);
         const { $ } = V();
         $("login-addr").value = target.addr;
         $("login-nick").value = nick;
@@ -251,6 +336,12 @@ async function quickConnectLast() {
         // stashed after showLogin, which drops the previous login's stash: a
         // recent has no bookmark name and must leave none behind (334).
         if (target.name) V().state.pendingBookmark = { name: target.name, addr: target.addr };
+    } else {
+        // See autoConnectBookmarks: the new tab has already become active by
+        // the time the bridge resolves this successful connect call.
+        const connectedGeneration = V().state.serverGeneration;
+        await V().checkCertificateClock?.(target.addr, tabID);
+        playActiveConnectionCue(tabID, connectedGeneration);
     }
 }
 
@@ -268,11 +359,26 @@ function renderRecents() {
         row.className = "recent-row";
         const starred = bms.some((b) => b.addr === r.addr && b.nickname === r.nickname);
         row.innerHTML = `<button type="button" class="recent-star" title="bookmark">${starred ? "★" : "☆"}</button>
-            <button type="button" class="recent-label"></button>`;
-        row.querySelector(".recent-label").textContent = (r.nickname || "?") + " @ " + r.addr;
-        row.querySelector(".recent-label").onclick = () => {
+            <button type="button" class="recent-label"></button>
+            <button type="button" class="recent-edit">Edit</button>`;
+        const label = row.querySelector(".recent-label");
+        const serverLabel = (r.nickname || "?") + " @ " + r.addr;
+        label.textContent = serverLabel;
+        label.onclick = () => {
             document.getElementById("login-addr").value = r.addr;
             document.getElementById("login-nick").value = r.nickname || "";
+        };
+        const edit = row.querySelector(".recent-edit");
+        edit.title = "Edit recent server";
+        edit.setAttribute("aria-label", `Edit recent server ${r.nickname || "server"} at ${r.addr}`);
+        edit.onclick = (event) => {
+            event.stopPropagation();
+            const addr = document.getElementById("login-addr");
+            addr.value = r.addr;
+            document.getElementById("login-nick").value = r.nickname || "";
+            V().state.pendingBookmark = null;
+            addr.focus();
+            addr.select();
         };
         const star = row.querySelector(".recent-star");
         star.setAttribute("aria-label", `${starred ? "Remove" : "Add"} bookmark for ${r.nickname || "server"} at ${r.addr}`);

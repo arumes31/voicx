@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -22,7 +23,7 @@ import (
 // its address and the server.
 func startServer(t *testing.T, fs FileStore) (string, *Server) {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -37,7 +38,7 @@ func startServer(t *testing.T, fs FileStore) (string, *Server) {
 	deadline := time.Now().Add(3 * time.Second)
 	ready := false
 	for time.Now().Before(deadline) {
-		conn, err := net.Dial("tcp", addr)
+		conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", addr)
 		if err == nil {
 			_ = conn.Close()
 			ready = true
@@ -62,7 +63,7 @@ func startServer(t *testing.T, fs FileStore) (string, *Server) {
 // dialTransfer connects and sends the init frame.
 func dialTransfer(t *testing.T, addr, transferID, token string) net.Conn {
 	t.Helper()
-	conn, err := net.Dial("tcp", addr)
+	conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", addr)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -168,7 +169,7 @@ func TestDownloadRejectsNonRegularBlob(t *testing.T) {
 	defer func() { _ = serverConn.Close() }()
 	defer func() { _ = clientConn.Close() }()
 
-	err := s.sendDownload(serverConn, &transfer{ChannelID: 7, Name: "directory.txt"}, 0)
+	err := s.sendDownload(context.Background(), serverConn, &transfer{ChannelID: 7, Name: "directory.txt"}, 0)
 	if err == nil {
 		t.Fatal("sendDownload accepted a directory as a blob")
 	}
@@ -193,9 +194,43 @@ func TestDownloadRejectsSymlinkEscape(t *testing.T) {
 	defer func() { _ = serverConn.Close() }()
 	defer func() { _ = clientConn.Close() }()
 
-	err := s.sendDownload(serverConn, &transfer{ChannelID: 7, Name: "link.txt", Size: 6}, 0)
+	err := s.sendDownload(context.Background(), serverConn, &transfer{ChannelID: 7, Name: "link.txt", Size: 6}, 0)
 	if err == nil {
 		t.Fatal("sendDownload followed a symlink outside the blob root")
+	}
+}
+
+func TestDownloadThrottleStopsWhenLifecycleContextIsCancelled(t *testing.T) {
+	rootDir := t.TempDir()
+	channelDir := filepath.Join(rootDir, "7")
+	if err := os.Mkdir(channelDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content := make([]byte, 2*1024)
+	if err := os.WriteFile(filepath.Join(channelDir, "slow.bin"), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := New(Config{Addr: ":0", RootDir: rootDir, MaxKBps: 1}, newFakeFileStore(), nil)
+	serverConn, clientConn := net.Pipe()
+	defer func() { _ = serverConn.Close() }()
+	defer func() { _ = clientConn.Close() }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- s.sendDownload(ctx, serverConn, &transfer{ID: "slow", ChannelID: 7, Name: "slow.bin", Size: int64(len(content))}, 0)
+	}()
+	if frame, err := netproto.ReadFrame(clientConn); err != nil || frame.Type != frameChunk {
+		t.Fatalf("first chunk = %+v, err=%v", frame, err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("sendDownload error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("sendDownload remained throttled after lifecycle cancellation")
 	}
 }
 
@@ -366,7 +401,7 @@ func TestDownloadResume(t *testing.T) {
 		if err != nil {
 			t.Fatalf("InitDownload: %v", err)
 		}
-		conn, err := net.Dial("tcp", addr)
+		conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", addr)
 		if err != nil {
 			t.Fatalf("dial: %v", err)
 		}
@@ -435,7 +470,7 @@ func TestInvalidInitFrame(t *testing.T) {
 	fs := newFakeFileStore()
 	addr, _ := startServer(t, fs)
 
-	conn, err := net.Dial("tcp", addr)
+	conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", addr)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}

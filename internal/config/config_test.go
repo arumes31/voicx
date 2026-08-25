@@ -21,6 +21,8 @@ func TestLoadFromEnv(t *testing.T) {
 	t.Setenv("VOICX_QUERY_ADDR", ":44444")
 	t.Setenv("VOICX_QUERY_ALLOW_REMOTE", "true")
 	t.Setenv("VOICX_METRICS_ALLOW_REMOTE", "true")
+	t.Setenv("VOICX_PPROF_ENABLED", "true")
+	t.Setenv("VOICX_SHUTDOWN_TIMEOUT", "45s")
 	t.Setenv("VOICX_DATABASE_URL", "postgres://user:pass@db:5432/x?sslmode=require")
 	t.Setenv("VOICX_REDIS_ADDR", "redis:6379")
 	t.Setenv("VOICX_REDIS_PASSWORD", "secret")
@@ -60,6 +62,8 @@ func TestLoadFromEnv(t *testing.T) {
 		{"QueryAddr", cfg.QueryAddr, ":44444"},
 		{"QueryAllowRemote", cfg.QueryAllowRemote, true},
 		{"MetricsAllowRemote", cfg.MetricsAllowRemote, true},
+		{"PprofEnabled", cfg.PprofEnabled, true},
+		{"ShutdownTimeout", cfg.ShutdownTimeout, 45 * time.Second},
 		{"DatabaseURL", cfg.DatabaseURL, "postgres://user:pass@db:5432/x?sslmode=require"},
 		{"RedisAddr", cfg.RedisAddr, "redis:6379"},
 		{"RedisPassword", cfg.RedisPassword, "secret"},
@@ -121,17 +125,27 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.MaxClients != 1024 {
 		t.Errorf("MaxClients = %d, want 1024", cfg.MaxClients)
 	}
+	if cfg.FileMaxConnections != 128 {
+		t.Errorf("FileMaxConnections = %d, want 128", cfg.FileMaxConnections)
+	}
+	if cfg.RedisDialTimeout != 5*time.Second || cfg.RedisReadTimeout != 3*time.Second || cfg.RedisWriteTimeout != 3*time.Second {
+		t.Errorf("Redis timeouts = %s/%s/%s, want 5s/3s/3s", cfg.RedisDialTimeout, cfg.RedisReadTimeout, cfg.RedisWriteTimeout)
+	}
+	if cfg.ShutdownTimeout != 30*time.Second {
+		t.Errorf("ShutdownTimeout = %s, want 30s", cfg.ShutdownTimeout)
+	}
 	if cfg.LogLevel != "info" {
 		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, "info")
 	}
 	if cfg.DevMode != true {
 		t.Errorf("DevMode = %v, want true", cfg.DevMode)
 	}
-	if cfg.QueryAllowRemote || cfg.MetricsAllowRemote {
+	if cfg.QueryAllowRemote || cfg.MetricsAllowRemote || cfg.PprofEnabled {
 		t.Errorf(
-			"remote admin/metrics opt-ins = %t/%t, want false/false",
+			"remote admin/metrics/pprof opt-ins = %t/%t/%t, want false/false/false",
 			cfg.QueryAllowRemote,
 			cfg.MetricsAllowRemote,
+			cfg.PprofEnabled,
 		)
 	}
 	if len(cfg.WebRTC.ICEServers) == 0 {
@@ -300,7 +314,24 @@ func TestValidateRejectsUnsafeValues(t *testing.T) {
 			mutate:  func(c *Config) { c.ClientTimeoutSeconds = 0 },
 			wantErr: "client_timeout_seconds",
 		},
+		{
+			name:    "zero shutdown timeout",
+			mutate:  func(c *Config) { c.ShutdownTimeout = 0 },
+			wantErr: "shutdown_timeout",
+		},
 		{name: "negative file limit", mutate: func(c *Config) { c.FileMaxSizeMB = -1 }, wantErr: "file_max_size_mb"},
+		{name: "zero file connections", mutate: func(c *Config) { c.FileMaxConnections = 0 }, wantErr: "file_max_connections"},
+		{name: "too many file connections", mutate: func(c *Config) { c.FileMaxConnections = 10_001 }, wantErr: "file_max_connections"},
+		{name: "zero Redis dial timeout", mutate: func(c *Config) { c.RedisDialTimeout = 0 }, wantErr: "redis_dial_timeout"},
+		{name: "Redis TLS field without TLS", mutate: func(c *Config) { c.RedisTLSServerName = "redis.example.test" }, wantErr: "redis_tls_server_name"},
+		{
+			name: "Redis TLS hostless address without server name",
+			mutate: func(c *Config) {
+				c.RedisTLSEnabled = true
+				c.RedisAddr = ":6379"
+			},
+			wantErr: "redis_tls_server_name",
+		},
 		{
 			name:    "idle pool exceeds open",
 			mutate:  func(c *Config) { c.DBMaxIdleConns = c.DBMaxOpenConns + 1 },
@@ -505,20 +536,48 @@ func TestWarningsReportExplicitUnsafeChoices(t *testing.T) {
 	}
 }
 
+func TestWarningsCoverProductionCredentialsAndRemoteExposure(t *testing.T) {
+	cfg := loadDefaultConfig(t)
+	cfg.DevMode = false
+	cfg.ServerPassword = ""
+	cfg.TURN.Secret = "123456789012345" // 15 bytes: warn.
+	cfg.RedisAddr = "198.51.100.10:6379"
+	cfg.RedisPassword = ""
+	cfg.HealthAddr = "198.51.100.10:12337"
+
+	warnings := strings.Join(cfg.Warnings(), "\n")
+	for _, text := range []string{"server_password", "turn.secret", "redis_password", "health_addr", "/dl"} {
+		if !strings.Contains(warnings, text) {
+			t.Errorf("Warnings() = %q, want text %q", warnings, text)
+		}
+	}
+
+	cfg.TURN.Secret = "1234567890123456" // 16 bytes: no short-secret warning.
+	cfg.RedisAddr = "127.0.0.1:6379"
+	cfg.HealthAddr = "[::1]:12337"
+	warnings = strings.Join(cfg.Warnings(), "\n")
+	for _, text := range []string{"turn.secret is shorter", "redis_password", "health_addr is reachable"} {
+		if strings.Contains(warnings, text) {
+			t.Errorf("Warnings() = %q, did not want %q", warnings, text)
+		}
+	}
+}
+
 // TestSummary verifies that Summary is informative without exposing endpoint
 // credentials or ICE URLs.
 func TestSummary(t *testing.T) {
 	cfg := &Config{
-		ServerName:    "voicx",
-		LogLevel:      "info",
-		DevMode:       true,
-		TCPAddr:       DefaultTCPAddr,
-		UDPAddr:       DefaultUDPAddr,
-		GRPCAddr:      DefaultGRPCAddr,
-		DatabaseURL:   "postgres://db-user:db-password@db:5432/voicx?sslmode=require&token=db-token",
-		RedisAddr:     "redis://redis-user:redis-password@redis:6379/0?secret=redis-token",
-		RedisPassword: "separate-redis-password",
-		MaxClients:    1024,
+		ServerName:      "voicx",
+		LogLevel:        "info",
+		DevMode:         true,
+		TCPAddr:         DefaultTCPAddr,
+		UDPAddr:         DefaultUDPAddr,
+		GRPCAddr:        DefaultGRPCAddr,
+		DatabaseURL:     "postgres://db-user:db-password@db:5432/voicx?sslmode=require&token=db-token",
+		RedisAddr:       "redis://redis-user:redis-password@redis:6379/0?secret=redis-token",
+		RedisPassword:   "separate-redis-password",
+		MaxClients:      1024,
+		ShutdownTimeout: 30 * time.Second,
 		WebRTC: WebRTCConfig{
 			ICEServers: []string{"turn:ice-user:ice-password@turn.example.com:3478"},
 			EnableAV1:  false,
@@ -530,6 +589,9 @@ func TestSummary(t *testing.T) {
 	}
 	if !strings.Contains(s, `name="voicx"`) || !strings.Contains(s, "db=\"postgres://db:5432/voicx?sslmode=require\"") {
 		t.Errorf("Summary() = %q, want safe identifying fields", s)
+	}
+	if !strings.Contains(s, "shutdown_timeout=30s") {
+		t.Errorf("Summary() = %q, want shutdown timeout", s)
 	}
 	for _, secret := range []string{
 		"db-user",

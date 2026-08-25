@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -168,6 +169,107 @@ func TestDMHistoryRefusesWithoutSettingsPath(t *testing.T) {
 	a := appWithCM(cm) // no settingsPath, and the default fallback is disarmed
 	if err := a.DMHistoryAppend("peer-1", "bob", DMEntry{Body: "x"}); err == "" {
 		t.Fatal("DM history wrote somewhere with no settings path configured")
+	}
+}
+
+func TestDMHistoryReadDoesNotBlockAppend(t *testing.T) {
+	_, cm := newPipedApp(t, func(*netproto.Frame) (netproto.MessageType, any, bool) {
+		return 0, nil, false
+	})
+	a := newLocalApp(t, cm)
+	if err := a.DMHistoryAppend("peer", "bob", DMEntry{Body: "old"}); err != "" {
+		t.Fatalf("seed append: %s", err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	originalHook := dmBeforeRead
+	dmBeforeRead = func() {
+		once.Do(func() { close(entered) })
+		<-release
+	}
+	t.Cleanup(func() { dmBeforeRead = originalHook })
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := a.DMHistoryLoad("peer")
+		readDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-timeoutC(t):
+		t.Fatal("history read did not enter its blocked disk-read seam")
+	}
+
+	appendDone := make(chan string, 1)
+	go func() { appendDone <- a.DMHistoryAppend("peer", "bob", DMEntry{Body: "new"}) }()
+	select {
+	case err := <-appendDone:
+		if err != "" {
+			t.Fatalf("append while read blocked: %s", err)
+		}
+	case <-timeoutC(t):
+		t.Fatal("append was blocked by a read-only DM history call")
+	}
+	close(release)
+	if err := <-readDone; err != nil {
+		t.Fatalf("blocked read: %v", err)
+	}
+}
+
+func TestDMSamePeerAppendAndSearchObserveCompleteLogVersions(t *testing.T) {
+	_, cm := newPipedApp(t, func(*netproto.Frame) (netproto.MessageType, any, bool) {
+		return 0, nil, false
+	})
+	a := newLocalApp(t, cm)
+	if err := a.DMHistoryAppend("peer", "bob", DMEntry{Body: "old"}); err != "" {
+		t.Fatalf("seed append: %s", err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	originalHook := dmBeforeRead
+	dmBeforeRead = func() {
+		once.Do(func() { close(entered) })
+		<-release
+	}
+	t.Cleanup(func() { dmBeforeRead = originalHook })
+	searchDone := make(chan struct {
+		result ChatSearchResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := a.DMSearch("peer", "", 10)
+		searchDone <- struct {
+			result ChatSearchResult
+			err    error
+		}{result, err}
+	}()
+	select {
+	case <-entered:
+	case <-timeoutC(t):
+		t.Fatal("search did not enter its blocked disk-read seam")
+	}
+	if err := a.DMHistoryAppend("peer", "bob", DMEntry{Body: "new"}); err != "" {
+		t.Fatalf("append concurrent with search: %s", err)
+	}
+	close(release)
+	got := <-searchDone
+	if got.err != nil {
+		t.Fatalf("search concurrent with append: %v", got.err)
+	}
+	for _, entry := range got.result.Messages {
+		if entry.Body != "old" && entry.Body != "new" {
+			t.Fatalf("search observed a corrupt/intermediate entry: %+v", entry)
+		}
+	}
+	msgs, err := a.DMHistoryLoad("peer")
+	if err != nil {
+		t.Fatalf("final read: %v", err)
+	}
+	if len(msgs) != 2 || msgs[0].Body != "old" || msgs[1].Body != "new" {
+		t.Fatalf("final log = %+v, want complete old/new history", msgs)
 	}
 }
 

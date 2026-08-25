@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, describe, it, mock } from "node:test";
 
-import { applyStaticLabels, currentLanguage, setLanguage, t } from "../src/i18n.js";
+import { applyStaticLabels, catalogParity, currentLanguage, interpolate, setLanguage, t } from "../src/i18n.js";
 
 const originalDocument = globalThis.document;
 const originalNavigator = globalThis.navigator;
@@ -53,6 +53,18 @@ describe("language selection and translation", () => {
             t("status.retry", { n: 2, max: 5, s: 8 }),
             "Versuch 2/5 in 8s…",
         );
+    });
+
+    it("replaces every occurrence of a placeholder without regex semantics", () => {
+        assert.equal(interpolate("{n} / {n} / {a.b}", { n: 2, "a.b": "safe" }), "2 / 2 / safe");
+    });
+
+    it("keeps catalog parity outside the language-switch hot path", () => {
+        const parity = catalogParity();
+        assert.deepEqual(parity, { missingFromEnglish: [], missingFromGerman: [] });
+        assert.equal(Object.isFrozen(parity), true);
+        assert.equal(Object.isFrozen(parity.missingFromEnglish), true);
+        assert.equal(Object.isFrozen(parity.missingFromGerman), true);
     });
 
     it("warns only once for a missing key and returns the key", () => {

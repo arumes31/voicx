@@ -32,6 +32,9 @@ func TestChannelEditDenied(t *testing.T) {
 	if e.Code != errCodePermissionDenied {
 		t.Fatalf("error code = %d, want %d (permission denied)", e.Code, errCodePermissionDenied)
 	}
+	if e.OriginType != uint16(netproto.MsgChannelEdit) {
+		t.Fatalf("error origin = %d, want ChannelEdit", e.OriginType)
+	}
 }
 
 // TestChannelEditOK verifies an edit persists to state and broadcasts a

@@ -574,11 +574,12 @@ func discardConnection(conn *sql.Conn) {
 	_ = conn.Raw(func(any) error { return driver.ErrBadConn })
 }
 
-// Ping verifies the database is reachable.
-func (s *Store) Ping() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	return s.db.PingContext(ctx)
+// Ping verifies the database is reachable using the caller's deadline.
+func (s *Store) Ping(ctx context.Context) error {
+	if err := s.db.PingContext(ctx); err != nil {
+		return fmt.Errorf("pinging database: %w", err)
+	}
+	return nil
 }
 
 // Close releases the database connection pool.

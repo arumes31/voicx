@@ -4,6 +4,7 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -13,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/nacl/box"
 	"golang.org/x/crypto/nacl/secretbox"
@@ -22,6 +25,138 @@ import (
 	"voicx/internal/netproto"
 	"voicx/internal/state"
 )
+
+func TestMoveCommitsWhenChannelKeyDeliveryIsCancelled(t *testing.T) {
+	core, logs := observer.New(zap.WarnLevel)
+	env := startTestEnvLogger(t, nil, nil, nil, zap.New(core))
+	defer env.stop()
+	conn, clientID := dialAuthed(t, env.addr, "user-uid")
+	defer func() { _ = conn.Close() }()
+	publicKey, _ := testX25519(t)
+	env.state.SetE2EPublicKey(clientID, b64e(publicKey[:]))
+	env.state.AddChannel(testChannel(1))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := env.srv.moveClient(ctx, clientID, 1, clientID); err != nil {
+		t.Fatalf("moveClient returned post-commit key-delivery error: %v", err)
+	}
+	client, ok := env.state.GetClient(clientID)
+	if !ok || client.ChannelID != 1 {
+		t.Fatalf("client state after move = %+v, want channel 1", client)
+	}
+	entries := logs.All()
+	if len(entries) != 1 {
+		t.Fatalf("post-move key delivery logs = %d, want exactly 1", len(entries))
+	}
+	if entries[0].Message != "delivering channel key after move failed" {
+		t.Fatalf("post-move key delivery log = %q", entries[0].Message)
+	}
+	allowedFields := map[string]bool{"client_id": true, "scope": true, "channel_id": true, "error": true}
+	for _, field := range entries[0].Context {
+		if !allowedFields[field.Key] {
+			t.Fatalf("unexpected delivery log field %q", field.Key)
+		}
+		if field.Key == "error" && field.Interface != nil {
+			if err, ok := field.Interface.(error); ok {
+				lower := strings.ToLower(err.Error())
+				for _, forbidden := range []string{"public", "private", "sealed"} {
+					if strings.Contains(lower, forbidden) {
+						t.Fatalf("delivery error leaked key material marker %q: %v", forbidden, err)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestKickClientRecordsAuditWithCallerContext(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	conn, clientID := dialAuthed(t, env.addr, "user-uid")
+	defer func() { _ = conn.Close() }()
+	env.state.AddChannel(testChannel(1))
+	if err := env.state.MoveClient(clientID, 1); err != nil {
+		t.Fatalf("position client for kick: %v", err)
+	}
+	if err := env.srv.KickClient(context.Background(), "serverquery", clientID, false, "maintenance"); err != nil {
+		t.Fatalf("KickClient: %v", err)
+	}
+	env.groups.mu.Lock()
+	defer env.groups.mu.Unlock()
+	if len(env.groups.audit) == 0 {
+		t.Fatal("KickClient did not write an audit marker")
+	}
+	entry := env.groups.audit[len(env.groups.audit)-1]
+	if entry.Actor != "serverquery" || entry.Action != "kick" || entry.Target != "user-uid" {
+		t.Fatalf("kick audit = %+v", entry)
+	}
+}
+
+func TestKeyRequestHonorsRequestContext(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	started := make(chan struct{})
+	env.auth.getE2EKeyFn = func(ctx context.Context, _ string) (string, error) {
+		close(started)
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	frame, err := netproto.Encode(netproto.MsgKeyRequest, netproto.KeyRequest{UniqueID: "offline-user"})
+	if err != nil {
+		t.Fatalf("encode key request: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- env.srv.handleKeyRequest(ctx, &Client{ID: "requester", UniqueID: "user-uid"}, frame)
+	}()
+	select {
+	case <-started:
+		cancel()
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("key lookup did not receive the request context")
+	}
+	if err := <-done; err != context.Canceled {
+		t.Fatalf("handleKeyRequest error = %v, want context.Canceled", err)
+	}
+}
+
+func TestKeyRequestRateLimitUsesDedicatedNamespace(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	env.srv.chatRate = newChatRateLimiter(1, time.Hour)
+	if !env.srv.chatRate.allow("user-uid", time.Now()) {
+		t.Fatal("could not consume the ordinary chat namespace")
+	}
+	frame, err := netproto.Encode(netproto.MsgKeyRequest, netproto.KeyRequest{UniqueID: "offline-user"})
+	if err != nil {
+		t.Fatalf("encode key request: %v", err)
+	}
+	request := func() (*netproto.Frame, error) {
+		serverConn, clientConn := net.Pipe()
+		defer func() { _ = serverConn.Close() }()
+		defer func() { _ = clientConn.Close() }()
+		done := make(chan error, 1)
+		go func() {
+			done <- env.srv.handleKeyRequest(context.Background(), &Client{ID: "requester", UniqueID: "user-uid", Conn: serverConn}, frame)
+		}()
+		response := readFrame(t, clientConn)
+		return response, <-done
+	}
+	response, err := request()
+	if err != nil || netproto.MessageType(response.Type) != netproto.MsgKeyResponse {
+		t.Fatalf("first key request = %s, err=%v; want key response", netproto.MessageType(response.Type), err)
+	}
+	response, err = request()
+	if err != nil || netproto.MessageType(response.Type) != netproto.MsgError {
+		t.Fatalf("second key request = %s, err=%v; want rate-limit error", netproto.MessageType(response.Type), err)
+	}
+	var responseErr netproto.Error
+	if err := netproto.Decode(response, &responseErr); err != nil || responseErr.Code != errCodeMalformed {
+		t.Fatalf("rate-limit response = %+v, decode err=%v", responseErr, err)
+	}
+}
 
 // testX25519 generates a throwaway X25519 keypair for tests.
 func testX25519(t *testing.T) (pub, priv [32]byte) {
@@ -117,6 +252,45 @@ func TestKeyPublishAndRequest(t *testing.T) {
 	}
 	if resp2.PublicKey != "" {
 		t.Fatalf("unknown user key = %q, want empty", resp2.PublicKey)
+	}
+}
+
+func TestKeyPublishRejectsInvalidX25519WithoutMutation(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+
+	conn, clientID := dialAuthed(t, env.addr, "user-uid")
+	defer func() { _ = conn.Close() }()
+	for _, test := range []struct {
+		name string
+		key  string
+	}{
+		{name: "malformed base64", key: "%%%"},
+		{name: "zero decoded bytes", key: b64e(nil)},
+		{name: "31 decoded bytes", key: b64e(make([]byte, 31))},
+		{name: "33 decoded bytes", key: b64e(make([]byte, 33))},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			send(t, conn, netproto.MsgKeyPublish, netproto.KeyPublish{PublicKey: test.key})
+			frame := readOfType(t, conn, netproto.MsgError)
+			var response netproto.Error
+			if err := netproto.Decode(frame, &response); err != nil {
+				t.Fatalf("decode error response: %v", err)
+			}
+			if response.Code != errCodeMalformed {
+				t.Fatalf("error code = %d, want malformed (%d)", response.Code, errCodeMalformed)
+			}
+			if _, stored := env.auth.e2eByUID["user-uid"]; stored {
+				t.Fatal("invalid public key was persisted")
+			}
+			client, ok := env.state.GetClient(clientID)
+			if !ok {
+				t.Fatal("authenticated client is absent from state")
+			}
+			if client.E2EPublicKey != "" {
+				t.Fatalf("invalid public key mutated state to %q", client.E2EPublicKey)
+			}
+		})
 	}
 }
 
@@ -296,22 +470,17 @@ func TestE2EDMSpoolCiphertext(t *testing.T) {
 	})
 
 	// Spooled as ciphertext with the sender's unique ID (the server processes
-	// the frame asynchronously — poll for it).
+	// the frame asynchronously).
 	var entry spooledEntry
-	deadline := time.Now().Add(3 * time.Second)
-	for {
+	waitFor(t, "encrypted direct message to be spooled", func() bool {
 		env.spool.mu.Lock()
+		defer env.spool.mu.Unlock()
 		if len(env.spool.pending) == 1 {
 			entry = env.spool.pending[0]
-			env.spool.mu.Unlock()
-			break
+			return true
 		}
-		env.spool.mu.Unlock()
-		if time.Now().After(deadline) {
-			t.Fatalf("spool size = %d, want 1", len(env.spool.pending))
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+		return false
+	})
 	if entry.Message != ciphertext || entry.FromUniqueID != "admin-uid" {
 		t.Fatalf("spooled = %+v, want ciphertext + admin-uid", entry)
 	}
@@ -477,14 +646,34 @@ func TestRotationCoalescing(t *testing.T) {
 	}
 	fsk := env.deps.ScopeKeys.(*fakeScopeKeys)
 	before := fsk.countFor(4)
+	var callbacks []func()
+	env.srv.rotationAfter = func(delay time.Duration, callback func()) {
+		if delay != time.Second {
+			t.Fatalf("rotation delay = %v, want 1s", delay)
+		}
+		callbacks = append(callbacks, callback)
+	}
 
 	for i := 0; i < 10; i++ {
 		env.srv.rotateScopeKey(ctx, 4)
 	}
-	waitFor(t, "the coalesced rotation to fire", func() bool { return fsk.countFor(4) > before })
-	time.Sleep(300 * time.Millisecond)
+	if len(callbacks) != 1 {
+		t.Fatalf("scheduled callbacks = %d, want 1", len(callbacks))
+	}
+	callbacks[0]()
 	if got := fsk.countFor(4) - before; got != 1 {
 		t.Fatalf("ten leaves in one window produced %d generations, want 1", got)
+	}
+	env.srv.rotMu.Lock()
+	pending := env.srv.rotPending[4]
+	env.srv.rotMu.Unlock()
+	if pending {
+		t.Fatal("rotation remained pending after its callback fired")
+	}
+
+	env.srv.rotateScopeKey(ctx, 4)
+	if len(callbacks) != 2 {
+		t.Fatalf("scheduled callbacks after completion = %d, want 2", len(callbacks))
 	}
 }
 

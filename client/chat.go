@@ -10,14 +10,18 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
+	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -42,7 +46,19 @@ import (
 // and decrypts it. The page carries the generations it references, so no
 // nested key round trip is needed (110).
 func (a *App) ChatHistory(channelID, beforeID int64, limit int) (netproto.ChatHistoryResponse, error) {
-	f, err := a.cmLoad().request(netproto.MsgChatHistory, netproto.MsgChatHistoryResponse,
+	m, err := a.requireCM()
+	if err != nil {
+		return netproto.ChatHistoryResponse{}, err
+	}
+	return chatHistoryWith(m, channelID, beforeID, limit)
+}
+
+// chatHistoryWith performs one page through the manager selected at the
+// compound operation's start. Search/export must not re-resolve App.cm for
+// every page: an active-tab switch midway through a scan would otherwise mix
+// two servers and their unrelated key generations.
+func chatHistoryWith(m *connManager, channelID, beforeID int64, limit int) (netproto.ChatHistoryResponse, error) {
+	f, err := m.request(netproto.MsgChatHistory, netproto.MsgChatHistoryResponse,
 		netproto.ChatHistory{ChannelID: channelID, BeforeID: beforeID, Limit: limit}, 10*time.Second)
 	if err != nil {
 		return netproto.ChatHistoryResponse{}, err
@@ -51,7 +67,6 @@ func (a *App) ChatHistory(channelID, beforeID int64, limit int) (netproto.ChatHi
 	if err := decodeJSON(f, &resp); err != nil {
 		return netproto.ChatHistoryResponse{}, err
 	}
-	m := a.cmLoad()
 	refused := installPageKeys(m, channelID, resp.Keys, resp.Refused)
 	for i := range resp.Messages {
 		openChatEntry(m, channelID, &resp.Messages[i], refused)
@@ -113,7 +128,11 @@ func openChatEntry(m *connManager, scope int64, e *netproto.ChatHistoryEntry, re
 // sealed with the channel's current scope key (the server decrypts it for
 // storage and re-seals for the broadcast).
 func (a *App) ChatEditMessage(channelID, messageID int64, newText string, expectedVersion uint64) string {
-	keyID, key, ok := a.cmLoad().scopeKeys.current(channelID)
+	m, err := a.requireCM()
+	if err != nil {
+		return err.Error()
+	}
+	keyID, key, ok := m.scopeKeys.current(channelID)
 	if !ok {
 		return "no chat key for this channel yet"
 	}
@@ -121,7 +140,7 @@ func (a *App) ChatEditMessage(channelID, messageID int64, newText string, expect
 	if err != nil {
 		return err.Error()
 	}
-	if err := a.cmLoad().write(netproto.MsgChatEdit, netproto.ChatEdit{
+	if err := m.write(netproto.MsgChatEdit, netproto.ChatEdit{
 		MessageID: messageID, NewText: blob, Enc: true, KeyID: keyID, ExpectedVersion: expectedVersion,
 	}); err != nil {
 		return err.Error()
@@ -131,7 +150,11 @@ func (a *App) ChatEditMessage(channelID, messageID int64, newText string, expect
 
 // ChatDeleteMessage deletes (tombstones) a message.
 func (a *App) ChatDeleteMessage(messageID int64) string {
-	if err := a.cmLoad().write(netproto.MsgChatDelete, netproto.ChatDelete{MessageID: messageID}); err != nil {
+	m, err := a.requireCM()
+	if err != nil {
+		return err.Error()
+	}
+	if err := m.write(netproto.MsgChatDelete, netproto.ChatDelete{MessageID: messageID}); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -139,7 +162,11 @@ func (a *App) ChatDeleteMessage(messageID int64) string {
 
 // ChatPinMessage pins or unpins a message.
 func (a *App) ChatPinMessage(channelID, messageID int64, pinned bool) string {
-	if err := a.cmLoad().write(netproto.MsgChatPin, netproto.ChatPin{
+	m, err := a.requireCM()
+	if err != nil {
+		return err.Error()
+	}
+	if err := m.write(netproto.MsgChatPin, netproto.ChatPin{
 		ChannelID: channelID, MessageID: messageID, Pinned: pinned,
 	}); err != nil {
 		return err.Error()
@@ -149,7 +176,11 @@ func (a *App) ChatPinMessage(channelID, messageID int64, pinned bool) string {
 
 // ChatPins lists a channel's pinned messages, decrypted exactly like history.
 func (a *App) ChatPins(channelID int64) (netproto.ChatPinsResponse, error) {
-	f, err := a.cmLoad().request(netproto.MsgChatPins, netproto.MsgChatPinsResponse,
+	m, err := a.requireCM()
+	if err != nil {
+		return netproto.ChatPinsResponse{}, err
+	}
+	f, err := m.request(netproto.MsgChatPins, netproto.MsgChatPinsResponse,
 		netproto.ChatPins{ChannelID: channelID}, 10*time.Second)
 	if err != nil {
 		return netproto.ChatPinsResponse{}, err
@@ -158,7 +189,6 @@ func (a *App) ChatPins(channelID int64) (netproto.ChatPinsResponse, error) {
 	if err := decodeJSON(f, &resp); err != nil {
 		return netproto.ChatPinsResponse{}, err
 	}
-	m := a.cmLoad()
 	refused := installPageKeys(m, channelID, resp.Keys, resp.Refused)
 	for i := range resp.Pins {
 		if resp.Pins[i].Message != nil {
@@ -225,7 +255,11 @@ func (a *App) Subscriptions() []int64 {
 // word list tells an evader what to avoid; a caller without the permission
 // gets an error frame instead of a response and this call times out.
 func (a *App) ChatFilterGet() (netproto.ChatFilterResponse, error) {
-	f, err := a.cmLoad().request(netproto.MsgChatFilterGet, netproto.MsgChatFilterResponse,
+	m, err := a.requireCM()
+	if err != nil {
+		return netproto.ChatFilterResponse{}, err
+	}
+	f, err := m.request(netproto.MsgChatFilterGet, netproto.MsgChatFilterResponse,
 		netproto.ChatFilterGet{}, 5*time.Second)
 	if err != nil {
 		return netproto.ChatFilterResponse{}, err
@@ -242,7 +276,11 @@ func (a *App) ChatFilterGet() (netproto.ChatFilterResponse, error) {
 // the wire form treats a missing list as "leave unchanged", which cannot say
 // "clear it" (117/118).
 func (a *App) ChatFilterSet(wordFilter, linkBlacklist, linkWhitelist string) (netproto.ChatFilterResponse, error) {
-	f, err := a.cmLoad().request(netproto.MsgChatFilterSet, netproto.MsgChatFilterResponse,
+	m, err := a.requireCM()
+	if err != nil {
+		return netproto.ChatFilterResponse{}, err
+	}
+	f, err := m.request(netproto.MsgChatFilterSet, netproto.MsgChatFilterResponse,
 		netproto.ChatFilterSet{
 			WordFilter:    &wordFilter,
 			LinkBlacklist: &linkBlacklist,
@@ -289,10 +327,14 @@ type ChatSearchResult struct {
 // beginning of history; complete=false means maxMessages or a mid-scan page
 // error stopped it, so the caller must present a partial result as partial.
 func (a *App) chatScan(channelID int64, maxMessages int, progress string, visit func(netproto.ChatHistoryEntry)) (int, bool, error) {
+	m, err := a.requireCM()
+	if err != nil {
+		return 0, false, err
+	}
 	scanned := 0
 	before := int64(0)
 	for scanned < maxMessages {
-		resp, err := a.ChatHistory(channelID, before, chatSearchPage)
+		resp, err := chatHistoryWith(m, channelID, before, chatSearchPage)
 		if err != nil {
 			if scanned == 0 {
 				return 0, false, err // nothing to show; surface it
@@ -311,7 +353,9 @@ func (a *App) chatScan(channelID int64, maxMessages int, progress string, visit 
 			return scanned, true, nil
 		}
 		if progress != "" {
-			a.emitPlain(progress, scanned)
+			// Keep progress with the manager captured before paging. A tab switch
+			// must not send this scan's UI updates into another server tab.
+			m.emit(progress, scanned)
 		}
 	}
 	return scanned, false, nil
@@ -395,6 +439,11 @@ type dmLog struct {
 	Nickname string    `json:"nickname,omitempty"`
 	Messages []DMEntry `json:"messages"` // oldest first
 }
+
+// dmBeforeRead is a test seam placed only around read-only public APIs. It
+// proves those APIs do not hold dmMu while a disk read is pending; writers
+// still retain dmMu for their read-modify-write transaction.
+var dmBeforeRead func()
 
 // dmHistoryDir returns the per-device log directory. An App with no settings
 // path (tests, with the default-path fallback disarmed) gets an error rather
@@ -549,8 +598,9 @@ func (a *App) DMHistoryLoad(peer string) ([]DMEntry, error) {
 	if peer == "" {
 		return nil, errors.New("peer is required")
 	}
-	a.dmMu.Lock()
-	defer a.dmMu.Unlock()
+	if hook := dmBeforeRead; hook != nil {
+		hook()
+	}
 	l, err := a.dmLoadLog(peer)
 	if err != nil {
 		return nil, err
@@ -625,8 +675,6 @@ func (a *App) DMHistoryClear(peer string) string {
 // survive a restart. Logs sealed to a different identity are skipped rather
 // than reported: they are not this user's conversations.
 func (a *App) DMHistoryPeers() []DMPeer {
-	a.dmMu.Lock()
-	defer a.dmMu.Unlock()
 	out := []DMPeer{}
 	dir, err := a.dmHistoryDir()
 	if err != nil {
@@ -681,10 +729,11 @@ func (a *App) DMSearch(peer, query string, maxMessages int) (ChatSearchResult, e
 		}
 	}
 
-	a.dmMu.Lock()
-	defer a.dmMu.Unlock()
 	res := ChatSearchResult{Messages: []netproto.ChatHistoryEntry{}}
 	for _, uid := range peers {
+		if hook := dmBeforeRead; hook != nil {
+			hook()
+		}
 		l, err := a.dmLoadLog(uid)
 		if err != nil {
 			continue
@@ -713,7 +762,11 @@ func (a *App) DMSearch(peer, query string, maxMessages int) (ChatSearchResult, e
 
 // ChatReact toggles a reaction on a message.
 func (a *App) ChatReact(messageID int64, emoji string) string {
-	if err := a.cmLoad().write(netproto.MsgChatReact, netproto.ChatReact{
+	m, err := a.requireCM()
+	if err != nil {
+		return err.Error()
+	}
+	if err := m.write(netproto.MsgChatReact, netproto.ChatReact{
 		MessageID: messageID, Emoji: emoji,
 	}); err != nil {
 		return err.Error()
@@ -723,7 +776,11 @@ func (a *App) ChatReact(messageID int64, emoji string) string {
 
 // SendTyping relays a typing indicator (channel scope or DM).
 func (a *App) SendTyping(channelID int64, toUniqueID string) string {
-	if err := a.cmLoad().write(netproto.MsgTyping, netproto.Typing{
+	m, err := a.requireCM()
+	if err != nil {
+		return err.Error()
+	}
+	if err := m.write(netproto.MsgTyping, netproto.Typing{
 		ChannelID: channelID, ToUniqueID: toUniqueID,
 	}); err != nil {
 		return err.Error()
@@ -733,7 +790,11 @@ func (a *App) SendTyping(channelID int64, toUniqueID string) string {
 
 // SendChatDelivered acks a received DM (delivery receipt to the sender).
 func (a *App) SendChatDelivered(toUniqueID, clientMsgID string) string {
-	if err := a.cmLoad().write(netproto.MsgChatDelivered, netproto.ChatDelivered{
+	m, err := a.requireCM()
+	if err != nil {
+		return err.Error()
+	}
+	if err := m.write(netproto.MsgChatDelivered, netproto.ChatDelivered{
 		ToUniqueID: toUniqueID, ClientMsgID: clientMsgID,
 	}); err != nil {
 		return err.Error()
@@ -743,7 +804,11 @@ func (a *App) SendChatDelivered(toUniqueID, clientMsgID string) string {
 
 // SendChatRead acks a read DM (read receipt to the sender).
 func (a *App) SendChatRead(toUniqueID, clientMsgID string) string {
-	if err := a.cmLoad().write(netproto.MsgChatRead, netproto.ChatRead{
+	m, err := a.requireCM()
+	if err != nil {
+		return err.Error()
+	}
+	if err := m.write(netproto.MsgChatRead, netproto.ChatRead{
 		ToUniqueID: toUniqueID, ClientMsgID: clientMsgID,
 	}); err != nil {
 		return err.Error()
@@ -760,7 +825,11 @@ func (a *App) SendChatRead(toUniqueID, clientMsgID string) string {
 // b_emoji_upload and rejects oversized images, so failures come back as an
 // error frame rather than a return value here.
 func (a *App) EmojiUpload(name, dataBase64 string) string {
-	if err := a.cmLoad().write(netproto.MsgEmojiUpload, netproto.EmojiUpload{
+	m, err := a.requireCM()
+	if err != nil {
+		return err.Error()
+	}
+	if err := m.write(netproto.MsgEmojiUpload, netproto.EmojiUpload{
 		Name: name, DataBase64: dataBase64,
 	}); err != nil {
 		return err.Error()
@@ -769,7 +838,11 @@ func (a *App) EmojiUpload(name, dataBase64 string) string {
 }
 
 func (a *App) EmojiList() (netproto.EmojiListResponse, error) {
-	f, err := a.cmLoad().request(netproto.MsgEmojiList, netproto.MsgEmojiListResponse,
+	m, err := a.requireCM()
+	if err != nil {
+		return netproto.EmojiListResponse{}, err
+	}
+	f, err := m.request(netproto.MsgEmojiList, netproto.MsgEmojiListResponse,
 		netproto.EmojiList{}, 10*time.Second)
 	if err != nil {
 		return netproto.EmojiListResponse{}, err
@@ -783,7 +856,11 @@ func (a *App) EmojiList() (netproto.EmojiListResponse, error) {
 
 // EmojiGet fetches one custom emoji image (cached by the frontend).
 func (a *App) EmojiGet(name string) (netproto.EmojiData, error) {
-	f, err := a.cmLoad().request(netproto.MsgEmojiGet, netproto.MsgEmojiData,
+	m, err := a.requireCM()
+	if err != nil {
+		return netproto.EmojiData{}, err
+	}
+	f, err := m.request(netproto.MsgEmojiGet, netproto.MsgEmojiData,
 		netproto.EmojiGet{Name: name}, 10*time.Second)
 	if err != nil {
 		return netproto.EmojiData{}, err
@@ -810,28 +887,14 @@ const (
 	ftStatus uint16 = 4
 )
 
-// ftAddr returns the file-transfer address for the current connection
-// (control-channel host + the port from the init response).
-func (a *App) ftAddr(port int) (string, error) {
-	a.cmLoad().mu.Lock()
-	conn := a.cmLoad().conn
-	a.cmLoad().mu.Unlock()
-	if conn == nil {
-		return "", errors.New("not connected")
-	}
-	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
-	if err != nil {
-		return "", err
-	}
-	return net.JoinHostPort(host, fmt.Sprint(port)), nil
-}
-
 // ftEndpoint is a resolved data-port target: where to dial, whether the port
 // speaks TLS, and the certificate to pin on it.
 type ftEndpoint struct {
 	addr        string
 	fingerprint string
+	certDER     []byte
 	tls         bool
+	epoch       uint64
 }
 
 // ftTarget resolves the data-port address and the certificate to pin on it.
@@ -841,17 +904,30 @@ type ftEndpoint struct {
 // and the transfer is refused rather than downgraded (91-135). A server that
 // reports a plaintext data port is honoured only when its control channel is
 // plaintext too, so a TLS server can never talk a client down to a clear port.
-func (a *App) ftTarget(init netproto.FileTransferInitResponse) (ftEndpoint, error) {
-	addr, err := a.ftAddr(init.Port)
+func (m *connManager) ftTarget(init netproto.FileTransferInitResponse) (ftEndpoint, error) {
+	// The endpoint and epoch come from one manager snapshot. Reading the
+	// address and certificate under separate locks could pair an old host with
+	// a new connection's pin after reconnect.
+	m.mu.Lock()
+	conn := m.conn
+	accepting := m.acceptingTransfers
+	control := m.fingerprint
+	controlCertDER := bytes.Clone(m.peerCertificateDER)
+	epoch := m.transferEpoch
+	m.mu.Unlock()
+	if conn == nil || !accepting {
+		return ftEndpoint{}, errors.New("not connected")
+	}
+	host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
 	if err != nil {
 		return ftEndpoint{}, err
 	}
-	_, control, _ := a.cmLoad().securitySnapshot()
+	addr := net.JoinHostPort(host, fmt.Sprint(init.Port))
 	if !init.TLS {
 		if control != "" {
 			return ftEndpoint{}, errors.New("server offered a plaintext file transfer port — refusing the transfer")
 		}
-		return ftEndpoint{addr: addr}, nil
+		return ftEndpoint{addr: addr, epoch: epoch}, nil
 	}
 	fingerprint := init.TLSFingerprint
 	if fingerprint == "" {
@@ -863,12 +939,36 @@ func (a *App) ftTarget(init netproto.FileTransferInitResponse) (ftEndpoint, erro
 	if control != "" && !secureEqualFold(fingerprint, control) {
 		return ftEndpoint{}, errors.New("file transfer certificate does not match the server — refusing the transfer")
 	}
-	return ftEndpoint{addr: addr, fingerprint: fingerprint, tls: true}, nil
+	if len(controlCertDER) == 0 {
+		return ftEndpoint{}, errors.New("file transfer TLS certificate is unavailable — refusing the transfer")
+	}
+	return ftEndpoint{
+		addr:        addr,
+		fingerprint: fingerprint,
+		certDER:     controlCertDER,
+		tls:         true,
+		epoch:       epoch,
+	}, nil
+}
+
+// ftTarget resolves a transfer target for the manager active at call start.
+// Long-running transfers call the connManager method directly so switching
+// tabs cannot redirect a later stage of the same transfer.
+func (a *App) ftTarget(init netproto.FileTransferInitResponse) (ftEndpoint, error) {
+	cm, err := a.requireCM()
+	if err != nil {
+		return ftEndpoint{}, err
+	}
+	return cm.ftTarget(init)
 }
 
 // ftPutBytes runs the init handshake and streams data to the data port.
 func (a *App) ftPutBytes(channelID int64, name string, data []byte) error {
-	f, err := a.cmLoad().request(netproto.MsgFileTransferInit, netproto.MsgFileTransferInitResponse,
+	cm, err := a.requireCM()
+	if err != nil {
+		return err
+	}
+	f, err := cm.request(netproto.MsgFileTransferInit, netproto.MsgFileTransferInitResponse,
 		netproto.FileTransferInit{ChannelID: channelID, Direction: "upload", Name: name, Size: int64(len(data))},
 		10*time.Second)
 	if err != nil {
@@ -878,16 +978,28 @@ func (a *App) ftPutBytes(channelID int64, name string, data []byte) error {
 	if err := decodeJSON(f, &init); err != nil {
 		return err
 	}
-	ep, err := a.ftTarget(init)
+	ep, err := cm.ftTarget(init)
 	if err != nil {
 		return err
 	}
-	return ftUpload(ep, init.Token, init.TransferID, data)
+	return cm.ftUpload(ep, init.Token, init.TransferID, data)
 }
 
 // ftGetBytes runs the init handshake and reads a file off the data port.
 func (a *App) ftGetBytes(channelID int64, name string) ([]byte, error) {
-	f, err := a.cmLoad().request(netproto.MsgFileTransferInit, netproto.MsgFileTransferInitResponse,
+	cm, err := a.requireCM()
+	if err != nil {
+		return nil, err
+	}
+	return a.ftGetBytesForCM(cm, channelID, name)
+}
+
+func (a *App) ftGetBytesForCM(cm *connManager, channelID int64, name string) ([]byte, error) {
+	return a.ftGetBytesForCMWithLimit(cm, channelID, name, maxLegacyTransferBytes)
+}
+
+func (a *App) ftGetBytesForCMWithLimit(cm *connManager, channelID int64, name string, maxBytes int64) ([]byte, error) {
+	f, err := cm.request(netproto.MsgFileTransferInit, netproto.MsgFileTransferInitResponse,
 		netproto.FileTransferInit{ChannelID: channelID, Direction: "download", Name: name},
 		10*time.Second)
 	if err != nil {
@@ -897,11 +1009,11 @@ func (a *App) ftGetBytes(channelID int64, name string) ([]byte, error) {
 	if err := decodeJSON(f, &init); err != nil {
 		return nil, err
 	}
-	ep, err := a.ftTarget(init)
+	ep, err := cm.ftTarget(init)
 	if err != nil {
 		return nil, err
 	}
-	return ftDownload(ep, init.Token, init.TransferID)
+	return cm.ftDownloadWithLimit(ep, init.Token, init.TransferID, maxBytes)
 }
 
 // UploadFile uploads data as a file into a channel and returns "" or the
@@ -970,9 +1082,15 @@ func parseFileRef(capture string) (storage, keyB64, name string) {
 // The key only ever exists inside the (encrypted) message body, so the file
 // gets exactly the protection the message text gets.
 func (a *App) UploadChatAttachment(channelID int64, name, dataBase64 string) (string, error) {
-	data, err := base64.StdEncoding.DecodeString(dataBase64)
+	data, err := io.ReadAll(io.LimitReader(
+		base64.NewDecoder(base64.StdEncoding, strings.NewReader(dataBase64)),
+		int64(maxChatAttachmentBytes)+1,
+	))
 	if err != nil {
 		return "", errors.New("invalid file data")
+	}
+	if len(data) > maxChatAttachmentBytes {
+		return "", errors.New("attachment exceeds 25 MiB limit")
 	}
 	var key [32]byte
 	if _, err := rand.Read(key[:]); err != nil {
@@ -990,33 +1108,234 @@ func (a *App) UploadChatAttachment(channelID int64, name, dataBase64 string) (st
 		"#" + safeDisplayName(name) + "]", nil
 }
 
-// DownloadChatAttachment fetches <storage> and unseals it with keyB64,
-// returning base64 plaintext. An empty keyB64 downloads a plain file, which is
-// what a legacy [file:photo.png] reference resolves to.
-func (a *App) DownloadChatAttachment(channelID int64, storage, keyB64 string) (string, error) {
+const maxChatAttachmentBytes = 25 << 20
+
+// Sealed attachments include a header plus one length-prefixed AES-GCM record
+// per plaintext chunk. They may therefore be slightly larger on the wire while
+// still representing at most 25 MiB after decryption.
+var maxSealedChatAttachmentBytes = sealedAttachmentSizeForPlaintext(maxChatAttachmentBytes)
+
+const maxInlineAttachmentBase64Bytes = 8 << 20
+
+var errChatAttachmentPreviewTooLarge = errors.New("attachment is too large to preview")
+
+// chatAttachmentBytesForCM fetches and opens one attachment with the captured
+// manager. A native save dialog may suspend the UI; retaining this manager
+// prevents a concurrent tab switch from redirecting the later download to a
+// different server.
+func (a *App) chatAttachmentBytesForCM(cm *connManager, channelID int64, storage, keyB64 string) ([]byte, error) {
 	// A caller that hands over the raw capture instead of its parts is parsed
 	// here too, so a token can never be mistaken for a file name.
 	if keyB64 == "" && strings.Contains(storage, "#") {
 		storage, keyB64, _ = parseFileRef(storage)
 	}
-	blob, err := a.ftGetBytes(channelID, storage)
-	if err != nil {
-		return "", err
-	}
-	if keyB64 == "" {
-		return base64.StdEncoding.EncodeToString(blob), nil
-	}
-	raw, err := base64.StdEncoding.DecodeString(keyB64)
-	if err != nil || len(raw) != 32 {
-		return "", errors.New("invalid attachment key")
+	if storage == "" {
+		return nil, errors.New("invalid attachment storage")
 	}
 	var key [32]byte
-	copy(key[:], raw)
-	plain, err := openFile(blob, key)
+	if keyB64 != "" {
+		raw, err := base64.StdEncoding.DecodeString(keyB64)
+		if err != nil || len(raw) != len(key) {
+			return nil, errors.New("invalid attachment key")
+		}
+		copy(key[:], raw)
+	}
+	var (
+		blob []byte
+		err  error
+	)
+	if a.chatAttachmentFetch != nil {
+		blob, err = a.chatAttachmentFetch(cm, channelID, storage)
+	} else {
+		maxWireBytes := maxChatAttachmentBytes
+		if keyB64 != "" {
+			maxWireBytes = maxSealedChatAttachmentBytes
+		}
+		blob, err = a.ftGetBytesForCMWithLimit(cm, channelID, storage, int64(maxWireBytes))
+	}
+	if err != nil {
+		return nil, err
+	}
+	if keyB64 == "" && len(blob) > maxChatAttachmentBytes {
+		return nil, errors.New("attachment exceeds 25 MiB limit")
+	}
+	if keyB64 == "" {
+		return blob, nil
+	}
+	if bytes.HasPrefix(blob, attachmentGCMHeader) {
+		if len(blob) > maxSealedChatAttachmentBytes {
+			return nil, errors.New("attachment exceeds 25 MiB limit")
+		}
+	} else if len(blob) > maxChatAttachmentBytes {
+		// The larger encrypted wire allowance is exclusively for the chunked
+		// GCM format. Legacy secretbox attachments retain their former cap.
+		return nil, errors.New("attachment exceeds 25 MiB limit")
+	}
+	plain, err := openFileLimited(blob, key, maxChatAttachmentBytes)
+	if err != nil {
+		return nil, err
+	}
+	return plain, nil
+}
+
+func (a *App) chatAttachmentBytes(channelID int64, storage, keyB64 string) ([]byte, error) {
+	cm, err := a.requireCM()
+	if err != nil {
+		return nil, err
+	}
+	return a.chatAttachmentBytesForCM(cm, channelID, storage, keyB64)
+}
+
+// DownloadChatAttachment fetches <storage> and unseals it with keyB64,
+// returning bounded base64 plaintext for inline preview. An empty keyB64
+// downloads a plain legacy [file:photo.png] reference.
+func (a *App) DownloadChatAttachment(channelID int64, storage, keyB64 string) (string, error) {
+	plain, err := a.chatAttachmentBytes(channelID, storage, keyB64)
 	if err != nil {
 		return "", err
 	}
+	if base64.StdEncoding.EncodedLen(len(plain)) > maxInlineAttachmentBase64Bytes {
+		return "", errChatAttachmentPreviewTooLarge
+	}
 	return base64.StdEncoding.EncodeToString(plain), nil
+}
+
+var errChatAttachmentDestinationExists = errors.New("the selected file already exists")
+
+// chatAttachmentLink is replaceable in tests that model a filename appearing
+// after the dialog/preflight check. os.Link is an atomic no-overwrite publish
+// on a same-directory temporary file, including on Windows NTFS.
+var chatAttachmentLink = os.Link
+
+func safeAttachmentFilename(defaultName string) string {
+	name := strings.TrimSpace(defaultName)
+	if i := strings.LastIndexAny(name, "/\\"); i >= 0 {
+		name = name[i+1:]
+	}
+	name = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, name)
+	if name == "" || name == "." || name == ".." {
+		return "attachment"
+	}
+	return name
+}
+
+func chatAttachmentDestination(dest string) (string, error) {
+	dest = filepath.Clean(dest)
+	base := filepath.Base(dest)
+	if dest == "." || base == "." || base == string(filepath.Separator) {
+		return "", errors.New("invalid attachment destination")
+	}
+	info, err := os.Stat(filepath.Dir(dest))
+	if err != nil {
+		return "", fmt.Errorf("opening attachment destination directory: %w", err)
+	}
+	if !info.IsDir() {
+		return "", errors.New("attachment destination parent is not a directory")
+	}
+	if _, err := os.Lstat(dest); err == nil {
+		return "", errChatAttachmentDestinationExists
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return "", fmt.Errorf("checking attachment destination: %w", err)
+	}
+	return dest, nil
+}
+
+func (a *App) chooseChatAttachmentPath(defaultName string) (string, error) {
+	options := wailsRuntime.SaveDialogOptions{
+		Title:           "Save chat attachment",
+		DefaultFilename: safeAttachmentFilename(defaultName),
+	}
+	if a.chatAttachmentSaveDialog != nil {
+		return a.chatAttachmentSaveDialog(a.ctx, options)
+	}
+	if a.ctx == nil {
+		return "", errors.New("save dialog is unavailable")
+	}
+	return wailsRuntime.SaveFileDialog(a.ctx, options)
+}
+
+func writeChatAttachmentAtomically(dest string, data []byte) (err error) {
+	dest, err = chatAttachmentDestination(dest)
+	if err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(filepath.Dir(dest), "."+filepath.Base(dest)+".tmp-")
+	if err != nil {
+		return err
+	}
+	temp := f.Name()
+	defer func() {
+		if temp != "" {
+			_ = os.Remove(temp)
+		}
+	}()
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if n, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	} else if n != len(data) {
+		_ = f.Close()
+		return io.ErrShortWrite
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := chatAttachmentLink(temp, dest); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return errChatAttachmentDestinationExists
+		}
+		return fmt.Errorf("publishing attachment: %w", err)
+	}
+	if err := os.Remove(temp); err != nil {
+		return fmt.Errorf("cleaning attachment temporary file: %w", err)
+	}
+	temp = ""
+	return nil
+}
+
+// SaveChatAttachment opens the native save dialog before downloading. It
+// decrypts only in Go and publishes a fully verified new destination without
+// replacing an existing file. Cancel returns an empty path and no error.
+func (a *App) SaveChatAttachment(channelID int64, storage, keyB64, defaultName string) (string, error) {
+	// Capture the active manager before the native dialog. A tab switch while
+	// the dialog is open must not redirect the selected attachment to another
+	// server; no network operation occurs until after the user chooses a path.
+	cm := a.cmLoad()
+	dest, err := a.chooseChatAttachmentPath(defaultName)
+	if err != nil || dest == "" {
+		return dest, err
+	}
+	dest, err = chatAttachmentDestination(dest)
+	if err != nil {
+		return "", err
+	}
+	if cm == nil {
+		return "", errors.New("not connected")
+	}
+	plain, err := a.chatAttachmentBytesForCM(cm, channelID, storage, keyB64)
+	if err != nil {
+		return "", err
+	}
+	write := a.chatAttachmentWrite
+	if write == nil {
+		write = writeChatAttachmentAtomically
+	}
+	if err := write(dest, plain); err != nil {
+		return "", err
+	}
+	return dest, nil
 }
 
 // ftDial dials the file-transfer port. The data port is TLS with the same
@@ -1025,18 +1344,64 @@ func (a *App) DownloadChatAttachment(channelID int64, storage, keyB64 string) (s
 // ftTarget only clears ep.tls for an all-plaintext dev server.
 func ftDial(ep ftEndpoint) (net.Conn, error) {
 	if !ep.tls {
-		return net.DialTimeout("tcp", ep.addr, 15*time.Second)
+		return (&net.Dialer{Timeout: 15 * time.Second}).DialContext(context.Background(), "tcp", ep.addr)
 	}
 	if ep.fingerprint == "" {
 		return nil, errors.New("file transfer TLS fingerprint is missing")
 	}
-	return tls.DialWithDialer(&net.Dialer{Timeout: 15 * time.Second}, "tcp", ep.addr, &tls.Config{
-		// #nosec G402 -- VerifyConnection enforces the established control-channel pin on every handshake.
-		InsecureSkipVerify: true,
-		MinVersion:         tls.VersionTLS13,
-		VerifyConnection:   pinFingerprint(ep.fingerprint),
-	})
+	tlsConfig, err := pinnedTLSConfig(ep.certDER, ep.fingerprint)
+	if err != nil {
+		return nil, err
+	}
+	dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{Timeout: 15 * time.Second},
+		Config:    tlsConfig,
+	}
+	return dialer.DialContext(context.Background(), "tcp", ep.addr)
 }
+
+// pinnedTLSConfig turns the exact certificate authenticated by the control
+// channel into a private trust store for the data port. Standard certificate
+// verification therefore remains enabled, while VerifyConnection keeps the
+// fingerprint pin explicit as a defense-in-depth check.
+func pinnedTLSConfig(certDER []byte, fingerprint string) (*tls.Config, error) {
+	if fingerprint == "" {
+		return nil, errors.New("file transfer TLS fingerprint is missing")
+	}
+	if len(certDER) == 0 {
+		return nil, errors.New("file transfer TLS certificate is missing")
+	}
+	leaf, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return nil, fmt.Errorf("parsing file transfer TLS certificate: %w", err)
+	}
+	if got := tlscert.FingerprintDER(leaf.Raw); !secureEqualFold(got, fingerprint) {
+		return nil, fmt.Errorf("file transfer certificate mismatch (%s, expected %s)", got, fingerprint)
+	}
+
+	serverName := ""
+	if len(leaf.DNSNames) > 0 {
+		serverName = leaf.DNSNames[0]
+	} else if len(leaf.IPAddresses) > 0 {
+		serverName = leaf.IPAddresses[0].String()
+	}
+	if serverName == "" {
+		return nil, errors.New("file transfer TLS certificate has no DNS or IP subject alternative name")
+	}
+
+	roots := x509.NewCertPool()
+	roots.AddCert(leaf)
+	return &tls.Config{
+		MinVersion:       tls.VersionTLS13,
+		RootCAs:          roots,
+		ServerName:       serverName,
+		VerifyConnection: pinFingerprint(fingerprint),
+	}, nil
+}
+
+// transferDial is injectable for deterministic disconnect-between-endpoint-
+// and-dial tests. Production always uses ftDial.
+var transferDial = ftDial
 
 // pinFingerprint builds the mandatory certificate check for the data port.
 // An empty pin fails closed because server-generated self-signed certificates
@@ -1061,12 +1426,33 @@ func pinFingerprint(want string) func(tls.ConnectionState) error {
 
 // ftUpload streams data to the file-transfer port with digest verification.
 func ftUpload(ep ftEndpoint, token, transferID string, data []byte) error {
-	conn, err := ftDial(ep)
+	conn, err := transferDial(ep)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = conn.Close() }()
+	return ftUploadConn(conn, token, transferID, data)
+}
 
+// ftUpload keeps even synchronous transfer paths bound to the captured
+// connection epoch. A disconnect after ftTarget but before dial is rejected
+// and the freshly dialed socket is closed before protocol bytes are written.
+func (m *connManager) ftUpload(ep ftEndpoint, token, transferID string, data []byte) error {
+	conn, err := transferDial(ep)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+	untrack, ok := m.trackTransferAt(transferID, ep.epoch, conn)
+	if !ok {
+		return errTransferCanceled
+	}
+	defer untrack()
+	return ftUploadConn(conn, token, transferID, data)
+}
+
+func ftUploadConn(conn net.Conn, token, transferID string, data []byte) error {
+	defer clearTransferDeadlines(conn)
 	if err := ftWriteJSON(conn, ftInit, map[string]string{"token": token, "transfer_id": transferID}); err != nil {
 		return err
 	}
@@ -1076,7 +1462,7 @@ func ftUpload(ep ftEndpoint, token, transferID string, data []byte) error {
 		if end > len(data) {
 			end = len(data)
 		}
-		if err := netproto.WriteFrame(conn, &netproto.Frame{Type: ftChunk, Payload: data[off:end]}); err != nil {
+		if err := ftWriteFrame(conn, &netproto.Frame{Type: ftChunk, Payload: data[off:end]}); err != nil {
 			return err
 		}
 	}
@@ -1087,50 +1473,122 @@ func ftUpload(ep ftEndpoint, token, transferID string, data []byte) error {
 	return ftReadStatus(conn)
 }
 
-// ftDownload reads a file from the file-transfer port with digest
-// verification.
-func ftDownload(ep ftEndpoint, token, transferID string) ([]byte, error) {
-	conn, err := ftDial(ep)
+func (m *connManager) ftDownload(ep ftEndpoint, token, transferID string) ([]byte, error) {
+	return m.ftDownloadWithLimit(ep, token, transferID, maxLegacyTransferBytes)
+}
+
+func (m *connManager) ftDownloadWithLimit(ep ftEndpoint, token, transferID string, maxBytes int64) ([]byte, error) {
+	conn, err := transferDial(ep)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = conn.Close() }()
+	untrack, ok := m.trackTransferAt(transferID, ep.epoch, conn)
+	if !ok {
+		return nil, errTransferCanceled
+	}
+	defer untrack()
+	return ftDownloadConnWithLimit(conn, token, transferID, maxBytes)
+}
 
-	if err := ftWriteJSON(conn, ftInit, map[string]string{"token": token, "transfer_id": transferID}); err != nil {
+const maxLegacyTransferBytes = 25 << 20
+
+func ftDownloadConnWithLimit(conn net.Conn, token, transferID string, maxBytes int64) ([]byte, error) {
+	var out bytes.Buffer
+	if _, err := ftDownloadTo(conn, token, transferID, &out, maxBytes); err != nil {
 		return nil, err
 	}
-	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+	return out.Bytes(), nil
+}
 
-	h := sha256.New()
-	var got []byte
+// ftDownloadTo is the shared streaming download core. maxBytes <= 0 permits
+// unbounded streaming (the progress-to-disk route); legacy in-memory callers
+// are capped before a chunk is written.
+func ftDownloadTo(conn net.Conn, token, transferID string, out io.Writer, maxBytes int64) (int64, error) {
+	return ftDownloadStream(
+		conn,
+		map[string]string{"token": token, "transfer_id": transferID},
+		out,
+		maxBytes,
+		0,
+		sha256.New(),
+		nil,
+	)
+}
+
+// ftDownloadStream is the one streaming download protocol implementation.
+// Callers may seed the hasher and total for a resumed download, and observe
+// each verified-on-arrival chunk for progress reporting.
+func ftDownloadStream(conn net.Conn, init any, out io.Writer, maxBytes, total int64, h hash.Hash, onChunk func(int64) error) (int64, error) {
+	defer clearTransferDeadlines(conn)
+	if err := ftWriteJSON(conn, ftInit, init); err != nil {
+		return total, err
+	}
+
 	for {
-		f, err := netproto.ReadFrame(conn)
+		f, err := ftReadFrame(conn)
 		if err != nil {
-			return nil, err
+			return total, err
 		}
 		switch f.Type {
 		case ftChunk:
-			got = append(got, f.Payload...)
+			if maxBytes > 0 && total+int64(len(f.Payload)) > maxBytes {
+				return total, fmt.Errorf("file exceeds %d byte in-memory transfer limit; use streaming download", maxBytes)
+			}
+			n, err := out.Write(f.Payload)
+			if err != nil {
+				return total, err
+			}
+			if n != len(f.Payload) {
+				return total, io.ErrShortWrite
+			}
+			total += int64(len(f.Payload))
 			h.Write(f.Payload)
+			if onChunk != nil {
+				if err := onChunk(total); err != nil {
+					return total, err
+				}
+			}
 		case ftDigest:
 			var d struct {
 				SHA256 string `json:"sha256"`
 			}
 			if err := json.Unmarshal(f.Payload, &d); err != nil {
-				return nil, err
+				return total, err
 			}
 			if d.SHA256 != hex.EncodeToString(h.Sum(nil)) {
-				return nil, errors.New("file digest mismatch")
+				return total, errFileDigestMismatch
 			}
 			if err := ftReadStatus(conn); err != nil {
-				return nil, err
+				return total, err
 			}
-			return got, nil
+			return total, nil
 		default:
-			return nil, fmt.Errorf("unexpected frame type %d", f.Type)
+			return total, fmt.Errorf("unexpected frame type %d", f.Type)
 		}
 	}
+}
+
+var errFileDigestMismatch = errors.New("file digest mismatch")
+
+var fileTransferIdleTimeout = 30 * time.Second
+
+// ftWriteFrame and ftReadFrame use rolling idle deadlines: each individual
+// frame must make progress within the timeout, while an active large transfer
+// may run indefinitely. The enclosing transfer clears both deadlines on exit.
+func ftWriteFrame(conn net.Conn, frame *netproto.Frame) error {
+	_ = conn.SetWriteDeadline(time.Now().Add(fileTransferIdleTimeout))
+	return netproto.WriteFrame(conn, frame)
+}
+
+func ftReadFrame(conn net.Conn) (*netproto.Frame, error) {
+	_ = conn.SetReadDeadline(time.Now().Add(fileTransferIdleTimeout))
+	return netproto.ReadFrame(conn)
+}
+
+func clearTransferDeadlines(conn net.Conn) {
+	_ = conn.SetReadDeadline(time.Time{})
+	_ = conn.SetWriteDeadline(time.Time{})
 }
 
 // ftWriteJSON writes a JSON payload frame on the file-transfer port.
@@ -1139,14 +1597,12 @@ func ftWriteJSON(conn net.Conn, frameType uint16, v any) error {
 	if err != nil {
 		return err
 	}
-	return netproto.WriteFrame(conn, &netproto.Frame{Type: frameType, Payload: payload})
+	return ftWriteFrame(conn, &netproto.Frame{Type: frameType, Payload: payload})
 }
 
 // ftReadStatus reads the server's final status frame.
 func ftReadStatus(conn net.Conn) error {
-	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
-	f, err := netproto.ReadFrame(conn)
+	f, err := ftReadFrame(conn)
 	if err != nil {
 		return err
 	}

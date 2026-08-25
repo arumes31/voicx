@@ -19,7 +19,7 @@ import (
 // MoveClient moves a client into a channel without a permission check. It
 // reuses the standard move path (state, temp-channel bookkeeping, voice
 // router sync, user_moved broadcast).
-func (s *TCPServer) MoveClient(clientID string, channelID int64) error {
+func (s *TCPServer) MoveClient(ctx context.Context, clientID string, channelID int64) error {
 	if s.deps == nil || s.deps.State == nil {
 		return errors.New("state backend unavailable")
 	}
@@ -29,29 +29,29 @@ func (s *TCPServer) MoveClient(clientID string, channelID int64) error {
 	if _, ok := s.clientByID(clientID); !ok {
 		return errors.New("target client not found")
 	}
-	return s.moveClient(clientID, channelID)
+	return s.moveClient(ctx, clientID, channelID, "serverquery")
 }
 
 // KickClient kicks a client from its channel or the server without a
 // permission check. byClientID identifies the initiator in the kicked event
 // (e.g. "serverquery").
-func (s *TCPServer) KickClient(byClientID, targetID string, fromServer bool, reason string) error {
+func (s *TCPServer) KickClient(ctx context.Context, byClientID, targetID string, fromServer bool, reason string) error {
 	target, ok := s.clientByID(targetID)
 	if !ok || !target.isAuthed() {
 		return errors.New("target client not found")
 	}
 	uniqueID := target.UniqueID
-	if err := s.performKick(byClientID, targetID, fromServer, false, reason); err != nil {
+	if err := s.performKick(byClientID, targetID, fromServer, false, reason, time.Time{}); err != nil {
 		return err
 	}
-	s.audit(context.Background(), byClientID, "kick", uniqueID,
+	s.audit(ctx, byClientID, "kick", uniqueID,
 		fmt.Sprintf("from_server=%t reason=%s", fromServer, reason))
 	return nil
 }
 
 // performKick is the shared kick implementation used by the control handler
 // (after its permission gate) and KickClient.
-func (s *TCPServer) performKick(byClientID, targetID string, fromServer, ban bool, reason string) error {
+func (s *TCPServer) performKick(byClientID, targetID string, fromServer, ban bool, reason string, expiresAt time.Time) error {
 	if s.deps == nil || s.deps.State == nil {
 		return errors.New("state backend unavailable")
 	}
@@ -59,13 +59,19 @@ func (s *TCPServer) performKick(byClientID, targetID string, fromServer, ban boo
 	if !ok || !target.isAuthed() {
 		return errors.New("target client not found")
 	}
+	targetState, ok := s.deps.State.GetClient(target.ID)
+	if !ok {
+		return errors.New("target client state not found")
+	}
 
 	evt := kickEvent{
 		ClientID:   target.ID,
+		ChannelID:  targetState.ChannelID,
 		ByClientID: byClientID,
 		Reason:     reason,
 		FromServer: fromServer,
 		Ban:        ban,
+		ExpiresAt:  banExpirationMillis(expiresAt),
 	}
 
 	if fromServer {
@@ -99,6 +105,10 @@ func (s *TCPServer) performKick(byClientID, targetID string, fromServer, ban boo
 	if s.deps.Voice != nil {
 		s.deps.Voice.LeaveChannel(target.ID, channelID)
 	}
+	// LeaveClient resolves the committed source channel under its lifecycle
+	// lock, which is authoritative if a concurrent move raced the initial
+	// state snapshot above.
+	evt.ChannelID = channelID
 	s.broadcastEvent(eventKicked, evt)
 	return nil
 }
@@ -112,19 +122,16 @@ func (s *TCPServer) BanClient(ctx context.Context, byClientID, targetID string, 
 		return errors.New("target client not found")
 	}
 
-	var expiresAt any
-	if seconds > 0 {
-		expiresAt = time.Now().Add(time.Duration(seconds) * time.Second)
-	}
+	expiresAt := banExpiration(seconds)
 	var bannedBy any
 	if caller, ok := s.clientByID(byClientID); ok && caller.UserID != 0 {
 		bannedBy = caller.UserID
 	}
-	if err := s.insertBan(ctx, target.UniqueID, reason, bannedBy, expiresAt); err != nil {
+	if err := s.insertBan(ctx, target.UniqueID, reason, bannedBy, persistentBanExpiration(expiresAt)); err != nil {
 		return fmt.Errorf("recording ban: %w", err)
 	}
 
-	if err := s.performKick(byClientID, targetID, true, true, reason); err != nil {
+	if err := s.performKick(byClientID, targetID, true, true, reason, expiresAt); err != nil {
 		return err
 	}
 	s.audit(ctx, byClientID, "ban", target.UniqueID,
@@ -224,17 +231,17 @@ func (s *TCPServer) banAdminAllowed(ctx context.Context, client *Client) (*permC
 // handleBanList returns the ban list, newest first.
 func (s *TCPServer) handleBanList(ctx context.Context, client *Client, f *netproto.Frame) error {
 	if err := netproto.Decode(f, &netproto.BanList{}); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed ban_list: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed ban_list: "+err.Error())
 	}
 	if s.deps == nil || s.deps.BanAdmin == nil {
-		return s.sendError(client, errCodeUnavailable, "ban store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "ban store unavailable")
 	}
 	if _, ok := s.banAdminAllowed(ctx, client); !ok {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyClientBan))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyClientBan))
 	}
 	bans, err := s.deps.BanAdmin.ListBans(ctx)
 	if err != nil {
-		return s.sendError(client, errCodeUnavailable, "ban list failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "ban list failed")
 	}
 	resp := netproto.BanListResponse{Bans: []netproto.BanEntry{}}
 	for _, b := range bans {
@@ -254,16 +261,16 @@ func (s *TCPServer) handleBanList(ctx context.Context, client *Client, f *netpro
 func (s *TCPServer) handleBanRemove(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.BanRemove
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed ban_remove: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed ban_remove: "+err.Error())
 	}
 	if s.deps == nil || s.deps.BanAdmin == nil {
-		return s.sendError(client, errCodeUnavailable, "ban store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "ban store unavailable")
 	}
 	if _, ok := s.banAdminAllowed(ctx, client); !ok {
-		return s.sendError(client, errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyClientBan))
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "insufficient permission: "+string(permissions.PermissionKeyClientBan))
 	}
 	if err := s.deps.BanAdmin.DeleteBan(ctx, msg.BanID); err != nil {
-		return s.sendError(client, errCodeUnavailable, "ban remove failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "ban remove failed")
 	}
 	s.audit(ctx, client.UniqueID, "ban_remove", strconv.FormatInt(msg.BanID, 10), "")
 	return nil

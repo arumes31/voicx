@@ -71,12 +71,12 @@ func (s *TCPServer) serverConfig() netproto.ServerConfig {
 	}
 }
 
-func (s *TCPServer) handleServerConfigQuery(_ context.Context, client *Client, f *netproto.Frame) error {
+func (s *TCPServer) handleServerConfigQuery(ctx context.Context, client *Client, f *netproto.Frame) error {
 	if err := netproto.Decode(f, &netproto.ServerConfigQuery{}); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed server_config_query: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed server_config_query: "+err.Error())
 	}
 	if !client.isAdmin() {
-		return s.sendError(client, errCodePermissionDenied, "server configuration requires administrator access")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "server configuration requires administrator access")
 	}
 	return s.writeMessage(client, netproto.MsgServerConfigResponse, s.serverConfig())
 }
@@ -84,17 +84,17 @@ func (s *TCPServer) handleServerConfigQuery(_ context.Context, client *Client, f
 func (s *TCPServer) handleServerConfigSet(ctx context.Context, client *Client, f *netproto.Frame) error {
 	var msg netproto.ServerConfig
 	if err := netproto.Decode(f, &msg); err != nil {
-		return s.sendError(client, errCodeMalformed, "malformed server_config_set: "+err.Error())
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "malformed server_config_set: "+err.Error())
 	}
 	if !client.isAdmin() {
-		return s.sendError(client, errCodePermissionDenied, "server configuration requires administrator access")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodePermissionDenied, "server configuration requires administrator access")
 	}
 	if msg.MaxClients < 0 || msg.MaxClients > 100_000 || msg.ClientTimeoutSeconds < 30 || msg.ClientTimeoutSeconds > 86_400 ||
 		msg.OpusBitrate < 6_000 || msg.OpusBitrate > 510_000 {
-		return s.sendError(client, errCodeMalformed, "invalid server configuration limits")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeMalformed, "invalid server configuration limits")
 	}
 	if s.deps == nil || s.deps.Chat == nil {
-		return s.sendError(client, errCodeUnavailable, "settings store unavailable")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "settings store unavailable")
 	}
 	values := map[string]string{
 		"max_clients_override":   strconv.Itoa(msg.MaxClients),
@@ -108,10 +108,10 @@ func (s *TCPServer) handleServerConfigSet(ctx context.Context, client *Client, f
 		SetServerSettings(context.Context, map[string]string, uint32) error
 	})
 	if !ok {
-		return s.sendError(client, errCodeUnavailable, "settings store does not support atomic updates")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "settings store does not support atomic updates")
 	}
 	if err := batch.SetServerSettings(ctx, values, 0); err != nil {
-		return s.sendError(client, errCodeUnavailable, "saving server configuration failed")
+		return s.sendErrorFor(client, requestOrigin(ctx), errCodeUnavailable, "saving server configuration failed")
 	}
 	s.configMu.Lock()
 	s.cfg.MaxClients = msg.MaxClients

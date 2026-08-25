@@ -45,7 +45,11 @@ type udpPacket struct {
 	payload []byte // header byte + body, owned by this struct
 }
 
-// UDPStats is a point-in-time snapshot of UDP server counters.
+// UDPStats is a point-in-time snapshot of UDP server counters. PacketsReceived
+// counts datagrams admitted after the rate limiter; PacketsRateLimited counts
+// pre-admission limiter rejects; PacketsDropped counts admitted datagrams later
+// discarded by queue pressure or protocol validation; PacketsProcessed counts
+// dequeued dispatch attempts.
 type UDPStats struct {
 	PacketsReceived    uint64
 	PacketsDropped     uint64
@@ -70,6 +74,8 @@ type UDPServer struct {
 
 	// Metrics is an optional metrics sink; nil means no-op.
 	Metrics metrics.Sink
+	// beforeProcess is a test seam for the per-packet recovery boundary.
+	beforeProcess func(udpPacket)
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -148,6 +154,7 @@ func (s *UDPServer) Start(ctx context.Context) error {
 		zap.Uint64("received", s.packetsReceived.Load()),
 		zap.Uint64("dropped", s.packetsDropped.Load()),
 		zap.Uint64("processed", s.packetsProcessed.Load()),
+		zap.Uint64("rate_limited", s.packetsRateLimited.Load()),
 	)
 	return nil
 }
@@ -183,6 +190,7 @@ func (s *UDPServer) readLoop() {
 			s.bufPool.Put(bufp)
 			s.packetsRateLimited.Add(1)
 			s.metric().IncUDPPacketsDropped()
+			s.metric().IncUDPPacketsRateLimited()
 			continue
 		}
 
@@ -216,9 +224,30 @@ func (s *UDPServer) readLoop() {
 func (s *UDPServer) worker() {
 	defer s.wg.Done()
 	for pkt := range s.inbound {
-		s.dispatch(pkt)
-		s.packetsProcessed.Add(1)
+		s.processPacket(pkt)
 	}
+}
+
+// processPacket contains failures to one dequeued datagram. A malformed or
+// panicking handler must not take down the bounded worker that serves later
+// packets. Payloads are deliberately never logged from this recovery path.
+func (s *UDPServer) processPacket(pkt udpPacket) {
+	defer s.packetsProcessed.Add(1)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.packetsDropped.Add(1)
+			s.metric().IncUDPPacketsDropped()
+			s.logger.Error("udp packet handler panic",
+				zap.String("panic_type", fmt.Sprintf("%T", recovered)),
+				zap.String("remote", safeUDPRemote(pkt.remote)),
+				zap.Stack("stack"),
+			)
+		}
+	}()
+	if s.beforeProcess != nil {
+		s.beforeProcess(pkt)
+	}
+	s.dispatch(pkt)
 }
 
 // dispatch parses the header byte and routes the packet to the appropriate
@@ -229,7 +258,7 @@ func (s *UDPServer) dispatch(pkt udpPacket) {
 		s.packetsDropped.Add(1)
 		s.metric().IncUDPPacketsDropped()
 		s.logger.Warn("udp malformed packet",
-			zap.String("remote", pkt.remote.String()),
+			zap.String("remote", safeUDPRemote(pkt.remote)),
 			zap.Error(err),
 		)
 		return
@@ -242,15 +271,22 @@ func (s *UDPServer) dispatch(pkt udpPacket) {
 	case netproto.UDPMsgPong:
 		s.metric().IncUDPPackets("pong")
 		// Unsolicited pong from a peer; nothing to do.
-		s.logger.Debug("udp pong received", zap.String("remote", pkt.remote.String()))
+		s.logger.Debug("udp pong received", zap.String("remote", safeUDPRemote(pkt.remote)))
 	default:
 		s.packetsDropped.Add(1)
 		s.metric().IncUDPPacketsDropped()
 		s.logger.Warn("udp unknown message type",
-			zap.String("remote", pkt.remote.String()),
+			zap.String("remote", safeUDPRemote(pkt.remote)),
 			zap.Uint8("msg_type", msgType),
 		)
 	}
+}
+
+func safeUDPRemote(remote *net.UDPAddr) string {
+	if remote == nil {
+		return "<unknown>"
+	}
+	return remote.String()
 }
 
 // metric returns the metrics sink, or a no-op when none is wired.
@@ -297,6 +333,15 @@ func (s *UDPServer) Stats() UDPStats {
 		PacketsProcessed:   s.packetsProcessed.Load(),
 		PacketsRateLimited: s.packetsRateLimited.Load(),
 	}
+}
+
+// InboundQueueDepth reports the current bounded worker queue depth. It is
+// intended for scrape-time metrics and remains safe before or after Start.
+func (s *UDPServer) InboundQueueDepth() int {
+	if s == nil {
+		return 0
+	}
+	return len(s.inbound)
 }
 
 // isClosed reports whether err indicates a closed socket, which is expected

@@ -16,21 +16,23 @@ import (
 // IsAdmin reports whether the authenticated user is a server admin (used to
 // show/hide admin-only UI).
 func (a *App) IsAdmin() bool {
-	return a.cmLoad() != nil && a.cmLoad().isAdminSnapshot()
+	cm := a.cmLoad()
+	return cm != nil && cm.isAdminSnapshot()
 }
 
 // IsGuest reports whether the active connection is an anonymous guest
 // session. The frontend uses this to stop account-only actions before they
 // reach the server.
 func (a *App) IsGuest() bool {
-	return a.cmLoad() != nil && a.cmLoad().isGuestSnapshot()
+	cm := a.cmLoad()
+	return cm != nil && cm.isGuestSnapshot()
 }
 
 // --- group list / CRUD -------------------------------------------------------
 
 // GroupList returns the groups of a type ("server" or "channel").
 func (a *App) GroupList(groupType string) (netproto.GroupListResponse, error) {
-	f, err := a.cmLoad().request(netproto.MsgGroupList, netproto.MsgGroupListResponse,
+	f, err := a.request(netproto.MsgGroupList, netproto.MsgGroupListResponse,
 		netproto.GroupList{Type: groupType}, 5*time.Second)
 	if err != nil {
 		return netproto.GroupListResponse{}, err
@@ -44,7 +46,7 @@ func (a *App) GroupList(groupType string) (netproto.GroupListResponse, error) {
 
 // GroupCreate creates a group and returns the refreshed group list.
 func (a *App) GroupCreate(groupType, name string, sortID int) (netproto.GroupListResponse, error) {
-	f, err := a.cmLoad().request(netproto.MsgGroupCreate, netproto.MsgGroupListResponse,
+	f, err := a.request(netproto.MsgGroupCreate, netproto.MsgGroupListResponse,
 		netproto.GroupCreate{Type: groupType, Name: name, SortID: sortID}, 5*time.Second)
 	if err != nil {
 		return netproto.GroupListResponse{}, err
@@ -61,7 +63,7 @@ func (a *App) GroupCreate(groupType, name string, sortID int) (netproto.GroupLis
 // all three fields are sent explicitly; an empty colour clears back to the
 // theme default. The server rejects anything but "#rrggbb" or "".
 func (a *App) GroupEdit(groupID int64, color string, hoist bool, sortID int) (netproto.GroupListResponse, error) {
-	f, err := a.cmLoad().request(netproto.MsgGroupEdit, netproto.MsgGroupListResponse,
+	f, err := a.request(netproto.MsgGroupEdit, netproto.MsgGroupListResponse,
 		netproto.GroupEdit{GroupID: groupID, Color: &color, Hoist: &hoist, SortID: &sortID}, 5*time.Second)
 	if err != nil {
 		return netproto.GroupListResponse{}, err
@@ -75,7 +77,7 @@ func (a *App) GroupEdit(groupID int64, color string, hoist bool, sortID int) (ne
 
 // GroupRename renames a group. Errors surface via the servererror event.
 func (a *App) GroupRename(groupType string, groupID int64, name string) string {
-	if err := a.cmLoad().write(netproto.MsgGroupRename, netproto.GroupRename{
+	if err := a.write(netproto.MsgGroupRename, netproto.GroupRename{
 		Type: groupType, GroupID: groupID, Name: name,
 	}); err != nil {
 		return err.Error()
@@ -85,7 +87,7 @@ func (a *App) GroupRename(groupType string, groupID int64, name string) string {
 
 // GroupDelete deletes a group (force required when it has members).
 func (a *App) GroupDelete(groupType string, groupID int64, force bool) string {
-	if err := a.cmLoad().write(netproto.MsgGroupDelete, netproto.GroupDelete{
+	if err := a.write(netproto.MsgGroupDelete, netproto.GroupDelete{
 		Type: groupType, GroupID: groupID, Force: force,
 	}); err != nil {
 		return err.Error()
@@ -96,7 +98,7 @@ func (a *App) GroupDelete(groupType string, groupID int64, force bool) string {
 // GroupAssign assigns a user to a group. expiresInSeconds > 0 makes the
 // membership timed (145); channelID is required for channel groups.
 func (a *App) GroupAssign(groupType string, groupID int64, uniqueID string, channelID int64, expiresInSeconds int64) string {
-	if err := a.cmLoad().write(netproto.MsgGroupAssign, netproto.GroupAssign{
+	if err := a.write(netproto.MsgGroupAssign, netproto.GroupAssign{
 		Type: groupType, GroupID: groupID, UniqueID: uniqueID,
 		ChannelID: channelID, ExpiresInSeconds: expiresInSeconds,
 	}); err != nil {
@@ -107,7 +109,7 @@ func (a *App) GroupAssign(groupType string, groupID int64, uniqueID string, chan
 
 // GroupUnassign removes a user from a group.
 func (a *App) GroupUnassign(groupType string, groupID int64, uniqueID string, channelID int64) string {
-	if err := a.cmLoad().write(netproto.MsgGroupUnassign, netproto.GroupUnassign{
+	if err := a.write(netproto.MsgGroupUnassign, netproto.GroupUnassign{
 		Type: groupType, GroupID: groupID, UniqueID: uniqueID, ChannelID: channelID,
 	}); err != nil {
 		return err.Error()
@@ -117,7 +119,7 @@ func (a *App) GroupUnassign(groupType string, groupID int64, uniqueID string, ch
 
 // GroupMembers returns a group's member list.
 func (a *App) GroupMembers(groupType string, groupID, channelID int64) (netproto.GroupMembersResponse, error) {
-	f, err := a.cmLoad().request(netproto.MsgGroupMembers, netproto.MsgGroupMembersResponse,
+	f, err := a.request(netproto.MsgGroupMembers, netproto.MsgGroupMembersResponse,
 		netproto.GroupMembers{Type: groupType, GroupID: groupID, ChannelID: channelID}, 5*time.Second)
 	if err != nil {
 		return netproto.GroupMembersResponse{}, err
@@ -134,7 +136,7 @@ func (a *App) GroupMembers(groupType string, groupID, channelID int64) (netproto
 // GroupIconSet uploads a server-group icon (base64 image, same validation as
 // avatars).
 func (a *App) GroupIconSet(groupID int64, dataBase64 string) string {
-	if err := a.cmLoad().write(netproto.MsgGroupIconSet, netproto.GroupIconSet{
+	if err := a.write(netproto.MsgGroupIconSet, netproto.GroupIconSet{
 		GroupID: groupID, DataBase64: dataBase64,
 	}); err != nil {
 		return err.Error()
@@ -144,7 +146,7 @@ func (a *App) GroupIconSet(groupID int64, dataBase64 string) string {
 
 // GroupIconGet fetches a server-group icon (empty DataBase64 = no icon).
 func (a *App) GroupIconGet(groupID int64) (netproto.GroupIconData, error) {
-	f, err := a.cmLoad().request(netproto.MsgGroupIconGet, netproto.MsgGroupIconData,
+	f, err := a.request(netproto.MsgGroupIconGet, netproto.MsgGroupIconData,
 		netproto.GroupIconGet{GroupID: groupID}, 5*time.Second)
 	if err != nil {
 		return netproto.GroupIconData{}, err
@@ -161,7 +163,7 @@ func (a *App) GroupIconGet(groupID int64) (netproto.GroupIconData, error) {
 // PermSet writes a permission entry on a tier. Errors surface via the
 // servererror event (permission denied / grant cap exceeded).
 func (a *App) PermSet(tier string, groupID int64, uniqueID string, channelID int64, key string, value, grant int, skip, negate bool) string {
-	if err := a.cmLoad().write(netproto.MsgPermSet, netproto.PermSet{
+	if err := a.write(netproto.MsgPermSet, netproto.PermSet{
 		Tier: tier, GroupID: groupID, UniqueID: uniqueID, ChannelID: channelID,
 		Key: key, Value: value, Grant: grant, Skip: skip, Negate: negate,
 	}); err != nil {
@@ -172,7 +174,7 @@ func (a *App) PermSet(tier string, groupID int64, uniqueID string, channelID int
 
 // PermUnset removes a permission entry (same addressing as PermSet).
 func (a *App) PermUnset(tier string, groupID int64, uniqueID string, channelID int64, key string) string {
-	if err := a.cmLoad().write(netproto.MsgPermUnset, netproto.PermUnset{
+	if err := a.write(netproto.MsgPermUnset, netproto.PermUnset{
 		Tier: tier, GroupID: groupID, UniqueID: uniqueID, ChannelID: channelID, Key: key,
 	}); err != nil {
 		return err.Error()
@@ -183,7 +185,7 @@ func (a *App) PermUnset(tier string, groupID int64, uniqueID string, channelID i
 // PermTemplateApply applies a built-in template (guest|member|moderator|
 // admin) to a server group or client.
 func (a *App) PermTemplateApply(template, tier string, groupID int64, uniqueID string) string {
-	if err := a.cmLoad().write(netproto.MsgPermTemplateApply, netproto.PermTemplateApply{
+	if err := a.write(netproto.MsgPermTemplateApply, netproto.PermTemplateApply{
 		Template: template, Tier: tier, GroupID: groupID, UniqueID: uniqueID,
 	}); err != nil {
 		return err.Error()
@@ -197,7 +199,7 @@ func (a *App) PermTemplateApply(template, tier string, groupID int64, uniqueID s
 // rather than a merge. The server caps the copy in both directions, so a
 // denial is expected UX and arrives via the servererror event.
 func (a *App) PermCopy(fromKind, fromID, toKind, toID string, channelID int64, replace bool) string {
-	if err := a.cmLoad().write(netproto.MsgPermCopy, netproto.PermCopy{
+	if err := a.write(netproto.MsgPermCopy, netproto.PermCopy{
 		FromKind: fromKind, FromID: fromID, ToKind: toKind, ToID: toID,
 		ChannelID: channelID, Replace: replace,
 	}); err != nil {
@@ -208,7 +210,7 @@ func (a *App) PermCopy(fromKind, fromID, toKind, toID string, channelID int64, r
 
 // PermList returns a target's current permission entries (editor read path).
 func (a *App) PermList(tier string, groupID int64, uniqueID string, channelID int64) (netproto.PermListResponse, error) {
-	f, err := a.cmLoad().request(netproto.MsgPermList, netproto.MsgPermListResponse,
+	f, err := a.request(netproto.MsgPermList, netproto.MsgPermListResponse,
 		netproto.PermList{Tier: tier, GroupID: groupID, UniqueID: uniqueID, ChannelID: channelID}, 5*time.Second)
 	if err != nil {
 		return netproto.PermListResponse{}, err
@@ -222,7 +224,7 @@ func (a *App) PermList(tier string, groupID int64, uniqueID string, channelID in
 
 // PermTrace returns the winning-tier trace of a permission for a user.
 func (a *App) PermTrace(uniqueID, key string, channelID int64) (netproto.PermTraceResponse, error) {
-	f, err := a.cmLoad().request(netproto.MsgPermTrace, netproto.MsgPermTraceResponse,
+	f, err := a.request(netproto.MsgPermTrace, netproto.MsgPermTraceResponse,
 		netproto.PermTrace{UniqueID: uniqueID, Key: key, ChannelID: channelID}, 5*time.Second)
 	if err != nil {
 		return netproto.PermTraceResponse{}, err
@@ -238,7 +240,7 @@ func (a *App) PermTrace(uniqueID, key string, channelID int64) (netproto.PermTra
 
 // AuditLog returns a page of the audit log (beforeID 0 = latest page).
 func (a *App) AuditLog(beforeID int64, limit int) (netproto.AuditLogResponse, error) {
-	f, err := a.cmLoad().request(netproto.MsgAuditLog, netproto.MsgAuditLogResponse,
+	f, err := a.request(netproto.MsgAuditLog, netproto.MsgAuditLogResponse,
 		netproto.AuditLog{BeforeID: beforeID, Limit: limit}, 5*time.Second)
 	if err != nil {
 		return netproto.AuditLogResponse{}, err
@@ -254,7 +256,7 @@ func (a *App) AuditLog(beforeID int64, limit int) (netproto.AuditLogResponse, er
 
 // BanList returns the ban list (gated server-side by ban power / admin).
 func (a *App) BanList() (netproto.BanListResponse, error) {
-	f, err := a.cmLoad().request(netproto.MsgBanList, netproto.MsgBanListResponse,
+	f, err := a.request(netproto.MsgBanList, netproto.MsgBanListResponse,
 		netproto.BanList{}, 5*time.Second)
 	if err != nil {
 		return netproto.BanListResponse{}, err
@@ -268,7 +270,7 @@ func (a *App) BanList() (netproto.BanListResponse, error) {
 
 // BanRemove lifts one ban by ID.
 func (a *App) BanRemove(banID int64) string {
-	if err := a.cmLoad().write(netproto.MsgBanRemove, netproto.BanRemove{BanID: banID}); err != nil {
+	if err := a.write(netproto.MsgBanRemove, netproto.BanRemove{BanID: banID}); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -278,7 +280,7 @@ func (a *App) BanRemove(banID int64) string {
 // ban and kick from the server; durationSeconds > 0 = temporary ban). Gated
 // server-side by kick/ban powers.
 func (a *App) KickClient(clientID string, fromServer, ban bool, reason string, durationSeconds int64) string {
-	if err := a.cmLoad().write(netproto.MsgKickClient, netproto.KickClient{
+	if err := a.write(netproto.MsgKickClient, netproto.KickClient{
 		ClientID: clientID, FromServer: fromServer, Ban: ban, Reason: reason,
 		DurationSeconds: durationSeconds,
 	}); err != nil {
@@ -292,7 +294,7 @@ func (a *App) KickClient(clientID string, fromServer, ban bool, reason string, d
 // CreateChannel creates a channel (164 full create dialog). It returns "" on
 // success or the failure reason; permission denials surface via servererror.
 func (a *App) CreateChannel(name, topic string, parentID int64, channelType, maxClients int, password string, neededJoinPower, opusBitrate int, opusFEC, opusDTX, opusStereo bool) string {
-	if err := a.cmLoad().write(netproto.MsgCreateChannel, netproto.CreateChannel{
+	if err := a.write(netproto.MsgCreateChannel, netproto.CreateChannel{
 		Name: name, Topic: topic, ParentID: parentID, Type: channelType,
 		MaxClients: maxClients, Password: password, NeededJoinPower: neededJoinPower,
 		OpusBitrate: opusBitrate, OpusFEC: &opusFEC, OpusDTX: &opusDTX, OpusStereo: &opusStereo,
@@ -327,7 +329,7 @@ func (a *App) ChannelEditTree(channelID int64, fields string, neededJoinPower, o
 	if msg.NeededJoinPower == nil && msg.OrderIndex == nil && msg.ParentID == nil && msg.InheritPermissions == nil {
 		return ""
 	}
-	if err := a.cmLoad().write(netproto.MsgChannelEdit, msg); err != nil {
+	if err := a.write(netproto.MsgChannelEdit, msg); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -335,7 +337,7 @@ func (a *App) ChannelEditTree(channelID int64, fields string, neededJoinPower, o
 
 // DeleteChannel deletes a channel (167 confirm + subtree warning in the UI).
 func (a *App) DeleteChannel(channelID int64) string {
-	if err := a.cmLoad().write(netproto.MsgDeleteChannel, netproto.DeleteChannel{ChannelID: channelID}); err != nil {
+	if err := a.write(netproto.MsgDeleteChannel, netproto.DeleteChannel{ChannelID: channelID}); err != nil {
 		return err.Error()
 	}
 	return ""

@@ -4,12 +4,105 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"voicx/internal/netproto"
 	"voicx/internal/permissions"
 )
+
+func TestPokeTrackerZeroValueIsolationCapacityAndExpiry(t *testing.T) {
+	now := time.Now()
+	var first, second pokeTracker
+	if !first.allow("alice→bob", now) {
+		t.Fatal("zero-value tracker rejected its initial poke")
+	}
+	if first.allow("alice→bob", now) {
+		t.Fatal("first tracker admitted a duplicate poke inside the cooldown")
+	}
+	if !second.allow("alice→bob", now) {
+		t.Fatal("second tracker inherited another server's cooldown")
+	}
+
+	var capped pokeTracker
+	for i := 0; i < maxPokeEntries; i++ {
+		if !capped.allow(fmt.Sprintf("caller-%d→target", i), now) {
+			t.Fatalf("tracker rejected entry %d before capacity", i)
+		}
+	}
+	if got := capped.len(); got != maxPokeEntries {
+		t.Fatalf("tracker entries = %d, want %d", got, maxPokeEntries)
+	}
+	if capped.allow("overflow→target", now) {
+		t.Fatal("tracker admitted a distinct pair over capacity")
+	}
+	if capped.allow("caller-0→target", now) {
+		t.Fatal("tracker admitted a duplicate at capacity")
+	}
+	if !capped.allow("fresh→target", now.Add(pokeCooldown)) {
+		t.Fatal("tracker did not prune stale entries at exact cooldown expiry")
+	}
+	if got := capped.len(); got != 1 {
+		t.Fatalf("tracker entries after expiry = %d, want 1", got)
+	}
+}
+
+func TestPokeTrackerConcurrentSameKeyAllowsOnce(t *testing.T) {
+	var tracker pokeTracker
+	const callers = 32
+	var wg sync.WaitGroup
+	allowed := make(chan bool, callers)
+	now := time.Now()
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			allowed <- tracker.allow("alice→bob", now)
+		}()
+	}
+	wg.Wait()
+	close(allowed)
+	count := 0
+	for ok := range allowed {
+		if ok {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("allowed %d concurrent pokes, want 1", count)
+	}
+}
+
+func TestPokeTrackerConcurrentDistinctFloodStaysBounded(t *testing.T) {
+	var tracker pokeTracker
+	const attempts = maxPokeEntries * 2
+	var wg sync.WaitGroup
+	allowed := make(chan bool, attempts)
+	now := time.Now()
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			allowed <- tracker.allow(fmt.Sprintf("caller-%d→target", i), now)
+		}(i)
+	}
+	wg.Wait()
+	close(allowed)
+	admitted := 0
+	for ok := range allowed {
+		if ok {
+			admitted++
+		}
+	}
+	if admitted > maxPokeEntries {
+		t.Fatalf("tracker admitted %d distinct pairs, cap is %d", admitted, maxPokeEntries)
+	}
+	if got := tracker.len(); got > maxPokeEntries {
+		t.Fatalf("tracker retained %d pairs, cap is %d", got, maxPokeEntries)
+	}
+}
 
 // TestSetStatus verifies status updates reach state and the broadcast.
 func TestSetStatus(t *testing.T) {

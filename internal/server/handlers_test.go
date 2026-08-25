@@ -6,11 +6,15 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +25,8 @@ import (
 	"voicx/internal/channels"
 	"voicx/internal/chatcrypto"
 	"voicx/internal/config"
+	"voicx/internal/eventbus"
+	"voicx/internal/metrics"
 	"voicx/internal/netproto"
 	"voicx/internal/permissions"
 	"voicx/internal/state"
@@ -32,12 +38,15 @@ import (
 // fakeAuth implements AuthBackend with in-memory credentials, public keys,
 // and bans.
 type fakeAuth struct {
-	passwords   map[string]string // uniqueID -> password
-	pubkeys     map[string]string // uniqueID -> PEM public key
-	users       map[string]*auth.User
-	nicknames   map[string]*auth.User // nickname -> user
-	pubkeyIndex map[string]*auth.User // PEM public key -> user
-	bans        map[string]*auth.Ban  // uniqueID or IP -> active ban
+	passwords      map[string]string // uniqueID -> password
+	pubkeys        map[string]string // uniqueID -> PEM public key
+	users          map[string]*auth.User
+	nicknames      map[string]*auth.User // nickname -> user
+	pubkeyIndex    map[string]*auth.User // PEM public key -> user
+	bans           map[string]*auth.Ban  // uniqueID or IP -> active ban
+	identifierAuth func(identifier, password string) (*auth.User, error)
+	challengeAuth  func(uniqueID string, challenge, signature []byte) (bool, error)
+	getE2EKeyFn    func(context.Context, string) (string, error)
 
 	mu       sync.Mutex
 	bindings [][2]any // (userID, publicKey) recorded by BindPublicKey
@@ -53,7 +62,30 @@ func (f *fakeAuth) AuthenticatePassword(_ context.Context, uniqueID, password st
 	return pw == password, nil
 }
 
+func (f *fakeAuth) AuthenticateIdentifier(_ context.Context, identifier, password string) (*auth.User, error) {
+	if f.identifierAuth != nil {
+		return f.identifierAuth(identifier, password)
+	}
+	if pw, ok := f.passwords[identifier]; ok {
+		if pw != password {
+			return nil, nil
+		}
+		return f.users[identifier], nil
+	}
+	u, ok := f.nicknames[identifier]
+	if !ok {
+		return nil, auth.ErrUserNotFound
+	}
+	if f.passwords[u.UniqueID] != password {
+		return nil, nil
+	}
+	return u, nil
+}
+
 func (f *fakeAuth) AuthenticateChallenge(_ context.Context, uniqueID string, challenge, signature []byte) (bool, error) {
+	if f.challengeAuth != nil {
+		return f.challengeAuth(uniqueID, challenge, signature)
+	}
 	pub, ok := f.pubkeys[uniqueID]
 	if !ok {
 		return false, auth.ErrUserNotFound
@@ -118,7 +150,10 @@ func (f *fakeAuth) SetE2EPublicKey(_ context.Context, userID int64, publicKey st
 }
 
 // GetE2EPublicKey resolves a published key by unique ID.
-func (f *fakeAuth) GetE2EPublicKey(_ context.Context, uniqueID string) (string, error) {
+func (f *fakeAuth) GetE2EPublicKey(ctx context.Context, uniqueID string) (string, error) {
+	if f.getE2EKeyFn != nil {
+		return f.getE2EKeyFn(ctx, uniqueID)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.e2eByUID == nil {
@@ -657,7 +692,10 @@ func (f *fakeScopeKeys) AllocScopeKeyID(_ context.Context, _ int64) (uint32, err
 	return f.nextID, nil
 }
 
-func (f *fakeScopeKeys) CurrentScopeKey(_ context.Context, scope int64) (*store.ScopeKey, error) {
+func (f *fakeScopeKeys) CurrentScopeKey(ctx context.Context, scope int64) (*store.ScopeKey, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var cur *store.ScopeKey
@@ -705,7 +743,8 @@ func (f *fakeScopeKeys) RotateScopeKey(ctx context.Context, scope int64, newKeyI
 // fakePerms implements PermLoader, returning the same tiered permissions for
 // every client.
 type fakePerms struct {
-	tp permissions.TieredPermissions
+	tp              permissions.TieredPermissions
+	loadForClientFn func(context.Context, int64, int64) (permissions.TieredPermissions, error)
 
 	// groupSet, when non-nil, is the canned set served by
 	// LoadGroupPermissions (guest-group tests).
@@ -715,7 +754,10 @@ type fakePerms struct {
 	invalidations [][2]int64
 }
 
-func (f *fakePerms) LoadForClient(context.Context, int64, int64) (permissions.TieredPermissions, error) {
+func (f *fakePerms) LoadForClient(ctx context.Context, userID, channelID int64) (permissions.TieredPermissions, error) {
+	if f.loadForClientFn != nil {
+		return f.loadForClientFn(ctx, userID, channelID)
+	}
 	return f.tp, nil
 }
 
@@ -981,7 +1023,7 @@ func startTestEnvLogger(t *testing.T, perms *permissions.TieredPermissions, muta
 			if err := <-startErr; err != nil {
 				t.Errorf("server start returned error: %v", err)
 			}
-			_ = srv.Shutdown()
+			_ = srv.Shutdown(context.Background())
 			bc.Close()
 		})
 	}
@@ -997,7 +1039,7 @@ func dialRetry(t *testing.T, addr string) net.Conn {
 	dialer := &net.Dialer{Timeout: 300 * time.Millisecond}
 	tlsCfg := &tls.Config{InsecureSkipVerify: true} //nolint:gosec // test client
 	for time.Now().Before(deadline) {
-		conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsCfg)
+		conn, err := (&tls.Dialer{NetDialer: dialer, Config: tlsCfg}).DialContext(t.Context(), "tcp", addr)
 		if err == nil {
 			return conn
 		}
@@ -1191,6 +1233,471 @@ func TestAuthenticateBadCredentials(t *testing.T) {
 	if resp.OK {
 		t.Fatal("authenticate with unknown user returned OK=true")
 	}
+}
+
+func TestControlLoginFailuresAreSourceWide(t *testing.T) {
+	limiter := auth.NewLoginFailureLimiter(auth.LoginFailureLimiterConfig{
+		MaxFailures:     2,
+		LockoutDuration: time.Minute,
+		FailureTTL:      time.Minute,
+		MaxEntries:      32,
+	})
+	env := startTestEnvDeps(t, nil, nil, func(deps *Deps) { deps.LoginLimiter = limiter })
+	defer env.stop()
+
+	for range 2 {
+		conn := dialRetry(t, env.addr)
+		send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: "user-uid", Password: "wrong"})
+		readOfType(t, conn, netproto.MsgAuthResponse)
+		_ = conn.Close()
+	}
+
+	other := dialRetry(t, env.addr)
+	defer func() { _ = other.Close() }()
+	send(t, other, netproto.MsgAuthenticate, netproto.Authenticate{Username: "admin-uid", Password: "pw"})
+	f := readOfType(t, other, netproto.MsgAuthResponse)
+	var response netproto.AuthResponse
+	if err := netproto.Decode(f, &response); err != nil {
+		t.Fatalf("decode source-wide lockout response: %v", err)
+	}
+	if response.OK || response.Reason != "too many failed logins, try again later" {
+		t.Fatalf("other principal bypassed source-wide lockout: %+v", response)
+	}
+
+	locked := dialRetry(t, env.addr)
+	defer func() { _ = locked.Close() }()
+	send(t, locked, netproto.MsgAuthenticate, netproto.Authenticate{Username: "user-uid", Password: "pw"})
+	f = readOfType(t, locked, netproto.MsgAuthResponse)
+	if err := netproto.Decode(f, &response); err != nil {
+		t.Fatalf("decode locked response: %v", err)
+	}
+	if response.OK || response.Reason != "too many failed logins, try again later" {
+		t.Fatalf("locked response = %+v", response)
+	}
+}
+
+func TestGlobalServerPasswordFailuresAreSourceWide(t *testing.T) {
+	limiter := auth.NewLoginFailureLimiter(auth.LoginFailureLimiterConfig{
+		MaxFailures:     2,
+		LockoutDuration: time.Minute,
+		FailureTTL:      time.Minute,
+		MaxEntries:      32,
+	})
+	verifications := 0
+	env := startTestEnvDeps(t, nil, nil, func(deps *Deps) {
+		deps.LoginLimiter = limiter
+		deps.ServerPasswordHash = "test-server-password-hash"
+		deps.VerifyServerPassword = func(string, string) error {
+			verifications++
+			return errors.New("password mismatch")
+		}
+	})
+	defer env.stop()
+
+	for _, username := range []string{"first-identifier", "second-identifier"} {
+		conn := dialRetry(t, env.addr)
+		send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{
+			Username: username, ServerPassword: "wrong",
+		})
+		f := readOfType(t, conn, netproto.MsgAuthResponse)
+		var response netproto.AuthResponse
+		if err := netproto.Decode(f, &response); err != nil {
+			t.Fatalf("decode failed-password response: %v", err)
+		}
+		if response.Reason != "invalid server password" {
+			t.Fatalf("failed-password response = %+v", response)
+		}
+		_ = conn.Close()
+	}
+
+	conn := dialRetry(t, env.addr)
+	defer func() { _ = conn.Close() }()
+	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{
+		Username: "rotated-identifier", ServerPassword: "correct",
+	})
+	f := readOfType(t, conn, netproto.MsgAuthResponse)
+	var response netproto.AuthResponse
+	if err := netproto.Decode(f, &response); err != nil {
+		t.Fatalf("decode lockout response: %v", err)
+	}
+	if response.Reason != "too many failed logins, try again later" {
+		t.Fatalf("username rotation bypassed source lockout: %+v", response)
+	}
+	if verifications != 2 {
+		t.Fatalf("server-password verifier calls = %d, want 2", verifications)
+	}
+}
+
+func TestGlobalServerPasswordReservationBoundsConcurrentVerifiers(t *testing.T) {
+	limiter := auth.NewLoginFailureLimiter(auth.LoginFailureLimiterConfig{
+		MaxFailures:      5,
+		LockoutDuration:  time.Minute,
+		FailureTTL:       time.Minute,
+		MaxEntries:       32,
+		MaxConcurrentKDF: 8,
+	})
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var calls atomic.Int32
+	env := startTestEnvDeps(t, nil, nil, func(deps *Deps) {
+		deps.LoginLimiter = limiter
+		deps.ServerPasswordHash = "test-server-password-hash"
+		deps.VerifyServerPassword = func(string, string) error {
+			calls.Add(1)
+			entered <- struct{}{}
+			<-release
+			return errors.New("password mismatch")
+		}
+	})
+	defer env.stop()
+
+	first := dialRetry(t, env.addr)
+	defer func() { _ = first.Close() }()
+	second := dialRetry(t, env.addr)
+	defer func() { _ = second.Close() }()
+	firstResponse := make(chan netproto.AuthResponse, 1)
+	go func() {
+		send(t, first, netproto.MsgAuthenticate, netproto.Authenticate{
+			Username: "first-identifier", ServerPassword: "wrong",
+		})
+		frame := readOfType(t, first, netproto.MsgAuthResponse)
+		var response netproto.AuthResponse
+		if err := netproto.Decode(frame, &response); err != nil {
+			t.Errorf("decode first verifier response: %v", err)
+		}
+		firstResponse <- response
+	}()
+	select {
+	case <-entered:
+	case <-time.After(waitDeadline):
+		t.Fatal("first server-password verifier did not enter")
+	}
+
+	send(t, second, netproto.MsgAuthenticate, netproto.Authenticate{
+		Username: "rotated-identifier", ServerPassword: "wrong",
+	})
+	frame := readOfType(t, second, netproto.MsgAuthResponse)
+	var rejected netproto.AuthResponse
+	if err := netproto.Decode(frame, &rejected); err != nil {
+		t.Fatalf("decode concurrent verifier response: %v", err)
+	}
+	if rejected.Reason != "too many failed logins, try again later" {
+		t.Fatalf("concurrent server-password response = %+v", rejected)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("server-password verifier calls = %d, want 1", calls.Load())
+	}
+	close(release)
+	if response := <-firstResponse; response.Reason != "invalid server password" {
+		t.Fatalf("first verifier response = %+v", response)
+	}
+}
+
+func TestSharedLoginLimiterBoundsTCPAndWebSocketKDF(t *testing.T) {
+	limiter := auth.NewLoginFailureLimiter(auth.LoginFailureLimiterConfig{
+		MaxFailures:      5,
+		LockoutDuration:  time.Minute,
+		FailureTTL:       time.Minute,
+		MaxEntries:       32,
+		MaxConcurrentKDF: 1,
+	})
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var tcpCalls atomic.Int32
+	env := startTestEnvDeps(t, nil, nil, func(deps *Deps) { deps.LoginLimiter = limiter })
+	defer env.stop()
+	env.auth.identifierAuth = func(string, string) (*auth.User, error) {
+		tcpCalls.Add(1)
+		entered <- struct{}{}
+		<-release
+		return nil, auth.ErrUserNotFound
+	}
+
+	tcpConn := dialRetry(t, env.addr)
+	defer func() { _ = tcpConn.Close() }()
+	tcpResult := make(chan netproto.AuthResponse, 1)
+	go func() {
+		send(t, tcpConn, netproto.MsgAuthenticate, netproto.Authenticate{Username: "tcp-user", Password: "wrong"})
+		frame := readOfType(t, tcpConn, netproto.MsgAuthResponse)
+		var response netproto.AuthResponse
+		if err := netproto.Decode(frame, &response); err != nil {
+			t.Errorf("decode TCP response: %v", err)
+		}
+		tcpResult <- response
+	}()
+	select {
+	case <-entered:
+	case <-time.After(waitDeadline):
+		t.Fatal("TCP verifier did not enter")
+	}
+
+	bus := eventbus.New(zap.NewNop())
+	defer bus.Close()
+	var wsCalls atomic.Int32
+	wsHandler := eventbus.HandlerWithLoginProtection(
+		bus,
+		func(context.Context, string, string) (bool, bool, error) {
+			wsCalls.Add(1)
+			return false, false, nil
+		},
+		zap.NewNop(),
+		limiter,
+		nil,
+	)
+	wsRequest := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://localhost/events", nil)
+	wsRequest.RemoteAddr = "192.0.2.10:1000"
+	wsRequest.SetBasicAuth("ws-user", "wrong")
+	wsRecorder := httptest.NewRecorder()
+	wsHandler.ServeHTTP(wsRecorder, wsRequest)
+	if wsRecorder.Code != http.StatusTooManyRequests {
+		t.Fatalf("WebSocket auth status = %d, want %d", wsRecorder.Code, http.StatusTooManyRequests)
+	}
+	if tcpCalls.Load() != 1 || wsCalls.Load() != 0 {
+		t.Fatalf("verifier calls TCP=%d WebSocket=%d, want 1/0", tcpCalls.Load(), wsCalls.Load())
+	}
+
+	close(release)
+	if response := <-tcpResult; response.Reason != "invalid credentials" {
+		t.Fatalf("TCP response = %+v", response)
+	}
+}
+
+func TestServerPasswordSuccessDoesNotClearAccountSourceFailures(t *testing.T) {
+	limiter := auth.NewLoginFailureLimiter(auth.LoginFailureLimiterConfig{
+		MaxFailures:     2,
+		LockoutDuration: time.Minute,
+		FailureTTL:      time.Minute,
+		MaxEntries:      32,
+	})
+	env := startTestEnvDeps(t, nil, nil, func(deps *Deps) {
+		deps.LoginLimiter = limiter
+		deps.ServerPasswordHash = "test-server-password-hash"
+		deps.VerifyServerPassword = func(string, string) error { return nil }
+	})
+	defer env.stop()
+
+	for _, username := range []string{"first-identifier", "second-identifier"} {
+		conn := dialRetry(t, env.addr)
+		send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{
+			Username: username, Password: "wrong", ServerPassword: "correct",
+		})
+		frame := readOfType(t, conn, netproto.MsgAuthResponse)
+		var response netproto.AuthResponse
+		if err := netproto.Decode(frame, &response); err != nil {
+			t.Fatalf("decode account failure response: %v", err)
+		}
+		if response.Reason != "invalid credentials" {
+			t.Fatalf("account failure response = %+v", response)
+		}
+		_ = conn.Close()
+	}
+
+	conn := dialRetry(t, env.addr)
+	defer func() { _ = conn.Close() }()
+	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{
+		Username: "admin-uid", Password: "pw", ServerPassword: "correct",
+	})
+	frame := readOfType(t, conn, netproto.MsgAuthResponse)
+	var response netproto.AuthResponse
+	if err := netproto.Decode(frame, &response); err != nil {
+		t.Fatalf("decode source lockout response: %v", err)
+	}
+	if response.Reason != "too many failed logins, try again later" {
+		t.Fatalf("server-password success cleared account source failures: %+v", response)
+	}
+}
+
+func TestImmediateGuestDoesNotClearAccountSourceFailures(t *testing.T) {
+	limiter := auth.NewLoginFailureLimiter(auth.LoginFailureLimiterConfig{
+		MaxFailures:     2,
+		LockoutDuration: time.Minute,
+		FailureTTL:      time.Minute,
+		MaxEntries:      32,
+	})
+	env := startTestEnvDeps(t, nil, nil, func(deps *Deps) { deps.LoginLimiter = limiter })
+	defer env.stop()
+
+	authenticate := func(msg netproto.Authenticate) netproto.AuthResponse {
+		t.Helper()
+		conn := dialRetry(t, env.addr)
+		defer func() { _ = conn.Close() }()
+		send(t, conn, netproto.MsgAuthenticate, msg)
+		frame := readOfType(t, conn, netproto.MsgAuthResponse)
+		var response netproto.AuthResponse
+		if err := netproto.Decode(frame, &response); err != nil {
+			t.Fatalf("decode auth response: %v", err)
+		}
+		return response
+	}
+
+	if response := authenticate(netproto.Authenticate{Username: "first", Password: "wrong"}); response.OK {
+		t.Fatalf("initial failed login = %+v", response)
+	}
+	if response := authenticate(netproto.Authenticate{Anonymous: true, Nickname: "guest"}); !response.OK {
+		t.Fatalf("immediate guest login = %+v", response)
+	}
+	if response := authenticate(netproto.Authenticate{Username: "second", Password: "wrong"}); response.OK {
+		t.Fatalf("second failed login = %+v", response)
+	}
+	if response := authenticate(netproto.Authenticate{Username: "admin-uid", Password: "pw"}); response.Reason != "too many failed logins, try again later" {
+		t.Fatalf("immediate guest cleared account source failures: %+v", response)
+	}
+}
+
+func TestSuccessfulOtherAccountDoesNotClearAccountSourceFailures(t *testing.T) {
+	limiter := auth.NewLoginFailureLimiter(auth.LoginFailureLimiterConfig{
+		MaxFailures:     2,
+		LockoutDuration: time.Minute,
+		FailureTTL:      time.Minute,
+		MaxEntries:      32,
+	})
+	env := startTestEnvDeps(t, nil, nil, func(deps *Deps) { deps.LoginLimiter = limiter })
+	defer env.stop()
+
+	authenticate := func(msg netproto.Authenticate) netproto.AuthResponse {
+		t.Helper()
+		conn := dialRetry(t, env.addr)
+		defer func() { _ = conn.Close() }()
+		send(t, conn, netproto.MsgAuthenticate, msg)
+		frame := readOfType(t, conn, netproto.MsgAuthResponse)
+		var response netproto.AuthResponse
+		if err := netproto.Decode(frame, &response); err != nil {
+			t.Fatalf("decode auth response: %v", err)
+		}
+		return response
+	}
+
+	if response := authenticate(netproto.Authenticate{Username: "first", Password: "wrong"}); response.OK {
+		t.Fatalf("initial failed login = %+v", response)
+	}
+	if response := authenticate(netproto.Authenticate{Username: "admin-uid", Password: "pw"}); !response.OK {
+		t.Fatalf("successful other account login = %+v", response)
+	}
+	if response := authenticate(netproto.Authenticate{Username: "second", Password: "wrong"}); response.OK {
+		t.Fatalf("second failed login = %+v", response)
+	}
+	if response := authenticate(netproto.Authenticate{Username: "user-uid", Password: "pw"}); response.Reason != "too many failed logins, try again later" {
+		t.Fatalf("successful other account cleared source failures: %+v", response)
+	}
+}
+
+func TestGuestSignatureDoesNotClearAccountSourceFailures(t *testing.T) {
+	limiter := auth.NewLoginFailureLimiter(auth.LoginFailureLimiterConfig{
+		MaxFailures:     2,
+		LockoutDuration: time.Minute,
+		FailureTTL:      time.Minute,
+		MaxEntries:      32,
+	})
+	env := startTestEnvDeps(t, nil, nil, func(deps *Deps) { deps.LoginLimiter = limiter })
+	defer env.stop()
+
+	authenticate := func(msg netproto.Authenticate) netproto.AuthResponse {
+		t.Helper()
+		conn := dialRetry(t, env.addr)
+		defer func() { _ = conn.Close() }()
+		send(t, conn, netproto.MsgAuthenticate, msg)
+		frame := readOfType(t, conn, netproto.MsgAuthResponse)
+		var response netproto.AuthResponse
+		if err := netproto.Decode(frame, &response); err != nil {
+			t.Fatalf("decode auth response: %v", err)
+		}
+		return response
+	}
+
+	if response := authenticate(netproto.Authenticate{Username: "first", Password: "wrong"}); response.OK {
+		t.Fatalf("initial failed login = %+v", response)
+	}
+
+	publicKey, privateKey, err := auth.GenerateIdentityKeyPair()
+	if err != nil {
+		t.Fatalf("generate guest identity: %v", err)
+	}
+	uniqueID, err := auth.UniqueIDFromPublicKey(publicKey)
+	if err != nil {
+		t.Fatalf("derive guest unique ID: %v", err)
+	}
+	guest := dialRetry(t, env.addr)
+	send(t, guest, netproto.MsgAuthenticate, netproto.Authenticate{
+		Username:  uniqueID,
+		Anonymous: true,
+		Nickname:  "keyguest",
+	})
+	challengeFrame := readOfType(t, guest, netproto.MsgAuthChallenge)
+	var challenge netproto.AuthChallenge
+	if err := netproto.Decode(challengeFrame, &challenge); err != nil {
+		t.Fatalf("decode guest challenge: %v", err)
+	}
+	signature, err := auth.SignChallenge(privateKey, challenge.Challenge)
+	if err != nil {
+		t.Fatalf("sign guest challenge: %v", err)
+	}
+	send(t, guest, netproto.MsgAuthSignature, netproto.AuthSignature{PublicKey: publicKey, Signature: signature})
+	responseFrame := readOfType(t, guest, netproto.MsgAuthResponse)
+	var guestResponse netproto.AuthResponse
+	if err := netproto.Decode(responseFrame, &guestResponse); err != nil {
+		t.Fatalf("decode guest signature response: %v", err)
+	}
+	if !guestResponse.OK {
+		t.Fatalf("guest signature login = %+v", guestResponse)
+	}
+	_ = guest.Close()
+
+	if response := authenticate(netproto.Authenticate{Username: "second", Password: "wrong"}); response.OK {
+		t.Fatalf("second failed login = %+v", response)
+	}
+	if response := authenticate(netproto.Authenticate{Username: "admin-uid", Password: "pw"}); response.Reason != "too many failed logins, try again later" {
+		t.Fatalf("guest signature cleared account source failures: %+v", response)
+	}
+}
+
+func TestBannedIPControlLoginSkipsServerPasswordVerification(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	env.deps.ServerPasswordHash = "not-a-valid-argon2id-hash"
+	env.auth.bans["127.0.0.1"] = &auth.Ban{ID: 1, Type: 0, Value: "127.0.0.1"}
+
+	conn := dialRetry(t, env.addr)
+	defer func() { _ = conn.Close() }()
+	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: "user-uid", Password: "pw"})
+	f := readOfType(t, conn, netproto.MsgAuthResponse)
+	var response netproto.AuthResponse
+	if err := netproto.Decode(f, &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.Reason != "banned" {
+		t.Fatalf("response reason = %q, want banned", response.Reason)
+	}
+}
+
+func TestTCPAuthenticationFailureMetric(t *testing.T) {
+	m := metrics.New()
+	env := startTestEnvDeps(t, nil, nil, func(deps *Deps) { deps.Metrics = m })
+	defer env.stop()
+
+	conn := dialRetry(t, env.addr)
+	defer func() { _ = conn.Close() }()
+	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: "attacker@example.invalid", Password: "wrong"})
+	readOfType(t, conn, netproto.MsgAuthResponse)
+
+	families, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	for _, family := range families {
+		if family.GetName() != "voicx_auth_failures_total" {
+			continue
+		}
+		if len(family.GetMetric()) != 1 {
+			t.Fatalf("auth failure metrics = %d, want 1", len(family.GetMetric()))
+		}
+		for _, label := range family.GetMetric()[0].GetLabel() {
+			if label.GetValue() == "attacker@example.invalid" {
+				t.Fatalf("attacker-controlled value leaked into metric label %s", label.GetName())
+			}
+		}
+		return
+	}
+	t.Fatal("voicx_auth_failures_total not gathered")
 }
 
 // TestAuthenticateBannedUniqueID verifies that a client whose unique ID has an
@@ -1552,7 +2059,7 @@ func TestApplyChannelDeletionTombstonesSubtreeBeforeRecorderDrain(t *testing.T) 
 
 	done := make(chan struct{})
 	go func() {
-		srv.ApplyChannelDeletion(channels.DeleteResult{RootID: 7, ChannelIDs: []int64{7, 8}})
+		srv.ApplyChannelDeletion(channels.DeleteResult{RootID: 7, ChannelIDs: []int64{7, 8}}, "")
 		close(done)
 	}()
 
@@ -1614,7 +2121,7 @@ func TestApplyChannelDeletionTombstonesEntireSubtreeBeforeBroadcast(t *testing.T
 
 	done := make(chan struct{})
 	go func() {
-		srv.ApplyChannelDeletion(channels.DeleteResult{RootID: 7, ChannelIDs: []int64{7, 8}})
+		srv.ApplyChannelDeletion(channels.DeleteResult{RootID: 7, ChannelIDs: []int64{7, 8}}, "")
 		close(done)
 	}()
 	for _, want := range []int64{7, 8} {
@@ -1788,6 +2295,119 @@ func TestChallengeAuthBadSignature(t *testing.T) {
 	}
 	if resp.OK || resp.Reason != "no pending challenge" {
 		t.Fatalf("auth response = %+v, want OK=false reason 'no pending challenge'", resp)
+	}
+}
+
+func TestChallengeAuthenticationFailuresAreRateLimited(t *testing.T) {
+	limiter := auth.NewLoginFailureLimiter(auth.LoginFailureLimiterConfig{
+		MaxFailures:     2,
+		LockoutDuration: time.Minute,
+		FailureTTL:      time.Minute,
+		MaxEntries:      32,
+	})
+	env := startTestEnvDeps(t, nil, nil, func(deps *Deps) { deps.LoginLimiter = limiter })
+	defer env.stop()
+
+	pubPEM, _, err := auth.GenerateIdentityKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateIdentityKeyPair: %v", err)
+	}
+	uid, err := auth.UniqueIDFromPublicKey(pubPEM)
+	if err != nil {
+		t.Fatalf("UniqueIDFromPublicKey: %v", err)
+	}
+	env.auth.pubkeys[uid] = pubPEM
+	env.auth.users[uid] = &auth.User{ID: 3, UniqueID: uid, Nickname: "keyuser"}
+
+	conn := dialRetry(t, env.addr)
+	defer func() { _ = conn.Close() }()
+	for range 2 {
+		send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: uid})
+		readOfType(t, conn, netproto.MsgAuthChallenge)
+		send(t, conn, netproto.MsgAuthSignature, netproto.AuthSignature{UniqueID: uid, Signature: []byte("bad")})
+		f := readOfType(t, conn, netproto.MsgAuthResponse)
+		var response netproto.AuthResponse
+		if err := netproto.Decode(f, &response); err != nil {
+			t.Fatalf("decode invalid signature response: %v", err)
+		}
+		if response.OK || response.Reason != "invalid credentials" {
+			t.Fatalf("invalid signature response = %+v", response)
+		}
+	}
+
+	send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: uid})
+	f := readOfType(t, conn, netproto.MsgAuthResponse)
+	var response netproto.AuthResponse
+	if err := netproto.Decode(f, &response); err != nil {
+		t.Fatalf("decode lockout response: %v", err)
+	}
+	if response.OK || response.Reason != "too many failed logins, try again later" {
+		t.Fatalf("lockout response = %+v", response)
+	}
+}
+
+func TestChallengeAuthenticationReservesSourceAndPrincipalBeforeVerification(t *testing.T) {
+	limiter := auth.NewLoginFailureLimiter(auth.LoginFailureLimiterConfig{
+		MaxFailures:      5,
+		LockoutDuration:  time.Minute,
+		FailureTTL:       time.Minute,
+		MaxEntries:       32,
+		MaxConcurrentKDF: 8,
+	})
+	env := startTestEnvDeps(t, nil, nil, func(deps *Deps) { deps.LoginLimiter = limiter })
+	defer env.stop()
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var calls atomic.Int32
+	env.auth.challengeAuth = func(string, []byte, []byte) (bool, error) {
+		calls.Add(1)
+		entered <- struct{}{}
+		<-release
+		return false, nil
+	}
+
+	first := dialRetry(t, env.addr)
+	defer func() { _ = first.Close() }()
+	second := dialRetry(t, env.addr)
+	defer func() { _ = second.Close() }()
+	const uid = "challenge-principal"
+	for _, conn := range []net.Conn{first, second} {
+		send(t, conn, netproto.MsgAuthenticate, netproto.Authenticate{Username: uid})
+		readOfType(t, conn, netproto.MsgAuthChallenge)
+	}
+
+	firstResponse := make(chan netproto.AuthResponse, 1)
+	go func() {
+		send(t, first, netproto.MsgAuthSignature, netproto.AuthSignature{UniqueID: uid, Signature: []byte("bad")})
+		frame := readOfType(t, first, netproto.MsgAuthResponse)
+		var response netproto.AuthResponse
+		if err := netproto.Decode(frame, &response); err != nil {
+			t.Errorf("decode first signature response: %v", err)
+		}
+		firstResponse <- response
+	}()
+	select {
+	case <-entered:
+	case <-time.After(waitDeadline):
+		t.Fatal("first challenge verification did not enter")
+	}
+
+	send(t, second, netproto.MsgAuthSignature, netproto.AuthSignature{UniqueID: uid, Signature: []byte("bad")})
+	frame := readOfType(t, second, netproto.MsgAuthResponse)
+	var rejected netproto.AuthResponse
+	if err := netproto.Decode(frame, &rejected); err != nil {
+		t.Fatalf("decode concurrent signature response: %v", err)
+	}
+	if rejected.Reason != "too many failed logins, try again later" {
+		t.Fatalf("concurrent challenge response = %+v", rejected)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("challenge verifier calls = %d, want 1", calls.Load())
+	}
+	close(release)
+	if response := <-firstResponse; response.Reason != "invalid credentials" {
+		t.Fatalf("first challenge response = %+v", response)
 	}
 }
 
@@ -2005,5 +2625,132 @@ func TestSpooledMessagesDeliveredOnLogin(t *testing.T) {
 
 	waitFor(t, "spool cleared", func() bool {
 		return env.spool.pendingCount() == 0
+	})
+}
+
+func TestMoveEventsCarryCommittedChannelAndActor(t *testing.T) {
+	env := startTestEnv(t, nil)
+	defer env.stop()
+	adminConn, adminID := dialAuthed(t, env.addr, "admin-uid")
+	defer func() { _ = adminConn.Close() }()
+	userConn, userID := dialAuthed(t, env.addr, "user-uid")
+	defer func() { _ = userConn.Close() }()
+	env.state.AddChannel(testChannel(1))
+	env.state.AddChannel(testChannel(2))
+
+	moves := make(chan userEvent, 3)
+	env.deps.Broadcast.SetEventTap(func(eventType string, payload []byte) {
+		if eventType != eventUserMoved {
+			return
+		}
+		var event userEvent
+		if err := json.Unmarshal(payload, &event); err == nil {
+			moves <- event
+		}
+	})
+	nextMove := func() userEvent {
+		t.Helper()
+		select {
+		case event := <-moves:
+			return event
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for user_moved event")
+			return userEvent{}
+		}
+	}
+
+	// A user joining their own channel is its own session/client actor.
+	send(t, userConn, netproto.MsgJoinChannel, netproto.JoinChannel{ChannelID: 1})
+	selfMove := nextMove()
+	if selfMove.ClientID != userID || selfMove.FromChannelID != 0 || selfMove.ChannelID != 1 || selfMove.ByClientID != userID {
+		t.Fatalf("self move = %+v, want session %s from 0 to 1 by itself", selfMove, userID)
+	}
+
+	// A control-channel administrator moves a distinct target session.
+	send(t, adminConn, netproto.MsgMoveClient, netproto.MoveClient{ClientID: userID, ChannelID: 2})
+	adminMove := nextMove()
+	if adminMove.ClientID != userID || adminMove.FromChannelID != 1 || adminMove.ChannelID != 2 || adminMove.ByClientID != adminID {
+		t.Fatalf("admin move = %+v, want target %s from 1 to 2 by %s", adminMove, userID, adminID)
+	}
+
+	// ServerQuery has no connected actor, so its established synthetic actor is
+	// explicit rather than fabricating a user/session identity.
+	if err := env.srv.MoveClient(context.Background(), userID, 1); err != nil {
+		t.Fatalf("ServerQuery MoveClient: %v", err)
+	}
+	queryMove := nextMove()
+	if queryMove.ClientID != userID || queryMove.FromChannelID != 2 || queryMove.ChannelID != 1 || queryMove.ByClientID != "serverquery" {
+		t.Fatalf("ServerQuery move = %+v", queryMove)
+	}
+}
+
+func TestBanEventsCarryExpiryAndTargetChannel(t *testing.T) {
+	t.Run("control temporary ban", func(t *testing.T) {
+		env := startTestEnv(t, nil)
+		defer env.stop()
+		adminConn, _ := dialAuthed(t, env.addr, "admin-uid")
+		defer func() { _ = adminConn.Close() }()
+		userConn, userID := dialAuthed(t, env.addr, "user-uid")
+		defer func() { _ = userConn.Close() }()
+		env.state.AddChannel(testChannel(1))
+		if err := env.state.MoveClient(userID, 1); err != nil {
+			t.Fatalf("position ban target: %v", err)
+		}
+
+		events := make(chan kickEvent, 1)
+		env.deps.Broadcast.SetEventTap(func(eventType string, payload []byte) {
+			if eventType != eventKicked {
+				return
+			}
+			var event kickEvent
+			if err := json.Unmarshal(payload, &event); err == nil {
+				events <- event
+			}
+		})
+		now := time.Now().UnixMilli()
+		send(t, adminConn, netproto.MsgKickClient, netproto.KickClient{
+			ClientID: userID, Ban: true, DurationSeconds: 60, Reason: "temporary",
+		})
+		select {
+		case event := <-events:
+			if !event.Ban || event.ChannelID != 1 || event.ExpiresAt < now+30_000 || event.ExpiresAt > now+90_000 {
+				t.Fatalf("temporary ban event = %+v, want target channel and ~60s expiry", event)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for temporary ban event")
+		}
+	})
+
+	t.Run("trusted permanent ban", func(t *testing.T) {
+		env := startTestEnv(t, nil)
+		defer env.stop()
+		userConn, userID := dialAuthed(t, env.addr, "user-uid")
+		defer func() { _ = userConn.Close() }()
+		env.state.AddChannel(testChannel(1))
+		if err := env.state.MoveClient(userID, 1); err != nil {
+			t.Fatalf("position ban target: %v", err)
+		}
+
+		events := make(chan kickEvent, 1)
+		env.deps.Broadcast.SetEventTap(func(eventType string, payload []byte) {
+			if eventType != eventKicked {
+				return
+			}
+			var event kickEvent
+			if err := json.Unmarshal(payload, &event); err == nil {
+				events <- event
+			}
+		})
+		if err := env.srv.BanClient(context.Background(), "serverquery", userID, 0, "permanent"); err != nil {
+			t.Fatalf("trusted BanClient: %v", err)
+		}
+		select {
+		case event := <-events:
+			if !event.Ban || event.ChannelID != 1 || event.ExpiresAt != 0 || event.ByClientID != "serverquery" {
+				t.Fatalf("permanent ban event = %+v, want serverquery permanent ban for channel 1", event)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for permanent ban event")
+		}
 	})
 }

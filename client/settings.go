@@ -19,6 +19,15 @@ import (
 // over the developer's real bookmarks.
 var allowDefaultSettingsPath = true
 
+// allowEmptySettingsSnapshot is a test-only escape hatch for App values built
+// without a settings path. Production must fail rather than pretending a
+// settings change was persisted nowhere.
+var allowEmptySettingsSnapshot bool
+
+// settingsRename is replaceable in atomicity tests. Production always uses
+// os.Rename after the fully synced temporary file has been closed.
+var settingsRename = os.Rename
+
 // Bookmark is a saved server (address + nickname; never passwords).
 type Bookmark struct {
 	Name        string `json:"name"`
@@ -96,7 +105,7 @@ type HotkeyProfile struct {
 // serialized default changes, and add the repair to migrateSettings:
 // loading merges the file ONTO the defaults, so a field an older client always
 // wrote wins over the new default unless it is explicitly repaired.
-const settingsVersion = 5
+const settingsVersion = 7
 
 // Settings holds all user preferences.
 type Settings struct {
@@ -254,6 +263,7 @@ func DefaultSettings() Settings {
 		NotifyConnection:      true,
 		WhisperSound:          true,
 		ChatNotificationLevel: "all",
+		ReconnectOnLoss:       true,
 		UpdatesAutoCheck:      true,
 
 		PTTReleaseDelayMs: 0,
@@ -261,13 +271,22 @@ func DefaultSettings() Settings {
 		WarnEmptyChannel:  true,
 		SoundPack:         "soft",
 		SoundVolume:       100,
-		// (385) one entry per notification-matrix event plus the local
-		// mic/voice ones, so every matrix row has a togglable sound.
+		// (385) one entry per notification-matrix event plus the connection,
+		// channel, and voice-action cues. Legacy join/leave entries stay in the
+		// file so version-7 migration can preserve earlier choices.
 		EventSounds: map[string]bool{
-			"join": true, "leave": true, "join_leave": true, "mention": true,
-			"keyword": true, "dm": true, "whisper": true, "poke": true,
-			"buddy_online": true, "kick": true, "announcement": true,
-			"channel_watch": true, "mic_on": true, "mic_off": true,
+			"join": true, "leave": true, // legacy pre-v7 split sources
+			"connection_connected": true, "connection_reconnected": true,
+			"connection_disconnected": true, "connection_lost": true,
+			"connection_reconnecting": true, "connection_failed": true,
+			"server_error":     true,
+			"own_channel_join": true, "own_channel_switch": true, "own_channel_leave": true,
+			"user_join": true, "user_leave": true, "user_move_in": true, "user_move_out": true,
+			"mic_on": true, "mic_off": true, "deafen_on": true, "deafen_off": true,
+			"ptt_on": true, "ptt_off": true,
+			"mention": true, "keyword": true, "dm": true, "channel_message": true,
+			"whisper": true, "poke": true, "join_leave": true, "buddy_online": true,
+			"kick": true, "announcement": true, "channel_watch": true,
 		},
 		WhisperReplyHotkey: "Ctrl+R",
 		VoiceLimiter:       true,
@@ -295,7 +314,9 @@ const autoAwaySentinel = "auto-away"
 // autoAwayMessage returns the status text to publish when the idle timer
 // fires (390), clamped to the server's status-message limit.
 func (a *App) autoAwayMessage() string {
+	a.settingsMu.Lock()
 	msg := strings.TrimSpace(a.settings.AutoAwayMessage)
+	a.settingsMu.Unlock()
 	if msg == "" {
 		msg = defaultAutoAwayMessage
 	}
@@ -333,7 +354,7 @@ func loadSettingsAt(path string) Settings {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return DefaultSettings()
 	}
-	return migrateSettings(s)
+	return normalizeSettings(migrateSettings(s))
 }
 
 // migrateSettings repairs a file written by an older client. A field the older
@@ -364,25 +385,117 @@ func migrateSettings(s Settings) Settings {
 		// spaces unavailable in every application while voicx was running.
 		s.HotkeyPTT = ""
 	}
+	if s.SettingsVersion < 6 {
+		// Version 6 makes reconnect-on-loss the safe default. Older files always
+		// serialized false unless the user opted in, so migrate them to the new
+		// behavior. A current-version false remains an explicit opt-out.
+		s.ReconnectOnLoss = true
+	}
+	if s.SettingsVersion < 7 {
+		migrateEventSoundSplits(&s)
+	}
 	s.SettingsVersion = settingsVersion
 	return s
 }
 
+// migrateEventSoundSplits carries pre-v7 choices to their more precise
+// successors. loadSettingsAt unmarshals old JSON onto new defaults, so a
+// legacy false must deliberately overwrite each new default true. Current
+// version-7 settings are left entirely alone: their split choices are already
+// explicit.
+func migrateEventSoundSplits(s *Settings) {
+	if s.EventSounds == nil {
+		return
+	}
+	for _, split := range []struct {
+		legacy string
+		new    []string
+	}{
+		{legacy: "join", new: []string{"own_channel_join", "own_channel_switch"}},
+		{legacy: "leave", new: []string{"own_channel_leave"}},
+		{legacy: "join_leave", new: []string{"user_join", "user_leave", "user_move_in", "user_move_out"}},
+	} {
+		if enabled, ok := s.EventSounds[split.legacy]; ok {
+			for _, event := range split.new {
+				s.EventSounds[event] = enabled
+			}
+		}
+	}
+}
+
+// normalizeSettings clamps presentation-only preferences. Structural values
+// (modes, enums, hotkey syntax) are validated by SaveSettings and are never
+// silently rewritten.
+func normalizeSettings(s Settings) Settings {
+	s.WindowOpacity = clampSetting(s.WindowOpacity, 20, 100)
+	s.UIFontSize = clampSetting(s.UIFontSize, 10, 20)
+	s.ChatFontSize = clampSetting(s.ChatFontSize, 12, 18)
+	s.SidebarWidth = normalizePanelWidth(s.SidebarWidth)
+	s.DetailsWidth = normalizePanelWidth(s.DetailsWidth)
+	s.ChatMaxLines = clampSetting(s.ChatMaxLines, 10, 5000)
+	return s
+}
+
+func clampSetting(value, min, max int) int {
+	if value < min {
+		return min
+	}
+	if value > max {
+		return max
+	}
+	return value
+}
+
+func normalizePanelWidth(value int) int {
+	if value == 0 {
+		return 0
+	}
+	return clampSetting(value, 160, 560)
+}
+
 // saveSettingsAt writes settings to path with 0600 permissions.
 func saveSettingsAt(path string, s Settings) error {
+	if path == "" {
+		return errors.New("settings path is empty")
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}
+	s = normalizeSettings(s)
 	raw, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
-	root, name, err := openParentRoot(path)
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".settings-*.tmp")
 	if err != nil {
 		return err
 	}
-	defer func() { _ = root.Close() }()
-	return root.WriteFile(name, raw, 0o600)
+	tmpPath := tmp.Name()
+	keep := false
+	defer func() {
+		_ = tmp.Close()
+		if !keep {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0o600); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(raw); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := settingsRename(tmpPath, path); err != nil {
+		return err
+	}
+	keep = true
+	return nil
 }
 
 // openParentRoot confines a single-file operation to the file's selected
@@ -430,26 +543,138 @@ func (a *App) settingsFile() string {
 	return path
 }
 
-// save persists the App's settings to its settings file.
-func (a *App) save() error {
-	a.settingsMu.Lock()
-	defer a.settingsMu.Unlock()
-	return a.saveLocked()
+// cloneSettings detaches every slice and map in Settings. JSON is already the
+// persistence representation, so this keeps the copy exhaustive as fields are
+// added without sharing mutable nested state with a caller or the frontend.
+func cloneSettings(s Settings) Settings {
+	raw, err := json.Marshal(s)
+	if err != nil {
+		panic("settings must be JSON serializable: " + err.Error())
+	}
+	var cloned Settings
+	if err := json.Unmarshal(raw, &cloned); err != nil {
+		panic("settings JSON round-trip: " + err.Error())
+	}
+	return cloned
 }
 
-// saveLocked persists settings while settingsMu is held.
-func (a *App) saveLocked() error {
-	if path := a.settingsFile(); path != "" {
-		return saveSettingsAt(path, a.settings)
+// updateSettings is a committed-base transaction. Every mutation starts from
+// the last durable in-memory snapshot, writes its candidate atomically, and
+// publishes memory only after that write succeeds. Serializing all three
+// phases prevents a later mutation from inheriting an earlier candidate that
+// ultimately fails to persist. settingsMu is never held across file I/O.
+func (a *App) updateSettings(mutate func(Settings) Settings) (uint64, error) {
+	if hook := a.beforeSettingsTransaction; hook != nil {
+		hook()
 	}
-	return nil
+	a.settingsTxMu.Lock()
+	defer a.settingsTxMu.Unlock()
+
+	a.settingsMu.Lock()
+	committed := cloneSettings(a.settings)
+	path := a.settingsFile()
+	a.settingsMu.Unlock()
+
+	candidate := normalizeSettings(cloneSettings(mutate(cloneSettings(committed))))
+	if err := settingsSnapshotWriter(path, candidate); err != nil {
+		return 0, err
+	}
+
+	a.settingsMu.Lock()
+	a.settings = candidate
+	a.settingsGeneration++
+	generation := a.settingsGeneration
+	a.settingsMu.Unlock()
+	return generation, nil
+}
+
+// settingsSnapshotWriter is replaceable in deterministic transaction tests.
+// Production always uses the atomic settings writer below.
+var settingsSnapshotWriter = saveSettingsSnapshot
+
+func saveSettingsSnapshot(path string, snapshot Settings) error {
+	if path == "" {
+		if allowEmptySettingsSnapshot {
+			return nil
+		}
+		return errors.New("settings path is empty")
+	}
+	return saveSettingsAt(path, snapshot)
 }
 
 // GetSettings returns the current settings to the frontend.
 func (a *App) GetSettings() Settings {
 	a.settingsMu.Lock()
 	defer a.settingsMu.Unlock()
-	return a.settings
+	return cloneSettings(a.settings)
+}
+
+type settingsEffectFamily uint8
+
+const (
+	settingsEffectHotkeys settingsEffectFamily = iota
+	settingsEffectOpacity
+	settingsEffectAlwaysOnTop
+)
+
+// applyLatestSettingsEffect commits one live effect family from the newest
+// authoritative snapshot. Family generations deliberately remain independent:
+// a newer mutation to a different setting must not drop an older opacity,
+// hotkey, or always-on-top effect that is still required. No settings lock is
+// held while calling hotkey, opacity, or Wails APIs.
+func (a *App) applyLatestSettingsEffect(ticket uint64, family settingsEffectFamily, apply func(Settings) error) error {
+	a.settingsMu.Lock()
+	first := cloneSettings(a.settings)
+	a.settingsMu.Unlock()
+	if hook := a.beforeSettingsEffect; hook != nil {
+		hook(ticket, first)
+	}
+
+	a.settingsEffectMu.Lock()
+	defer a.settingsEffectMu.Unlock()
+	var committed *uint64
+	switch family {
+	case settingsEffectHotkeys:
+		committed = &a.hotkeyEffectGeneration
+	case settingsEffectOpacity:
+		committed = &a.opacityEffectGeneration
+	case settingsEffectAlwaysOnTop:
+		committed = &a.alwaysOnTopEffectGeneration
+	default:
+		return errors.New("unknown settings effect family")
+	}
+	if ticket <= *committed {
+		return nil
+	}
+	*committed = ticket
+	a.settingsMu.Lock()
+	live := cloneSettings(a.settings)
+	a.settingsMu.Unlock()
+
+	return apply(live)
+}
+
+func (a *App) applyHotkeyEffect(ticket uint64) error {
+	return a.applyLatestSettingsEffect(ticket, settingsEffectHotkeys, func(live Settings) error {
+		a.applySettingsHotkeys(live)
+		return nil
+	})
+}
+
+func (a *App) applyOpacityEffect(ticket uint64) error {
+	return a.applyLatestSettingsEffect(ticket, settingsEffectOpacity, func(live Settings) error {
+		a.opacityMu.Lock()
+		err := windowOpacityApply(live.WindowOpacity)
+		a.opacityMu.Unlock()
+		return err
+	})
+}
+
+func (a *App) applyAlwaysOnTopEffect(ticket uint64) error {
+	return a.applyLatestSettingsEffect(ticket, settingsEffectAlwaysOnTop, func(live Settings) error {
+		alwaysOnTopApply(a.ctx, live.AlwaysOnTop)
+		return nil
+	})
 }
 
 // emitSettingsUpdate hands the frontend the merged settings blob. Every field
@@ -481,6 +706,7 @@ func mergeGoOwned(cur, incoming Settings) Settings {
 // whole object (Go-owned fields are kept, see mergeGoOwned); hotkey specs
 // are validated and re-applied.
 func (a *App) SaveSettings(s Settings) string {
+	s = cloneSettings(s)
 	if err := validateHotkeySpec(s.HotkeyPTT); err != nil {
 		return "ptt hotkey: " + err.Error()
 	}
@@ -501,21 +727,37 @@ func (a *App) SaveSettings(s Settings) string {
 	default:
 		return "invalid chat notification level"
 	}
-	a.settingsMu.Lock()
-	a.settings = mergeGoOwned(a.settings, s)
-	err := a.saveLocked()
-	a.settingsMu.Unlock()
+	generation, err := a.updateSettings(func(current Settings) Settings {
+		return mergeGoOwned(current, s)
+	})
 	if err != nil {
 		return err.Error()
 	}
 	a.emitSettingsUpdate()
-	a.applyHotkey("ptt", s.HotkeyPTT)
-	a.applyHotkey("mute_toggle", s.HotkeyMute)
-	a.applyHotkey("deafen_toggle", s.HotkeyDeafen)
-	a.applyHotkey("quick_connect", s.HotkeyQuickConnect)
-	a.applyHotkey("compact_toggle", s.HotkeyCompact)
-	a.applyHotkey("whisper_reply", s.WhisperReplyHotkey)
+	if err := a.applyAllSettingsEffects(generation); err != nil {
+		return err.Error()
+	}
 	return ""
+}
+
+// applyAllSettingsEffects is used by a full settings replacement: every live
+// family may have changed in that snapshot, so each needs an independent
+// current-state commit.
+func (a *App) applyAllSettingsEffects(ticket uint64) error {
+	if err := a.applyHotkeyEffect(ticket); err != nil {
+		return err
+	}
+	// A settings-only/headless App has no Wails window to mutate. Keep its
+	// persisted/hotkey state valid without asking the platform helper to find a
+	// window that does not exist; a live App always has ctx before SaveSettings
+	// can reach this point.
+	if a.ctx == nil {
+		return nil
+	}
+	if err := a.applyOpacityEffect(ticket); err != nil {
+		return err
+	}
+	return a.applyAlwaysOnTopEffect(ticket)
 }
 
 // RecordRecent prepends addr+nickname to the connect history (282): most
@@ -525,18 +767,21 @@ func (a *App) RecordRecent(addr, nickname string) {
 		return
 	}
 	rec := RecentServer{Addr: addr, Nickname: nickname, LastUsed: time.Now().Unix()}
-	out := []RecentServer{rec}
-	for _, r := range a.settings.Recents {
-		if r.Addr == addr && r.Nickname == nickname {
-			continue
+	_, err := a.updateSettings(func(current Settings) Settings {
+		out := []RecentServer{rec}
+		for _, r := range current.Recents {
+			if r.Addr == addr && r.Nickname == nickname {
+				continue
+			}
+			out = append(out, r)
 		}
-		out = append(out, r)
-	}
-	if len(out) > 10 {
-		out = out[:10]
-	}
-	a.settings.Recents = out
-	if err := a.save(); err != nil {
+		if len(out) > 10 {
+			out = out[:10]
+		}
+		current.Recents = out
+		return current
+	})
+	if err != nil {
 		log.Printf("saving settings recents failed: %v", err)
 		return
 	}

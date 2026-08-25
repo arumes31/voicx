@@ -166,15 +166,47 @@ func writeIdentityAt(path string, raw []byte) error {
 	if err != nil {
 		return err
 	}
+	return writePrivateFileAtomic(filepath.Join(dir, name), raw)
+}
+
+// writePrivateFileAtomic replaces a private-key file only after its complete
+// contents have reached a temporary owner-only file. This is shared by the
+// live identity and portable export paths: a failed write must leave the last
+// credential intact rather than truncating it.
+func writePrivateFileAtomic(path string, raw []byte) (retErr error) {
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	root, err := os.OpenRoot(dir)
+	tmp, err := os.CreateTemp(dir, ".identity-*.tmp")
 	if err != nil {
 		return err
 	}
-	defer func() { _ = root.Close() }()
-	return root.WriteFile(name, raw, 0o600)
+	tmpPath := tmp.Name()
+	keep := false
+	defer func() {
+		_ = tmp.Close()
+		if !keep {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(0o600); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(raw); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	keep = true
+	return nil
 }
 
 // identityIDs lists the identity file stems in dir, sorted.
@@ -314,7 +346,25 @@ func (a *App) resolveActive() (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	id, path := resolveActiveIn(dir, a.settings.ActiveIdentity)
+	a.settingsMu.Lock()
+	activeIdentity := a.settings.ActiveIdentity
+	a.settingsMu.Unlock()
+	id, path := resolveActiveIn(dir, activeIdentity)
+	return id, path, nil
+}
+
+// activeIdentityLocked resolves and loads the App-selected identity. Callers
+// hold identityMu; settings is sampled under settingsMu, never from the
+// legacy/global settings file used by a background connection manager.
+func (a *App) activeIdentityLocked() (*identity, string, error) {
+	_, path, err := a.resolveActive()
+	if err != nil {
+		return nil, "", err
+	}
+	id, err := loadOrCreateIdentityAt(path)
+	if err != nil {
+		return nil, "", err
+	}
 	return id, path, nil
 }
 
@@ -359,6 +409,20 @@ func decodeIdentity(raw []byte) (*identity, error) {
 		id.Protection = ""
 	}
 	return &id, nil
+}
+
+// loadIdentityAtStrict reads an existing identity without migration or
+// creation. Destructive/backup commits must never recreate a credential that
+// another operation deleted while a native dialog was open.
+func loadIdentityAtStrict(path string) (*identity, error) {
+	raw, err := readIdentityAt(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) == 0 {
+		return nil, errors.New("identity file is empty")
+	}
+	return decodeIdentity(raw)
 }
 
 // loadOrCreateIdentityAt is loadOrCreateIdentity with an explicit path
@@ -482,9 +546,9 @@ func saveIdentityAt(path string, id *identity) error {
 	return nil
 }
 
-// exportIdentityTo writes a PORTABLE copy: the private key in the clear, so
-// the backup still opens on a new machine (353/354). It also stamps the
-// backup marker on the live file so the reminder stops.
+// exportIdentityTo writes a PORTABLE copy and stamps the live file only when
+// it still represents the exported key. It never writes the caller's stale
+// identity object back over a regenerated source.
 func exportIdentityTo(dest, src string, id *identity) error {
 	out := *id
 	out.Protection = ""
@@ -495,11 +559,32 @@ func exportIdentityTo(dest, src string, id *identity) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(dest, raw, 0o600); err != nil {
+	if err := writePrivateFileAtomic(dest, raw); err != nil {
 		return err
 	}
-	id.ExportedAt = out.ExportedAt
-	return saveIdentityAt(src, id)
+	return stampIdentityExported(src, id, out.ExportedAt)
+}
+
+func stampIdentityExported(src string, exported *identity, at int64) error {
+	current, err := loadIdentityAtStrict(src)
+	if err != nil {
+		return err
+	}
+	want, err := exported.uniqueID()
+	if err != nil {
+		return err
+	}
+	got, err := current.uniqueID()
+	if err != nil {
+		return err
+	}
+	if got != want {
+		// Regeneration won the race. The exported copy is still a legitimate
+		// backup of its prior key, but it must not mark or overwrite the new one.
+		return nil
+	}
+	current.ExportedAt = at
+	return saveIdentityAt(src, current)
 }
 
 // --- security level (352) ------------------------------------------------------
@@ -617,6 +702,8 @@ func entryFor(dir, id, activeID string) IdentityEntry {
 // ListIdentities returns every stored identity (351), migrating the legacy
 // single identity file in on first call.
 func (a *App) ListIdentities() []IdentityEntry {
+	a.identityMu.Lock()
+	defer a.identityMu.Unlock()
 	dir, err := identitiesDir()
 	if err != nil {
 		return []IdentityEntry{}
@@ -656,6 +743,8 @@ func (a *App) forgetCachedIdentity(id *identity) {
 // CreateIdentity generates a new identity labelled name WITHOUT switching to
 // it (351). It returns "" on success or the failure reason.
 func (a *App) CreateIdentity(name string) string {
+	a.identityMu.Lock()
+	defer a.identityMu.Unlock()
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return "name is required"
@@ -682,6 +771,14 @@ func (a *App) CreateIdentity(name string) string {
 // identity and switches to it (351). Re-importing a key that is already
 // stored just selects it instead of creating a duplicate account row.
 func (a *App) adoptImportedIdentity(id *identity, fallbackName string) string {
+	a.identityMu.Lock()
+	defer a.identityMu.Unlock()
+	return a.adoptImportedIdentityLocked(id, fallbackName)
+}
+
+// adoptImportedIdentityLocked is the serialized live-store commit half of
+// import. The dialog and external-file read happen before identityMu is held.
+func (a *App) adoptImportedIdentityLocked(id *identity, fallbackName string) string {
 	dir, err := identitiesDir()
 	if err != nil {
 		return err.Error()
@@ -690,7 +787,7 @@ func (a *App) adoptImportedIdentity(id *identity, fallbackName string) string {
 	for _, existing := range identityIDs(dir) {
 		if e := entryFor(dir, existing, ""); e.UniqueID != "" {
 			if uid, err := id.uniqueID(); err == nil && uid == e.UniqueID {
-				return a.SwitchIdentity(existing)
+				return a.switchIdentityLocked(existing)
 			}
 		}
 	}
@@ -718,22 +815,33 @@ func (a *App) adoptImportedIdentity(id *identity, fallbackName string) string {
 	if err := saveIdentityAt(filepath.Join(dir, newID+".json"), id); err != nil {
 		return err.Error()
 	}
-	return a.SwitchIdentity(newID)
+	return a.switchIdentityLocked(newID)
 }
 
 // SwitchIdentity makes id the active identity (351). Live connections keep
 // the key they authenticated with; the change applies on the next connect.
 func (a *App) SwitchIdentity(id string) string {
+	a.identityMu.Lock()
+	defer a.identityMu.Unlock()
+	return a.switchIdentityLocked(id)
+}
+
+// switchIdentityLocked changes the active identity while identityMu is held.
+// It exists so import can remain one serialized commit without recursively
+// acquiring identityMu.
+func (a *App) switchIdentityLocked(id string) string {
 	path, err := identityPathFor(id)
 	if err != nil {
 		return err.Error()
 	}
-	loaded, err := loadOrCreateIdentityAt(path)
+	loaded, err := loadIdentityAtStrict(path)
 	if err != nil {
 		return err.Error()
 	}
-	a.settings.ActiveIdentity = id
-	if err := a.save(); err != nil {
+	if _, err := a.updateSettings(func(settings Settings) Settings {
+		settings.ActiveIdentity = id
+		return settings
+	}); err != nil {
 		return err.Error()
 	}
 	a.forgetCachedIdentity(loaded)
@@ -744,6 +852,8 @@ func (a *App) SwitchIdentity(id string) string {
 // RenameIdentity changes an identity's display label (351). The file stem is
 // the stable ID and does not move.
 func (a *App) RenameIdentity(id, name string) string {
+	a.identityMu.Lock()
+	defer a.identityMu.Unlock()
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return "name is required"
@@ -752,7 +862,7 @@ func (a *App) RenameIdentity(id, name string) string {
 	if err != nil {
 		return err.Error()
 	}
-	loaded, err := loadOrCreateIdentityAt(path)
+	loaded, err := loadIdentityAtStrict(path)
 	if err != nil {
 		return err.Error()
 	}
@@ -767,6 +877,8 @@ func (a *App) RenameIdentity(id, name string) string {
 // deleted, and an identity that has never been exported needs the caller to
 // confirm: the key is the user's account on every server that has seen it.
 func (a *App) DeleteIdentity(id string, confirmUnexported bool) string {
+	a.identityMu.Lock()
+	defer a.identityMu.Unlock()
 	path, err := identityPathFor(id)
 	if err != nil {
 		return err.Error()
@@ -779,7 +891,7 @@ func (a *App) DeleteIdentity(id string, confirmUnexported bool) string {
 	if _, err := os.Stat(path); err != nil {
 		return "no such identity"
 	}
-	loaded, err := loadOrCreateIdentityAt(path)
+	loaded, err := loadIdentityAtStrict(path)
 	if err != nil {
 		return err.Error()
 	}
@@ -789,16 +901,21 @@ func (a *App) DeleteIdentity(id string, confirmUnexported bool) string {
 	if err := os.Remove(path); err != nil {
 		return err.Error()
 	}
-	if a.settings.ActiveIdentity == id || a.settings.ActiveIdentity == "" {
+	a.settingsMu.Lock()
+	activeIdentity := a.settings.ActiveIdentity
+	a.settingsMu.Unlock()
+	if activeIdentity == id || activeIdentity == "" {
 		newActive, _, err := a.resolveActive()
 		if err != nil {
 			return err.Error()
 		}
-		a.settings.ActiveIdentity = newActive
+		if _, err := a.updateSettings(func(settings Settings) Settings {
+			settings.ActiveIdentity = newActive
+			return settings
+		}); err != nil {
+			return err.Error()
+		}
 		a.forgetCachedIdentity(nil)
-	}
-	if err := a.save(); err != nil {
-		return err.Error()
 	}
 	a.emitSettingsUpdate()
 	return ""
@@ -808,6 +925,8 @@ func (a *App) DeleteIdentity(id string, confirmUnexported bool) string {
 // security level (352), giving up after maxSeconds. The counter is persisted
 // so the level survives a restart.
 func (a *App) ImproveIdentityLevel(id string, target, maxSeconds int) IdentityLevelResult {
+	a.identityMu.Lock()
+	defer a.identityMu.Unlock()
 	if target < 1 || target > 40 {
 		return IdentityLevelResult{Error: "target level must be 1..40"}
 	}
@@ -818,7 +937,7 @@ func (a *App) ImproveIdentityLevel(id string, target, maxSeconds int) IdentityLe
 	if err != nil {
 		return IdentityLevelResult{Error: err.Error()}
 	}
-	loaded, err := loadOrCreateIdentityAt(path)
+	loaded, err := loadIdentityAtStrict(path)
 	if err != nil {
 		return IdentityLevelResult{Error: err.Error()}
 	}
@@ -837,6 +956,8 @@ func (a *App) ImproveIdentityLevel(id string, target, maxSeconds int) IdentityLe
 // exported (353). An unexported key dies with the machine, so the frontend
 // nags until this turns false.
 func (a *App) IdentityBackupPending() bool {
+	a.identityMu.Lock()
+	defer a.identityMu.Unlock()
 	_, path, err := a.resolveActive()
 	if err != nil {
 		return false

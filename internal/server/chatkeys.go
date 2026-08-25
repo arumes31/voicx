@@ -89,13 +89,32 @@ type chatKeyManager struct {
 	store  ScopeKeyStore
 	kek    *chatcrypto.KEKRing
 	logger *zap.Logger
+	// onFailure is an immutable constructor callback. It reports only public
+	// operation boundaries so wrapped helpers cannot double-count one error.
+	onFailure func(operation string)
 }
 
-func newChatKeyManager(st ScopeKeyStore, kek *chatcrypto.KEKRing, logger *zap.Logger) *chatKeyManager {
+func newChatKeyManager(st ScopeKeyStore, kek *chatcrypto.KEKRing, logger *zap.Logger, onFailure ...func(string)) *chatKeyManager {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	return &chatKeyManager{scopes: make(map[int64]*scopeEntry), store: st, kek: kek, logger: logger}
+	var failureObserver func(string)
+	if len(onFailure) > 0 {
+		failureObserver = onFailure[0]
+	}
+	return &chatKeyManager{
+		scopes:    make(map[int64]*scopeEntry),
+		store:     st,
+		kek:       kek,
+		logger:    logger,
+		onFailure: failureObserver,
+	}
+}
+
+func (m *chatKeyManager) reportFailure(operation string) {
+	if m != nil && m.onFailure != nil {
+		m.onFailure(operation)
+	}
 }
 
 // configured reports whether key persistence is wired.
@@ -189,7 +208,12 @@ func (m *chatKeyManager) cacheOldLocked(e *scopeEntry, id uint32, key [32]byte) 
 // when the scope has none. It is the ONLY minting entry point, and callers
 // must have established that the client belongs to the scope (or that the
 // scope is the fixed global one) before reaching it.
-func (m *chatKeyManager) EnsureScope(ctx context.Context, scope int64) (uint32, [32]byte, error) {
+func (m *chatKeyManager) EnsureScope(ctx context.Context, scope int64) (_ uint32, _ [32]byte, retErr error) {
+	defer func() {
+		if retErr != nil {
+			m.reportFailure("ensure")
+		}
+	}()
 	var zero [32]byte
 	if m == nil {
 		return 0, zero, errChatKeysUnconfigured
@@ -275,7 +299,12 @@ func (m *chatKeyManager) at(ctx context.Context, scope int64, gen uint32) ([32]b
 //
 // The caller MUST NOT hold any manager lock while redistributing the result:
 // deliverScopeKey -> sealFor -> at re-enters this scope's mutex.
-func (m *chatKeyManager) rotate(ctx context.Context, scope int64) (uint32, [32]byte, error) {
+func (m *chatKeyManager) rotate(ctx context.Context, scope int64) (_ uint32, _ [32]byte, retErr error) {
+	defer func() {
+		if retErr != nil {
+			m.reportFailure("rotate")
+		}
+	}()
 	var zero [32]byte
 	if m == nil {
 		return 0, zero, errChatKeysUnconfigured
@@ -312,7 +341,12 @@ func (m *chatKeyManager) rotate(ctx context.Context, scope int64) (uint32, [32]b
 
 // sealFor seals one generation of a scope for a member's X25519 public key
 // (base64) using box.SealAnonymous, producing a ChannelKey message.
-func (m *chatKeyManager) sealFor(ctx context.Context, scope int64, gen uint32, memberPubB64 string) (*netproto.ChannelKey, error) {
+func (m *chatKeyManager) sealFor(ctx context.Context, scope int64, gen uint32, memberPubB64 string) (_ *netproto.ChannelKey, retErr error) {
+	defer func() {
+		if retErr != nil {
+			m.reportFailure("seal_key")
+		}
+	}()
 	pubRaw, err := base64.StdEncoding.DecodeString(memberPubB64)
 	if err != nil || len(pubRaw) != 32 {
 		return nil, errInvalidPublicKey
@@ -340,7 +374,12 @@ func (m *chatKeyManager) sealFor(ctx context.Context, scope int64, gen uint32, m
 // open decrypts a scope-encrypted body (base64 nonce‖secretbox) with an
 // explicit generation. Taking the generation rather than assuming "current"
 // is what lets an edit or a history entry under a rotated key still open.
-func (m *chatKeyManager) open(ctx context.Context, scope int64, gen uint32, blobB64 string) (string, error) {
+func (m *chatKeyManager) open(ctx context.Context, scope int64, gen uint32, blobB64 string) (_ string, retErr error) {
+	defer func() {
+		if retErr != nil {
+			m.reportFailure("decrypt")
+		}
+	}()
 	key, err := m.at(ctx, scope, gen)
 	if err != nil {
 		return "", err
@@ -360,7 +399,12 @@ func (m *chatKeyManager) open(ctx context.Context, scope int64, gen uint32, blob
 
 // seal encrypts plaintext with the scope's current generation. It never
 // mints; callers that may face a fresh scope call EnsureScope first.
-func (m *chatKeyManager) seal(ctx context.Context, scope int64, plain string) (uint32, string, error) {
+func (m *chatKeyManager) seal(ctx context.Context, scope int64, plain string) (_ uint32, _ string, retErr error) {
+	defer func() {
+		if retErr != nil {
+			m.reportFailure("encrypt")
+		}
+	}()
 	id, key, err := m.current(ctx, scope)
 	if err != nil {
 		return 0, "", err

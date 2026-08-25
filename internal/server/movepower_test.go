@@ -5,7 +5,6 @@ package server
 
 import (
 	"testing"
-	"time"
 
 	"voicx/internal/auth"
 	"voicx/internal/netproto"
@@ -74,12 +73,10 @@ func TestMoveClientMeetsTargetNeededPower(t *testing.T) {
 
 	send(t, callerConn, netproto.MsgMoveClient, netproto.MoveClient{ClientID: targetID, ChannelID: 1})
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
+	waitFor(t, "target move after sufficient move power", func() bool {
 		if sc, ok := env.state.GetClient(targetID); ok && sc.ChannelID == 1 {
-			return
+			return true
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("target was never moved despite sufficient move power")
+		return false
+	})
 }

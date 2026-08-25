@@ -26,6 +26,7 @@ import (
 // AuthBackend is the subset of auth.AuthService the TCP server needs.
 type AuthBackend interface {
 	AuthenticatePassword(ctx context.Context, uniqueID, password string) (bool, error)
+	AuthenticateIdentifier(ctx context.Context, identifier, password string) (*auth.User, error)
 	AuthenticateChallenge(ctx context.Context, uniqueID string, challenge, signature []byte) (bool, error)
 	AuthenticateNickname(ctx context.Context, nickname, password string) (*auth.User, error)
 	LookupUser(ctx context.Context, uniqueID string) (*auth.User, error)
@@ -284,6 +285,12 @@ type Deps struct {
 	Groups       GroupStore
 	BanAdmin     BanAdminStore
 	Metrics      metrics.Sink
+	// LoginLimiter limits failed TCP control-channel passwords. Nil installs
+	// the production default; tests can inject a clock-controlled limiter.
+	LoginLimiter *auth.LoginFailureLimiter
+	// VerifyServerPassword overrides global-password verification in focused
+	// tests. Production uses auth.VerifyPassword.
+	VerifyServerPassword func(password, encodedHash string) error
 
 	// Rules delivers the operator's rules and gates unaccepted clients
 	// (215). Nil means no server configured rules at all, so nothing is

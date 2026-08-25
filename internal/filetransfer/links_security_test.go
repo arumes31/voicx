@@ -100,7 +100,7 @@ func TestDownloadLinkRejectsMalformedPathsAndMethods(t *testing.T) {
 	} {
 		t.Run(path, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
-			registry.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+			registry.ServeHTTP(recorder, httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil))
 			if recorder.Code != http.StatusNotFound {
 				t.Fatalf("GET %q status = %d, want 404", path, recorder.Code)
 			}
@@ -108,7 +108,7 @@ func TestDownloadLinkRejectsMalformedPathsAndMethods(t *testing.T) {
 	}
 
 	recorder := httptest.NewRecorder()
-	registry.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/dl/"+token, nil))
+	registry.ServeHTTP(recorder, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/dl/"+token, nil))
 	if recorder.Code != http.StatusMethodNotAllowed || recorder.Header().Get("Allow") != http.MethodGet {
 		t.Fatalf("POST status/Allow = %d/%q", recorder.Code, recorder.Header().Get("Allow"))
 	}
@@ -121,7 +121,7 @@ func TestDownloadLinkSecurityHeadersAndDisposition(t *testing.T) {
 		t.Fatal(err)
 	}
 	recorder := httptest.NewRecorder()
-	registry.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dl/"+token, nil))
+	registry.ServeHTTP(recorder, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/dl/"+token, nil))
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
 	}
@@ -145,6 +145,34 @@ func TestDownloadLinkSecurityHeadersAndDisposition(t *testing.T) {
 	}
 }
 
+type deadlineRecorder struct {
+	*httptest.ResponseRecorder
+	deadline time.Time
+}
+
+func (r *deadlineRecorder) SetWriteDeadline(deadline time.Time) error {
+	r.deadline = deadline
+	return nil
+}
+
+func TestDownloadLinkClearsWriteDeadlineBeforeServingRange(t *testing.T) {
+	registry, rel := newTestLinkRegistry(t, []byte("abcdef"))
+	token, _, err := registry.Create(rel, "shared.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/dl/"+token, nil)
+	request.Header.Set("Range", "bytes=1-3")
+	registry.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusPartialContent || recorder.Body.String() != "bcd" {
+		t.Fatalf("range response = %d %q, want 206 bcd", recorder.Code, recorder.Body.String())
+	}
+	if !recorder.deadline.IsZero() {
+		t.Fatalf("write deadline = %s, want cleared", recorder.deadline)
+	}
+}
+
 func TestDownloadLinkExpiresAtDeadline(t *testing.T) {
 	registry, rel := newTestLinkRegistry(t, []byte("expired"))
 	now := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)
@@ -155,7 +183,7 @@ func TestDownloadLinkExpiresAtDeadline(t *testing.T) {
 	}
 	now = expires
 	recorder := httptest.NewRecorder()
-	registry.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/dl/"+token, nil))
+	registry.ServeHTTP(recorder, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/dl/"+token, nil))
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("expired link status = %d, want 404", recorder.Code)
 	}

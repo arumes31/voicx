@@ -1,32 +1,27 @@
-// Package version holds the build metadata embedded into voicx binaries via
-// -ldflags -X at build time. Both the server and the Wails client import it
-// (the client module reuses it through `replace voicx => ../`).
+// Package version owns the version displayed by voicx binaries.
 //
-// Version string format: <base>+<build>[.<commit>][-dirty], e.g.
-//
-//	0.4.0+87.abc1234
-//	0.4.0+87.abc1234-dirty
-//
-// where Build is `git rev-list --count HEAD` (auto-increments on every
-// commit) and Commit is the short SHA. Binaries built without ldflags show
-// "0.0.0-dev".
+// Release tags provide stable semantic versions. Development builds add the
+// Git revision and (when needed) a source fingerprint. Linker
+// flags may provide richer metadata, but plain `go build` and `wails build`
+// still fall back to the VCS information embedded by the Go toolchain.
 package version
 
-import (
-	"strconv"
-	"strings"
-)
+// DeclaredRelease is the compile-time release line used by unstamped builds.
+// The repository check keeps it synchronized with VERSION.
+const DeclaredRelease = "0.4.0"
+
+const defaultVersion = DeclaredRelease + "-dev"
 
 var (
-	// Version is the base semver (from the VERSION file at build time).
-	Version = "0.0.0-dev"
-	// Build is the commit count (git rev-list --count HEAD).
+	// Version is the semantic release line. Untagged builds use a -dev suffix.
+	Version = defaultVersion
+	// Build is retained as diagnostic metadata for older build scripts.
 	Build = ""
-	// Commit is the short git SHA.
+	// Commit is the Git revision.
 	Commit = ""
-	// BuildDate is the RFC 3339 build timestamp.
+	// BuildDate is the RFC 3339 commit or build timestamp.
 	BuildDate = ""
-	// Dirty marks uncommitted changes at build time ("true"/"false").
+	// Dirty marks a build made from modified or untracked files.
 	Dirty = ""
 	// UpdateRepo is the GitHub "owner/repo" slug used for client
 	// auto-updates. Operators set it at build time; it defaults to a
@@ -38,80 +33,37 @@ var (
 	UpdatePublicKeys = ""
 )
 
-// String returns the full version string, e.g. "0.4.0+87.abc1234-dirty".
+// String returns the complete semantic build identity.
 func String() string {
-	s := Version
-	if Build != "" {
-		s += "+" + Build
-	}
-	if Commit != "" {
-		if Build == "" {
-			s += "+"
-		} else {
-			s += "."
-		}
-		s += Commit
-	}
-	if Dirty == "true" {
-		s += "-dirty"
-	}
-	return s
+	return Current().String()
 }
 
-// Short returns the base version plus build number, e.g. "0.4.0+87".
+// Short returns the canonical semantic build identity used in the main UI and
+// update comparisons.
 func Short() string {
-	if Build == "" {
-		return Version
-	}
-	return Version + "+" + Build
+	return Current().Short()
 }
 
-// Parse splits a version tag (with optional leading "v" and "+suffix") into
-// its base semver and build number. "v0.4.0+87" -> ("0.4.0", 87).
-func Parse(v string) (base string, build int) {
-	v = strings.TrimPrefix(v, "v")
-	base, plus, _ := strings.Cut(v, "+")
-	if plus != "" {
-		count, rest, _ := strings.Cut(plus, ".")
-		_ = rest // commit hash suffix ignored
-		build, _ = strconv.Atoi(count)
-	}
-	return base, build
+// Release returns only the stable numeric release line.
+func Release() string {
+	base, _ := Parse(Current().Version)
+	return base
 }
 
-// Compare reports whether release tag a is newer than version b, comparing
-// base semver first, then build number. It returns true when a > b.
+// Parse splits a version into its stable numeric base and legacy numeric build
+// metadata. For example, "v0.4.0+87" returns ("0.4.0", 87).
+func Parse(value string) (base string, build int) {
+	return parse(value)
+}
+
+// Compare reports whether release a is newer than version b. It follows SemVer
+// precedence, so build metadata does not affect ordering.
 func Compare(a, b string) bool {
-	baseA, buildA := Parse(a)
-	baseB, buildB := Parse(b)
-	if c := compareSemver(baseA, baseB); c != 0 {
-		return c > 0
-	}
-	return buildA > buildB
+	return compareVersions(a, b) > 0
 }
 
-// compareSemver compares two dotted numeric versions: -1, 0, or 1.
-func compareSemver(a, b string) int {
-	pa := strings.Split(a, ".")
-	pb := strings.Split(b, ".")
-	n := len(pa)
-	if len(pb) > n {
-		n = len(pb)
-	}
-	for i := 0; i < n; i++ {
-		var x, y int
-		if i < len(pa) {
-			x, _ = strconv.Atoi(pa[i])
-		}
-		if i < len(pb) {
-			y, _ = strconv.Atoi(pb[i])
-		}
-		if x != y {
-			if x > y {
-				return 1
-			}
-			return -1
-		}
-	}
-	return 0
+// IsPrerelease reports whether value is a valid semantic prerelease.
+func IsPrerelease(value string) bool {
+	parsed, valid := parseSemver(value)
+	return valid && len(parsed.prerelease) > 0
 }

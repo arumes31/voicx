@@ -1,7 +1,7 @@
 // Package health provides a minimal HTTP health/readiness endpoint for the
 // voicx server. It uses only the standard library: /healthz reports process
 // liveness (always 200 once serving) and /readyz reports readiness by
-// invoking a caller-supplied probe (typically a Postgres ping).
+// invoking a caller-supplied aggregate dependency check.
 package health
 
 import (
@@ -36,13 +36,23 @@ type Server struct {
 
 // SchemaVersionHandler reports the newest successfully applied migration.
 // The callback keeps the health package independent from a database driver.
-func SchemaVersionHandler(probe func(context.Context) (string, error)) http.Handler {
+// Probe errors are logged for operators but never returned to callers.
+func SchemaVersionHandler(logger *zap.Logger, probe func(context.Context) (string, error)) http.Handler {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if probe == nil {
+			logger.Warn("schema version probe is not configured")
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), readyTimeout)
 		defer cancel()
 		version, err := probe(ctx)
 		if err != nil {
-			http.Error(w, "schema version unavailable", http.StatusServiceUnavailable)
+			logger.Warn("schema version probe failed", zap.Error(err))
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -52,8 +62,8 @@ func SchemaVersionHandler(probe func(context.Context) (string, error)) http.Hand
 }
 
 // New constructs a Server that will listen on addr. ready is the readiness
-// probe invoked by /readyz; a nil return means ready. ready may be nil, in
-// which case /readyz always reports ready.
+// aggregate readiness check invoked by /readyz; a nil return means ready.
+// ready may be nil, in which case /readyz always reports ready.
 func New(addr string, logger *zap.Logger, ready func(ctx context.Context) error) *Server {
 	if logger == nil {
 		logger = zap.NewNop()
@@ -116,16 +126,21 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.srv.Shutdown(ctx)
 }
 
-// handleHealthz reports liveness: the process is up and serving. It returns
-// a small JSON body carrying the embedded version.
-func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
+// handleHealthz reports liveness: the process is up and serving. The build
+// version is useful for local diagnosis but is not disclosed to remote peers.
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_, _ = fmt.Fprintf(w, `{"status":"ok","version":%q}`+"\n", version.String())
+	if remoteIsLoopback(r.RemoteAddr) {
+		_, _ = fmt.Fprintf(w, `{"status":"ok","version":%q}`+"\n", version.String())
+		return
+	}
+	_, _ = w.Write([]byte(`{"status":"ok"}` + "\n"))
 }
 
 // handleReadyz reports readiness: 200 when the probe succeeds, 503 otherwise.
 func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request, ready func(ctx context.Context) error) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	if ready != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), readyTimeout)
 		defer cancel()

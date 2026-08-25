@@ -17,9 +17,15 @@ import (
 var assets embed.FS
 
 func main() {
+	configureStandardLogger()
 	// (331) crash handler: a panic anywhere in main writes a timestamped
 	// crash log that is offered at the next start.
 	guardCrash("main", runApp)
+}
+
+func configureStandardLogger() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.LUTC)
+	log.SetPrefix("")
 }
 
 // runApp is main's body under the crash guard.

@@ -30,7 +30,7 @@ func startTLSServer(t *testing.T, fs FileStore) (string, string, *Server) {
 		t.Fatalf("tlscert.Ensure: %v", err)
 	}
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -50,7 +50,7 @@ func startTLSServer(t *testing.T, fs FileStore) (string, string, *Server) {
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		conn, err := net.Dial("tcp", addr)
+		conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", addr)
 		if err == nil {
 			_ = conn.Close()
 			break
@@ -93,7 +93,7 @@ func pinnedTLSConfig(wantFP string) *tls.Config {
 // dialTransferTLS connects over pinned TLS and sends the init frame.
 func dialTransferTLS(t *testing.T, addr, fp, transferID, token string) net.Conn {
 	t.Helper()
-	conn, err := tls.Dial("tcp", addr, pinnedTLSConfig(fp))
+	conn, err := (&tls.Dialer{NetDialer: &net.Dialer{}, Config: pinnedTLSConfig(fp)}).DialContext(t.Context(), "tcp", addr)
 	if err != nil {
 		t.Fatalf("tls dial: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestFileTransferRequiresTLS(t *testing.T) {
 		t.Fatalf("InitUpload: %v", err)
 	}
 
-	conn, err := net.Dial("tcp", addr)
+	conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", addr)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -211,11 +211,11 @@ func TestFileTransferRequiresTLS13(t *testing.T) {
 	fs := newFakeFileStore()
 	addr, _, _ := startTLSServer(t, fs)
 
-	conn, err := tls.Dial("tcp", addr, &tls.Config{
+	conn, err := (&tls.Dialer{NetDialer: &net.Dialer{}, Config: &tls.Config{
 		InsecureSkipVerify: true, //nolint:gosec // protocol-version test
 		MinVersion:         tls.VersionTLS12,
 		MaxVersion:         tls.VersionTLS12,
-	})
+	}}).DialContext(t.Context(), "tcp", addr)
 	if err == nil {
 		_ = conn.Close()
 		t.Fatal("TLS 1.2 handshake succeeded, want rejection")
@@ -237,7 +237,7 @@ func TestFingerprintMismatchRejected(t *testing.T) {
 		t.Fatal("two generated certificates share a fingerprint")
 	}
 
-	conn, err := tls.Dial("tcp", addr, pinnedTLSConfig(otherFP))
+	conn, err := (&tls.Dialer{NetDialer: &net.Dialer{}, Config: pinnedTLSConfig(otherFP)}).DialContext(t.Context(), "tcp", addr)
 	if err == nil {
 		_ = conn.Close()
 		t.Fatal("handshake succeeded against a mismatched pin")

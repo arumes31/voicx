@@ -8,18 +8,20 @@ import "@fontsource-variable/jetbrains-mono";
 import { initMenu } from "./menu.js";
 import { initSettingsUI } from "./settings-ui.js";
 import { initClientInfo } from "./clientinfo.js";
-import { initUpdater } from "./updater.js";
+import { initUpdater, startupAutoCheck } from "./updater.js";
 import { playEvent, playChannelJoin, beep, testAll } from "./sounds.js";
 import {
     startMicMeter, stopMicMeter, pttRelease, makeLimiter,
     getUserVolume, isUserMuted, setUserMuted, registerUserChain, unregisterUserChain,
     setDucking, attachUserNormalizer, detachUserNormalizer, detachAllUserNormalizers,
     captureConstraints, markCaptureProfile, applyCaptureProfile,
+    syncMuteButton, renderMicStatus,
 } from "./audio.js";
 import {
     initVideo, videoTrackAdded, videoTrackRemoved, videoSpeaking,
     videoRefreshNames, clearVideoGrid, shareToggle, setLowBandwidth, isLowBandwidth,
     parseTrackID, SLOT_SCREEN_AUDIO, cameraToggle, resetCameraState, clearRegionBox, trackSlots,
+    renegotiate,
 } from "./video.js";
 import * as chatUI from "./chat-ui.js";
 import { initPermsUI } from "./perms-ui.js";
@@ -35,6 +37,7 @@ import { extractPresentedFingerprint } from "./security.js";
 import { isActivationKey } from "./a11y.js";
 import { createLiveAnnouncementQueue } from "./live-announcer.js";
 import { dialogFocusableSelector, initModalSystem, mountServerDialog } from "./modal.js";
+import { parseRuntimeObject } from "./runtime-json.js";
 
 const P = () => window.__voicxPerms;
 window.__voicxChat = chatUI;
@@ -79,7 +82,11 @@ const state = {
     avatarPending: new Set(),
     serverGeneration: 0, // invalidates async responses when the active server tab changes
     settings: null,
+    activeTabID: "", // frontend-observed active tab; guards async finalizers against tab switches
+    replayingTabID: "", // journal replay is view restoration, not fresh activity
+    pendingInitialChannelCueTabID: "", // new tab's first own-channel cue waits for replay
     lastConnect: null,   // {addr, nick, pw, spw, bookmark} for reconnect-on-loss
+    lastSuccessfulConnect: null, // in-memory only; keeps manual tray reconnect available after Disconnect
     tabConnects: new Map(), // (281) tab ID -> its own lastConnect record
     pendingBookmark: null, // (334) {name, addr} of the bookmark loaded into the login dialog
     reconnectAttempts: 0,
@@ -178,7 +185,10 @@ function applyAppearance() {
     root.style.setProperty("--font-body", fonts[s.ui_font] || fonts.outfit);
     root.style.fontSize = (s.ui_font_size || 14) + "px";
     // (293) restore compact mode.
-    document.body.classList.toggle("compact", !!s.compact_mode);
+    const compact = !!s.compact_mode;
+    if (compact) window.__voicxFiles?.activateWorkspaceTab?.("chat", { focus: false });
+    document.body.classList.toggle("compact", compact);
+    if (compact) window.__voicxFiles?.restoreVisibleWorkspaceFocus?.();
 }
 
 // ---------------------------------------------------------------------------
@@ -261,39 +271,70 @@ async function connectFromLogin() {
     const nick = $("login-nick").value.trim();
     const pw = $("login-password").value;
     const spw = $("login-serverpw").value;
+    // A bridge call can outlive a tab switch. Only the tab/generation that
+    // initiated this login may announce its eventual failure.
+    const requestServerGeneration = state.serverGeneration;
+    const requestTabID = state.activeTabID;
+    const playCurrentConnectionFailure = () => {
+        if (requestServerGeneration === state.serverGeneration && requestTabID === state.activeTabID) {
+            playEvent("connection_failed");
+        }
+    };
     $("login-error").textContent = "";
     // (334) a nickname override replaces the login nickname, so addr+nickname
     // no longer identifies the bookmark this login came from: forward the name
     // the bookmark menu stashed, unless the dialog was retargeted since.
     const bookmark = state.pendingBookmark?.addr === addr ? state.pendingBookmark.name : "";
     try {
-        const err = await window.go.main.App.ConnectBookmarkTab(bookmark, addr, nick, pw, spw);
+        const { error: err, tabID } = await connectBookmarkTabWithID(
+            bookmark, addr, nick, pw, spw);
         if (err) {
             // (4a) TOFU fingerprint mismatch: prominent warning + explicit
             // trust action — never silently accepted.
             if (err.startsWith("tls fingerprint mismatch")) {
+                playCurrentConnectionFailure();
                 showFingerprintWarning(addr, err);
                 return;
             }
+            playCurrentConnectionFailure();
             $("login-error").textContent = err;
             return;
         }
-        state.myNickname = nick;
-        await rememberTabConnect({ addr, nick, pw, spw, bookmark });
         // (334) consumed: lastConnect carries the name for reconnects from
         // here on. Clearing only on success keeps the retry after a rejected
         // password identifiable.
         state.pendingBookmark = null;
+        const connection = { addr, nick, pw, spw, bookmark };
+        const ownsActiveTab = await rememberTabConnect(connection, null, tabID);
+        if (!ownsActiveTab) return;
+        const finalizationGeneration = state.serverGeneration;
+        // A legacy binding has no tab ID, so retain the direct warning path.
+        // Current bindings check the exact tab from tabs.js after activation.
+        const clockWarning = tabID ? "" : await certificateClockWarning(addr);
         state.reconnectAttempts = 0;
+        let myClientID = "";
+        let isAdmin = false;
+        let isGuest = !pw;
+        let security = "";
         try {
-            state.myClientID = await window.go.main.App.ClientID();
+            myClientID = await window.go.main.App.ClientID();
         } catch { /* client-id display/ducking degrade gracefully */ }
         try {
-            state.isAdmin = await window.go.main.App.IsAdmin();
-        } catch { state.isAdmin = false; }
+            isAdmin = await window.go.main.App.IsAdmin();
+        } catch { /* keep the least-privileged fallback */ }
         try {
-            state.isGuest = await window.go.main.App.IsGuest();
-        } catch { state.isGuest = !pw; }
+            isGuest = await window.go.main.App.IsGuest();
+        } catch { /* the credential-derived fallback remains valid */ }
+        try {
+            security = await window.go.main.App.ConnectionSecurity();
+        } catch { /* best-effort status line */ }
+        if (state.serverGeneration !== finalizationGeneration) return;
+        if (!await tabIsActive(tabID)) return;
+        if (state.serverGeneration !== finalizationGeneration) return;
+        state.myNickname = nick;
+        state.myClientID = myClientID;
+        state.isAdmin = isAdmin;
+        state.isGuest = isGuest;
         P()?.redeemPendingToken?.();
         $("conn-pill").textContent = addr;
         $("conn-pill").classList.add("up");
@@ -309,12 +350,12 @@ async function connectFromLogin() {
         window.__voicxSocial.refreshNews(); // (313) server news pane
         startQualitySampler(); // (333) connection quality pill
         noteActivity(); // (308) auto-away timer starts at connect
+        playEvent("connection_connected");
         // (4a) surface the connection security as an info line.
-        try {
-            const sec = await window.go.main.App.ConnectionSecurity();
-            sysMsg("connected: " + sec);
-        } catch { /* best-effort */ }
+        if (security) sysMsg("connected: " + security);
+        warnCertificateClock(clockWarning, addr);
     } catch (e) {
+        playCurrentConnectionFailure();
         $("login-error").textContent = String(e);
     } finally {
         submit.disabled = false;
@@ -361,30 +402,332 @@ async function showFingerprintWarning(addr, detail) {
     mountServerDialog(overlay, { initialFocus: ".dlg-cancel" });
 }
 
+function normalizeConnectResult(result) {
+    if (typeof result === "string") return { tabID: "", error: result };
+    return {
+        tabID: String(result?.tab_id || ""),
+        error: String(result?.error || ""),
+    };
+}
+
+async function connectBookmarkTabWithID(bookmark, addr, nick, pw, spw) {
+    const method = window.go.main.App.ConnectBookmarkTabWithID;
+    if (typeof method === "function") {
+        return normalizeConnectResult(await method(bookmark, addr, nick, pw, spw));
+    }
+    return normalizeConnectResult(
+        await window.go.main.App.ConnectBookmarkTab(bookmark, addr, nick, pw, spw));
+}
+
+async function activeTabInfo() {
+    try {
+        return (await window.go.main.App.ListTabs()).find((tab) => tab.active) || null;
+    } catch {
+        return null;
+    }
+}
+
+async function tabIsActive(tabID) {
+    if (!tabID) return true; // compatibility with pre-tab-ID bindings
+    if (state.activeTabID && state.activeTabID !== tabID) return false;
+    const active = await activeTabInfo();
+    if (state.activeTabID && state.activeTabID !== tabID) return false;
+    return active?.id === tabID;
+}
+
+async function certificateClockWarning(expectedAddr = "", expectedTabID = "") {
+    const generation = state.serverGeneration;
+    try {
+        if (expectedTabID && !await tabIsActive(expectedTabID)) return "";
+        const warning = String(await window.go.main.App.CertificateClockWarning() || "").trim();
+        if (!expectedAddr && !expectedTabID) return warning;
+        // If the user switched tabs while the bridge call was pending, do not
+        // attribute the active tab's certificate warning to this server.
+        const active = await activeTabInfo();
+        if (generation !== state.serverGeneration) return "";
+        if (expectedTabID && active?.id !== expectedTabID) return "";
+        return active?.addr && expectedAddr && active.addr !== expectedAddr ? "" : warning;
+    } catch {
+        return "";
+    }
+}
+
+function warnCertificateClock(warning, addr) {
+    if (!warning) return;
+    const context = addr ? `Certificate timing warning for ${addr}: ` : "Certificate timing warning: ";
+    sysMsg(context + warning);
+    toast(context + warning, "warn", "alert");
+}
+
+const clockCheckedTabs = new Set();
+
+async function checkCertificateClock(addr, tabID = "") {
+    if (tabID && clockCheckedTabs.has(tabID)) return;
+    const warning = await certificateClockWarning(addr, tabID);
+    if (tabID) {
+        if (!await tabIsActive(tabID)) return;
+        clockCheckedTabs.add(tabID);
+    }
+    warnCertificateClock(warning, addr);
+}
+
 // rememberTabConnect files the credential record under the tab it belongs to
 // (281): switching away and back must restore the record a reconnect needs,
 // and only the connect call knows the password.
-async function rememberTabConnect(c) {
+async function rememberTabConnect(c, expectedGeneration = null, tabID = "") {
+    const active = await activeTabInfo();
+    if (expectedGeneration !== null && expectedGeneration !== reconnectGeneration) return false;
+    state.lastSuccessfulConnect = { ...c };
+    if (tabID) state.tabConnects.set(tabID, c);
+    else if (active) state.tabConnects.set(active.id, c);
+    if (tabID && (active?.id !== tabID || (state.activeTabID && state.activeTabID !== tabID))) return false;
     state.lastConnect = c;
-    try {
-        const active = (await window.go.main.App.ListTabs()).find((t) => t.active);
-        if (active) state.tabConnects.set(active.id, c);
-    } catch { /* lastConnect alone still covers the single-tab case */ }
+    return true;
 }
 
-async function disconnect() {
-    state.lastConnect = null; // intentional disconnect: no reconnect
+let reconnectCountdownTimer = null;
+let reconnectRequestPending = false;
+let reconnectGeneration = 0;
+let reconnectFailureSounded = false;
+let reconnectCueTimer = null;
+
+function autoReconnectEnabled() {
+    // Missing settings and pre-setting-version profiles inherit the safer
+    // default: recover an unexpectedly lost connection unless explicitly off.
+    return state.settings?.reconnect_on_loss !== false;
+}
+
+function clearReconnectTimer() {
     if (state.reconnectTimer) {
         clearTimeout(state.reconnectTimer);
         state.reconnectTimer = null;
     }
-    state.reconnectInFlight = false;
-    chatUI.cancelReconnectAnnouncementBatch();
-    await window.go.main.App.Disconnect();
+    if (reconnectCountdownTimer) {
+        clearInterval(reconnectCountdownTimer);
+        reconnectCountdownTimer = null;
+    }
+    if (reconnectCueTimer) {
+        clearTimeout(reconnectCueTimer);
+        reconnectCueTimer = null;
+    }
 }
 
+async function completeReconnect(c, generation, tabID) {
+    // The backend query must precede unrelated awaits so it reads the tab the
+    // reconnect just created. The message below also names that server.
+    const clockWarning = tabID ? "" : await certificateClockWarning(c.addr);
+    const ownsActiveTab = await rememberTabConnect(c, generation, tabID);
+    if (generation !== reconnectGeneration) return false;
+    const finalizationGeneration = state.serverGeneration;
+    state.reconnectAttempts = 0;
+    // A user-selected tab now owns the global UI. The reconnect still
+    // succeeded in the background, so stop retrying without painting over it.
+    if (!ownsActiveTab) return true;
+    let myClientID = state.myClientID;
+    let isAdmin = false;
+    let isGuest = !c.pw;
+    try {
+        myClientID = await window.go.main.App.ClientID();
+    } catch { /* client-id display and quality sampling degrade gracefully */ }
+    try {
+        isAdmin = await window.go.main.App.IsAdmin();
+    } catch { /* keep the least-privileged fallback */ }
+    try {
+        isGuest = await window.go.main.App.IsGuest();
+    } catch { /* the credential-derived fallback remains valid */ }
+    if (generation !== reconnectGeneration) return false;
+    if (state.serverGeneration !== finalizationGeneration) return true;
+    if (!await tabIsActive(tabID)) return true;
+    if (state.serverGeneration !== finalizationGeneration) return true;
+    state.myNickname = c.nick;
+    state.myClientID = myClientID;
+    state.isAdmin = isAdmin;
+    state.isGuest = isGuest;
+    P()?.redeemPendingToken?.();
+    $("conn-pill").textContent = c.addr;
+    $("conn-pill").classList.add("up");
+    $("conn-lock").classList.remove("hidden");
+    showWorkspace();
+    refreshPermissions();
+    applyWhisperSettings();
+    chatUI.onConnect();
+    P()?.refreshGroups?.().then(() => renderTree());
+    window.__voicxFiles?.loadServerIcon?.();
+    window.__voicxSocial?.refreshNews?.();
+    startQualitySampler();
+    noteActivity();
+    playEvent("connection_reconnected");
+    warnCertificateClock(clockWarning, c.addr);
+    return generation === reconnectGeneration;
+}
+
+async function attemptReconnect(c = state.lastConnect, { announceFailure = true } = {}) {
+    if (!c || state.reconnectInFlight) return false;
+    const generation = reconnectGeneration;
+    state.reconnectInFlight = true;
+    let err = "";
+    let tabID = "";
+    try {
+        const result = await connectBookmarkTabWithID(
+            c.bookmark || "", c.addr, c.nick, c.pw, c.spw);
+        err = result.error;
+        tabID = result.tabID;
+    } catch (cause) {
+        err = String(cause || "reconnect failed");
+    } finally {
+        state.reconnectInFlight = false;
+    }
+    if (generation !== reconnectGeneration) {
+        // Disconnect may have run while the native connect call was pending.
+        // If that stale call nevertheless opened a tab, close it before it can
+        // restore credentials or paint the UI as connected again.
+        if (!err && tabID) {
+            try { await window.go.main.App.CloseTab(tabID); } catch { /* best-effort stale-tab cleanup */ }
+        }
+        return false;
+    }
+    if (err) {
+        sysMsg("reconnect failed: " + err);
+        if (announceFailure) toast("Reconnect failed: " + err, "warn", "conn");
+        return false;
+    }
+    const completed = await completeReconnect(c, generation, tabID);
+    if (!completed && generation !== reconnectGeneration && tabID) {
+        try { await window.go.main.App.CloseTab(tabID); } catch { /* best-effort stale-tab cleanup */ }
+    }
+    return completed;
+}
+
+function scheduleReconnect(
+    target = state.lastConnect,
+    generation = reconnectGeneration,
+    sourceTabID = state.activeTabID,
+    sourceServerGeneration = state.serverGeneration,
+) {
+    const ownsSource = () => generation === reconnectGeneration
+        && sourceServerGeneration === state.serverGeneration
+        && sourceTabID === state.activeTabID;
+    if (generation !== reconnectGeneration || !autoReconnectEnabled() || !target || state.reconnectAttempts >= 5) {
+        if (target && state.reconnectAttempts >= 5 && !reconnectFailureSounded && ownsSource()) {
+            reconnectFailureSounded = true;
+            playEvent("connection_failed");
+        }
+        chatUI.cancelReconnectAnnouncementBatch();
+        showLogin();
+        return;
+    }
+    // Pin the retry series to the connection that dropped. A tab switch may
+    // replace state.lastConnect while the five-second countdown is running.
+    const reconnectTarget = { ...target };
+
+    if (state.reconnectAttempts === 0) {
+        reconnectFailureSounded = false;
+        // Let the loss contour complete before the recovery contour starts.
+        // The timer is cancelled by a manual disconnect or a newer connection.
+        reconnectCueTimer = setTimeout(() => {
+            reconnectCueTimer = null;
+            if (ownsSource() && state.lastConnect?.addr === reconnectTarget.addr) {
+                playEvent("connection_reconnecting");
+            }
+        }, 550);
+    }
+    state.reconnectAttempts++;
+    chatUI.beginReconnectAnnouncementBatch();
+    sysMsg(`reconnecting in 5s (attempt ${state.reconnectAttempts}/5)…`);
+    $("conn-pill").textContent = `retry ${state.reconnectAttempts}/5 in 5s…`;
+    let countdown = 4;
+    reconnectCountdownTimer = setInterval(() => {
+        if (countdown <= 0 || !state.reconnectTimer) {
+            clearInterval(reconnectCountdownTimer);
+            reconnectCountdownTimer = null;
+            return;
+        }
+        $("conn-pill").textContent = `retry ${state.reconnectAttempts}/5 in ${countdown--}s…`;
+    }, 1000);
+    state.reconnectTimer = setTimeout(async () => {
+        clearReconnectTimer();
+        if (generation !== reconnectGeneration) return;
+        const connected = await attemptReconnect(reconnectTarget, { announceFailure: false });
+        if (connected) return;
+        if (generation !== reconnectGeneration) return;
+        chatUI.cancelReconnectAnnouncementBatch();
+        scheduleReconnect(reconnectTarget, generation, sourceTabID, sourceServerGeneration);
+    }, 5000);
+}
+
+async function reconnectLastServerNow() {
+    // The native menu is disabled while connected. Keep this guard for a
+    // delayed menu click already queued by the operating system.
+    if (state.reconnectInFlight || reconnectRequestPending) return;
+    reconnectRequestPending = true;
+    try {
+        let isConnected = $("conn-pill").classList.contains("up");
+        try { isConnected ||= !!(await window.go.main.App.Connected()); } catch { /* visual state is the fallback */ }
+        if (isConnected || state.reconnectInFlight) return;
+
+        clearReconnectTimer();
+        const c = state.lastSuccessfulConnect;
+        if (!c) {
+            await window.__voicxTabs?.quickConnectLast?.();
+            return;
+        }
+        // Intentional Disconnect clears lastConnect to suppress automatic
+        // reconnect. Restore only the in-memory successful record after the
+        // user explicitly chooses the tray action.
+        state.lastConnect = { ...c };
+        chatUI.beginReconnectAnnouncementBatch();
+        $("conn-pill").textContent = "reconnecting now…";
+        const connected = await attemptReconnect(state.lastConnect);
+        if (connected) return;
+        chatUI.cancelReconnectAnnouncementBatch();
+        if (autoReconnectEnabled()) scheduleReconnect();
+        else showLogin();
+    } finally {
+        reconnectRequestPending = false;
+    }
+}
+
+window.runtime.EventsOn("tray_reconnect", () => { void reconnectLastServerNow(); });
+window.runtime.EventsOn("tray_disconnect", () => { void disconnect(); });
+
+async function disconnect() {
+    // Clear reconnect intent synchronously. CloseTab owns the actual
+    // intentional connection edge and publishes it before tab replacement.
+    const sourceServerGeneration = state.serverGeneration;
+    const sourceTabID = state.activeTabID;
+    const wasVisiblyConnected = $("conn-pill").classList.contains("up");
+    const ownsSource = () => sourceServerGeneration === state.serverGeneration
+        && sourceTabID === state.activeTabID;
+    reconnectGeneration++;
+    state.lastConnect = null; // intentional disconnect: no reconnect
+    clearReconnectTimer();
+    chatUI.cancelReconnectAnnouncementBatch();
+    try {
+        await window.go.main.App.Disconnect();
+    } catch {
+        // The local cancellation above is still intentional even when the
+        // bridge is already gone. Surface one actionable connection warning
+        // instead of leaking an unhandled tray-event rejection.
+        if (wasVisiblyConnected && ownsSource()) {
+            toast("disconnect failed", "warn", "conn");
+            playEvent("connection_failed");
+        }
+    }
+}
+
+// Go emits this before disconnecting an active connected tab and before a
+// replacement tab's reset/replay batch. It centralizes menu, tray and tab-X
+// teardown into one exactly-once user-facing connection edge.
+window.runtime.EventsOn("intentional_disconnect", (tabID) => {
+    if (String(tabID || "") !== state.activeTabID) return;
+    if (state.settings?.notify_connection !== false) toast("Disconnected", "info", "conn");
+    playEvent("connection_disconnected");
+});
+
 window.runtime.EventsOn("disconnected", () => {
-    if (state.settings?.notify_connection !== false) toast("Connection lost", "warn", "conn");
+    const unexpected = !!state.lastConnect;
+    if (unexpected && state.settings?.notify_connection !== false) toast("Connection lost", "warn", "conn");
+    if (unexpected) playEvent("connection_lost");
     sysMsg("disconnected from server");
     // (32/33) whisper state is per-connection: client IDs and the server-side
     // whisper list do not survive a reconnect.
@@ -392,78 +735,24 @@ window.runtime.EventsOn("disconnected", () => {
     state.whisperArmed = false;
     state.whisperPrev = null;
     state.myChannelID = 0;
+    state.myClientID = "";
     resetVoiceSession();
-    stopQualitySampler();
     state.selectedClientID = "";
     state.isGuest = true;
     setDetailsOpen(false);
     $("conn-pill").textContent = "offline";
     $("conn-pill").classList.remove("up");
+    stopQualitySampler();
 
-    // Reconnect on connection loss (Application setting): 5 tries, 5s apart.
-    if (state.settings?.reconnect_on_loss && state.lastConnect && state.reconnectAttempts < 5) {
-        state.reconnectAttempts++;
-        chatUI.beginReconnectAnnouncementBatch();
-        sysMsg(`reconnecting in 5s (attempt ${state.reconnectAttempts}/5)…`);
-        // (332) reconnect timeline in the status pill.
-        $("conn-pill").textContent = `retry ${state.reconnectAttempts}/5 in 5s…`;
-        let countdown = 4;
-        const tick = setInterval(() => {
-            if (countdown <= 0 || !state.reconnectTimer) {
-                clearInterval(tick);
-                return;
-            }
-            $("conn-pill").textContent = `retry ${state.reconnectAttempts}/5 in ${countdown--}s…`;
-        }, 1000);
-        state.reconnectTimer = setTimeout(async () => {
-            clearInterval(tick);
-            state.reconnectTimer = null;
-            const c = state.lastConnect;
-            if (!c) {
-                chatUI.cancelReconnectAnnouncementBatch();
-                return;
-            }
-            state.reconnectInFlight = true;
-            let err;
-            try {
-                err = await window.go.main.App.ConnectBookmarkTab(c.bookmark || "", c.addr, c.nick, c.pw, c.spw);
-            } catch (cause) {
-                err = String(cause || "reconnect failed");
-            } finally {
-                state.reconnectInFlight = false;
-            }
-            if (err === "") {
-                // (281) the retry opened a NEW tab: the record has to move with it.
-                await rememberTabConnect(c);
-                try {
-                    state.myClientID = await window.go.main.App.ClientID();
-                } catch { /* best-effort */ }
-                try {
-                    state.isAdmin = await window.go.main.App.IsAdmin();
-                } catch { state.isAdmin = false; }
-                try {
-                    state.isGuest = await window.go.main.App.IsGuest();
-                } catch { state.isGuest = !c.pw; }
-                P()?.redeemPendingToken?.();
-                $("conn-pill").textContent = c.addr;
-                $("conn-pill").classList.add("up");
-                showWorkspace();
-                refreshPermissions();
-                applyWhisperSettings();
-                chatUI.onConnect();
-                P().refreshGroups().then(() => renderTree());
-            } else {
-                chatUI.cancelReconnectAnnouncementBatch();
-            }
-        }, 5000);
-        return;
-    }
-    showLogin();
+    // Unexpected loss reconnects by default. An explicit false setting opts
+    // out; intentional disconnects clear lastConnect before this event.
+    scheduleReconnect();
 });
 
 window.runtime.EventsOn("servererror", (msg) => {
     const text = String(msg).replace(/^\d+:\s*/, "");
     toast(text || "The server rejected that action", "warn");
+    playEvent("server_error");
 });
 
 // (282) the Go side maintains settings of its own (recents on every connect),
@@ -530,26 +819,67 @@ function qualityFromPing(pingMs, known) {
 }
 
 let qualityTimer = null;
+let qualityAgeTimer = null;
+let qualitySamplerEpoch = 0;
+let lastQualitySample = null;
+
+function qualitySampleAge(at, now = Date.now()) {
+    const seconds = Math.max(0, Math.floor((now - at) / 1000));
+    if (seconds < 5) return "just now";
+    if (seconds < 60) return `${seconds} second${seconds === 1 ? "" : "s"} ago`;
+    const minutes = Math.floor(seconds / 60);
+    return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+}
+
+function renderQualitySample() {
+    if (!lastQualitySample) return;
+    const pill = $("conn-pill");
+    pill.dataset.quality = lastQualitySample.quality;
+    pill.title = `connection quality: ${lastQualitySample.quality} ` +
+        `(RTT ${lastQualitySample.pingMs} ms, sampled ${qualitySampleAge(lastQualitySample.at)})`;
+}
 
 function startQualitySampler() {
     stopQualitySampler();
-    qualityTimer = setInterval(async () => {
+    const epoch = qualitySamplerEpoch;
+    const generation = state.serverGeneration;
+    const sample = async () => {
         if (!state.myClientID) return;
+        const clientID = state.myClientID;
         try {
-            const info = await window.go.main.App.GetClientInfo(state.myClientID);
+            const info = await window.go.main.App.GetClientInfo(clientID);
+            if (epoch !== qualitySamplerEpoch || generation !== state.serverGeneration ||
+                clientID !== state.myClientID) return;
             const q = qualityFromPing(info.ping_ms, info.ping_ms >= 0);
-            const pill = $("conn-pill");
-            pill.dataset.quality = q;
-            if (q) pill.title = `connection quality: ${q} (RTT ${info.ping_ms} ms)`;
-        } catch { /* transient */ }
-    }, 5000);
+            if (q) {
+                lastQualitySample = { quality: q, pingMs: info.ping_ms, at: Date.now() };
+                renderQualitySample();
+            }
+        } catch {
+            // Keep the last successful sample, but age it so stale telemetry
+            // is never presented as current.
+            if (epoch === qualitySamplerEpoch) renderQualitySample();
+        }
+    };
+    sample();
+    qualityTimer = setInterval(sample, 5000);
+    qualityAgeTimer = setInterval(renderQualitySample, 1000);
 }
 
 function stopQualitySampler() {
+    qualitySamplerEpoch++;
     if (qualityTimer) {
         clearInterval(qualityTimer);
         qualityTimer = null;
     }
+    if (qualityAgeTimer) {
+        clearInterval(qualityAgeTimer);
+        qualityAgeTimer = null;
+    }
+    lastQualitySample = null;
+    const pill = $("conn-pill");
+    delete pill.dataset.quality;
+    pill.title = pill.classList.contains("up") ? "" : "Offline — no current RTT sample";
 }
 
 // ---------------------------------------------------------------------------
@@ -564,8 +894,24 @@ function stopQualitySampler() {
 const lastKnownChannel = new Map();
 const LAST_CHANNEL_MAX = 200;
 
+function actionSoundsSuppressed() {
+    return !!state.replayingTabID;
+}
+
+// A tab switch replays the other tab's journal so the view can be rebuilt.
+// That history is not live join/leave activity and must never play cues.
+window.runtime.EventsOn("tab_replay_done", (tabID) => {
+    if (String(tabID || "") !== state.replayingTabID) return;
+    state.replayingTabID = "";
+    // Identity resolution may have won or lost the race with this marker.
+    // In either case, this resolves a new tab's first own-channel cue exactly
+    // once, while restored tabs have no pending cue to play.
+    syncOwnChannel({ audible: false });
+});
+
 window.runtime.EventsOn("snapshot", (json) => {
-    const snap = JSON.parse(json);
+    const snap = parseRuntimeObject(json);
+    if (!snap) return;
     // broadcast.ClientInfo does not serialize priority_speaker, so carry the
     // flags over from the previous state (they arrive via
     // priority_speaker_changed events).
@@ -598,17 +944,38 @@ window.runtime.EventsOn("snapshot", (json) => {
 
 // syncOwnChannel makes channel ownership independent of whether the snapshot
 // / user_moved event or the active-tab ClientID lookup finishes first.
-function syncOwnChannel() {
+function syncOwnChannel({ audible = true } = {}) {
     if (!state.myClientID) return;
     const me = state.clients.find((c) => c.client_id === state.myClientID);
     if (!me) return;
     const channelID = Number(me.channel_id) || 0;
     if (state.myChannelID === channelID) {
+        // Identity can resolve while journal replay is still muted. In that
+        // ordering it has already recorded our initial channel, so replay_done
+        // must flush the pending new-tab join from this equality branch.
+        const initialCuePending = state.pendingInitialChannelCueTabID === state.activeTabID;
+        if (initialCuePending && channelID > 0 && !actionSoundsSuppressed()) {
+            playChannelJoin();
+            state.pendingInitialChannelCueTabID = "";
+        }
         ensureVoiceForChannel();
         return;
     }
+    const previousChannelID = state.myChannelID;
     state.myChannelID = channelID;
-    if (channelID > 0) playChannelJoin();
+    const initialCuePending = state.pendingInitialChannelCueTabID === state.activeTabID;
+    let playedCue = false;
+    if ((audible || initialCuePending) && !actionSoundsSuppressed()) {
+        if (channelID > 0) {
+            if (previousChannelID > 0) playEvent("own_channel_switch");
+            else playChannelJoin();
+            playedCue = true;
+        } else if (previousChannelID > 0) {
+            playEvent("own_channel_leave");
+            playedCue = true;
+        }
+    }
+    if (playedCue && initialCuePending) state.pendingInitialChannelCueTabID = "";
     expandMyBranch();
     applyChannelAudio();
     chatUI.onMyChannelChanged();
@@ -682,7 +1049,8 @@ function flattenChannel(node) {
 }
 
 window.runtime.EventsOn("channellist", (json) => {
-    const list = JSON.parse(json);
+    const list = parseRuntimeObject(json);
+    if (!list) return;
     for (const ch of list.channels || []) {
         if (!state.channels.find((c) => c.ChannelID === Number(ch.id))) {
             state.channels.push({ ChannelID: Number(ch.id), ParentID: 0, Name: ch.name, HasIcon: false });
@@ -692,7 +1060,8 @@ window.runtime.EventsOn("channellist", (json) => {
 });
 
 window.runtime.EventsOn("event", (json) => {
-    const env = JSON.parse(json);
+    const env = parseRuntimeObject(json);
+    if (!env) return;
     const d = env.data || {};
     switch (env.type) {
         case "user_joined": {
@@ -708,7 +1077,8 @@ window.runtime.EventsOn("event", (json) => {
                 if (joinedChannel === state.myChannelID && state.myChannelID !== 0) {
                     // (385) joins in my channel dispatch through the matrix.
                     window.__voicxNotify?.notify("join_leave", (d.nickname || "someone") + " joined your channel",
-                        { channelID: state.myChannelID, className: "joins", kind: "info" });
+                        { channelID: state.myChannelID, className: "joins", kind: "info",
+                            soundEvent: "user_join", noSound: actionSoundsSuppressed() });
                 }
             }
             break;
@@ -726,9 +1096,10 @@ window.runtime.EventsOn("event", (json) => {
                     }
                 }
                 chatUI.sysJoinLeave(was.nickname || was.unique_id || "someone", "left"); // (130/131)
-                if (was.channel_id === state.myChannelID && state.myChannelID !== 0) {
+                if (was.client_id !== state.myClientID && was.channel_id === state.myChannelID && state.myChannelID !== 0) {
                     window.__voicxNotify?.notify("join_leave", (was.nickname || "someone") + " left your channel",
-                        { channelID: state.myChannelID, className: "joins", kind: "info" });
+                        { channelID: state.myChannelID, className: "joins", kind: "info",
+                            soundEvent: "user_leave", noSound: actionSoundsSuppressed() });
                 }
             }
             videoTrackRemoved(d.client_id);
@@ -737,20 +1108,46 @@ window.runtime.EventsOn("event", (json) => {
         }
         case "user_moved": {
             const c = state.clients.find((c) => c.client_id === d.client_id);
-            if (c) c.channel_id = d.channel_id;
+            const previousRemoteChannelID = Number(c?.channel_id) || 0;
+            const nextChannelID = Number(d.channel_id) || 0;
+            if (c) c.channel_id = nextChannelID;
             if (d.client_id === state.myClientID) {
                 const previousChannelID = state.myChannelID;
-                state.myChannelID = d.channel_id;
-                if (d.channel_id > 0 && d.channel_id !== previousChannelID) playChannelJoin();
+                state.myChannelID = nextChannelID;
+                let playedOwnCue = false;
+                if (!actionSoundsSuppressed()) {
+                    if (nextChannelID > 0 && nextChannelID !== previousChannelID) {
+                        if (previousChannelID > 0) playEvent("own_channel_switch");
+                        else playChannelJoin();
+                        playedOwnCue = true;
+                    } else if (nextChannelID === 0 && previousChannelID > 0) {
+                        playEvent("own_channel_leave");
+                        playedOwnCue = true;
+                    }
+                }
+                // A new tab can finish its replay in channel 0, then receive
+                // its first live self-move. That live cue fulfills the pending
+                // initial transition; leave no marker for a later equality
+                // sync to replay the same join.
+                if (playedOwnCue && state.pendingInitialChannelCueTabID === state.activeTabID) {
+                    state.pendingInitialChannelCueTabID = "";
+                }
                 expandMyBranch(); // (302)
                 applyChannelAudio();
                 chatUI.onMyChannelChanged(); // (103/111) load history + header for the new channel
                 window.__voicxFiles?.onChannelChanged?.(); // (256) file browser follows the channel
-                recordRecentChannel(d.channel_id); // (320) recent channels
+                recordRecentChannel(nextChannelID); // (320) recent channels
                 ensureVoiceForChannel();
-            } else if (d.channel_id === state.myChannelID && state.myChannelID !== 0 && c) {
-                window.__voicxNotify?.notify("join_leave", (c.nickname || "someone") + " joined your channel",
-                    { channelID: state.myChannelID, className: "joins", kind: "info" });
+            } else if (c && nextChannelID === state.myChannelID && state.myChannelID !== 0
+                && previousRemoteChannelID !== nextChannelID) {
+                window.__voicxNotify?.notify("join_leave", (c.nickname || "someone") + " moved into your channel",
+                    { channelID: state.myChannelID, className: "joins", kind: "info",
+                        soundEvent: "user_move_in", noSound: actionSoundsSuppressed() });
+            } else if (c && previousRemoteChannelID === state.myChannelID && state.myChannelID !== 0
+                && previousRemoteChannelID !== nextChannelID) {
+                window.__voicxNotify?.notify("join_leave", (c.nickname || "someone") + " moved out of your channel",
+                    { channelID: previousRemoteChannelID, className: "joins", kind: "info",
+                        soundEvent: "user_move_out", noSound: actionSoundsSuppressed() });
             }
             recomputeDucking();
             break;
@@ -799,7 +1196,10 @@ window.runtime.EventsOn("event", (json) => {
                 state.collapsedChannels.delete(channelID);
                 state.expandedVirtual.delete(channelID);
             }
-            if (selfDisplaced) state.myChannelID = 0;
+            if (selfDisplaced) {
+                if (state.myChannelID > 0 && !actionSoundsSuppressed()) playEvent("own_channel_leave");
+                state.myChannelID = 0;
+            }
             chatUI.onChannelsDeleted([...deleted]);
             if (selfDisplaced) {
                 chatUI.onMyChannelChanged();
@@ -1666,7 +2066,10 @@ let voiceStartPromise = null;
 // session, while disconnecting or changing server tabs tears it down.
 function ensureVoiceForChannel() {
     if (state.myChannelID <= 0) {
-        if (state.pc || state.localStream || voiceStartPromise) resetVoiceSession();
+        if (state.pc || state.localStream || voiceStartPromise ||
+            state.micState === "none" || state.micState === "denied") {
+            resetVoiceSession();
+        }
         return Promise.resolve(false);
     }
     if (state.pc) {
@@ -1704,6 +2107,8 @@ function resetVoiceSession() {
     voiceSessionEpoch++;
     teardownVoice();
     resetVoiceUI();
+    state.micState = "unknown";
+    renderMicStatus($("mic-status"), "unknown");
 }
 
 // (25) Capture follows the joined channel's audio profile: a music channel is
@@ -1717,6 +2122,10 @@ function audioConstraints() {
 function videoConstraints() {
     const fps = state.settings?.camera_fps || 30;
     return { width: 640, height: 360, frameRate: { ideal: fps } };
+}
+
+function microphoneFailureState(error) {
+    return error?.name === "NotAllowedError" || error?.name === "SecurityError" ? "denied" : "none";
 }
 
 async function startVoice(expectedEpoch = voiceSessionEpoch) {
@@ -1741,6 +2150,9 @@ async function startVoice(expectedEpoch = voiceSessionEpoch) {
                     video: videoConstraints(),
                 });
             } catch (ve) {
+                if (expectedEpoch === voiceSessionEpoch && state.myChannelID > 0) {
+                    setMicState(microphoneFailureState(micErr));
+                }
                 throw new Error("no microphone or camera available (mic: " +
                     (micErr.name || micErr) + ", camera: " + (ve.name || ve) + ")");
             }
@@ -1751,7 +2163,7 @@ async function startVoice(expectedEpoch = voiceSessionEpoch) {
         state.localStream = null;
         return false;
     }
-    setMicState(micErr === null ? "ok" : micErr.name === "NotAllowedError" ? "denied" : "none");
+    setMicState(micErr === null ? "ok" : microphoneFailureState(micErr));
     // (25) record which profile this capture was taken with, so a later move
     // only re-captures when the profile actually changes.
     markCaptureProfile(state.localStream.getAudioTracks()[0],
@@ -1782,6 +2194,10 @@ async function startVoice(expectedEpoch = voiceSessionEpoch) {
     const pc = iceServers && iceServers.length
         ? new RTCPeerConnection({ iceServers })
         : new RTCPeerConnection();
+    // A replacement peer owns a new ICE-restart ladder. Dispose the previous
+    // current owner's timer before publishing the replacement; callbacks from
+    // that old peer can never affect the new one.
+    if (state.pc && state.pc !== pc) resetICERestart(state.pc);
     state.pc = pc;
 
     const audioTrack = state.localStream.getAudioTracks()[0];
@@ -1808,8 +2224,12 @@ async function startVoice(expectedEpoch = voiceSessionEpoch) {
 
     pc.onicecandidate = (e) => {
         if (e.candidate) {
-            window.go.main.App.SendICECandidate(
-                e.candidate.candidate, e.candidate.sdpMid || "", e.candidate.sdpMLineIndex || 0);
+            // A candidate can arrive while teardown has already closed the
+            // control bridge. There is nothing useful to show for that race,
+            // but its rejected promise must not become an unhandled one.
+            void window.go.main.App.SendICECandidate(
+                e.candidate.candidate, e.candidate.sdpMid || "", e.candidate.sdpMLineIndex || 0,
+            ).catch(() => {});
         }
     };
     // (59) ICE restart: re-offer with iceRestart on failed/disconnected,
@@ -1932,62 +2352,96 @@ $("voice-prio").onclick = async () => {
 const ICE_BACKOFF_MS = [1000, 2000, 5000, 15000];
 let iceFailures = 0;
 let iceTimer = null;
+let iceFailureNotified = false;
+let iceRestartPC = null;
+
+function ownsICERestart(pc) {
+    return state.pc === pc && iceRestartPC === pc;
+}
+
+function claimICERestart(pc) {
+    if (state.pc !== pc) return false;
+    if (iceRestartPC === pc) return true;
+    // This can only be reached by the current peer. A prior owner's timer is
+    // stale at this point and must not keep the current ladder blocked.
+    if (iceTimer !== null) clearTimeout(iceTimer);
+    iceRestartPC = pc;
+    iceFailures = 0;
+    iceTimer = null;
+    iceFailureNotified = false;
+    return true;
+}
 
 function onICEStateChange(pc) {
+    if (pc !== state.pc) return;
     const s = pc.iceConnectionState;
     if (s === "connected" || s === "completed") {
-        resetICERestart();
+        resetICERestart(pc);
         return;
     }
-    if ((s === "failed" || s === "disconnected") && iceTimer === null) {
-        scheduleICERestart();
+    if (s === "failed" || s === "disconnected") {
+        scheduleICERestart(pc);
     }
 }
 
-function resetICERestart() {
+function resetICERestart(pc) {
+    if (!ownsICERestart(pc)) return;
+    if (iceTimer !== null) clearTimeout(iceTimer);
     iceFailures = 0;
-    if (iceTimer !== null) {
-        clearTimeout(iceTimer);
-        iceTimer = null;
-    }
+    iceFailureNotified = false;
+    iceTimer = null;
+    iceRestartPC = null;
 }
 
-function scheduleICERestart() {
-    if (!state.pc) return;
+function scheduleICERestart(pc) {
+    if (state.pc !== pc || !claimICERestart(pc) || !ownsICERestart(pc)) return;
+    if (iceTimer !== null) return;
     if (iceFailures >= ICE_BACKOFF_MS.length) {
-        toast("Voice connection unstable — reconnect if it does not recover", "warn", "conn");
+        if (!iceFailureNotified) {
+            iceFailureNotified = true;
+            toast("Voice connection unstable — reconnect if it does not recover", "warn", "conn");
+        }
         return;
     }
     const delay = ICE_BACKOFF_MS[iceFailures++];
-    iceTimer = setTimeout(async () => {
+    let timer = null;
+    timer = setTimeout(async () => {
+        if (!ownsICERestart(pc) || iceTimer !== timer) return;
         iceTimer = null;
-        const pc = state.pc;
-        if (!pc) return;
         const s = pc.iceConnectionState;
         if (s === "connected" || s === "completed" || s === "closed") {
-            resetICERestart();
+            resetICERestart(pc);
             return;
         }
         try {
             const offer = await pc.createOffer({ iceRestart: true });
+            if (!ownsICERestart(pc)) return;
             await pc.setLocalDescription(offer);
+            if (!ownsICERestart(pc)) return;
             const answerSDP = await window.go.main.App.WebRTCOffer(offer.sdp, trackSlots());
+            if (!ownsICERestart(pc)) return;
             await pc.setRemoteDescription({ type: "answer", sdp: answerSDP });
-        } catch (e) {
-            sysMsg("ice restart failed: " + e);
+        } catch {
+            // Retry scheduling below owns failure feedback. Per-attempt chat
+            // lines would flood the conversation during a bad network spell.
         }
         // Still not connected: oniceconnectionstatechange may not fire again
         // for a persistent failure, so chain the next backoff step explicitly.
-        if (state.pc === pc && !["connected", "completed", "closed"].includes(pc.iceConnectionState)) {
-            scheduleICERestart();
+        if (ownsICERestart(pc) && !["connected", "completed", "closed"].includes(pc.iceConnectionState)) {
+            scheduleICERestart(pc);
         }
     }, delay);
+    if (!ownsICERestart(pc)) {
+        clearTimeout(timer);
+        return;
+    }
+    iceTimer = timer;
 }
 
 function teardownVoice() {
     stopVoiceMonitor();
     stopMicMeter();
-    resetICERestart();
+    resetICERestart(state.pc);
     if (unduckTimer) {
         clearTimeout(unduckTimer);
         unduckTimer = null;
@@ -2047,24 +2501,111 @@ function resetVoiceUI() {
 function setMicState(s) {
     state.micState = s;
     const el = $("mic-status");
+    const videoOnly = !!state.localStream?.getVideoTracks?.().length;
+    renderMicStatus(el, s, retryMicrophoneAccess, videoOnly, $("ptt-btn"));
     if (s === "ok") {
-        el.textContent = "";
         $("ptt-btn").disabled = false;
     } else if (s === "none") {
-        el.textContent = "No microphone found — video only";
         $("ptt-btn").disabled = true;
-        sysMsg("no microphone found; joined voice video-only");
+        sysMsg(videoOnly ? "no microphone found; joined voice video-only" :
+            "no microphone found; voice capture unavailable");
     } else if (s === "denied") {
-        el.textContent = "Mic access denied — video only";
         $("ptt-btn").disabled = true;
-        sysMsg("microphone access denied; joined voice video-only");
+        sysMsg(videoOnly ? "microphone access denied; joined voice video-only" :
+            "microphone access denied; voice capture unavailable");
+    }
+}
+
+let micRetryPromise = null;
+
+// Retry only the missing microphone. Keeping the existing peer connection and
+// local video stream avoids interrupting a working camera or screen share.
+function retryMicrophoneAccess() {
+    if (micRetryPromise) return micRetryPromise;
+    micRetryPromise = retryMicrophoneCapture().finally(() => {
+        micRetryPromise = null;
+    });
+    return micRetryPromise;
+}
+
+async function retryMicrophoneCapture() {
+    if (state.myChannelID <= 0) return false;
+    // A session where every capture device failed has no peer connection to
+    // extend. In that case retry the normal staged capture flow.
+    if (!state.pc || !state.localStream) {
+        return ensureVoiceForChannel();
+    }
+    if (state.localStream.getAudioTracks().length > 0) {
+        setMicState("ok");
+        return true;
+    }
+
+    const peerConnection = state.pc;
+    const localStream = state.localStream;
+    const expectedEpoch = voiceSessionEpoch;
+    const generation = state.serverGeneration;
+    const current = () => state.pc === peerConnection && state.localStream === localStream &&
+        voiceSessionEpoch === expectedEpoch && state.serverGeneration === generation && state.myChannelID > 0;
+    let capturedStream;
+    try {
+        capturedStream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints() });
+    } catch (error) {
+        if (current()) setMicState(microphoneFailureState(error));
+        return false;
+    }
+
+    const audioTrack = capturedStream.getAudioTracks()[0];
+    if (!audioTrack) {
+        capturedStream.getTracks().forEach((track) => track.stop());
+        if (current()) setMicState("none");
+        return false;
+    }
+    if (!current()) {
+        capturedStream.getTracks().forEach((track) => track.stop());
+        return false;
+    }
+
+    localStream.addTrack(audioTrack);
+    markCaptureProfile(audioTrack, state.channels.find((channel) => channel.ChannelID === state.myChannelID));
+    let transceiver = null;
+    try {
+        transceiver = peerConnection.addTransceiver(audioTrack, {
+            direction: "sendrecv",
+            streams: [localStream],
+        });
+        await renegotiate(peerConnection, generation);
+        if (!current()) throw new DOMException("voice session changed", "AbortError");
+        await applyChannelAudio();
+        startVoiceMonitor();
+        startMicMeter(localStream);
+        applyVoiceState();
+        setMicState("ok");
+        setVoiceStatus("voice on");
+        sysMsg("microphone connected");
+        return true;
+    } catch (error) {
+        localStream.removeTrack(audioTrack);
+        audioTrack.stop();
+        await transceiver?.sender?.replaceTrack(null).catch(() => {});
+        try {
+            if (transceiver) transceiver.direction = "inactive";
+        } catch { /* the peer connection may already be closed */ }
+        if (!current()) return false;
+        setMicState(state.micState === "denied" ? "denied" : "none");
+        sysMsg("microphone retry failed: " + (error?.message || error));
+        return false;
+    } finally {
+        for (const track of capturedStream.getTracks()) {
+            if (track !== audioTrack) track.stop();
+        }
     }
 }
 
 // Server->client ICE and renegotiation.
 window.runtime.EventsOn("ice", (json) => {
     if (!state.pc) return;
-    const c = JSON.parse(json);
+    const c = parseRuntimeObject(json);
+    if (!c) return;
     state.pc.addIceCandidate({
         candidate: c.candidate,
         sdpMid: c.sdp_mid || null,
@@ -2072,13 +2613,26 @@ window.runtime.EventsOn("ice", (json) => {
     }).catch(() => {});
 });
 
-window.runtime.EventsOn("offer", async (json) => {
-    if (!state.pc) return;
-    const o = JSON.parse(json);
-    await state.pc.setRemoteDescription({ type: "offer", sdp: o.sdp });
-    const answer = await state.pc.createAnswer();
-    await state.pc.setLocalDescription(answer);
-    window.go.main.App.WebRTCAnswer(answer.sdp);
+window.runtime.EventsOn("offer", (json) => {
+    const pc = state.pc;
+    const o = parseRuntimeObject(json);
+    if (!pc || !o || typeof o.sdp !== "string") return;
+    const generation = state.serverGeneration;
+    // Wails does not observe a returned event-handler promise. Contain every
+    // async rejection here so a failed renegotiation cannot surface globally.
+    // A tab reset may replace both the active backend and its peer while the
+    // offer is pending, so never answer through the new backend for old SDP.
+    void (async () => {
+        try {
+            await pc.setRemoteDescription({ type: "offer", sdp: o.sdp });
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            if (generation !== state.serverGeneration || state.pc !== pc) return;
+            await window.go.main.App.WebRTCAnswer(answer.sdp);
+        } catch {
+            // The peer may have closed or a later negotiation may have won.
+        }
+    })();
 });
 
 // Mute / deafen / PTT ---------------------------------------------------------
@@ -2414,6 +2968,11 @@ function setPTT(active) {
         $("ptt-btn").classList.toggle("live", effective);
         $("ptt-btn").setAttribute("aria-pressed", String(effective));
         window.go.main.App.SetPTT(effective);
+        // VAD continuously changes pttActive as speech starts and stops; only
+        // physical push-to-talk actions earn an audible confirmation.
+        if ((state.settings?.activation_mode || "ptt") === "ptt") {
+            playEvent(effective ? "ptt_on" : "ptt_off");
+        }
         applyVoiceState();
         updateTalkBanner();
     });
@@ -2435,19 +2994,21 @@ $("ptt-btn").addEventListener("blur", () => setPTT(false));
 
 $("voice-mute").onclick = () => {
     state.muted = !state.muted;
-    $("voice-mute").classList.toggle("active", state.muted);
-    $("voice-mute").setAttribute("aria-pressed", String(state.muted));
+    syncMuteButton($("voice-mute"), state.muted);
     window.go.main.App.SetMuted(state.muted);
     if (state.muted) playEvent("mic_off");
     else playEvent("mic_on");
     applyVoiceState();
     renderTree();
 };
+syncMuteButton($("voice-mute"), state.muted);
 
 function setDeafened(on) {
+    if (state.deafened === on) return;
     state.deafened = on;
     $("remote-video").muted = on;
     if (remoteChain.master) remoteChain.master.gain.value = on ? 0 : Math.min(2, (state.settings?.volume ?? 100) / 100);
+    playEvent(on ? "deafen_on" : "deafen_off");
     renderTree();
 }
 
@@ -2514,7 +3075,9 @@ window.runtime.EventsOn("hotkey", (action) => {
 // only. Toggled from the View menu or the compact hotkey.
 function toggleCompact() {
     const on = !document.body.classList.contains("compact");
+    if (on) window.__voicxFiles?.activateWorkspaceTab?.("chat", { focus: false });
     document.body.classList.toggle("compact", on);
+    window.__voicxFiles?.restoreVisibleWorkspaceFocus?.();
     if (state.settings) {
         state.settings.compact_mode = on;
         window.go.main.App.SaveSettings(state.settings);
@@ -2672,7 +3235,10 @@ window.__voicx = {
     connectFromLogin, renderTree, setChannelExpanded, setDetailsOpen, setDirectTargetVisible,
     clientName, initials, fetchAvatar,
     applyAppearance, toggleCompact, recentChannels, syncOwnChannel,
-    ensureVoiceForChannel, resetVoiceSession,
+    playConnectionCue: (event = "connection_connected") => playEvent(event),
+    startQualitySampler, stopQualitySampler,
+    checkCertificateClock,
+    ensureVoiceForChannel, resetVoiceSession, retryMicrophoneAccess,
     // (70) shared system audio controls for the screen tile's context menu.
     shareAudioCtl: {
         get: (clientID) => {

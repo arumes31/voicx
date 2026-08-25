@@ -30,8 +30,12 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// Chat service handles channel chat, global server chat, direct messages,
-// and offline message spool requests.
+// Deprecated: Chat is intentionally unserved. End-to-end and scope-key
+// encrypted chat stays on the control channel; the message types remain for
+// descriptor and source compatibility while clients migrate away from this RPC
+// service.
+//
+// Deprecated: Do not use.
 type ChatClient interface {
 	// SendChannelChat sends a message to a channel.
 	SendChannelChat(ctx context.Context, in *SendChannelChatRequest, opts ...grpc.CallOption) (*SendChatResponse, error)
@@ -49,6 +53,7 @@ type chatClient struct {
 	cc grpc.ClientConnInterface
 }
 
+// Deprecated: Do not use.
 func NewChatClient(cc grpc.ClientConnInterface) ChatClient {
 	return &chatClient{cc}
 }
@@ -107,8 +112,12 @@ func (c *chatClient) AckOfflineMessages(ctx context.Context, in *AckOfflineMessa
 // All implementations must embed UnimplementedChatServer
 // for forward compatibility.
 //
-// Chat service handles channel chat, global server chat, direct messages,
-// and offline message spool requests.
+// Deprecated: Chat is intentionally unserved. End-to-end and scope-key
+// encrypted chat stays on the control channel; the message types remain for
+// descriptor and source compatibility while clients migrate away from this RPC
+// service.
+//
+// Deprecated: Do not use.
 type ChatServer interface {
 	// SendChannelChat sends a message to a channel.
 	SendChannelChat(context.Context, *SendChannelChatRequest) (*SendChatResponse, error)
@@ -155,6 +164,7 @@ type UnsafeChatServer interface {
 	mustEmbedUnimplementedChatServer()
 }
 
+// Deprecated: Do not use.
 func RegisterChatServer(s grpc.ServiceRegistrar, srv ChatServer) {
 	// If the following call pancis, it indicates UnimplementedChatServer was
 	// embedded by pointer and is nil.  This will cause panics if an

@@ -30,6 +30,10 @@ export function CancelTransfer(arg1) {
   return window['go']['main']['App']['CancelTransfer'](arg1);
 }
 
+export function CertificateClockWarning() {
+  return window['go']['main']['App']['CertificateClockWarning']();
+}
+
 export function ChannelEdit(arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9) {
   return window['go']['main']['App']['ChannelEdit'](arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9);
 }
@@ -106,6 +110,10 @@ export function CloseTab(arg1) {
   return window['go']['main']['App']['CloseTab'](arg1);
 }
 
+export function DisconnectTab(arg1) {
+  return window['go']['main']['App']['DisconnectTab'](arg1);
+}
+
 export function ComplaintClear(arg1, arg2) {
   return window['go']['main']['App']['ComplaintClear'](arg1, arg2);
 }
@@ -122,12 +130,20 @@ export function ConnectBookmarkTab(arg1, arg2, arg3, arg4, arg5) {
   return window['go']['main']['App']['ConnectBookmarkTab'](arg1, arg2, arg3, arg4, arg5);
 }
 
+export function ConnectBookmarkTabWithID(arg1, arg2, arg3, arg4, arg5) {
+  return window['go']['main']['App']['ConnectBookmarkTabWithID'](arg1, arg2, arg3, arg4, arg5);
+}
+
 export function ConnectGuest(arg1, arg2) {
   return window['go']['main']['App']['ConnectGuest'](arg1, arg2);
 }
 
 export function ConnectGuestBookmarkTab(arg1, arg2, arg3) {
   return window['go']['main']['App']['ConnectGuestBookmarkTab'](arg1, arg2, arg3);
+}
+
+export function ConnectGuestBookmarkTabWithID(arg1, arg2, arg3) {
+  return window['go']['main']['App']['ConnectGuestBookmarkTabWithID'](arg1, arg2, arg3);
 }
 
 export function ConnectGuestTab(arg1, arg2) {
@@ -460,6 +476,10 @@ export function RegenerateIdentity() {
 
 export function RenameIdentity(arg1, arg2) {
   return window['go']['main']['App']['RenameIdentity'](arg1, arg2);
+}
+
+export function SaveChatAttachment(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['SaveChatAttachment'](arg1, arg2, arg3, arg4);
 }
 
 export function SaveSettings(arg1) {

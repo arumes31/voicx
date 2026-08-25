@@ -134,6 +134,50 @@ func TestGuestTokenPromotionDB(t *testing.T) {
 	}
 }
 
+func TestUseTokenRestoresExpiredGroupMembership(t *testing.T) {
+	s := testDBStore(t)
+	ctx := context.Background()
+	suffix := fmt.Sprint(time.Now().UnixNano())
+	userID := seedTestUser(t, s, suffix)
+	groupID, err := s.CreateGroup(ctx, "server", "expired_token_"+suffix, 1)
+	if err != nil {
+		t.Fatalf("CreateGroup: %v", err)
+	}
+	t.Cleanup(func() { _ = s.DeleteGroup(ctx, "server", groupID, true) })
+
+	// Use a fixed past cutoff and a parameterized insert so this regression does
+	// not depend on the database clock or a short wall-clock wait.
+	expiredAt := time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC)
+	const seedExpired = `INSERT INTO server_group_members (user_id, server_group_id, expires_at)
+		VALUES ($1, $2, $3)`
+	if _, err := s.DB().ExecContext(ctx, seedExpired, userID, groupID, expiredAt); err != nil {
+		t.Fatalf("seeding expired group membership: %v", err)
+	}
+
+	key, err := s.CreateToken(ctx, 0, groupID, 1)
+	if err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+	t.Cleanup(func() { _ = s.DeleteToken(ctx, key) })
+	grant, err := s.UseTokenForIdentity(ctx, key, userID, "", "")
+	if err != nil {
+		t.Fatalf("UseTokenForIdentity: %v", err)
+	}
+	if grant.GroupID != groupID {
+		t.Fatalf("group grant = %d, want %d", grant.GroupID, groupID)
+	}
+
+	var active bool
+	const membershipActive = `SELECT expires_at IS NULL FROM server_group_members
+		WHERE user_id = $1 AND server_group_id = $2`
+	if err := s.DB().QueryRowContext(ctx, membershipActive, userID, groupID).Scan(&active); err != nil {
+		t.Fatalf("querying restored group membership: %v", err)
+	}
+	if !active {
+		t.Fatal("token redemption left the group membership expired")
+	}
+}
+
 // TestDeleteComplaintsAgainstDB covers the targeted and blanket clears.
 func TestDeleteComplaintsAgainstDB(t *testing.T) {
 	s := testDBStore(t)

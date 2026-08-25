@@ -25,7 +25,7 @@ func setupLegacyChatConsistency(
 	s.DB().SetMaxIdleConns(1)
 	applyPreLedgerMigrations(t, s, "015z_chat_consistency_columns.sql")
 
-	if _, err := s.DB().Exec(`CREATE SCHEMA legacy_shadow;
+	if _, err := s.DB().ExecContext(t.Context(), `CREATE SCHEMA legacy_shadow;
 		CREATE TABLE legacy_shadow.chat_messages
 			(LIKE public.chat_messages INCLUDING ALL);
 		ALTER TABLE legacy_shadow.chat_messages
@@ -46,7 +46,7 @@ func setupLegacyChatConsistency(
 		t.Fatalf("creating legacy 016 database shape: %v", err)
 	}
 	if wrongPublicIndex {
-		if _, err := s.DB().Exec(`ALTER TABLE public.chat_messages
+		if _, err := s.DB().ExecContext(t.Context(), `ALTER TABLE public.chat_messages
 			ADD COLUMN version BIGINT NOT NULL DEFAULT 1;
 			ALTER TABLE public.chat_messages ADD COLUMN client_msg_id TEXT;
 			CREATE INDEX idx_chat_messages_client_msg_id
@@ -60,18 +60,18 @@ func setupLegacyChatConsistency(
 		if name >= "015z_chat_consistency_columns.sql" {
 			break
 		}
-		if _, err := s.DB().Exec(`INSERT INTO public.schema_migrations
+		if _, err := s.DB().ExecContext(t.Context(), `INSERT INTO public.schema_migrations
 			(filename, checksum) VALUES ($1, $2)`, name, migrationChecksum(t, name)); err != nil {
 			t.Fatalf("recording applied pre-016 migration %s: %v", name, err)
 		}
 	}
-	if _, err := s.DB().Exec(`INSERT INTO public.schema_migrations
+	if _, err := s.DB().ExecContext(t.Context(), `INSERT INTO public.schema_migrations
 		(filename, checksum) VALUES ($1, $2)`, legacyChatConsistencyFilename, legacyChecksum); err != nil {
 		t.Fatalf("recording legacy 016 checksum: %v", err)
 	}
 	// Persist a historically unsafe path on the sole pooled connection. The
 	// current runner must neither trust its indexes nor redirect public repair.
-	if _, err := s.DB().Exec(`SET search_path = legacy_shadow, public, pg_catalog`); err != nil {
+	if _, err := s.DB().ExecContext(t.Context(), `SET search_path = legacy_shadow, public, pg_catalog`); err != nil {
 		t.Fatalf("setting legacy non-public search path: %v", err)
 	}
 	return s

@@ -36,7 +36,7 @@ const (
 // Control service handles authentication, channel management, permission
 // queries, and file transfer control.
 type ControlClient interface {
-	// Authenticate validates credentials and returns a session token.
+	// Authenticate validates credentials and returns the authenticated user ID.
 	Authenticate(ctx context.Context, in *AuthenticateRequest, opts ...grpc.CallOption) (*AuthenticateResponse, error)
 	// CreateChannel creates a new channel under an optional parent.
 	CreateChannel(ctx context.Context, in *CreateChannelRequest, opts ...grpc.CallOption) (*CreateChannelResponse, error)
@@ -46,7 +46,8 @@ type ControlClient interface {
 	ListChannels(ctx context.Context, in *ListChannelsRequest, opts ...grpc.CallOption) (*ListChannelsResponse, error)
 	// QueryPermissions returns the effective permissions for a user in a channel.
 	QueryPermissions(ctx context.Context, in *QueryPermissionsRequest, opts ...grpc.CallOption) (*QueryPermissionsResponse, error)
-	// File transfer control RPCs.
+	// File transfer RPCs intentionally return UNIMPLEMENTED. Transfer tokens are
+	// minted only by the control channel after a per-client permission check.
 	StartFileTransfer(ctx context.Context, in *StartFileTransferRequest, opts ...grpc.CallOption) (*StartFileTransferResponse, error)
 	GetFileTransferStatus(ctx context.Context, in *GetFileTransferStatusRequest, opts ...grpc.CallOption) (*GetFileTransferStatusResponse, error)
 	CancelFileTransfer(ctx context.Context, in *CancelFileTransferRequest, opts ...grpc.CallOption) (*CancelFileTransferResponse, error)
@@ -147,7 +148,7 @@ func (c *controlClient) CancelFileTransfer(ctx context.Context, in *CancelFileTr
 // Control service handles authentication, channel management, permission
 // queries, and file transfer control.
 type ControlServer interface {
-	// Authenticate validates credentials and returns a session token.
+	// Authenticate validates credentials and returns the authenticated user ID.
 	Authenticate(context.Context, *AuthenticateRequest) (*AuthenticateResponse, error)
 	// CreateChannel creates a new channel under an optional parent.
 	CreateChannel(context.Context, *CreateChannelRequest) (*CreateChannelResponse, error)
@@ -157,7 +158,8 @@ type ControlServer interface {
 	ListChannels(context.Context, *ListChannelsRequest) (*ListChannelsResponse, error)
 	// QueryPermissions returns the effective permissions for a user in a channel.
 	QueryPermissions(context.Context, *QueryPermissionsRequest) (*QueryPermissionsResponse, error)
-	// File transfer control RPCs.
+	// File transfer RPCs intentionally return UNIMPLEMENTED. Transfer tokens are
+	// minted only by the control channel after a per-client permission check.
 	StartFileTransfer(context.Context, *StartFileTransferRequest) (*StartFileTransferResponse, error)
 	GetFileTransferStatus(context.Context, *GetFileTransferStatusRequest) (*GetFileTransferStatusResponse, error)
 	CancelFileTransfer(context.Context, *CancelFileTransferRequest) (*CancelFileTransferResponse, error)

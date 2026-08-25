@@ -86,6 +86,46 @@ func TestIdentityRoundTrip(t *testing.T) {
 	}
 }
 
+func TestOfflineIdentityUIDAndInfoFollowAppActiveIdentity(t *testing.T) {
+	a := identityTestApp(t, "off")
+	first := a.IdentityUID()
+	if first == "" {
+		t.Fatal("offline active identity UID is empty")
+	}
+	info := a.IdentityInfo()
+	if info.UniqueID != first || info.Path == "" {
+		t.Fatalf("offline identity info = %+v, want UID %q", info, first)
+	}
+	if err := a.CreateIdentity("second"); err != "" {
+		t.Fatal(err)
+	}
+	if err := a.SwitchIdentity("second"); err != "" {
+		t.Fatal(err)
+	}
+	second := a.IdentityUID()
+	info = a.IdentityInfo()
+	if second == "" || second == first || info.UniqueID != second || !strings.HasSuffix(info.Path, "second.json") {
+		t.Fatalf("switched offline identity UID/info = %q/%+v", second, info)
+	}
+}
+
+func TestNewAppOfflineIdentityUIDIsGeneratedFromAppActivePath(t *testing.T) {
+	root := t.TempDir()
+	oldRoot, oldProtection := identityRootOverride, keyProtectionSetting
+	identityRootOverride = root
+	keyProtectionSetting = func() string { return "off" }
+	t.Cleanup(func() {
+		identityRootOverride = oldRoot
+		keyProtectionSetting = oldProtection
+	})
+	a := NewApp()
+	uid := a.IdentityUID()
+	info := a.IdentityInfo()
+	if uid == "" || info.UniqueID != uid || info.Path == "" {
+		t.Fatalf("NewApp offline identity = %q/%+v", uid, info)
+	}
+}
+
 // TestIdentityKeyProtection covers both halves of 354: with protection on the
 // stored private key is a DPAPI blob that still round-trips, and with it off
 // the plaintext fallback keeps working.
@@ -266,6 +306,33 @@ func TestIdentityIDsCannotEscapeStore(t *testing.T) {
 	}
 }
 
+func TestMissingIdentityMutationsNeverCreateCredential(t *testing.T) {
+	a := identityTestApp(t, "off")
+	if err := a.CreateIdentity("second"); err != "" {
+		t.Fatal(err)
+	}
+	const missing = "raced-away"
+	path, err := identityPathFor(missing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SwitchIdentity(missing); err == "" {
+		t.Fatal("switch accepted missing identity")
+	}
+	if err := a.RenameIdentity(missing, "new name"); err == "" {
+		t.Fatal("rename accepted missing identity")
+	}
+	if err := a.DeleteIdentity(missing, true); err == "" {
+		t.Fatal("delete accepted missing identity")
+	}
+	if got := a.ImproveIdentityLevel(missing, 2, 1); got.Error == "" {
+		t.Fatal("improve accepted missing identity")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("missing identity mutation created %q: %v", path, err)
+	}
+}
+
 // TestLegacyIdentityMigrates verifies the pre-351 single identity.json is
 // adopted instead of a new key being minted — that key is the user's account
 // on every server they have joined (351).
@@ -386,6 +453,56 @@ func TestIdentityBackupReminder(t *testing.T) {
 	}
 	if !a.IdentityBackupPending() {
 		t.Fatal("backup marker is global, not per identity")
+	}
+}
+
+func TestExportNeverWritesStaleIdentityBackOverRegeneration(t *testing.T) {
+	a := identityTestApp(t, "off")
+	src := a.ListIdentities()[0].Path
+	stale, err := loadOrCreateIdentityAt(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := newIdentity("replacement")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveIdentityAt(src, replacement); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(t.TempDir(), "stale-backup.json")
+	if err := exportIdentityTo(dest, src, stale); err != nil {
+		t.Fatal(err)
+	}
+	live, err := loadOrCreateIdentityAt(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := live.uniqueID()
+	want, _ := replacement.uniqueID()
+	if got != want {
+		t.Fatal("stale export overwrote regenerated identity")
+	}
+	if live.ExportedAt != 0 {
+		t.Fatal("stale export marked replacement as backed up")
+	}
+}
+
+func TestExportStampDoesNotRecreateDeletedIdentity(t *testing.T) {
+	a := identityTestApp(t, "off")
+	src := a.ListIdentities()[0].Path
+	id, err := loadOrCreateIdentityAt(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(src); err != nil {
+		t.Fatal(err)
+	}
+	if err := stampIdentityExported(src, id, time.Now().Unix()); err == nil {
+		t.Fatal("stamping a deleted identity unexpectedly succeeded")
+	}
+	if _, err := os.Stat(src); !os.IsNotExist(err) {
+		t.Fatalf("export stamping recreated deleted identity: %v", err)
 	}
 }
 

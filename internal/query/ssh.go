@@ -18,12 +18,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
 	"go.uber.org/zap"
 	"golang.org/x/crypto/ssh"
 
+	"voicx/internal/auth"
 	"voicx/internal/safecast"
 )
 
@@ -77,7 +79,7 @@ func (s *SSHServer) Start(ctx context.Context) error {
 	}
 	cfg.AddHostKey(signer)
 
-	ln, err := net.Listen("tcp", s.Addr)
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", s.Addr)
 	if err != nil {
 		return fmt.Errorf("query ssh listen on %s: %w", s.Addr, err)
 	}
@@ -155,14 +157,19 @@ func (s *SSHServer) Close() error {
 }
 
 // passwordCallback authenticates an SSH login with the query credentials and
-// feeds the same per-IP lockout counter as the TCP port.
+// feeds the same source-and-principal limiter as the TCP query port.
 func (s *SSHServer) passwordCallback(ctx context.Context) func(ssh.ConnMetadata, []byte) (*ssh.Permissions, error) {
 	authFailed := errors.New("invalid loginname or password")
 	return func(meta ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
 		ip := hostOnly(meta.RemoteAddr().String())
-		if s.base.lockedOut(ip) {
+		sourceScope := auth.LoginFailureScope("ssh:"+ip, "")
+		principalScope := auth.LoginFailureScope("", meta.User())
+		attempt, allowed := s.base.ReserveLoginAttempt(sourceScope, principalScope)
+		if !allowed {
+			s.base.RecordAuthFailure("ssh", "locked_out")
 			return nil, errors.New("too many failed logins, try again later")
 		}
+		defer attempt.Cancel()
 		ok, admin, err := s.base.backend.Authenticate(ctx, meta.User(), string(password))
 		if err != nil {
 			s.logger.Warn("query ssh login error", zap.Error(err))
@@ -171,10 +178,11 @@ func (s *SSHServer) passwordCallback(ctx context.Context) func(ssh.ConnMetadata,
 		if !ok || !admin {
 			// Non-admins are refused like bad credentials: ServerQuery is
 			// admin-only and the distinction would confirm an account.
-			s.base.recordLoginFailure(ip)
+			attempt.Fail()
+			s.base.RecordAuthFailure("ssh", "invalid_credentials")
 			return nil, authFailed
 		}
-		s.base.clearLoginFailures(ip)
+		attempt.Succeed(principalScope)
 		return nil, nil
 	}
 }
@@ -304,6 +312,31 @@ func hostOnly(addr string) string {
 	return host
 }
 
+// readPrivateKeyFile reads a private key from one opened descriptor. On
+// POSIX, accepting group- or world-readable key material would disclose the
+// SSH server identity, so fail closed without changing operator-managed modes.
+func readPrivateKeyFile(path, label string) ([]byte, error) {
+	// #nosec G304 -- callers pass administrator-selected private-key paths.
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("%s %q permissions %o are too permissive; remove group and other access", label, path, info.Mode().Perm())
+	}
+	raw, err := io.ReadAll(f)
+	if err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
 // loadOrCreateHostKey reads the ed25519 host key at path, generating and
 // persisting one (0600) when it is missing.
 func loadOrCreateHostKey(path string) (ssh.Signer, error) {
@@ -312,7 +345,7 @@ func loadOrCreateHostKey(path string) (ssh.Signer, error) {
 	}
 	// #nosec G304 -- path is an administrator-selected SSH host-key location,
 	// intentionally outside a fixed application data root.
-	raw, err := os.ReadFile(path)
+	raw, err := readPrivateKeyFile(path, "SSH host key")
 	if err == nil {
 		return ssh.ParsePrivateKey(raw)
 	}
@@ -336,7 +369,7 @@ func loadOrCreateHostKey(path string) (ssh.Signer, error) {
 	// #nosec G304 -- path is the same administrator-selected host-key location.
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if errors.Is(err, os.ErrExist) {
-		raw, readErr := os.ReadFile(path) // #nosec G304 -- configured host-key path.
+		raw, readErr := readPrivateKeyFile(path, "SSH host key")
 		if readErr != nil {
 			return nil, readErr
 		}

@@ -3,6 +3,7 @@ package grpcserver
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
 
 	"go.uber.org/zap"
@@ -36,16 +37,18 @@ type eventsService struct {
 // the event types the proto schema can express. Fields absent from a given
 // event stay zero.
 type busEvent struct {
-	ClientID   string `json:"client_id"`
-	UniqueID   string `json:"unique_id"`
-	Nickname   string `json:"nickname"`
-	ChannelID  int64  `json:"channel_id"`
-	Name       string `json:"name"`
-	ParentID   int64  `json:"parent_id"`
-	ByClientID string `json:"by_client_id"`
-	Reason     string `json:"reason"`
-	Ban        bool   `json:"ban"`
-	Speaking   bool   `json:"speaking"`
+	ClientID      string `json:"client_id"`
+	UniqueID      string `json:"unique_id"`
+	Nickname      string `json:"nickname"`
+	ChannelID     int64  `json:"channel_id"`
+	FromChannelID int64  `json:"from_channel_id"`
+	Name          string `json:"name"`
+	ParentID      int64  `json:"parent_id"`
+	ByClientID    string `json:"by_client_id"`
+	Reason        string `json:"reason"`
+	Ban           bool   `json:"ban"`
+	Speaking      bool   `json:"speaking"`
+	ExpiresAt     int64  `json:"expires_at"`
 }
 
 // busTypeFor maps a proto EventType to the internal broadcast type string.
@@ -78,22 +81,20 @@ func subscribedTypes(req *voicxv1.SubscribeEventsRequest) ([]string, map[voicxv1
 	if len(requested) == 0 {
 		return allBusTypes, nil, nil
 	}
-	wanted := map[voicxv1.EventType]bool{}
-	seen := map[string]bool{}
-	var busTypes []string
+	wanted := make(map[voicxv1.EventType]bool, len(requested))
+	seen := make(map[string]bool, len(requested))
+	busTypes := make([]string, 0, len(requested))
 	for _, t := range requested {
 		name, ok := busTypeFor[t]
 		if !ok {
-			continue
+			return nil, nil, status.Errorf(codes.InvalidArgument,
+				"unsupported event type %d (%s)", t, t.String())
 		}
 		wanted[t] = true
 		if !seen[name] {
 			seen[name] = true
 			busTypes = append(busTypes, name)
 		}
-	}
-	if len(wanted) == 0 {
-		return nil, nil, status.Error(codes.InvalidArgument, "event_types contains no supported values")
 	}
 	return busTypes, wanted, nil
 }
@@ -108,7 +109,7 @@ func (e *eventsService) Subscribe(req *voicxv1.SubscribeEventsRequest, stream gr
 	}
 	sub := e.bus.Subscribe("grpc:"+caller, busTypes, 0)
 	if sub == nil {
-		return nil
+		return status.Error(codes.Unavailable, "event stream unavailable")
 	}
 	defer sub.Unsubscribe()
 
@@ -125,11 +126,24 @@ func (e *eventsService) Subscribe(req *voicxv1.SubscribeEventsRequest, stream gr
 			return nil
 		case evt, ok := <-sub.C:
 			if !ok {
-				// Evicted by the drop policy: ending the stream tells the bot
-				// its view is no longer complete.
-				return nil
+				switch sub.CloseReason() {
+				case eventbus.CloseReasonSlowConsumer:
+					return status.Error(codes.ResourceExhausted, "event stream fell behind; resync required")
+				case eventbus.CloseReasonBusClosed:
+					return status.Error(codes.Unavailable, "event stream unavailable")
+				default:
+					return nil
+				}
 			}
-			msg := toProto(evt)
+			msg, err := toProto(evt)
+			if err != nil {
+				e.logger.Warn("dropping malformed eventbus payload",
+					zap.String("event_type", boundedEventType(evt.Type)),
+					zap.Uint64("sequence", evt.Seq),
+					zap.Error(err),
+				)
+				continue
+			}
 			if msg == nil || (wanted != nil && !wanted[msg.Type]) {
 				continue
 			}
@@ -140,21 +154,34 @@ func (e *eventsService) Subscribe(req *voicxv1.SubscribeEventsRequest, stream gr
 	}
 }
 
-// toProto converts a bus event into the proto envelope, or nil when the event
-// has no representation in the schema.
-func toProto(evt eventbus.Event) *voicxv1.Event {
+const maxLoggedEventTypeBytes = 64
+
+// boundedEventType retains enough type context for an operator without
+// allowing an unexpected producer to make a log field unbounded.
+func boundedEventType(eventType string) string {
+	if len(eventType) <= maxLoggedEventTypeBytes {
+		return eventType
+	}
+	return eventType[:maxLoggedEventTypeBytes] + "…"
+}
+
+// toProto converts a bus event into the proto envelope. It returns nil, nil
+// when the event has no representation in the schema, and returns an error
+// only when the payload could not be decoded.
+func toProto(evt eventbus.Event) (*voicxv1.Event, error) {
 	var payload busEvent
 	if len(evt.Data) > 0 {
 		if err := json.Unmarshal(evt.Data, &payload); err != nil {
-			return nil
+			return nil, fmt.Errorf("decode event payload: %w", err)
 		}
 	}
 	out := &voicxv1.Event{
 		Id:        formatUint(evt.Seq),
 		Timestamp: evt.Time.UnixMilli(),
 	}
-	// user_id is the SESSION id (client_id): it is the only identifier every
-	// event carries, so bots can correlate across event types.
+	// user_id and actor fields carry connected client/session IDs (client_id),
+	// not the persistent account identifier (unique_id). A client/session ID is
+	// available on every event, so bots can correlate across event types.
 	switch evt.Type {
 	case "user_joined":
 		out.Type = voicxv1.EventType_EVENT_TYPE_USER_JOINED
@@ -173,14 +200,17 @@ func toProto(evt eventbus.Event) *voicxv1.Event {
 	case "user_moved":
 		out.Type = voicxv1.EventType_EVENT_TYPE_USER_MOVED
 		out.Payload = &voicxv1.Event_UserMoved{UserMoved: &voicxv1.UserMovedEvent{
-			UserId:      payload.ClientID,
-			ToChannelId: formatInt(payload.ChannelID),
+			UserId:        payload.ClientID,
+			FromChannelId: formatInt(payload.FromChannelID),
+			ToChannelId:   formatInt(payload.ChannelID),
+			MovedBy:       payload.ByClientID,
 		}}
 	case "speaking_changed":
 		out.Type = voicxv1.EventType_EVENT_TYPE_USER_SPEAKING
 		out.Payload = &voicxv1.Event_UserSpeaking{UserSpeaking: &voicxv1.UserSpeakingEvent{
-			UserId:   payload.ClientID,
-			Speaking: payload.Speaking,
+			ChannelId: formatInt(payload.ChannelID),
+			UserId:    payload.ClientID,
+			Speaking:  payload.Speaking,
 		}}
 	case "channel_created":
 		out.Type = voicxv1.EventType_EVENT_TYPE_CHANNEL_CREATED
@@ -193,26 +223,30 @@ func toProto(evt eventbus.Event) *voicxv1.Event {
 		out.Type = voicxv1.EventType_EVENT_TYPE_CHANNEL_DELETED
 		out.Payload = &voicxv1.Event_ChannelDeleted{ChannelDeleted: &voicxv1.ChannelDeletedEvent{
 			ChannelId: formatInt(payload.ChannelID),
+			Reason:    payload.Reason,
 		}}
 	case "kicked":
 		// One broadcast covers both: a kick that also bans is reported as a ban.
 		if payload.Ban {
 			out.Type = voicxv1.EventType_EVENT_TYPE_USER_BANNED
 			out.Payload = &voicxv1.Event_UserBanned{UserBanned: &voicxv1.UserBannedEvent{
-				UserId:   payload.ClientID,
-				BannedBy: payload.ByClientID,
-				Reason:   payload.Reason,
+				UserId:    payload.ClientID,
+				BannedBy:  payload.ByClientID,
+				Reason:    payload.Reason,
+				ExpiresAt: payload.ExpiresAt,
+				ChannelId: formatInt(payload.ChannelID),
 			}}
-			return out
+			return out, nil
 		}
 		out.Type = voicxv1.EventType_EVENT_TYPE_USER_KICKED
 		out.Payload = &voicxv1.Event_UserKicked{UserKicked: &voicxv1.UserKickedEvent{
-			UserId:   payload.ClientID,
-			KickedBy: payload.ByClientID,
-			Reason:   payload.Reason,
+			ChannelId: formatInt(payload.ChannelID),
+			UserId:    payload.ClientID,
+			KickedBy:  payload.ByClientID,
+			Reason:    payload.Reason,
 		}}
 	default:
-		return nil
+		return nil, nil
 	}
-	return out
+	return out, nil
 }

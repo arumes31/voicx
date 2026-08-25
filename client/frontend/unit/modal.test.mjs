@@ -5,12 +5,14 @@ import {
     canFocusTarget,
     closeDialog,
     closeServerDialogs,
+    confirmDialog,
     dialogFocusableSelector,
     dialogStackInsertionIndex,
     initModalSystem,
     isCurrentServerDialog,
     mountDialog,
     mountServerDialog,
+    promptDialog,
     registerDialogLifecycle,
     topDialog,
 } from "../src/modal.js";
@@ -512,6 +514,48 @@ test("shared modal lifecycle handles focus, cancellation, removal, and restorati
         assert.equal(document.activeElement, empty.overlay);
         closeDialog(empty.overlay);
         flushFrames();
+    });
+
+    await t.test("promise dialogs accept, cancel, restore focus, and reset with their server", async () => {
+        launcher.focus();
+        const promptResult = promptDialog({
+            title: "Rename file",
+            label: "New name",
+            value: "before.txt",
+            confirmLabel: "Rename",
+            serverScoped: true,
+        });
+        const prompt = topDialog();
+        flushFrames();
+        const input = prompt.querySelector(".dlg-input");
+        assert.equal(document.activeElement, input);
+        input.value = "after.txt";
+        prompt.querySelector(".dlg-ok").onclick();
+        prompt.querySelector(".dlg-ok").onclick();
+        assert.equal(await promptResult, "after.txt");
+        flushFrames();
+        assert.equal(document.activeElement, launcher);
+
+        const cancelled = confirmDialog({
+            title: "Delete file?",
+            message: "This cannot be undone.",
+            confirmLabel: "Delete",
+            danger: true,
+            serverScoped: true,
+        });
+        flushFrames();
+        document.dispatchEvent(keyEvent("Escape"));
+        assert.equal(await cancelled, false);
+        flushFrames();
+        assert.equal(document.activeElement, launcher);
+
+        const reset = promptDialog({ title: "Server-owned prompt", serverScoped: true });
+        flushFrames();
+        globalThis.window.__voicx.state.serverGeneration++;
+        assert.equal(closeServerDialogs(), 1);
+        assert.equal(await reset, null);
+        flushFrames();
+        assert.equal(topDialog(), null);
     });
 
     await t.test("derives semantics, associates controls, and rebuilds menu launchers", () => {

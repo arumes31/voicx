@@ -16,7 +16,7 @@ func (a *App) SetStatus(status, message string) string {
 	if status == "away" && message == autoAwaySentinel {
 		message = a.autoAwayMessage()
 	}
-	if err := a.cmLoad().write(netproto.MsgSetStatus, netproto.SetStatus{Status: status, Message: message}); err != nil {
+	if err := a.write(netproto.MsgSetStatus, netproto.SetStatus{Status: status, Message: message}); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -25,7 +25,7 @@ func (a *App) SetStatus(status, message string) string {
 // Poke sends a poke to a client (321/322; server enforces permission +
 // cooldown, errors arrive via servererror).
 func (a *App) Poke(clientID, message string) string {
-	if err := a.cmLoad().write(netproto.MsgPoke, netproto.Poke{ClientID: clientID, Message: message}); err != nil {
+	if err := a.write(netproto.MsgPoke, netproto.Poke{ClientID: clientID, Message: message}); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -33,7 +33,7 @@ func (a *App) Poke(clientID, message string) string {
 
 // ServerInfo returns the server's public information (313).
 func (a *App) ServerInfo() (netproto.ServerInfoResponse, error) {
-	f, err := a.cmLoad().request(netproto.MsgServerInfoQuery, netproto.MsgServerInfoResponse,
+	f, err := a.request(netproto.MsgServerInfoQuery, netproto.MsgServerInfoResponse,
 		netproto.ServerInfoQuery{}, 5*time.Second)
 	if err != nil {
 		return netproto.ServerInfoResponse{}, err

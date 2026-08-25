@@ -161,17 +161,33 @@ function dlgAbout() {
                 <div class="mono about-version"></div>
                 <div class="mono about-uid"></div>
                 <div class="about-links">
-                    <a href="https://github.com/voicx" target="_blank">project</a> ·
-                    <a href="https://github.com/voicx/issues" target="_blank">issues</a>
+                    <a href="https://github.com/arumes31/voicx" target="_blank" rel="noopener noreferrer">project</a> ·
+                    <a href="https://github.com/arumes31/voicx/issues" target="_blank" rel="noopener noreferrer">issues</a>
                 </div>
             </div>
             <div class="dlg-buttons"><button class="dlg-ok">Close</button></div>
         </div>`;
-    window.go.main.App.ClientVersion().then((v) => {
-        overlay.querySelector(".about-version").textContent = "version " + v;
-    });
+    const versionEl = overlay.querySelector(".about-version");
+    const setVersion = (text) => {
+        if (overlay.isConnected && versionEl.isConnected) versionEl.textContent = text;
+    };
+    window.go.main.App.ClientVersion()
+        .then((v) => setVersion("version " + v))
+        .catch(() => setVersion("version unavailable"));
     const uidEl = overlay.querySelector(".about-uid");
     uidEl.textContent = state.myUniqueID || "(not connected)";
+    for (const link of overlay.querySelectorAll(".about-links a")) {
+        link.onclick = (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            // Keep the Wails webview on the app. The bridge owns external
+            // browser opening, and the ignored rejection is only a failed
+            // hand-off after this dialog has already handled the click.
+            void Promise.resolve()
+                .then(() => window.runtime.BrowserOpenURL(link.href))
+                .catch(() => {});
+        };
+    }
     overlay.querySelector(".dlg-ok").onclick = () => overlay.remove();
     overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
     mountDialog(overlay);
@@ -268,7 +284,7 @@ function manageBookmarks() {
             const row = document.createElement("div");
             row.className = "bm-row";
             row.innerHTML = `
-                <span class="bm-dot" title="color (284)"></span>
+                <span class="bm-dot" title="color"></span>
                 <span class="bm-name"></span>
                 <span class="bm-addr mono"></span>
                 <button class="bm-up" title="move up">↑</button>
@@ -327,18 +343,18 @@ function editBookmark(b, persist, render) {
             <h3>Edit bookmark</h3>
             <label class="dlg-label">Name</label>
             <input class="dlg-input bm-f-name" />
-            <label class="dlg-label">Folder (283)</label>
+            <label class="dlg-label">Folder</label>
             <input class="dlg-input bm-f-folder" placeholder="e.g. work / friends" />
-            <label class="dlg-label">Hotkey profile (300)</label>
+            <label class="dlg-label">Hotkey profile</label>
             <input class="dlg-input bm-f-profile" placeholder="default" />
-            <label class="dlg-label">Nickname override (334)</label>
+            <label class="dlg-label">Nickname override</label>
             <input class="dlg-input bm-f-nick" placeholder="use bookmark nickname" />
-            <label class="dlg-label">Avatar override (335)</label>
+            <label class="dlg-label">Avatar override</label>
             <div class="bm-f-avatar-row">
                 <button class="icon-btn bm-f-avatar-btn">choose image…</button>
                 <span class="bm-f-avatar-state mono"></span>
             </div>
-            <label class="dlg-label"><input type="checkbox" class="bm-f-auto" /> auto-connect on startup (286; guest/prefill only — passwords are never stored)</label>
+            <label class="dlg-label"><input type="checkbox" class="bm-f-auto" /> auto-connect on startup (guest/prefill only — passwords are never stored)</label>
             <div class="dlg-buttons">
                 <button class="dlg-ok">Save</button>
                 <button class="dlg-cancel">Cancel</button>
@@ -559,7 +575,7 @@ export function initMenu() {
         }),
         menuAction("Window opacity…", () => {}, {
             disabled: true,
-            tooltip: "not supported by the Wails v2 WebView2 backend (292)",
+            tooltip: "not supported by the Wails v2 WebView2 backend",
         }),
         divider(),
         menuAction("Theme: dark", () => setTheme("dark")),

@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -11,6 +13,109 @@ import (
 
 	"voicx/internal/store"
 )
+
+func TestAuthenticateIdentifierVerifiesExactlyOnce(t *testing.T) {
+	tests := []struct {
+		name     string
+		lookup   func(context.Context, string) (passwordCredential, error)
+		password string
+		wantUser bool
+		wantErr  error
+	}{
+		{
+			name: "unknown account",
+			lookup: func(context.Context, string) (passwordCredential, error) {
+				return passwordCredential{}, sql.ErrNoRows
+			},
+			password: "wrong",
+			wantErr:  ErrUserNotFound,
+		},
+		{
+			name: "known wrong password",
+			lookup: func(context.Context, string) (passwordCredential, error) {
+				return passwordCredential{user: User{UniqueID: "uid"}, hash: "stored"}, nil
+			},
+			password: "wrong",
+		},
+		{
+			name: "passwordless account",
+			lookup: func(context.Context, string) (passwordCredential, error) {
+				return passwordCredential{user: User{UniqueID: "uid"}}, nil
+			},
+			password: "wrong",
+		},
+		{
+			name: "known correct password",
+			lookup: func(context.Context, string) (passwordCredential, error) {
+				return passwordCredential{user: User{UniqueID: "uid"}, hash: "stored"}, nil
+			},
+			password: "correct",
+			wantUser: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			svc := &AuthService{
+				lookupIdentifier: test.lookup,
+				verifyPassword: func(password, hash string) error {
+					calls++
+					if hash == "stored" && password == "correct" {
+						return nil
+					}
+					return errors.New("password mismatch")
+				},
+			}
+			user, err := svc.AuthenticateIdentifier(context.Background(), "identifier", test.password)
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("AuthenticateIdentifier() error = %v, want %v", err, test.wantErr)
+			}
+			if (user != nil) != test.wantUser {
+				t.Fatalf("AuthenticateIdentifier() user = %#v, want present=%t", user, test.wantUser)
+			}
+			if calls != 1 {
+				t.Fatalf("password verifier calls = %d, want 1", calls)
+			}
+		})
+	}
+}
+
+func TestAuthenticateIdentifierPrefersExactUniqueIDOverNickname(t *testing.T) {
+	svc, s := testAuthServiceWithStore(t)
+	ctx := context.Background()
+	identifier := uniqueNickname("identifier-collision")
+	uniquePassword := "unique-password"
+	nicknamePassword := "nickname-password"
+	uniqueHash, err := HashPassword(uniquePassword)
+	if err != nil {
+		t.Fatalf("HashPassword(unique): %v", err)
+	}
+	nicknameHash, err := HashPassword(nicknamePassword)
+	if err != nil {
+		t.Fatalf("HashPassword(nickname): %v", err)
+	}
+	nicknameUniqueID := uniqueNickname("nickname-owner")
+	const insert = `INSERT INTO users (unique_id, nickname, password_hash, created_at)
+		VALUES ($1, $2, $3, NOW())`
+	if _, err := s.DB().ExecContext(ctx, insert, identifier, uniqueNickname("unique-owner"), uniqueHash); err != nil {
+		t.Fatalf("insert exact unique ID: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx, insert, nicknameUniqueID, identifier, nicknameHash); err != nil {
+		t.Fatalf("insert colliding nickname: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = s.DB().ExecContext(ctx, `DELETE FROM users WHERE unique_id IN ($1, $2)`, identifier, nicknameUniqueID)
+	})
+
+	user, err := svc.AuthenticateIdentifier(ctx, identifier, uniquePassword)
+	if err != nil || user == nil || user.UniqueID != identifier {
+		t.Fatalf("AuthenticateIdentifier exact unique ID = %#v, %v", user, err)
+	}
+	user, err = svc.AuthenticateIdentifier(ctx, identifier, nicknamePassword)
+	if err != nil || user != nil {
+		t.Fatalf("nickname collision overrode exact unique ID: %#v, %v", user, err)
+	}
+}
 
 // testAuthService constructs an AuthService backed by a real Postgres store if
 // one is reachable. It skips the calling test when no database is available.
@@ -159,7 +264,7 @@ func TestRegisterUserDuplicate(t *testing.T) {
 	svc := testAuthService(t)
 
 	nick := uniqueNickname("dupuser")
-	pw := "password"
+	pw := "long-password"
 
 	if _, err := svc.RegisterUser(context.Background(), nick, pw); err != nil {
 		t.Fatalf("RegisterUser 1: %v", err)

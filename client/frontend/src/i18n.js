@@ -3,8 +3,8 @@
 // USAGE PATTERN (how to add strings):
 //   1. Add the key with BOTH translations to the catalogs below
 //      (key = dotted path, e.g. "menu.connections"). en and de must carry
-//      the same keys — the debug console warns about mismatches at startup
-//      and there is a Go-side parity test reading this file.
+//      the same keys — unit tests enforce parity without putting work on the
+//      language-switch hot path.
 //   2. In code use t("menu.connections"); with placeholders:
 //      t("chat.connectedAs", { nick }) → "Connected as {nick}".
 //   3. Settings → Application → Language applies it live (menus and the
@@ -63,8 +63,8 @@ const en = {
     "settings.security": "Security",
     "settings.server": "Server",
     "settings.notifications": "Notifications",
-    "settings.language": "Language (336)",
-    "settings.searchPlaceholder": "search settings… (350)",
+    "settings.language": "Language",
+    "settings.searchPlaceholder": "search settings…",
     "chat.connectedAs": "Connected as {nick}",
     "status.offline": "offline",
     "status.retry": "retry {n}/{max} in {s}s…",
@@ -123,8 +123,8 @@ const de = {
     "settings.security": "Sicherheit",
     "settings.server": "Server",
     "settings.notifications": "Benachrichtigungen",
-    "settings.language": "Sprache (336)",
-    "settings.searchPlaceholder": "Einstellungen suchen… (350)",
+    "settings.language": "Sprache",
+    "settings.searchPlaceholder": "Einstellungen suchen…",
     "chat.connectedAs": "Verbunden als {nick}",
     "status.offline": "offline",
     "status.retry": "Versuch {n}/{max} in {s}s…",
@@ -132,7 +132,21 @@ const de = {
     "notif.clearAll": "alle löschen",
 };
 
-const catalogs = { en, de };
+const catalogs = Object.freeze({
+    en: Object.freeze(en),
+    de: Object.freeze(de),
+});
+
+// catalogParity is a pure, immutable diagnostic for unit tests and release
+// checks. Language changes stay allocation-free apart from their own setting.
+export function catalogParity() {
+    const enKeys = new Set(Object.keys(catalogs.en));
+    const deKeys = new Set(Object.keys(catalogs.de));
+    return Object.freeze({
+        missingFromEnglish: Object.freeze([...deKeys].filter((key) => !enKeys.has(key)).sort()),
+        missingFromGerman: Object.freeze([...enKeys].filter((key) => !deKeys.has(key)).sort()),
+    });
+}
 
 let lang = "en";
 
@@ -142,12 +156,6 @@ export function setLanguage(l) {
         l = (navigator.language || "en").toLowerCase().startsWith("de") ? "de" : "en";
     }
     lang = catalogs[l] ? l : "en";
-    // Startup self-check: warn about key mismatches (336 debug aid).
-    const enKeys = Object.keys(en).sort().join(",");
-    const deKeys = Object.keys(de).sort().join(",");
-    if (enKeys !== deKeys) {
-        console.warn("[i18n] catalog key mismatch between en and de");
-    }
 }
 
 export function currentLanguage() {
@@ -157,6 +165,16 @@ export function currentLanguage() {
 // t translates a key, substituting {placeholders} from vars. Missing keys
 // warn once in the debug console and fall back to the key itself.
 const warned = new Set();
+
+// interpolate replaces every literal placeholder occurrence without treating
+// the key as a regular expression. Translation keys may contain punctuation.
+export function interpolate(template, vars) {
+    let text = String(template);
+    for (const [key, value] of Object.entries(vars || {})) {
+        text = text.split("{" + key + "}").join(String(value));
+    }
+    return text;
+}
 
 export function t(key, vars) {
     let s = catalogs[lang][key];
@@ -173,12 +191,7 @@ export function t(key, vars) {
             console.warn("[i18n] missing translation", lang, key, "— using en");
         }
     }
-    if (vars) {
-        for (const [k, v] of Object.entries(vars)) {
-            s = s.replace("{" + k + "}", String(v));
-        }
-    }
-    return s;
+    return vars ? interpolate(s, vars) : s;
 }
 
 // applyStaticLabels re-labels the static index.html surfaces (login card).

@@ -24,22 +24,28 @@ var trayCtl *tray
 // tray wraps the systray menu and badge state.
 type tray struct {
 	app *App
+	// emit is injected separately so tray menu actions can be tested
+	// without constructing a Wails runtime context.
+	emit func(string, any)
 
-	mu       sync.Mutex
-	mentions int
-	ptt      bool
-	muted    bool
-	visible  bool
+	mu          sync.Mutex
+	mentions    int
+	ptt         bool
+	muted       bool
+	visible     bool
+	isConnected bool
 
-	miShowHide *systray.MenuItem
-	miMute     *systray.MenuItem
-	miDeafen   *systray.MenuItem
+	miShowHide   *systray.MenuItem
+	miMute       *systray.MenuItem
+	miDeafen     *systray.MenuItem
+	miReconnect  *systray.MenuItem
+	miDisconnect *systray.MenuItem
 }
 
 // initTray starts the tray on the calling goroutine and blocks until quit.
 // When ready is non-nil it is closed after the tray menu is fully wired.
 func initTray(a *App, ready chan<- struct{}) {
-	trayCtl = &tray{app: a, visible: true}
+	trayCtl = &tray{app: a, emit: a.emitPlain, visible: true}
 	systray.Run(func() {
 		trayCtl.onReady()
 		if ready != nil {
@@ -57,7 +63,9 @@ func (t *tray) onReady() {
 	t.miMute = systray.AddMenuItem("Mute", "toggle microphone mute")
 	t.miDeafen = systray.AddMenuItem("Deafen", "toggle deafen")
 	systray.AddSeparator()
-	miDisconnect := systray.AddMenuItem("Disconnect", "disconnect the active server tab")
+	t.miReconnect = systray.AddMenuItem("Reconnect last server", "reconnect the last server")
+	t.miDisconnect = systray.AddMenuItem("Disconnect", "disconnect the active server tab")
+	t.setConnected(t.app.Connected())
 	miQuit := systray.AddMenuItem("Quit", "quit voicx")
 
 	// recover is per-goroutine: the menu event loop needs its own guard (331).
@@ -70,8 +78,10 @@ func (t *tray) onReady() {
 				t.app.emitHotkey("mute_toggle")
 			case <-t.miDeafen.ClickedCh:
 				t.app.emitHotkey("deafen_toggle")
-			case <-miDisconnect.ClickedCh:
-				t.app.Disconnect()
+			case <-t.miReconnect.ClickedCh:
+				t.reconnectLast()
+			case <-t.miDisconnect.ClickedCh:
+				t.disconnectActive()
 			case <-miQuit.ClickedCh:
 				systray.Quit()
 				if t.app.ctx != nil {
@@ -80,6 +90,61 @@ func (t *tray) onReady() {
 			}
 		}
 	})
+}
+
+// setConnected synchronizes reconnect availability with the active tab. The
+// mutex serializes state changes and MenuItem updates from connection relays.
+func (t *tray) setConnected(isConnected bool) {
+	t.mu.Lock()
+	t.isConnected = isConnected
+	if t.miReconnect != nil {
+		if isConnected {
+			t.miReconnect.Disable()
+		} else {
+			t.miReconnect.Enable()
+		}
+	}
+	if t.miDisconnect != nil {
+		if isConnected {
+			t.miDisconnect.Enable()
+		} else {
+			t.miDisconnect.Disable()
+		}
+	}
+	t.mu.Unlock()
+}
+
+// traySetConnected reflects the active tab's connection state in the tray.
+func traySetConnected(isConnected bool) {
+	if trayCtl == nil {
+		return
+	}
+	trayCtl.setConnected(isConnected)
+}
+
+// reconnectLast asks the frontend to reuse its credential-bearing last
+// connection record. The connected check is repeated in the frontend as a
+// defense against a delayed native-menu click.
+func (t *tray) reconnectLast() {
+	t.mu.Lock()
+	isConnected, emit := t.isConnected, t.emit
+	t.mu.Unlock()
+	if isConnected || emit == nil {
+		return
+	}
+	emit("tray_reconnect", nil)
+}
+
+// disconnectActive routes through the frontend so it cancels any pending
+// retry and clears the automatic-reconnect target before closing the tab.
+func (t *tray) disconnectActive() {
+	t.mu.Lock()
+	isConnected, emit := t.isConnected, t.emit
+	t.mu.Unlock()
+	if !isConnected || emit == nil {
+		return
+	}
+	emit("tray_disconnect", nil)
 }
 
 // toggleWindow shows or hides the main window (287).

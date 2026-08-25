@@ -14,6 +14,7 @@ import (
 	"os"
 	"testing"
 
+	"voicx/internal/updatemanifest"
 	"voicx/internal/version"
 )
 
@@ -95,11 +96,11 @@ func TestCheckForUpdateRequiresSignature(t *testing.T) {
 
 func TestCheckForUpdateUpToDate(t *testing.T) {
 	withUpdateRepo(t, "o/r")
-	oldV, oldB := version.Version, version.Build
-	version.Version, version.Build = "0.4.0", "100"
-	defer func() { version.Version, version.Build = oldV, oldB }()
+	oldVersion := version.Version
+	version.Version = "0.4.0"
+	defer func() { version.Version = oldVersion }()
 
-	srv := fakeGitHub(t, `{"tag_name": "v0.4.0+99", "assets": []}`)
+	srv := fakeGitHub(t, `{"tag_name": "v0.4.0+different-build", "assets": []}`)
 	defer srv.Close()
 
 	old := updateAPIBase
@@ -195,7 +196,7 @@ func TestVerifySignedManifest(t *testing.T) {
 	}
 	withUpdatePublicKeys(t, base64.StdEncoding.EncodeToString(publicKey))
 
-	manifest := []byte(manifestVersionPrefix + "v1.2.3\nabc  " + clientAssetName + "\n")
+	manifest := []byte(updatemanifest.VersionPrefix + "v1.2.3\nabc  " + clientAssetName + "\n")
 	signature := []byte(base64.StdEncoding.EncodeToString(ed25519.Sign(privateKey, manifest)))
 	if err := verifySignedManifest(manifest, signature, "v1.2.3"); err != nil {
 		t.Fatalf("verify signed manifest: %v", err)

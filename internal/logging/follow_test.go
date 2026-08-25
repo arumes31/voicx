@@ -75,6 +75,39 @@ func TestTeeUsesPrimaryLevel(t *testing.T) {
 	}
 }
 
+func TestTeeEscapesEmbeddedLineBreaksForRecentAndFollow(t *testing.T) {
+	isolateRing(t)
+	core, _ := observer.New(zapcore.DebugLevel)
+	logger := zap.New(core).WithOptions(Tee())
+	follow, cancel := Follow()
+	defer cancel()
+	logger.Info("line-one\r\nline-two", zap.String("field", "carriage\rreturn\nnewline"))
+
+	select {
+	case line := <-follow:
+		assertEscapedRingLine(t, line)
+	case <-time.After(time.Second):
+		t.Fatal("follower did not receive escaped log line")
+	}
+	recent := Recent(1, "line-one")
+	if len(recent) != 1 {
+		t.Fatalf("Recent = %v, want one line", recent)
+	}
+	assertEscapedRingLine(t, recent[0])
+}
+
+func assertEscapedRingLine(t *testing.T, line string) {
+	t.Helper()
+	if strings.ContainsAny(line, "\r\n") {
+		t.Fatalf("ring line contains physical line break: %q", line)
+	}
+	for _, escaped := range []string{`\r`, `\n`} {
+		if !strings.Contains(line, escaped) {
+			t.Fatalf("ring line %q is missing escaped %q", line, escaped)
+		}
+	}
+}
+
 // TestFollowStreamsNewLines verifies a follower receives lines emitted after
 // it subscribed, and stops receiving after it cancels.
 func TestFollowStreamsNewLines(t *testing.T) {

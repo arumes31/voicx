@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"voicx/internal/channels"
 	"voicx/internal/netproto"
@@ -314,12 +313,10 @@ func TestJoinChannelWithoutInheritanceAllowed(t *testing.T) {
 
 	send(t, conn, netproto.MsgJoinChannel, netproto.JoinChannel{ChannelID: 2})
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
+	waitFor(t, "client join of the non-inheriting sub-channel", func() bool {
 		if sc, ok := env.state.GetClient(clientID); ok && sc.ChannelID == 2 {
-			return
+			return true
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("client never joined the non-inheriting sub-channel")
+		return false
+	})
 }

@@ -3,44 +3,51 @@
 
 GO          ?= go
 DOCKER      ?= docker
-IMAGE       ?= voicx:dev
+VOICX_IMAGE ?= voicx:dev
+VOICX_BACKUP_IMAGE ?= voicx-backup:dev
+export VOICX_IMAGE VOICX_BACKUP_IMAGE
 BINARY       = bin/voicx
 PKG          = ./cmd/server
 
-# Embedded version metadata (see internal/version). Build = commit count, so
-# every commit bumps the version; dirty flag for uncommitted changes.
-VOICX_VERSION    ?= $(shell cat VERSION 2>/dev/null || echo 0.0.0-dev)
-VOICX_BUILD      ?= $(shell git rev-list --count HEAD 2>/dev/null || echo 0)
-VOICX_COMMIT     ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
-VOICX_DIRTY      ?= $(shell git diff --quiet 2>/dev/null && echo false || echo true)
-VOICX_BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+# One cross-platform calculator supplies an exact tag version or a deterministic
+# commit/dirty-tree development version without rewriting tracked files.
+VERSION_TOOL = $(GO) run ./cmd/version
 VOICX_UPDATE_REPO ?= voicx/voicx
 VOICX_UPDATE_PUBLIC_KEYS ?=
 
-VERSION_FLAGS = -ldflags="-s -w \
-	-X voicx/internal/version.Version=$(VOICX_VERSION) \
-	-X voicx/internal/version.Build=$(VOICX_BUILD) \
-	-X voicx/internal/version.Commit=$(VOICX_COMMIT) \
-	-X voicx/internal/version.BuildDate=$(VOICX_BUILD_DATE) \
-	-X voicx/internal/version.Dirty=$(VOICX_DIRTY) \
+UPDATE_LDFLAGS = \
 	-X voicx/internal/version.UpdateRepo=$(VOICX_UPDATE_REPO) \
-	-X voicx/internal/version.UpdatePublicKeys=$(VOICX_UPDATE_PUBLIC_KEYS)"
+	-X voicx/internal/version.UpdatePublicKeys=$(VOICX_UPDATE_PUBLIC_KEYS)
 
-.PHONY: all build run migrate proto tidy test cover fmt vet docker-build docker-run docker-stop compose-up compose-down compose-logs chaos chaos-webrtc profile-db query-load webrtc-load canary clean help client-build
+.PHONY: all build client-build run version version-check migrate proto tidy test cover fmt vet docker-build docker-run docker-stop compose-up compose-down compose-logs chaos chaos-webrtc profile-db query-load webrtc-load canary clean help
 
 all: build
 
 ## build: compile the server binary into ./bin
 build:
-	$(GO) build $(VERSION_FLAGS) -o $(BINARY) $(PKG)
+	@set -e; \
+	version_ldflags="$$($(VERSION_TOOL) -format ldflags)"; \
+	$(GO) build -trimpath -ldflags="-s -w $$version_ldflags $(UPDATE_LDFLAGS)" -o $(BINARY) $(PKG)
 
 ## client-build: build the Wails client with embedded version metadata
 client-build:
-	cd client && wails build $(VERSION_FLAGS)
+	@set -e; \
+	version_ldflags="$$($(VERSION_TOOL) -format ldflags)"; \
+	cd client && wails build -trimpath -ldflags="-s -w $$version_ldflags $(UPDATE_LDFLAGS)"
 
 ## run: run the server locally (go run)
 run:
-	$(GO) run $(VERSION_FLAGS) $(PKG)
+	@set -e; \
+	version_ldflags="$$($(VERSION_TOOL) -format ldflags)"; \
+	$(GO) run -trimpath -ldflags="-s -w $$version_ldflags $(UPDATE_LDFLAGS)" $(PKG)
+
+## version: print the exact version for the current source state
+version:
+	$(VERSION_TOOL)
+
+## version-check: verify all tracked package versions match VERSION
+version-check:
+	$(VERSION_TOOL) -check
 
 ## migrate: run database migrations (go run ./cmd/migrate)
 migrate:
@@ -52,15 +59,25 @@ proto:
 
 ## tidy: run go mod tidy
 tidy:
-	$(GO) mod tidy
+	@set -e; \
+	$(GO) mod tidy; \
+	cd client && $(GO) mod tidy
 
 ## test: run the full test suite
 test:
-	$(GO) test ./...
+	@set -e; \
+	mkdir -p client/frontend/dist; \
+	touch client/frontend/dist/.test-placeholder; \
+	$(GO) test ./...; \
+	cd client && $(GO) test ./...
 
 ## cover: run the full test suite with coverage report
 cover:
-	$(GO) test -cover ./...
+	@set -e; \
+	mkdir -p client/frontend/dist; \
+	touch client/frontend/dist/.test-placeholder; \
+	$(GO) test -cover ./...; \
+	cd client && $(GO) test -cover ./...
 
 ## fmt: format all Go sources
 fmt:
@@ -70,20 +87,17 @@ fmt:
 vet:
 	$(GO) vet ./...
 
-## docker-build: build the voicx:dev image from the Dockerfile
+## docker-build: build the $(VOICX_IMAGE) image from the Dockerfile
 docker-build:
-	$(DOCKER) build \
-		--build-arg VOICX_VERSION=$(VOICX_VERSION) \
-		--build-arg VOICX_BUILD=$(VOICX_BUILD) \
-		--build-arg VOICX_COMMIT=$(VOICX_COMMIT) \
-		--build-arg VOICX_DIRTY=$(VOICX_DIRTY) \
-		--build-arg VOICX_BUILD_DATE=$(VOICX_BUILD_DATE) \
+	@set -e; \
+	version_args="$$($(VERSION_TOOL) -format docker)"; \
+	$(DOCKER) build $$version_args \
 		--build-arg VOICX_UPDATE_REPO=$(VOICX_UPDATE_REPO) \
-		-t $(IMAGE) .
+		-t $(VOICX_IMAGE) .
 
-## docker-run: run the voicx:dev image with default ports published
+## docker-run: run the $(VOICX_IMAGE) image with default ports published
 docker-run:
-	$(DOCKER) run --rm -p 12333:12333 -p 12334:12334/udp -p 12335:12335 -p 12336:12336 -p 12337:12337 $(IMAGE)
+	$(DOCKER) run --rm -p 12333:12333 -p 12334:12334/udp -p 12335:12335 -p 12336:12336 -p 12337:12337 $(VOICX_IMAGE)
 
 ## docker-stop: stop and remove any running voicx containers
 docker-stop:
@@ -91,7 +105,10 @@ docker-stop:
 
 ## compose-up: build and start the full stack (voicx + postgres + redis) detached
 compose-up:
-	$(DOCKER) compose up -d --build
+	@set -e; \
+	version_args="$$($(VERSION_TOOL) -format docker)"; \
+	$(DOCKER) compose build $$version_args --build-arg VOICX_UPDATE_REPO=$(VOICX_UPDATE_REPO)
+	$(DOCKER) compose up -d --no-build
 
 ## compose-down: stop and remove the compose stack (containers, networks)
 compose-down:
@@ -128,6 +145,7 @@ canary:
 ## clean: remove local build artifacts
 clean:
 	rm -rf bin out dist
+	rm -f adduser.exe e2e.exe
 
 ## help: print this help
 help:

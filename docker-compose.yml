@@ -20,15 +20,14 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        # .git is excluded from the docker context; inject version metadata
-        # via build args (override in .env or use make docker-build).
-        VOICX_VERSION: ${VOICX_VERSION:-0.0.0-dev}
-        VOICX_BUILD: ${VOICX_BUILD:-0}
-        VOICX_COMMIT: ${VOICX_COMMIT:-none}
+        # Make/CI inject Git metadata. Empty values make a direct Compose build
+        # derive a deterministic version from the copied source tree.
+        VOICX_VERSION: ${VOICX_VERSION:-}
+        VOICX_COMMIT: ${VOICX_COMMIT:-}
         VOICX_DIRTY: ${VOICX_DIRTY:-false}
-        VOICX_BUILD_DATE: ${VOICX_BUILD_DATE:-unknown}
+        VOICX_BUILD_DATE: ${VOICX_BUILD_DATE:-}
         VOICX_UPDATE_REPO: ${VOICX_UPDATE_REPO:-voicx/voicx}
-    image: voicx:latest
+    image: ${VOICX_IMAGE:-voicx:dev}
     container_name: voicx
     # --- GPU access for server-side hardware transcoding (optional) --------
     # Only needed when recording.video_args uses a hardware encoder. Uncomment
@@ -82,6 +81,26 @@ services:
       # Writable data (uploaded files, avatars, icons, recordings) so the
       # root filesystem can stay read-only.
       - voicxdata:/data
+      - type: bind
+        source: ${VOICX_COMPOSE_DATABASE_URL_FILE:-./docker/secrets/.empty}
+        target: /run/secrets/voicx_database_url
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ${POSTGRES_PASSWORD_FILE:-./docker/secrets/.empty}
+        target: /run/secrets/postgres_password
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ${REDIS_PASSWORD_FILE:-./docker/secrets/.empty}
+        target: /run/secrets/redis_password
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ${TURN_SECRET_FILE:-./docker/secrets/.empty}
+        target: /run/secrets/turn_secret
+        read_only: true
+        bind: { create_host_path: false }
     environment:
       # --- Logging ---
       VOICX_LOG_LEVEL: ${VOICX_LOG_LEVEL:-info}
@@ -90,12 +109,23 @@ services:
       VOICX_DEV_MODE: ${VOICX_DEV_MODE:?set VOICX_DEV_MODE to true or false}
 
       # --- Database (points at the postgres service) ---
-      VOICX_DATABASE_URL: "${VOICX_COMPOSE_DATABASE_URL:-postgres://${POSTGRES_USER:-voicx}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-voicx}?sslmode=disable}"
+      # The entrypoint builds a percent-encoded URL from these discrete values
+      # unless a complete URL or URL_FILE is supplied for an external database.
+      VOICX_DATABASE_URL: ${VOICX_COMPOSE_DATABASE_URL:-}
+      VOICX_DATABASE_URL_FILE: ${VOICX_COMPOSE_DATABASE_URL_FILE:+/run/secrets/voicx_database_url}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-voicx}
+      POSTGRES_DB: ${POSTGRES_DB:-voicx}
+      POSTGRES_SSLMODE: ${POSTGRES_SSLMODE:-disable}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_PASSWORD_FILE: ${POSTGRES_PASSWORD_FILE:+/run/secrets/postgres_password}
       VOICX_PII_KEY_FILE: "/data/keys/pii.key"
 
       # --- Redis (points at the redis service) ---
       VOICX_REDIS_ADDR: "redis:6379"
       VOICX_REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      VOICX_REDIS_PASSWORD_FILE: ${REDIS_PASSWORD_FILE:+/run/secrets/redis_password}
 
       # --- Listen addresses (kept in sync with the published ports) ---
       VOICX_TCP_ADDR: ":12333"
@@ -104,6 +134,8 @@ services:
       VOICX_GRPC_ADDR: "127.0.0.1:12338"
       VOICX_HEALTH_ADDR: ":12337"
       VOICX_METRICS_ALLOW_REMOTE: ${VOICX_METRICS_ALLOW_REMOTE:-false}
+      VOICX_PPROF_ENABLED: ${VOICX_PPROF_ENABLED:-false}
+      VOICX_SHUTDOWN_TIMEOUT: ${VOICX_SHUTDOWN_TIMEOUT:-30s}
       VOICX_QUERY_ADDR: ${VOICX_QUERY_ADDR:-127.0.0.1:12335}
       VOICX_QUERY_ALLOW_REMOTE: ${VOICX_QUERY_ALLOW_REMOTE:-false}
       VOICX_QUERY_SSH_ENABLED: ${VOICX_QUERY_SSH_ENABLED:-false}
@@ -119,16 +151,10 @@ services:
 
       # --- TURN (optional; must match the coturn service, profile "turn") ---
       VOICX_TURN_SECRET: ${TURN_SECRET:-}
+      VOICX_TURN_SECRET_FILE: ${TURN_SECRET_FILE:+/run/secrets/turn_secret}
       VOICX_TURN_REALM: ${TURN_REALM:-voicx}
       # Comma-separated client URIs, e.g. turn:localhost:12340?transport=udp
       VOICX_TURN_URIS: ${VOICX_TURN_URIS:-}
-    healthcheck:
-      test: [ "CMD-SHELL", "wget -qO- http://127.0.0.1:12337/healthz || exit 1" ]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-
   # ---------------------------------------------------------------------------
   # postgres — primary relational database
   # ---------------------------------------------------------------------------
@@ -143,12 +169,18 @@ services:
       - "5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-voicx}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_PASSWORD_FILE: ${POSTGRES_PASSWORD_FILE:+/run/secrets/postgres_password}
       POSTGRES_DB: ${POSTGRES_DB:-voicx}
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - type: bind
+        source: ${POSTGRES_PASSWORD_FILE:-./docker/secrets/.empty}
+        target: /run/secrets/postgres_password
+        read_only: true
+        bind: { create_host_path: false }
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-voicx} -d ${POSTGRES_DB:-voicx}" ]
+      test: [ "CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\"" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -157,26 +189,74 @@ services:
   # Nightly compressed dumps. Backups use a volume separate from pgdata and
   # are retained for seven days; set BACKUP_REMOTE for optional object upload.
   postgres-backup:
-    image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777 # 16.14-alpine3.24
+    build:
+      context: .
+      dockerfile: Dockerfile.backup
+    image: ${VOICX_BACKUP_IMAGE:-voicx-backup:dev}
     profiles: ["backup"]
-    restart: unless-stopped
+    restart: ${BACKUP_RESTART_POLICY:-unless-stopped}
     depends_on:
       postgres:
         condition: service_healthy
     networks:
       - voicx-net
     environment:
-      DATABASE_URL: "${VOICX_COMPOSE_DATABASE_URL:-postgres://${POSTGRES_USER:-voicx}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-voicx}?sslmode=disable}"
-      POSTGRES_DB: ${POSTGRES_DB:-voicx}
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-voicx}
+      PGDATABASE: ${POSTGRES_DB:-voicx}
+      PGSSLMODE: ${POSTGRES_SSLMODE:-disable}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_PASSWORD_FILE: ${POSTGRES_PASSWORD_FILE:+/run/secrets/postgres_password}
+      # A complete external application URL selects this fail-closed path:
+      # every BACKUP_PG* setting and backup password source becomes required.
+      BACKUP_EXTERNAL_DATABASE: "${VOICX_COMPOSE_DATABASE_URL:+1}${VOICX_COMPOSE_DATABASE_URL_FILE:+1}"
+      BACKUP_PGHOST: ${BACKUP_PGHOST:-}
+      BACKUP_PGPORT: ${BACKUP_PGPORT:-}
+      BACKUP_PGUSER: ${BACKUP_PGUSER:-}
+      BACKUP_PGDATABASE: ${BACKUP_PGDATABASE:-}
+      BACKUP_PGSSLMODE: ${BACKUP_PGSSLMODE:-}
+      BACKUP_POSTGRES_PASSWORD: ${BACKUP_POSTGRES_PASSWORD:-}
+      BACKUP_POSTGRES_PASSWORD_FILE: ${BACKUP_POSTGRES_PASSWORD_FILE:+/run/secrets/backup_postgres_password}
+      BACKUP_PGSSLROOTCERT: ${BACKUP_PGSSLROOTCERT_FILE:+/run/secrets/backup_pgsslrootcert}
+      BACKUP_PGSSLCERT: ${BACKUP_PGSSLCERT_FILE:+/run/secrets/backup_pgsslcert}
+      BACKUP_PGSSLKEY: ${BACKUP_PGSSLKEY_FILE:+/run/secrets/backup_pgsslkey}
       BACKUP_DIR: /backups/postgres
       BACKUP_RETENTION_DAYS: 7
       BACKUP_REMOTE: ${BACKUP_REMOTE:-}
+      RCLONE_CONFIG: ${RCLONE_CONFIG_FILE:+/run/secrets/rclone.conf}
     volumes:
       - pgbackups:/backups
-      - ./scripts/postgres-backup.sh:/usr/local/bin/postgres-backup.sh:ro
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - "if [ -n \"$$BACKUP_REMOTE\" ]; then apk add --no-cache rclone; fi; while true; do h=$$(date -u +%H); m=$$(date -u +%M); s=$$(date -u +%S); h=$${h#0}; m=$${m#0}; s=$${s#0}; now=$$((h * 3600 + m * 60 + s)); if [ $$now -lt 8100 ]; then delay=$$((8100 - now)); else delay=$$((86400 - now + 8100)); fi; sleep $$delay; /bin/sh /usr/local/bin/postgres-backup.sh; done"
+      - type: bind
+        source: ${POSTGRES_PASSWORD_FILE:-./docker/secrets/.empty}
+        target: /run/secrets/postgres_password
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ${BACKUP_POSTGRES_PASSWORD_FILE:-./docker/secrets/.empty}
+        target: /run/secrets/backup_postgres_password
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ${BACKUP_PGSSLROOTCERT_FILE:-./docker/secrets/.empty}
+        target: /run/secrets/backup_pgsslrootcert
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ${BACKUP_PGSSLCERT_FILE:-./docker/secrets/.empty}
+        target: /run/secrets/backup_pgsslcert
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ${BACKUP_PGSSLKEY_FILE:-./docker/secrets/.empty}
+        target: /run/secrets/backup_pgsslkey
+        read_only: true
+        bind: { create_host_path: false }
+      - type: bind
+        source: ${RCLONE_CONFIG_FILE:-./docker/secrets/.empty}
+        target: /run/secrets/rclone.conf
+        read_only: true
+        bind: { create_host_path: false }
 
   # ---------------------------------------------------------------------------
   # redis — cache / pub-sub / session store
@@ -190,14 +270,21 @@ services:
     # Exposed only internally; the voicx service connects via `redis:6379`.
     expose:
       - "6379"
-    # Enable AOF persistence so cached/session state survives restarts.
-    command: [ "redis-server", "--appendonly", "yes" ]
-    # If a Redis password is desired, set REDIS_PASSWORD in .env and uncomment:
-    # command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
     volumes:
       - redisdata:/data
+      - ./scripts/secret-env.sh:/usr/local/lib/voicx/secret-env.sh:ro
+      - ./scripts/redis-entrypoint.sh:/usr/local/bin/voicx-redis-entrypoint.sh:ro
+      - type: bind
+        source: ${REDIS_PASSWORD_FILE:-./docker/secrets/.empty}
+        target: /run/secrets/redis_password
+        read_only: true
+        bind: { create_host_path: false }
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_PASSWORD_FILE: ${REDIS_PASSWORD_FILE:+/run/secrets/redis_password}
+    entrypoint: ["/bin/sh", "/usr/local/bin/voicx-redis-entrypoint.sh"]
     healthcheck:
-      test: [ "CMD", "redis-cli", "ping" ]
+      test: [ "CMD-SHELL", ". /usr/local/lib/voicx/secret-env.sh && secret_env_load REDIS_PASSWORD optional && REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -237,8 +324,15 @@ services:
       - voicx-net
     environment:
       TURN_SECRET: ${TURN_SECRET:-}
+      TURN_SECRET_FILE: ${TURN_SECRET_FILE:+/run/secrets/turn_secret}
     volumes:
       - ./scripts/coturn-entrypoint.sh:/usr/local/bin/voicx-coturn-entrypoint.sh:ro
+      - ./scripts/secret-env.sh:/usr/local/lib/voicx/secret-env.sh:ro
+      - type: bind
+        source: ${TURN_SECRET_FILE:-./docker/secrets/.empty}
+        target: /run/secrets/turn_secret
+        read_only: true
+        bind: { create_host_path: false }
     entrypoint: [ "/bin/sh", "/usr/local/bin/voicx-coturn-entrypoint.sh" ]
     ports:
       - "12340:12340"

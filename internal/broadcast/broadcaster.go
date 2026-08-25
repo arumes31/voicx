@@ -7,6 +7,7 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -39,6 +40,11 @@ const clientBufferSize = 16
 type Broadcaster struct {
 	logger *zap.Logger
 	sm     *state.Manager
+	// observers are immutable constructor dependencies. They run after the
+	// broadcaster releases its locks, so they must remain short and must not
+	// call back into the broadcaster.
+	observeSnapshotDuration func(time.Duration)
+	observeClientBacklog    func(int)
 
 	// sendMu preserves message order when multiple server goroutines publish
 	// concurrently. Registry lifetime remains protected by mu.
@@ -68,15 +74,28 @@ type Stats struct {
 	Dropped   uint64
 }
 
+// Observers contains optional, bounded telemetry hooks. They intentionally
+// use plain values and callbacks so broadcast stays independent from metrics.
+type Observers struct {
+	ObserveSnapshotDuration func(time.Duration)
+	ObserveClientBacklog    func(int)
+}
+
 // New constructs a Broadcaster wired to the provided logger and state manager.
-func New(logger *zap.Logger, sm *state.Manager) *Broadcaster {
+func New(logger *zap.Logger, sm *state.Manager, observers ...Observers) *Broadcaster {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
+	var telemetry Observers
+	if len(observers) > 0 {
+		telemetry = observers[0]
+	}
 	return &Broadcaster{
-		logger:  logger,
-		sm:      sm,
-		clients: make(map[string]*clientQueue),
+		logger:                  logger,
+		sm:                      sm,
+		observeSnapshotDuration: telemetry.ObserveSnapshotDuration,
+		observeClientBacklog:    telemetry.ObserveClientBacklog,
+		clients:                 make(map[string]*clientQueue),
 	}
 }
 
@@ -120,55 +139,77 @@ func (b *Broadcaster) Unregister(clientID string) {
 // least-privileged values (false, "") for a true fan-out and use
 // BroadcastToClient with a per-client BuildSnapshot when visibility differs.
 func (b *Broadcaster) BroadcastSnapshot(forAdmin bool, viewerUniqueID string) {
-	snap := BuildSnapshot(b.sm, forAdmin, viewerUniqueID)
-	payload, err := json.Marshal(snap)
+	payload, err := b.snapshotPayload(forAdmin, viewerUniqueID)
 	if err != nil {
 		b.logger.Error("broadcast: failed to marshal snapshot", zap.Error(err))
 		return
 	}
 	b.sendMu.Lock()
-	defer b.sendMu.Unlock()
-	b.broadcastToAllLocked(payload)
+	depths := b.broadcastToAllLocked(payload)
+	b.sendMu.Unlock()
+	b.observeBacklogs(depths)
+}
+
+func (b *Broadcaster) snapshotPayload(forAdmin bool, viewerUniqueID string) (payload []byte, err error) {
+	started := time.Now()
+	defer func() {
+		if b.observeSnapshotDuration != nil {
+			b.observeSnapshotDuration(time.Since(started))
+		}
+	}()
+	return json.Marshal(BuildSnapshot(b.sm, forAdmin, viewerUniqueID))
 }
 
 // BroadcastToChannel sends a raw payload to all clients currently in the given
 // channel (looked up via state.Manager.ChannelMembers). Sends are non-blocking.
 func (b *Broadcaster) BroadcastToChannel(channelID int64, payload []byte) {
 	b.sendMu.Lock()
-	defer b.sendMu.Unlock()
 	if b.sm == nil {
+		b.sendMu.Unlock()
 		return
 	}
 	members := b.sm.ChannelMembers(channelID)
 	b.mu.RLock()
-	defer b.mu.RUnlock()
 	if b.closed {
+		b.mu.RUnlock()
+		b.sendMu.Unlock()
 		return
 	}
+	depths := make([]int, 0, len(members))
 	for _, c := range members {
 		queue, ok := b.clients[c.ClientID]
 		if !ok {
 			continue
 		}
-		b.trySend(queue, c.ClientID, payload)
+		_, depth := b.trySend(queue, c.ClientID, payload)
+		depths = append(depths, depth)
 	}
+	b.mu.RUnlock()
+	b.sendMu.Unlock()
+	b.observeBacklogs(depths)
 }
 
 // BroadcastToClient sends a payload to a single registered client. Returns an
 // error if the client is not registered or its channel is full.
 func (b *Broadcaster) BroadcastToClient(clientID string, payload []byte) error {
 	b.sendMu.Lock()
-	defer b.sendMu.Unlock()
 	b.mu.RLock()
-	defer b.mu.RUnlock()
 	if b.closed {
+		b.mu.RUnlock()
+		b.sendMu.Unlock()
 		return ErrClosed
 	}
 	queue, ok := b.clients[clientID]
 	if !ok {
+		b.mu.RUnlock()
+		b.sendMu.Unlock()
 		return ErrNotRegistered
 	}
-	if b.trySend(queue, clientID, payload) {
+	sent, depth := b.trySend(queue, clientID, payload)
+	b.mu.RUnlock()
+	b.sendMu.Unlock()
+	b.observeBacklogs([]int{depth})
+	if sent {
 		return nil
 	}
 	return ErrChannelFull
@@ -200,14 +241,15 @@ func (b *Broadcaster) BroadcastEvent(eventType string, payload []byte) {
 	}
 
 	b.sendMu.Lock()
-	defer b.sendMu.Unlock()
 	b.mu.RLock()
 	tap := b.tap
 	b.mu.RUnlock()
 	if tap != nil {
 		tap(eventType, payload)
 	}
-	b.broadcastToAllLocked(wrapped)
+	depths := b.broadcastToAllLocked(wrapped)
+	b.sendMu.Unlock()
+	b.observeBacklogs(depths)
 }
 
 // ClientCount returns the number of currently registered clients.
@@ -241,28 +283,40 @@ func (b *Broadcaster) Close() {
 
 // broadcastToAllLocked sends a payload to every registered client. The caller
 // holds sendMu so each queue observes the same publish order.
-func (b *Broadcaster) broadcastToAllLocked(payload []byte) {
+func (b *Broadcaster) broadcastToAllLocked(payload []byte) []int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if b.closed {
-		return
+		return nil
 	}
+	depths := make([]int, 0, len(b.clients))
 	for id, queue := range b.clients {
-		b.trySend(queue, id, payload)
+		_, depth := b.trySend(queue, id, payload)
+		depths = append(depths, depth)
 	}
+	return depths
 }
 
 // trySend performs a non-blocking, ownership-safe send. The caller holds
 // sendMu and at least a read lock on b.mu, so no other producer can fill the
 // queue after the capacity check and the channel cannot close.
-func (b *Broadcaster) trySend(queue *clientQueue, clientID string, payload []byte) bool {
+func (b *Broadcaster) trySend(queue *clientQueue, clientID string, payload []byte) (bool, int) {
 	if len(queue.ch) == cap(queue.ch) {
 		b.noteDrop(queue, clientID)
-		return false
+		return false, cap(queue.ch)
 	}
 	queue.ch <- bytes.Clone(payload)
 	b.delivered.Add(1)
-	return true
+	return true, len(queue.ch)
+}
+
+func (b *Broadcaster) observeBacklogs(depths []int) {
+	if b.observeClientBacklog == nil {
+		return
+	}
+	for _, depth := range depths {
+		b.observeClientBacklog(depth)
+	}
 }
 
 func (b *Broadcaster) noteDrop(queue *clientQueue, clientID string) {

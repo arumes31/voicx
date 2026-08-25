@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
@@ -70,6 +71,12 @@ const (
 // maxKeyRequest caps one MsgChatKeyRequest; the server caps the answer at the
 // same number and reports Truncated when it could not serve them all.
 const maxKeyRequest = 64
+
+const (
+	pubKeyCacheCapacity = 1024
+	pubKeyCacheTTL      = 15 * time.Minute
+	maxAsyncDecrypts    = 8
+)
 
 // scopeKeyWait/scopeKeyRetry bound the pull-and-retry for a generation that
 // arrived on a live broadcast before its key did.
@@ -140,23 +147,138 @@ func (a *App) E2EEDiagnostics(peerUniqueID string) (E2EEDiagnostics, error) {
 
 // pubKeyCache caches X25519 public keys by unique ID.
 type pubKeyCache struct {
-	mu   sync.Mutex
-	keys map[string][32]byte
+	mu       sync.Mutex
+	keys     map[string]pubKeyEntry
+	inFlight map[string]pubKeyFlight
+	now      func() time.Time
+	sequence uint64
+	epoch    uint64
 }
 
-func newPubKeyCache() *pubKeyCache { return &pubKeyCache{keys: map[string][32]byte{}} }
+// pubKeyFlight belongs to one connection/cache epoch. clear wakes any old
+// waiters so disconnect cannot strand a decrypt goroutine behind a dead
+// directory request.
+type pubKeyFlight struct {
+	done  chan struct{}
+	epoch uint64
+}
+
+type pubKeyEntry struct {
+	key       [32]byte
+	expiresAt time.Time
+	used      uint64
+}
+
+func newPubKeyCache() *pubKeyCache { return newPubKeyCacheAt(time.Now) }
+
+func newPubKeyCacheAt(now func() time.Time) *pubKeyCache {
+	return &pubKeyCache{
+		keys:     make(map[string]pubKeyEntry),
+		inFlight: make(map[string]pubKeyFlight),
+		now:      now,
+	}
+}
 
 func (c *pubKeyCache) get(uid string) ([32]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	k, ok := c.keys[uid]
-	return k, ok
+	return c.getLocked(uid)
+}
+
+func (c *pubKeyCache) getLocked(uid string) ([32]byte, bool) {
+	entry, ok := c.keys[uid]
+	if !ok {
+		return [32]byte{}, false
+	}
+	if !entry.expiresAt.After(c.now()) {
+		delete(c.keys, uid)
+		return [32]byte{}, false
+	}
+	c.sequence++
+	entry.used = c.sequence
+	c.keys[uid] = entry
+	return entry.key, true
 }
 
 func (c *pubKeyCache) put(uid string, key [32]byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.keys[uid] = key
+	c.putLocked(uid, key)
+}
+
+// putAt admits a fetch result only if its connection epoch is still current.
+// An old leader completing after reconnect must never repopulate this cache.
+func (c *pubKeyCache) putAt(uid string, key [32]byte, epoch uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.epoch != epoch {
+		return false
+	}
+	c.putLocked(uid, key)
+	return true
+}
+
+func (c *pubKeyCache) putLocked(uid string, key [32]byte) {
+	c.evictExpiredLocked()
+	if _, exists := c.keys[uid]; !exists && len(c.keys) >= pubKeyCacheCapacity {
+		var oldestUID string
+		var oldest uint64
+		for candidate, entry := range c.keys {
+			if oldestUID == "" || entry.used < oldest {
+				oldestUID, oldest = candidate, entry.used
+			}
+		}
+		delete(c.keys, oldestUID)
+	}
+	c.sequence++
+	c.keys[uid] = pubKeyEntry{key: key, expiresAt: c.now().Add(pubKeyCacheTTL), used: c.sequence}
+}
+
+func (c *pubKeyCache) evictExpiredLocked() {
+	now := c.now()
+	for uid, entry := range c.keys {
+		if !entry.expiresAt.After(now) {
+			delete(c.keys, uid)
+		}
+	}
+}
+
+func (c *pubKeyCache) getOrClaimFetch(uid string) (key [32]byte, cached, leader bool, done <-chan struct{}, epoch uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if key, cached = c.getLocked(uid); cached {
+		return key, true, false, nil, c.epoch
+	}
+	if existing, ok := c.inFlight[uid]; ok {
+		return [32]byte{}, false, false, existing.done, existing.epoch
+	}
+	ch := make(chan struct{})
+	c.inFlight[uid] = pubKeyFlight{done: ch, epoch: c.epoch}
+	return [32]byte{}, false, true, ch, c.epoch
+}
+
+func (c *pubKeyCache) finishFetch(uid string, epoch uint64) {
+	c.mu.Lock()
+	flight, ok := c.inFlight[uid]
+	if ok && flight.epoch == epoch {
+		delete(c.inFlight, uid)
+	}
+	c.mu.Unlock()
+	if ok && flight.epoch == epoch {
+		close(flight.done)
+	}
+}
+
+func (c *pubKeyCache) clear() {
+	c.mu.Lock()
+	clear(c.keys)
+	c.epoch++
+	flights := c.inFlight
+	c.inFlight = make(map[string]pubKeyFlight)
+	c.mu.Unlock()
+	for _, flight := range flights {
+		close(flight.done)
+	}
 }
 
 type scopeKeyPullKey struct {
@@ -172,9 +294,18 @@ type scopeKeyStore struct {
 	latest   map[int64]uint32
 	refused  map[int64]map[uint32]bool
 	inFlight map[scopeKeyPullKey]bool
+	waiters  map[scopeKeyPullKey][]scopeDecryptWork
 	// updated is closed and replaced whenever a generation lands, so a waiter
 	// blocked on a missing generation wakes without polling.
 	updated chan struct{}
+}
+
+// scopeDecryptWork retains the individual ciphertext resolver and renderer
+// for one follower. Sharing a leader's plaintext would corrupt distinct
+// messages that happen to use the same scope generation.
+type scopeDecryptWork struct {
+	resolve func() string
+	emit    func(string)
 }
 
 func newScopeKeyStore() *scopeKeyStore {
@@ -183,6 +314,7 @@ func newScopeKeyStore() *scopeKeyStore {
 		latest:   map[int64]uint32{},
 		refused:  map[int64]map[uint32]bool{},
 		inFlight: map[scopeKeyPullKey]bool{},
+		waiters:  map[scopeKeyPullKey][]scopeDecryptWork{},
 		updated:  make(chan struct{}),
 	}
 }
@@ -305,6 +437,39 @@ func (s *scopeKeyStore) releasePull(scope int64, keyID uint32) {
 	s.wake()
 }
 
+const maxScopeDecryptWaiters = 64
+
+// queuePull either claims missing-key work or queues an event which is replayed
+// when the leader has the key. The queue is intentionally bounded: overload
+// gets a safe placeholder instead of unbounded retained ciphertext closures.
+func (s *scopeKeyStore) queuePull(scope int64, keyID uint32, work scopeDecryptWork) (leader, queued bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pk := scopeKeyPullKey{scope: scope, keyID: keyID}
+	if s.inFlight[pk] {
+		if len(s.waiters[pk]) >= maxScopeDecryptWaiters {
+			return false, false
+		}
+		s.waiters[pk] = append(s.waiters[pk], work)
+		return false, true
+	}
+	s.inFlight[pk] = true
+	return true, true
+}
+
+// finishQueuedPull clears ownership and returns queued callbacks for the
+// worker to invoke after all store locks are released.
+func (s *scopeKeyStore) finishQueuedPull(scope int64, keyID uint32) []scopeDecryptWork {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pk := scopeKeyPullKey{scope: scope, keyID: keyID}
+	callbacks := s.waiters[pk]
+	delete(s.waiters, pk)
+	delete(s.inFlight, pk)
+	s.wake()
+	return callbacks
+}
+
 // --- seal / open -------------------------------------------------------------
 
 // sealDM encrypts a direct message for recipientPub (true E2EE).
@@ -364,6 +529,24 @@ var attachmentGCMHeader = []byte("VCXGCM1\n")
 
 const attachmentChunkSize = 64 * 1024
 
+var (
+	attachmentChunkCiphertextOverhead = securee2ee.FileChunkCiphertextOverhead()
+	attachmentChunkMaxCiphertextBytes = attachmentChunkSize + attachmentChunkCiphertextOverhead
+	attachmentChunkLengthBytes        = binary.Size(uint32(0))
+)
+
+// sealedAttachmentSizeForPlaintext returns the exact largest encrypted blob
+// produced by sealFile for a plaintext length. Keep it next to the framing so
+// in-memory transfer caps track the header, record length, and AES-GCM format.
+func sealedAttachmentSizeForPlaintext(plainBytes int) int {
+	if plainBytes <= 0 {
+		return len(attachmentGCMHeader)
+	}
+	chunkCount := (plainBytes + attachmentChunkSize - 1) / attachmentChunkSize
+	return len(attachmentGCMHeader) + plainBytes +
+		chunkCount*(attachmentChunkLengthBytes+attachmentChunkCiphertextOverhead)
+}
+
 // sealFile encrypts each attachment chunk with a distinct HKDF-SHA256-derived
 // AES-256-GCM key before any bytes reach the TCP transfer port. The record
 // framing permits bounded-memory streaming while openFile retains the legacy
@@ -413,16 +596,23 @@ func dmHistoryKey(id *identity) ([32]byte, error) {
 
 // openFile decrypts an attachment blob produced by sealFile.
 func openFile(blob []byte, key [32]byte) ([]byte, error) {
+	return openFileLimited(blob, key, 0)
+}
+
+// openFileLimited decrypts a blob while refusing plaintext beyond maxBytes.
+// A non-positive maxBytes keeps the legacy unbounded helper behaviour.
+func openFileLimited(blob []byte, key [32]byte, maxBytes int) ([]byte, error) {
 	if bytes.HasPrefix(blob, attachmentGCMHeader) {
 		reader := bytes.NewReader(blob[len(attachmentGCMHeader):])
 		var out bytes.Buffer
 		for index := uint64(0); reader.Len() > 0; index++ {
 			var size uint32
-			if err := binary.Read(reader, binary.BigEndian, &size); err != nil || size == 0 || size > attachmentChunkSize+64 {
+			if err := binary.Read(reader, binary.BigEndian, &size); err != nil {
 				return nil, errors.New("invalid attachment chunk framing")
 			}
 			chunkLength, err := safecast.Uint32ToInt(size)
-			if err != nil || chunkLength > reader.Len() {
+			if err != nil || chunkLength < attachmentChunkCiphertextOverhead ||
+				chunkLength > attachmentChunkMaxCiphertextBytes || chunkLength > reader.Len() {
 				return nil, errors.New("invalid attachment chunk framing")
 			}
 			chunk := make([]byte, chunkLength)
@@ -432,6 +622,9 @@ func openFile(blob []byte, key [32]byte) ([]byte, error) {
 			plain, err := securee2ee.DecryptFileChunk(key[:], "attachment", index, chunk)
 			if err != nil {
 				return nil, errors.New("attachment decryption failed (wrong key or tampered)")
+			}
+			if maxBytes > 0 && (len(plain) > maxBytes || out.Len() > maxBytes-len(plain)) {
+				return nil, errors.New("attachment plaintext exceeds configured limit")
 			}
 			out.Write(plain)
 		}
@@ -446,15 +639,18 @@ func openFile(blob []byte, key [32]byte) ([]byte, error) {
 	if !ok {
 		return nil, errors.New("attachment decryption failed (wrong key or tampered)")
 	}
+	if maxBytes > 0 && len(plain) > maxBytes {
+		return nil, errors.New("attachment plaintext exceeds configured limit")
+	}
 	return plain, nil
 }
 
 // --- connManager integration -------------------------------------------------
 
-// publishE2EKey publishes the client's X25519 public key after auth. The
-// server answers with the sealed channel key when the client is in a channel;
-// the global generation already rode along in the AuthResponse.
-func (m *connManager) publishE2EKey() error {
+// publishE2EKeyConn publishes the client's X25519 public key during
+// establishment. It deliberately writes the not-yet-installed connection so
+// a failure cannot emit a spurious disconnect or start stale background loops.
+func (m *connManager) publishE2EKeyConn(conn net.Conn) error {
 	id, err := m.identity()
 	if err != nil {
 		return err
@@ -463,7 +659,7 @@ func (m *connManager) publishE2EKey() error {
 	if err != nil {
 		return err
 	}
-	return m.write(netproto.MsgKeyPublish, netproto.KeyPublish{
+	return m.writeConn(conn, netproto.MsgKeyPublish, netproto.KeyPublish{
 		PublicKey: base64.StdEncoding.EncodeToString(pub[:]),
 	})
 }
@@ -577,16 +773,24 @@ func (m *connManager) requestKeys(scope int64, ids []uint32) error {
 // peerPubKey resolves a user's X25519 public key: cache first, then the
 // server directory. Returns ok=false when the user never published one.
 func (m *connManager) peerPubKey(uniqueID string) ([32]byte, bool) {
-	if k, ok := m.pubKeys.get(uniqueID); ok {
-		return k, true
+	cachedKey, cached, leader, done, epoch := m.pubKeys.getOrClaimFetch(uniqueID)
+	if cached {
+		return cachedKey, true
 	}
+	if !leader {
+		<-done
+		return m.pubKeys.get(uniqueID)
+	}
+	defer m.pubKeys.finishFetch(uniqueID, epoch)
+	// The directory request happens without the cache lock. Followers wait on
+	// the per-UID channel above and then re-read the result.
 	f, err := m.request(netproto.MsgKeyRequest, netproto.MsgKeyResponse,
 		netproto.KeyRequest{UniqueID: uniqueID}, 5*time.Second)
 	if err != nil {
 		return [32]byte{}, false
 	}
 	var resp netproto.KeyResponse
-	if err := netproto.Decode(f, &resp); err != nil || resp.PublicKey == "" {
+	if err := netproto.Decode(f, &resp); err != nil || resp.UniqueID != uniqueID || resp.PublicKey == "" {
 		return [32]byte{}, false
 	}
 	raw, err := base64.StdEncoding.DecodeString(resp.PublicKey)
@@ -595,7 +799,9 @@ func (m *connManager) peerPubKey(uniqueID string) ([32]byte, bool) {
 	}
 	var k [32]byte
 	copy(k[:], raw)
-	m.pubKeys.put(uniqueID, k)
+	if !m.pubKeys.putAt(uniqueID, k, epoch) {
+		return [32]byte{}, false
+	}
 	return k, true
 }
 
@@ -677,6 +883,32 @@ func (m *connManager) maybeDecryptEvent(payload string) string {
 	return payload
 }
 
+// startDecrypt bounds background decryption and its dependent key fetches.
+// The read loop never waits for capacity; saturation returns a local
+// placeholder synchronously rather than retaining attacker-controlled
+// ciphertext or growing an unbounded goroutine queue.
+func (m *connManager) startDecrypt(name string, fn func()) bool {
+	if m.decryptSem == nil {
+		return false
+	}
+	select {
+	case m.decryptSem <- struct{}{}:
+		go guardCrash(name, func() {
+			defer func() { <-m.decryptSem }()
+			fn()
+		})
+		return true
+	default:
+		return false
+	}
+}
+
+func presentChat(chat *netproto.ChatBroadcast) {
+	chat.Enc = false
+	chat.E2E = false
+	chat.KeyID = 0
+}
+
 // decryptChatEvent unseals a live chat broadcast.
 func (m *connManager) decryptChatEvent(data json.RawMessage, payload string) string {
 	var chat netproto.ChatBroadcast
@@ -690,7 +922,11 @@ func (m *connManager) decryptChatEvent(data json.RawMessage, payload string) str
 		// request (the response arrives on this same loop).
 		// recover is per-goroutine and this parses attacker-controlled
 		// ciphertext, so it needs its own crash guard (331).
-		go guardCrash("decryptDM", func() { m.decryptDMAsync(chat, payload) })
+		if !m.startDecrypt("decryptDM", func() { m.decryptDMAsync(chat, payload) }) {
+			chat.Text = missingKeyText
+			presentChat(&chat)
+			return rewrapChat("chat", chat, payload)
+		}
 		return ""
 	}
 
@@ -701,13 +937,21 @@ func (m *connManager) decryptChatEvent(data json.RawMessage, payload string) str
 		// The generation is unknown: pull it (99/100) and re-emit. This MUST
 		// be a goroutine — the bundle arrives on this read loop — and needs
 		// its own crash guard for the same reason as the DM branch (331).
-		go guardCrash("chatKeyFetch", func() {
-			chat.Text = m.awaitScopeText(scope, chat.KeyID, blob)
+		if !m.startScopeDecrypt(scope, chat.KeyID, func() string {
+			return m.scopeTextAfterFetch(scope, chat.KeyID, blob)
+		}, func(text string) {
+			chat.Text = text
+			presentChat(&chat)
 			m.emit("event", rewrapChat("chat", chat, payload))
-		})
+		}) {
+			chat.Text = missingKeyText
+			presentChat(&chat)
+			return rewrapChat("chat", chat, payload)
+		}
 		return ""
 	}
 	chat.Text = text
+	presentChat(&chat)
 	return rewrapChat("chat", chat, payload)
 }
 
@@ -731,10 +975,13 @@ func (m *connManager) decryptEventField(envType, field string, data json.RawMess
 
 	text, ok := m.resolveScopeText(scope, keyID, blob)
 	if !ok {
-		go guardCrash("chatKeyFetch", func() {
-			m.emit("event", finishEventField(envType, field, obj,
-				m.awaitScopeText(scope, keyID, blob), payload))
-		})
+		if !m.startScopeDecrypt(scope, keyID, func() string {
+			return m.scopeTextAfterFetch(scope, keyID, blob)
+		}, func(text string) {
+			m.emit("event", finishEventField(envType, field, obj, text, payload))
+		}) {
+			return finishEventField(envType, field, obj, missingKeyText, payload)
+		}
 		return ""
 	}
 	return finishEventField(envType, field, obj, text, payload)
@@ -758,47 +1005,69 @@ func (m *connManager) resolveScopeText(scope int64, keyID uint32, blob string) (
 	return plain, true
 }
 
-// awaitScopeText pulls a generation the client missed and unseals blob once it
-// lands. It MUST run off the read loop: the bundle arrives on that loop, and
-// connManager.request holds a process-global mutex while waiting on it.
-func (m *connManager) awaitScopeText(scope int64, keyID uint32, blob string) string {
-	if !m.scopeKeys.claimPull(scope, keyID) {
-		deadline := time.Now().Add(scopeKeyWait)
-		for {
-			ch := m.scopeKeys.waitCh()
-			if text, ok := m.resolveScopeText(scope, keyID, blob); ok {
-				return text
-			}
-			if time.Now().After(deadline) {
-				return missingKeyText
-			}
-			select {
-			case <-ch:
-			case <-time.After(scopeKeyRetry):
-			}
-		}
+// startScopeDecrypt starts at most one key pull per scope generation and
+// retains a capped set of follower events for replay. It never creates a
+// waiter goroutine: one worker obtains the key, then emits every queued event.
+func (m *connManager) startScopeDecrypt(scope int64, keyID uint32, resolve func() string, emit func(string)) bool {
+	work := scopeDecryptWork{resolve: resolve, emit: emit}
+	leader, queued := m.scopeKeys.queuePull(scope, keyID, work)
+	if !queued {
+		return false // bounded queue full: caller synchronously emits safe text
 	}
-	defer m.scopeKeys.releasePull(scope, keyID)
+	if !leader {
+		return true
+	}
+	if !m.startDecrypt("chatKeyFetch", func() {
+		m.awaitScopeKey(scope, keyID)
+		text := work.resolve()
+		callbacks := m.scopeKeys.finishQueuedPull(scope, keyID)
+		work.emit(text)
+		for _, callback := range callbacks {
+			callback.emit(callback.resolve())
+		}
+	}) {
+		// No worker was accepted; followers already returned from the read loop,
+		// so explicitly give them the same safe placeholder.
+		for _, callback := range m.scopeKeys.finishQueuedPull(scope, keyID) {
+			callback.emit(missingKeyText)
+		}
+		return false
+	}
+	return true
+}
+
+// awaitScopeKey performs the one network pull owned by a scope generation.
+// It MUST run off the read loop because its answer arrives on that same loop.
+func (m *connManager) awaitScopeKey(scope int64, keyID uint32) {
 
 	deadline := time.Now().Add(scopeKeyWait)
 	for {
-		if text, ok := m.resolveScopeText(scope, keyID, blob); ok {
-			return text
+		if _, ok := m.scopeKeys.get(scope, keyID); ok || m.scopeKeys.isRefused(scope, keyID) {
+			return
 		}
 		if time.Now().After(deadline) {
-			return missingKeyText
+			return
 		}
 		// Take the wake channel BEFORE asking, or the answer can land in the
 		// gap and this waits out the full retry window for nothing.
 		ch := m.scopeKeys.waitCh()
 		if err := m.requestKeys(scope, []uint32{keyID}); err != nil {
-			return missingKeyText
+			return
 		}
 		select {
 		case <-ch:
 		case <-time.After(scopeKeyRetry):
 		}
 	}
+}
+
+// scopeTextAfterFetch never makes network requests. It is used after the
+// leader's single key fetch to independently open each queued ciphertext.
+func (m *connManager) scopeTextAfterFetch(scope int64, keyID uint32, blob string) string {
+	if text, ok := m.resolveScopeText(scope, keyID, blob); ok {
+		return text
+	}
+	return missingKeyText
 }
 
 // scopeOf maps a chat broadcast to its key scope (channel id, 0 = global).
@@ -830,6 +1099,7 @@ func (m *connManager) decryptDMAsync(chat netproto.ChatBroadcast, payload string
 	} else {
 		chat.Text = plain
 	}
+	presentChat(&chat)
 	m.emit("event", rewrapChat("chat", chat, payload))
 }
 
@@ -853,6 +1123,10 @@ func finishEventField(envType, field string, obj map[string]any, text, fallback 
 	obj[field] = text
 	delete(obj, "enc")
 	delete(obj, "key_id")
+	// Compatibility/event variants carry these aliases. Once a placeholder or
+	// plaintext is emitted, no ciphertext or generation metadata may survive.
+	delete(obj, "body_enc")
+	delete(obj, "keys")
 	data, err := json.Marshal(obj)
 	if err != nil {
 		return fallback

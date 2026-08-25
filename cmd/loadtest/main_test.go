@@ -28,6 +28,16 @@ func (fakeAuth) AuthenticatePassword(_ context.Context, uniqueID, password strin
 	return uniqueID == "lt-uid" && password == "pw", nil
 }
 
+func (fakeAuth) AuthenticateIdentifier(_ context.Context, identifier, password string) (*auth.User, error) {
+	if identifier != "lt-uid" {
+		return nil, auth.ErrUserNotFound
+	}
+	if password != "pw" {
+		return nil, nil
+	}
+	return &auth.User{ID: 1, UniqueID: identifier, Nickname: "loadtest"}, nil
+}
+
 func (fakeAuth) AuthenticateChallenge(context.Context, string, []byte, []byte) (bool, error) {
 	return false, nil
 }
@@ -78,7 +88,7 @@ func (fakePerms) LoadGroupPermissions(context.Context, int64) (permissions.Permi
 // TestLoadtestSmoke runs the simulator against a real in-process server and
 // verifies clients connect, authenticate, and send chat.
 func TestLoadtestSmoke(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -105,7 +115,7 @@ func TestLoadtestSmoke(t *testing.T) {
 	// Wait for the listener.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		conn, err := net.Dial("tcp", addr)
+		conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", addr)
 		if err == nil {
 			_ = conn.Close()
 			break
@@ -144,7 +154,7 @@ func TestLoadtestSmoke(t *testing.T) {
 	if err := <-errCh; err != nil {
 		t.Fatalf("server start error: %v", err)
 	}
-	_ = srv.Shutdown()
+	_ = srv.Shutdown(t.Context())
 }
 
 func TestReadRTPIdentifiers(t *testing.T) {

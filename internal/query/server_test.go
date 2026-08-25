@@ -13,6 +13,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"voicx/internal/auth"
+	"voicx/internal/metrics"
 )
 
 func closeServerQueryTestResource(t *testing.T, closer io.Closer) {
@@ -81,9 +84,11 @@ type textCall struct {
 }
 
 type createCall struct {
-	name  string
-	topic string
-	ctype int
+	name      string
+	topic     string
+	parentID  int64
+	maxClient int
+	ctype     int
 }
 
 type banCall struct {
@@ -125,14 +130,20 @@ func (f *fakeBackend) SendText(_ context.Context, targetMode int, target, msg st
 	return nil
 }
 
-func (f *fakeBackend) CreateChannel(_ context.Context, name, topic string, channelType int) (int64, error) {
+func (f *fakeBackend) CreateChannel(_ context.Context, params ChannelCreateParams) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.created = append(f.created, createCall{name, topic, channelType})
+	f.created = append(f.created, createCall{
+		name:      params.Name,
+		topic:     params.Topic,
+		parentID:  params.ParentID,
+		maxClient: params.MaxClients,
+		ctype:     params.Type,
+	})
 	return 42, nil
 }
 
-func (f *fakeBackend) DeleteChannel(_ context.Context, channelID int64) error {
+func (f *fakeBackend) DeleteChannel(_ context.Context, channelID int64, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deleted = append(f.deleted, channelID)
@@ -270,14 +281,14 @@ func (f *fakeBackend) Shutdown(_ context.Context, restart bool) error {
 	return nil
 }
 
-func (f *fakeBackend) PermOverview(_ context.Context, uniqueID string, channelID int64) ([]PermLine, error) {
+func (f *fakeBackend) PermOverview(_ context.Context, uniqueID string, channelID int64) ([]PermLine, bool, error) {
 	if uniqueID != "user-uid" {
-		return nil, errors.New("user not found")
+		return nil, false, errors.New("user not found")
 	}
 	return []PermLine{
 		{Key: "i_client_talk_power", Value: 42, Grant: 50, Tier: "server_group"},
 		{Key: "b_channel_modify", Value: 1, Tier: "client_specific"},
-	}, nil
+	}, false, nil
 }
 
 func (f *fakeBackend) ChannelPermList(context.Context, int64) ([]ChannelPerm, error) {
@@ -462,7 +473,7 @@ func startQueryServer(t *testing.T, backend Backend) (string, *Server) {
 // the listener starts.
 func startQueryServerWith(t *testing.T, backend Backend, configure func(*Server)) (string, *Server) {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -480,7 +491,7 @@ func startQueryServerWith(t *testing.T, backend Backend, configure func(*Server)
 	// Wait until the server accepts.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		conn, err := net.Dial("tcp", addr)
+		conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", addr)
 		if err == nil {
 			_ = conn.Close()
 			break
@@ -498,7 +509,7 @@ func startQueryServerWith(t *testing.T, backend Backend, configure func(*Server)
 // dialQuery connects and consumes the two banner lines.
 func dialQuery(t *testing.T, addr string) (net.Conn, *bufio.Reader) {
 	t.Helper()
-	conn, err := net.Dial("tcp", addr)
+	conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", addr)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -555,7 +566,7 @@ func lastErr(t *testing.T, lines []string) string {
 
 func TestGreeting(t *testing.T) {
 	addr, _ := startQueryServer(t, newFakeBackend())
-	conn, err := net.Dial("tcp", addr)
+	conn, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", addr)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -828,6 +839,95 @@ func TestBruteForceLockout(t *testing.T) {
 	}
 }
 
+func TestUnknownLoginMatchesWrongPasswordAndIsLimited(t *testing.T) {
+	backend := newFakeBackend()
+	addr, server := startQueryServerWith(t, backend, func(s *Server) { s.MaxLoginFailures = 3 })
+	m := metrics.New()
+	server.SetMetrics(m)
+	conn, reader := dialQuery(t, addr)
+	defer closeServerQueryTestResource(t, conn)
+
+	wrongKnown := lastErr(t, sendCmd(t, conn, reader, "login admin-uid wrong"))
+	unknown := lastErr(t, sendCmd(t, conn, reader, "login unknown-principal wrong"))
+	if wrongKnown != unknown {
+		t.Fatalf("wrong known response = %q, unknown response = %q", wrongKnown, unknown)
+	}
+
+	families, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	for _, family := range families {
+		if family.GetName() != "voicx_auth_failures_total" {
+			continue
+		}
+		if len(family.GetMetric()) != 1 || family.GetMetric()[0].GetCounter().GetValue() != 2 {
+			t.Fatalf("query auth failure metric = %+v, want one invalid-credential series with value 2", family.GetMetric())
+		}
+		goto metricChecked
+	}
+	t.Fatal("query auth failure metric was not gathered")
+
+metricChecked:
+
+	limitedAddr, _ := startQueryServerWith(t, backend, func(s *Server) { s.MaxLoginFailures = 1 })
+	limitedConn, limitedReader := dialQuery(t, limitedAddr)
+	defer closeServerQueryTestResource(t, limitedConn)
+	_ = sendCmd(t, limitedConn, limitedReader, "login unknown-principal wrong")
+	if got := lastErr(t, sendCmd(t, limitedConn, limitedReader, "login unknown-principal wrong")); !strings.Contains(got, `too\smany\sfailed\slogins`) {
+		t.Fatalf("unknown login was not limited: %q", got)
+	}
+}
+
+func TestServerQueryLoginFailureStateExpiresResetsAndIsBounded(t *testing.T) {
+	backend := newFakeBackend()
+	server := New("127.0.0.1:0", nil, backend)
+	server.MaxLoginFailures = 2
+	server.LockoutDuration = time.Minute
+	server.LoginFailureTTL = 30 * time.Second
+	server.MaxLoginFailureEntries = 2
+	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
+	server.loginNow = func() time.Time { return now }
+
+	expiring := auth.LoginFailureScope("192.0.2.1", "expiring")
+	server.RecordLoginFailure(expiring)
+	now = now.Add(31 * time.Second)
+	server.RecordLoginFailure(expiring)
+	if !server.LoginAllowed(expiring) {
+		t.Fatal("expired failure streak did not reset")
+	}
+
+	locked := auth.LoginFailureScope("192.0.2.1", "locked")
+	server.RecordLoginFailure(locked)
+	server.RecordLoginFailure(locked)
+	if server.LoginAllowed(locked) {
+		t.Fatal("scope was not locked at threshold")
+	}
+	server.ClearLoginFailures(locked)
+	if !server.LoginAllowed(locked) {
+		t.Fatal("successful-login reset did not clear lockout")
+	}
+
+	capacityServer := New("127.0.0.1:0", nil, backend)
+	capacityServer.MaxLoginFailures = 2
+	capacityServer.LockoutDuration = time.Minute
+	capacityServer.LoginFailureTTL = time.Minute
+	capacityServer.MaxLoginFailureEntries = 2
+	capacityServer.loginNow = func() time.Time { return now }
+	first := auth.LoginFailureScope("192.0.2.1", "first")
+	second := auth.LoginFailureScope("192.0.2.1", "second")
+	third := auth.LoginFailureScope("192.0.2.1", "third")
+	capacityServer.RecordLoginFailure(first)
+	now = now.Add(time.Second)
+	capacityServer.RecordLoginFailure(second)
+	now = now.Add(time.Second)
+	capacityServer.RecordLoginFailure(third)
+	capacityServer.RecordLoginFailure(first)
+	if !capacityServer.LoginAllowed(first) {
+		t.Fatal("capacity eviction did not reset the oldest incomplete streak")
+	}
+}
+
 func TestConnectionCap(t *testing.T) {
 	addr, _ := startQueryServerWith(t, newFakeBackend(), func(s *Server) { s.MaxConns = 2 })
 
@@ -837,7 +937,7 @@ func TestConnectionCap(t *testing.T) {
 	defer closeServerQueryTestResource(t, c2)
 
 	// Third connection is refused with an error line.
-	c3, err := net.Dial("tcp", addr)
+	c3, err := (&net.Dialer{}).DialContext(t.Context(), "tcp", addr)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
