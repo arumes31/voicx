@@ -74,8 +74,14 @@ jobs:
             go.sum
             client/go.sum
 
-      - name: Install govulncheck v1.6.0
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+      - name: Install govulncheck v1.7.0
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+
+      - name: Install Linux client dependencies
+        if: matrix.module == 'client'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxtst-dev libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev
 
       - name: Scan ${{ matrix.module }} module
         working-directory: ${{ matrix.directory }}
@@ -119,8 +125,8 @@ jobs:
             go.sum
             client/go.sum
 
-      - name: Install gosec v2.28.0
-        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
+      - name: Install gosec v2.29.0
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
 
       - name: Scan ${{ matrix.scan }}
         working-directory: ${{ matrix.directory }}

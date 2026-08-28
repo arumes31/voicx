@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"syscall"
+
+	"voicx/internal/safecast"
 )
 
 func validateRecordingDirectoryOwner(info os.FileInfo) error {
@@ -14,11 +16,16 @@ func validateRecordingDirectoryOwner(info os.FileInfo) error {
 	if !ok || stat == nil {
 		return errors.New("cannot determine existing recording directory owner")
 	}
-	if stat.Uid != uint32(os.Geteuid()) {
+	euid := os.Geteuid()
+	expectedUID, err := safecast.IntToUint32(euid)
+	if err != nil {
+		return fmt.Errorf("converting effective user ID: %w", err)
+	}
+	if stat.Uid != expectedUID {
 		return fmt.Errorf(
 			"existing recording directory owner %d does not match process owner %d",
 			stat.Uid,
-			os.Geteuid(),
+			euid,
 		)
 	}
 	return nil
