@@ -3,8 +3,8 @@
 # voicx - voice/video server (Phase 1 base image)
 # =============================================================================
 # Multi-stage build:
-#   1. builder  - cross-compiles a static Go binary from Go 1.26.5/Alpine 3.24
-#   2. runtime  - minimal Alpine 3.24 image running as a non-root user
+#   1. builder  - cross-compiles static binaries from Go 1.27/Alpine
+#   2. runtime  - scratch image running as a non-root user
 #
 # NOTE on CGO: Phase 1 keeps CGO_ENABLED=0 to produce a fully static binary
 # that runs on scratch/alpine without libc dependencies. Later phases that
@@ -15,7 +15,7 @@
 # -----------------------------------------------------------------------------
 # Builder stage
 # -----------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
@@ -30,7 +30,7 @@ ARG VOICX_BUILD_DATE=unknown
 ARG VOICX_UPDATE_REPO=voicx/voicx
 
 # git is required by `go mod download` for modules that reference VCS sources.
-RUN apk add --no-cache git
+RUN apk add --no-cache ca-certificates git tzdata
 
 WORKDIR /src
 
@@ -58,32 +58,24 @@ RUN --mount=type=cache,target=/go/pkg/mod \
       -X voicx/internal/version.BuildDate=${VOICX_BUILD_DATE} \
       -X voicx/internal/version.Dirty=${VOICX_DIRTY} \
       -X voicx/internal/version.UpdateRepo=${VOICX_UPDATE_REPO}" \
-    -o /out/voicx ./cmd/server
+    -o /out/voicx ./cmd/server \
+    && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build \
+      -mod=readonly -trimpath -ldflags="-s -w -buildid=" \
+      -o /out/healthcheck ./cmd/healthcheck \
+    && mkdir -p /runtime/data/files /runtime/data/recordings /runtime/home/voicx
 
 # -----------------------------------------------------------------------------
 # Runtime stage
 # -----------------------------------------------------------------------------
-FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS runtime
-
-# ca-certificates: required for outbound TLS (e.g. HTTPS clients, webhooks).
-# tzdata:         required for proper timezone handling in logs/scheduling.
-# wget:           used by the HEALTHCHECK below.
-RUN apk add --no-cache ca-certificates tzdata wget
-
-# Create a non-root user/group with a fixed UID for predictable permissions.
-# uid 10001 avoids clashes with common alpine system users.
-RUN addgroup -S -g 10001 voicx \
-    && adduser  -S -G voicx -u 10001 -h /home/voicx voicx
-
-# Data directories for uploaded files, avatars/icons, and recordings. The
-# compose stack mounts a named volume at /data; creating it here (owned by
-# the runtime user) makes fresh volumes initialize with the right ownership
-# even with read_only rootfs + cap_drop.
-RUN mkdir -p /data/files /data/recordings \
-    && chown -R 10001:10001 /data
+FROM scratch AS runtime
 
 # Copy the compiled binary from the builder stage.
 COPY --from=builder --chown=10001:10001 /out/voicx /out/voicx
+COPY --from=builder --chown=10001:10001 /out/healthcheck /out/healthcheck
+COPY --from=builder --chown=10001:10001 /runtime/data /data
+COPY --from=builder --chown=10001:10001 /runtime/home /home
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
 
 # Drop privileges: run as the non-root voicx user.
 USER 10001:10001
@@ -100,7 +92,7 @@ EXPOSE 12333/tcp 12334/udp 12335/tcp 12336/tcp 12337/tcp 12338/tcp 12339/tcp
 
 # Liveness probe against the health endpoint.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget -qO- http://127.0.0.1:12337/healthz || exit 1
+    CMD ["/out/healthcheck"]
 
 STOPSIGNAL SIGTERM
 

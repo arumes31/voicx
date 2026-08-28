@@ -5,12 +5,12 @@ updates:
     schedule:
       interval: "weekly"
 
-  - package-ecosystem: "gmod"
+  - package-ecosystem: "gomod"
     directory: "/"
     schedule:
       interval: "weekly"
 
-  - package-ecosystem: "gmod"
+  - package-ecosystem: "gomod"
     directory: "/client"
     schedule:
       interval: "weekly"
