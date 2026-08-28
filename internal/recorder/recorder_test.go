@@ -157,6 +157,15 @@ func testLogger() *zap.Logger {
 	return logger
 }
 
+func secureTempDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatalf("restrict temporary recording directory: %v", err)
+	}
+	return dir
+}
+
 func testConfig(dir string) Config {
 	return Config{Enabled: true, Dir: dir, WindowsACLReady: true}
 }
@@ -164,7 +173,7 @@ func testConfig(dir string) Config {
 // TestBuildArgsDefaults verifies the default ffmpeg command line (copy
 // codecs, SDP input, output file).
 func TestBuildArgsDefaults(t *testing.T) {
-	r := New(Config{Enabled: true, Dir: t.TempDir()}, testLogger())
+	r := New(Config{Enabled: true, Dir: secureTempDir(t)}, testLogger())
 	args := r.buildArgs("in.sdp", "out.webm")
 	joined := strings.Join(args, " ")
 
@@ -180,7 +189,7 @@ func TestBuildArgsDefaults(t *testing.T) {
 func TestBuildArgsHardwareEncoder(t *testing.T) {
 	r := New(Config{
 		Enabled:   true,
-		Dir:       t.TempDir(),
+		Dir:       secureTempDir(t),
 		VideoArgs: []string{"-c:v", "h264_nvenc", "-preset", "p1"},
 		AudioArgs: []string{"-c:a", "libopus"},
 		Format:    "mp4",
@@ -209,7 +218,7 @@ func TestBuildSDP(t *testing.T) {
 // TestStartStopLifecycle verifies a recording session starts ffmpeg with the
 // expected command, registers router taps, and stops gracefully.
 func TestStartStopLifecycle(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureTempDir(t)
 	r := New(testConfig(dir), testLogger())
 	exec := &fakeExec{}
 	r.Exec = exec.run
@@ -261,7 +270,7 @@ func TestStartStopLifecycle(t *testing.T) {
 // TestStopKillsStuckProcess verifies Stop kills ffmpeg when it does not exit
 // within the recorder's grace period.
 func TestStopKillsStuckProcess(t *testing.T) {
-	r := New(testConfig(t.TempDir()), testLogger())
+	r := New(testConfig(secureTempDir(t)), testLogger())
 	r.stopGracePeriod = 25 * time.Millisecond
 	r.killWait = time.Second
 	exec := &fakeExec{}
@@ -296,7 +305,7 @@ func TestStopKillsStuckProcess(t *testing.T) {
 
 // TestStartDisabled verifies recording is gated by the Enabled flag.
 func TestStartDisabled(t *testing.T) {
-	r := New(Config{Enabled: false, Dir: t.TempDir()}, testLogger())
+	r := New(Config{Enabled: false, Dir: secureTempDir(t)}, testLogger())
 	if _, err := r.Start(context.Background(), 1, &fakeTapRouter{}); err != ErrDisabled {
 		t.Fatalf("Start on disabled recorder = %v, want ErrDisabled", err)
 	}
@@ -304,7 +313,7 @@ func TestStartDisabled(t *testing.T) {
 
 // TestStopNotRecording verifies Stop on an unknown channel errors.
 func TestStopNotRecording(t *testing.T) {
-	r := New(testConfig(t.TempDir()), testLogger())
+	r := New(testConfig(secureTempDir(t)), testLogger())
 	if err := r.Stop(99); err != ErrNotRecording {
 		t.Fatalf("Stop = %v, want ErrNotRecording", err)
 	}

@@ -57,7 +57,7 @@ func releaseAndStop(t *testing.T, recorder *Recorder, cmd *fakeCommand, channelI
 }
 
 func TestConcurrentStartReservesChannelAtomically(t *testing.T) {
-	recorder := New(testConfig(t.TempDir()), zap.NewNop())
+	recorder := New(testConfig(secureTempDir(t)), zap.NewNop())
 	exec := &fakeExec{}
 	recorder.Exec = exec.run
 	router := &fakeTapRouter{}
@@ -117,7 +117,7 @@ func (e *multiExec) run(_ context.Context, _ string, args ...string) Command {
 }
 
 func TestConcurrentRecordingLimitIsAtomic(t *testing.T) {
-	cfg := testConfig(t.TempDir())
+	cfg := testConfig(secureTempDir(t))
 	cfg.MaxConcurrent = 3
 	recorder := New(cfg, zap.NewNop())
 	exec := &multiExec{}
@@ -185,7 +185,7 @@ func (e *contextExec) run(ctx context.Context, _ string, args ...string) Command
 }
 
 func TestRecordingLifetimeOutlivesRequestContext(t *testing.T) {
-	recorder := New(testConfig(t.TempDir()), zap.NewNop())
+	recorder := New(testConfig(secureTempDir(t)), zap.NewNop())
 	exec := &contextExec{}
 	recorder.Exec = exec.run
 	requestCtx, cancelRequest := context.WithCancel(context.Background())
@@ -210,7 +210,7 @@ func TestRecordingLifetimeOutlivesRequestContext(t *testing.T) {
 }
 
 func TestUnexpectedProcessExitCleansSessionAndArtifacts(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureTempDir(t)
 	recorder := New(testConfig(dir), zap.NewNop())
 	exec := &fakeExec{}
 	recorder.Exec = exec.run
@@ -243,7 +243,7 @@ func TestUnexpectedProcessExitCleansSessionAndArtifacts(t *testing.T) {
 }
 
 func TestMissingRecordingOutputIsReported(t *testing.T) {
-	recorder := New(testConfig(t.TempDir()), zap.NewNop())
+	recorder := New(testConfig(secureTempDir(t)), zap.NewNop())
 	command := newFakeCommand("")
 	recorder.Exec = func(context.Context, string, ...string) Command { return command }
 	if _, err := recorder.Start(context.Background(), 15, &fakeTapRouter{}); err != nil {
@@ -260,7 +260,7 @@ func TestMissingRecordingOutputIsReported(t *testing.T) {
 }
 
 func TestReturnedSessionMutationCannotRedirectCleanup(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureTempDir(t)
 	recorder := New(testConfig(dir), zap.NewNop())
 	exec := &fakeExec{}
 	recorder.Exec = exec.run
@@ -269,7 +269,7 @@ func TestReturnedSessionMutationCannotRedirectCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	originalSDP := session.sdpPath
-	victim := filepath.Join(t.TempDir(), "victim.txt")
+	victim := filepath.Join(secureTempDir(t), "victim.txt")
 	if err := os.WriteFile(victim, []byte("leave me"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -305,7 +305,7 @@ func TestReturnedSessionMutationCannotRedirectCleanup(t *testing.T) {
 }
 
 func TestRecordingPathsAreUniqueAndNeverOverwrite(t *testing.T) {
-	recorder := New(testConfig(t.TempDir()), zap.NewNop())
+	recorder := New(testConfig(secureTempDir(t)), zap.NewNop())
 	fixed := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC)
 	recorder.now = func() time.Time { return fixed }
 	exec := &fakeExec{}
@@ -372,7 +372,7 @@ func (*failingBindCommand) Wait() error  { return errors.New("unexpected Wait") 
 func (*failingBindCommand) Kill() error  { return errors.New("unexpected Kill") }
 
 func TestBindRecordingRootFailureClosesCommandResources(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureTempDir(t)
 	command := &failingBindCommand{}
 	recorder := New(testConfig(dir), zap.NewNop())
 	recorder.Exec = func(context.Context, string, ...string) Command { return command }
@@ -388,7 +388,7 @@ func TestBindRecordingRootFailureClosesCommandResources(t *testing.T) {
 }
 
 func TestStartFailureRemovesSensitiveSDP(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureTempDir(t)
 	recorder := New(testConfig(dir), zap.NewNop())
 	recorder.Exec = func(context.Context, string, ...string) Command {
 		return &failingStartCommand{stdin: &fakeWriteCloser{}}
@@ -406,7 +406,7 @@ func TestStartFailureRemovesSensitiveSDP(t *testing.T) {
 }
 
 func TestRecorderValidatesDirectConstructionAndClosedState(t *testing.T) {
-	valid := New(testConfig(t.TempDir()), zap.NewNop())
+	valid := New(testConfig(secureTempDir(t)), zap.NewNop())
 	//nolint:staticcheck // This explicitly verifies the exported method's nil-context guard.
 	if _, err := valid.Start(nil, 1, &fakeTapRouter{}); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("nil context error = %v", err)
@@ -428,14 +428,14 @@ func TestRecorderValidatesDirectConstructionAndClosedState(t *testing.T) {
 		t.Fatalf("start after Close error = %v", err)
 	}
 
-	invalid := New(Config{Enabled: true, Dir: t.TempDir(), Format: "mkv"}, zap.NewNop())
+	invalid := New(Config{Enabled: true, Dir: secureTempDir(t), Format: "mkv"}, zap.NewNop())
 	if _, err := invalid.Start(context.Background(), 1, &fakeTapRouter{}); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("invalid format error = %v", err)
 	}
 }
 
 func TestConcurrentStopIsIdempotent(t *testing.T) {
-	recorder := New(testConfig(t.TempDir()), zap.NewNop())
+	recorder := New(testConfig(secureTempDir(t)), zap.NewNop())
 	exec := &fakeExec{}
 	recorder.Exec = exec.run
 	router := &fakeTapRouter{}
@@ -462,7 +462,7 @@ func TestConcurrentStopIsIdempotent(t *testing.T) {
 }
 
 func TestConcurrentForcedStopReturnsConsistentTimeout(t *testing.T) {
-	recorder := New(testConfig(t.TempDir()), zap.NewNop())
+	recorder := New(testConfig(secureTempDir(t)), zap.NewNop())
 	recorder.stopGracePeriod = 20 * time.Millisecond
 	recorder.killWait = time.Second
 	exec := &fakeExec{}
@@ -575,7 +575,7 @@ func TestRecorderShutdownIsBoundedWithWedgedCollaborators(t *testing.T) {
 		{name: "Close", stop: func(recorder *Recorder) error { return recorder.Close() }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			recorder := New(testConfig(t.TempDir()), zap.NewNop())
+			recorder := New(testConfig(secureTempDir(t)), zap.NewNop())
 			recorder.stopGracePeriod = 20 * time.Millisecond
 			recorder.killWait = 20 * time.Millisecond
 			command := newWedgedCommand()
@@ -710,7 +710,7 @@ func assertBlockedStartupResourcesStopped(
 }
 
 func TestCloseBoundsInflightStartAndCachesOutcome(t *testing.T) {
-	recorder := New(testConfig(t.TempDir()), zap.NewNop())
+	recorder := New(testConfig(secureTempDir(t)), zap.NewNop())
 	recorder.killWait = 20 * time.Millisecond
 	exec := &fakeExec{}
 	recorder.Exec = exec.run
@@ -772,7 +772,7 @@ func TestCloseBoundsInflightStartAndCachesOutcome(t *testing.T) {
 }
 
 func TestStopCancelsInflightStartAndOwnsResources(t *testing.T) {
-	recorder := New(testConfig(t.TempDir()), zap.NewNop())
+	recorder := New(testConfig(secureTempDir(t)), zap.NewNop())
 	recorder.killWait = 20 * time.Millisecond
 	exec := &fakeExec{}
 	recorder.Exec = exec.run
@@ -840,7 +840,7 @@ func TestStopCancelsInflightStartAndOwnsResources(t *testing.T) {
 }
 
 func TestProcessExitDuringBlockedTapRegistrationPreventsPublication(t *testing.T) {
-	recorder := New(testConfig(t.TempDir()), zap.NewNop())
+	recorder := New(testConfig(secureTempDir(t)), zap.NewNop())
 	exec := &fakeExec{}
 	recorder.Exec = exec.run
 	router := newBlockingAddRouter()
@@ -896,7 +896,7 @@ func TestProcessExitDuringBlockedTapRegistrationPreventsPublication(t *testing.T
 }
 
 func TestProcessExitWhileTapRegistrationIsWedgedReturnsBounded(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureTempDir(t)
 	recorder := New(testConfig(dir), zap.NewNop())
 	recorder.killWait = 20 * time.Millisecond
 	exec := &fakeExec{}
@@ -955,7 +955,7 @@ func TestProcessExitWhileTapRegistrationIsWedgedReturnsBounded(t *testing.T) {
 }
 
 func TestRequestCancellationDuringTapRegistrationAbortsStartup(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureTempDir(t)
 	recorder := New(testConfig(dir), zap.NewNop())
 	exec := &fakeExec{}
 	recorder.Exec = exec.run
@@ -990,7 +990,7 @@ func TestRequestCancellationDuringTapRegistrationAbortsStartup(t *testing.T) {
 }
 
 func TestStartupCleanupRetainsReservationUntilProcessIsReaped(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureTempDir(t)
 	recorder := New(testConfig(dir), zap.NewNop())
 	recorder.killWait = 20 * time.Millisecond
 	command := newWedgedCommand()
@@ -1072,7 +1072,7 @@ func (r *delayedRemovalRouter) RemoveTap(tapID string) {
 }
 
 func TestDelayedOldUnregisterCannotRemoveReplacementTap(t *testing.T) {
-	recorder := New(testConfig(t.TempDir()), zap.NewNop())
+	recorder := New(testConfig(secureTempDir(t)), zap.NewNop())
 	exec := &fakeExec{}
 	recorder.Exec = exec.run
 	router := newDelayedRemovalRouter()
@@ -1139,7 +1139,7 @@ func TestDelayedOldUnregisterCannotRemoveReplacementTap(t *testing.T) {
 
 func TestRecorderCopiesConfigArguments(t *testing.T) {
 	videoArgs := []string{"-c:v", "h264_nvenc"}
-	recorder := New(Config{Enabled: true, Dir: t.TempDir(), VideoArgs: videoArgs}, zap.NewNop())
+	recorder := New(Config{Enabled: true, Dir: secureTempDir(t), VideoArgs: videoArgs}, zap.NewNop())
 	videoArgs[1] = "mutated"
 	args := strings.Join(recorder.buildArgs("input.sdp", "output.webm"), " ")
 	if !strings.Contains(args, "h264_nvenc") || strings.Contains(args, "mutated") {
@@ -1172,8 +1172,8 @@ func TestTapRejectsInvalidInputsAndCloseIsIdempotent(t *testing.T) {
 }
 
 func TestRecordingDirectoryRejectsSymlink(t *testing.T) {
-	target := t.TempDir()
-	link := filepath.Join(t.TempDir(), "recordings-link")
+	target := secureTempDir(t)
+	link := filepath.Join(secureTempDir(t), "recordings-link")
 	if err := os.Symlink(target, link); err != nil {
 		t.Skipf("symlink unavailable: %v", err)
 	}
@@ -1225,7 +1225,7 @@ func TestExistingRecordingDirectoryPermissionsAreValidatedNotChanged(t *testing.
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows recording access is enforced through the acknowledged NTFS DACL")
 	}
-	dir := filepath.Join(t.TempDir(), "existing")
+	dir := filepath.Join(secureTempDir(t), "existing")
 	if err := os.Mkdir(dir, 0o750); err != nil {
 		t.Fatal(err)
 	}
@@ -1249,7 +1249,7 @@ func TestRecorderCreatesRestrictedDirectory(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows recording directories must be pre-provisioned with a restricted DACL")
 	}
-	dir := filepath.Join(t.TempDir(), "recordings")
+	dir := filepath.Join(secureTempDir(t), "recordings")
 	recorder := New(testConfig(dir), zap.NewNop())
 	exec := &fakeExec{}
 	recorder.Exec = exec.run
@@ -1270,7 +1270,7 @@ func TestWindowsRecordingDirectoryMustBePreprovisioned(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("Windows-specific DACL provisioning invariant")
 	}
-	dir := filepath.Join(t.TempDir(), "missing-recordings")
+	dir := filepath.Join(secureTempDir(t), "missing-recordings")
 	recorder := New(testConfig(dir), zap.NewNop())
 	if _, err := recorder.Start(context.Background(), 59, &fakeTapRouter{}); !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("Start with missing Windows recording directory = %v, want ErrInvalidConfig", err)
@@ -1333,7 +1333,7 @@ func (c *delayedRootOpenCommand) Kill() error {
 }
 
 func TestDelayedChildOpenCannotEscapeRenamedRecordingRoot(t *testing.T) {
-	parent := t.TempDir()
+	parent := secureTempDir(t)
 	dir := filepath.Join(parent, "recordings")
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -1379,7 +1379,7 @@ func TestDelayedChildOpenCannotEscapeRenamedRecordingRoot(t *testing.T) {
 }
 
 func TestDefaultCommandBindsPathsToRetainedRoot(t *testing.T) {
-	dir := t.TempDir()
+	dir := secureTempDir(t)
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -1437,7 +1437,7 @@ func TestLinuxChildTraversesInheritedRecordingRootAfterRename(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("Linux /proc/self/fd functional probe")
 	}
-	parent := t.TempDir()
+	parent := secureTempDir(t)
 	dir := filepath.Join(parent, "recordings")
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatal(err)

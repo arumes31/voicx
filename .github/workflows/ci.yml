@@ -195,6 +195,11 @@ jobs:
           cache: npm
           cache-dependency-path: client/frontend/package-lock.json
 
+      - name: install Linux client dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxtst-dev libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev
+
       - name: install pinned Go security analyzers
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
@@ -328,10 +333,12 @@ jobs:
       - name: compute version metadata
         shell: bash
         run: |
-          echo "VOICX_BUILD=$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
-          echo "VOICX_COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
-          echo "VOICX_BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
-          echo "VOICX_DIRTY=false" >> "$GITHUB_ENV"
+          {
+            echo "VOICX_BUILD=$(git rev-list --count HEAD)"
+            echo "VOICX_COMMIT=$(git rev-parse --short HEAD)"
+            echo "VOICX_BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "VOICX_DIRTY=false"
+          } >> "$GITHUB_ENV"
 
       - name: validate update signing configuration
         shell: bash
